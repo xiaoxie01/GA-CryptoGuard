@@ -1,0 +1,573 @@
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+
+def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    payload = payload or {}
+    if payload.get("receive_id"):
+        return {"receive_id": payload["receive_id"], "receive_id_type": payload.get("receive_id_type", "chat_id")}
+    env_receive_id = os.environ.get("CRYPTO_GUARD_FEISHU_RECEIVE_ID")
+    if env_receive_id:
+        return {
+            "receive_id": env_receive_id,
+            "receive_id_type": os.environ.get("CRYPTO_GUARD_FEISHU_RECEIVE_ID_TYPE", "chat_id"),
+        }
+    return repo.latest_feishu_target()
+
+
+def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    active_symbols = repo.active_analysis_symbols()
+    ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120)
+    signals = repo.latest_signals_by_symbol(limit=80)
+    states = repo.latest_analysis_states(limit=120)
+    open_orders = repo.list_open_paper_orders()
+    active_watches = repo.list_active_opportunity_watches()
+    equity = repo.latest_equity_snapshot()
+    failed_jobs = repo.recent_failed_jobs(limit=5)
+    queue_counts = {
+        "pending_user": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority <= 2"),
+        "pending_background": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority > 2"),
+        "running": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='running'"),
+    }
+    duckdb_stats = _duckdb_hourly_stats(now)
+    agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
+    return {
+        "ok": True,
+        "generated_at_utc": now,
+        "active_symbols": active_symbols,
+        "latest_signals": signals,
+        "analysis_states": states,
+        "ga_decisions": ga_decisions,
+        "active_watches": active_watches,
+        "open_orders": open_orders,
+        "equity_snapshot": equity,
+        "failed_jobs": failed_jobs,
+        "queue_counts": queue_counts,
+        "duckdb_stats": duckdb_stats,
+        "agent_brief": agent_brief,
+        "text": (
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats)
+            if ga_decisions
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity)
+        ),
+    }
+
+
+def render_ga_hourly_summary(
+    generated_at_utc: str,
+    active_symbols: list[str],
+    ga_decisions: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    active_watches: list[dict[str, Any]],
+    failed_jobs: list[dict[str, Any]],
+    queue_counts: dict[str, int],
+    equity_snapshot: dict[str, Any] | None = None,
+    duckdb_stats: dict[str, Any] | None = None,
+) -> str:
+    rows = [_decision_row(row) for row in ga_decisions]
+    grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
+    for row in rows:
+        grade = str(row.get("signal_grade") or "D")
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+    high_grade = [r for r in rows if str(r.get("signal_grade")) in {"S", "A", "B"}]
+    no_edge = [r for r in rows if str(r.get("signal_grade")) in {"C", "D"}]
+    lines = [
+        "**GA CryptoGuard 每小时摘要**",
+        f"北京时间（UTC+8）：{_format_time_utc8(generated_at_utc)}",
+        f"UTC 时间：{generated_at_utc}",
+        "",
+        "**一、系统状态**",
+        f"- scheduler：运行中；队列 user={queue_counts.get('pending_user', 0)} background={queue_counts.get('pending_background', 0)} running={queue_counts.get('running', 0)}",
+        "- market data：SQLite 热数据；Redis/Parquet/DuckDB 状态见 /status",
+        f"- Feishu queue：最近失败任务 {len(failed_jobs)}",
+        "",
+        "**二、模拟盘摘要**",
+    ]
+    if equity_snapshot:
+        snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
+        lines.append(
+            f"- equity={float(equity_snapshot.get('account_equity') or 0):.2f}；"
+            f"unrealized={float(equity_snapshot.get('unrealized_pnl') or 0):.2f}；"
+            f"realized={float(equity_snapshot.get('realized_pnl') or 0):.2f}；"
+            f"drawdown={float(snap.get('drawdown_percent') or 0):.2f}%"
+        )
+    else:
+        lines.append("- 暂无净值快照")
+    lines.append(f"- open/pending orders：{len(open_orders)}")
+
+    lines.extend(["", "**三、高等级机会（S/A/B）**"])
+    if not high_grade:
+        lines.append("- 暂无 S/A/B 级机会")
+    for row in high_grade[:10]:
+        lines.append(
+            f"- {row['symbol']}：{row.get('signal_grade')}，{float(row.get('confidence') or 0) * 100:.0f}%；"
+            f"{_decision_text(row.get('decision'))}；{row.get('final_summary') or '-'}"
+        )
+
+    lines.extend(["", "**四、当前机会监控**"])
+    if not active_watches:
+        lines.append("- 暂无 active 机会监控")
+    for watch in active_watches[:10]:
+        condition = _compact_items(_safe_json(watch.get("watch_condition_json"), []), max_items=2)
+        lines.append(f"- #{watch['id']} {watch['symbol']} {watch.get('direction') or '-'}：{condition or watch.get('watch_reason') or '-'}")
+
+    lines.extend(["", "**五、C/D 无优势品种汇总**"])
+    distribution = (duckdb_stats or {}).get("signal_distribution") or grade_counts
+    source = (duckdb_stats or {}).get("source") or "in_memory_fallback"
+    lines.append("- 等级分布：" + "，".join(f"{k}={v}" for k, v in distribution.items()) + f"（{source}）")
+    if no_edge:
+        symbols = ", ".join(row["symbol"] for row in no_edge[:30])
+        lines.append(f"- C/D：{symbols}")
+        reasons = _compact_items([row.get("final_summary") for row in no_edge], max_items=3)
+        lines.append(f"- 主要原因：{reasons or '趋势不清晰或风控不足'}")
+    else:
+        lines.append("- 暂无 C/D 无优势品种")
+
+    lines.extend(["", "**六、风险事件**"])
+    if failed_jobs:
+        for job in failed_jobs[:5]:
+            lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
+    else:
+        lines.append("- 暂无新的失败任务或风险事件")
+    lines.append("")
+    lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
+    return "\n".join(lines)
+
+
+def _duckdb_hourly_stats(generated_at_utc: str) -> dict[str, Any]:
+    try:
+        end = datetime.fromisoformat(generated_at_utc.replace("Z", "+00:00"))
+        start = end - timedelta(hours=1)
+        distribution = DuckDBAnalytics().hourly_signal_distribution(
+            start.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            end.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        )
+        return {"ok": True, "source": "duckdb", "signal_distribution": distribution}
+    except Exception as exc:
+        return {"ok": False, "source": "in_memory_fallback", "error": str(exc), "signal_distribution": {}}
+
+
+def render_hourly_report_text(
+    generated_at_utc: str,
+    active_symbols: list[str],
+    signals: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    failed_jobs: list[dict[str, Any]],
+    queue_counts: dict[str, int],
+    agent_brief: dict[str, Any] | None = None,
+    analysis_states: list[dict[str, Any]] | None = None,
+    equity_snapshot: dict[str, Any] | None = None,
+) -> str:
+    signal_by_symbol = {s["symbol"]: s for s in signals}
+    state_by_symbol: dict[str, dict[str, Any]] = {}
+    for item in analysis_states or []:
+        symbol = item.get("symbol")
+        if symbol and symbol not in state_by_symbol:
+            state_by_symbol[symbol] = item.get("state") or _safe_json(item.get("state_json"), {})
+    orders_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for order in open_orders:
+        orders_by_symbol.setdefault(order["symbol"], []).append(order)
+    lines = [
+        "**CryptoGuard 每小时简报**",
+        f"北京时间（UTC+8）：{_format_time_utc8(generated_at_utc)}",
+        f"UTC 时间：{generated_at_utc}",
+        "",
+        "**产品分析概览：**",
+    ]
+    if agent_brief and agent_brief.get("summary"):
+        lines.extend(["**GA/LLM 巡航摘要：**", str(agent_brief["summary"]), ""])
+    if not active_symbols:
+        lines.append("- 暂无启用产品")
+    for symbol in active_symbols[:30]:
+        signal = signal_by_symbol.get(symbol)
+        if not signal:
+            lines.append(f"- {symbol}：暂无分析记录")
+            continue
+        lines.extend(_signal_report_lines(symbol, signal, orders_by_symbol.get(symbol, []), state_by_symbol.get(symbol)))
+    if len(active_symbols) > 30:
+        lines.append(f"- 其余 {len(active_symbols) - 30} 个产品略。")
+
+    lines.extend(["", "**模拟盘持仓/订单：**"])
+    if not open_orders:
+        lines.append("- 当前无 pending/open 模拟盘订单")
+    else:
+        for order in open_orders[:20]:
+            tps = _safe_json(order.get("take_profit_json"), [])
+            tp_text = ", ".join(str(tp.get("price")) for tp in tps if isinstance(tp, dict)) or "-"
+            lines.append(
+                f"- #{order['id']} {order['symbol']} {order['side']} {order['status']} "
+                f"entry={order.get('entry_price') or order.get('trigger_price') or '-'} "
+                f"SL={order.get('stop_loss') or '-'} TP={tp_text}"
+            )
+
+    lines.extend(["", "**净值曲线摘要：**"])
+    if equity_snapshot:
+        try:
+            snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
+            lines.append(
+                f"- 当前权益：{float(equity_snapshot.get('account_equity') or 0):.2f}；"
+                f"未实现盈亏：{float(equity_snapshot.get('unrealized_pnl') or 0):.2f}；"
+                f"已实现盈亏：{float(equity_snapshot.get('realized_pnl') or 0):.2f}；"
+                f"回撤：{float(snap.get('drawdown_percent') or 0):.2f}%"
+            )
+        except Exception:
+            lines.append("- 暂无可解析净值快照")
+    else:
+        lines.append("- 暂无净值快照")
+
+    lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
+    health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"
+    lines.extend(["", "**系统健康度：**", f"- 状态：{health}", f"- 飞书 outbox/队列：用户 {queue_counts['pending_user']}，后台 {queue_counts['pending_background']}，运行中 {queue_counts['running']}"])
+    if failed_jobs:
+        lines.extend(["", "**最近失败任务：**"])
+        for job in failed_jobs:
+            err = (job.get("error_message") or "")[:120]
+            lines.append(f"- #{job['id']} {job['job_type']}：{err}")
+    lines.append("")
+    lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
+    return "\n".join(lines)
+
+
+def _count(repo: CryptoGuardRepository, sql: str) -> int:
+    return int(repo.conn.execute(sql).fetchone()[0])
+
+
+def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
+    raw = _safe_json(row.get("raw_decision_json"), {})
+    return {
+        "ga_decision_id": row.get("id"),
+        "symbol": row.get("symbol"),
+        "decision": row.get("decision"),
+        "legacy_decision": raw.get("legacy_decision"),
+        "signal_grade": row.get("signal_grade"),
+        "confidence": row.get("confidence"),
+        "market_bias": row.get("market_bias"),
+        "trend_stage": row.get("trend_stage"),
+        "final_summary": row.get("final_summary"),
+        "risk_check": _safe_json(row.get("risk_check_json"), {}),
+        "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
+    }
+
+
+def _decision_text(value: Any) -> str:
+    mapping = {
+        "create_paper_order": "模拟盘候选",
+        "opportunity_watch": "等待触发",
+        "monitor_only": "仅观察",
+        "no_edge": "无明显优势",
+        "close_position": "平仓候选",
+        "adjust_stop_loss": "调整止损",
+        "hold_position": "继续持有",
+    }
+    return mapping.get(str(value or ""), str(value or "-"))
+
+
+def _agent_hourly_brief(
+    active_symbols: list[str],
+    signals: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    failed_jobs: list[dict[str, Any]],
+    queue_counts: dict[str, int],
+) -> dict[str, Any]:
+    fallback = {
+        "summary": "本小时巡航已完成，详见各产品趋势状态、机会判断与风险说明。",
+        "focus_symbols": [],
+        "why_no_opportunity": [],
+        "next_checks": [],
+    }
+    try:
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
+
+        compact_signals = []
+        for signal in signals[:30]:
+            decision = _safe_json(signal.get("ga_decision_json"), {}) or signal
+            compact_signals.append(
+                {
+                    "symbol": signal.get("symbol"),
+                    "decision": decision.get("decision"),
+                    "signal_grade": decision.get("signal_grade"),
+                    "confidence": decision.get("confidence"),
+                    "trend_stage": decision.get("trend_stage"),
+                    "market_bias": decision.get("market_bias"),
+                    "summary": decision.get("summary"),
+                    "counter_evidence": decision.get("counter_evidence"),
+                    "analysis_source": decision.get("analysis_source"),
+                    "llm_status": decision.get("llm_status"),
+                }
+            )
+        return run_agent_json_task(
+            task_name="hourly_alert_quality_brief",
+            payload={
+                "active_symbols": active_symbols,
+                "latest_signals": compact_signals,
+                "open_orders": open_orders[:20],
+                "failed_jobs": failed_jobs,
+                "queue_counts": queue_counts,
+            },
+            fallback=fallback,
+            instructions=[
+                "总结本小时各产品趋势状态、为什么有/没有机会、下一小时应重点观察什么。",
+                "不要输出实盘建议。",
+                "summary 字段应适合放在飞书简报顶部。",
+            ],
+        )
+    except Exception:
+        return fallback
+
+
+def _signal_report_lines(symbol: str, signal: dict[str, Any], open_orders: list[dict[str, Any]] | None = None, analysis_state: dict[str, Any] | None = None) -> list[str]:
+    decision_json = _safe_json(signal.get("ga_decision_json"), {})
+    decision = decision_json if isinstance(decision_json, dict) and decision_json else signal
+    grade = decision.get("signal_grade") or signal.get("signal_grade") or "-"
+    confidence = decision.get("confidence", signal.get("confidence"))
+    confidence_text = f"{float(confidence) * 100:.0f}%" if confidence is not None else "-"
+    decision_name = decision.get("decision") or signal.get("decision") or "unknown"
+    trend = decision.get("trend_stage") or signal.get("trend_stage") or "-"
+    bias = decision.get("market_bias") or signal.get("direction") or "-"
+    conclusion = _analysis_conclusion(symbol, decision)
+    lines = [
+        f"- **{symbol}**：{decision_name}，等级 {grade}，置信度 {confidence_text}",
+        f"  - 研判来源：{_analysis_source_text(decision)}",
+        f"  - 趋势状态：{trend}；市场倾向：{bias}",
+        f"  - GA 分析结论：{conclusion}",
+    ]
+    profiles = _profile_summary(decision)
+    if profiles:
+        lines.append(f"  - 多周期：{profiles}")
+    opportunity = _opportunity_summary(decision)
+    lines.append(f"  - 机会判断：{opportunity}")
+    plan = _trade_plan_summary(decision)
+    lines.append(f"  - 交易计划：{plan}")
+    position = _position_summary(open_orders or [])
+    lines.append(f"  - 持仓/订单：{position}")
+    no_opportunity = _no_opportunity_reason(decision)
+    if no_opportunity:
+        lines.append(f"  - 暂无机会原因：{no_opportunity}")
+    if analysis_state:
+        lines.extend(_analysis_state_report_lines(analysis_state))
+    counter = _compact_items(decision.get("counter_evidence") or _safe_json(signal.get("risk_notes"), []), max_items=2)
+    if counter:
+        lines.append(f"  - 反向证据/风险：{counter}")
+    return lines
+
+
+def _trade_plan_summary(decision: dict[str, Any]) -> str:
+    plan = decision.get("trade_plan")
+    risk = decision.get("risk_check") or {}
+    if decision.get("has_trade_plan") and isinstance(plan, dict):
+        tps = _compact_items([tp.get("price") for tp in plan.get("take_profits", []) if isinstance(tp, dict)], max_items=3)
+        return f"{plan.get('side')} {plan.get('entry_type')}，入场 {plan.get('entry_price') or plan.get('trigger_price')}，止损 {plan.get('stop_loss')}，止盈 {tps or '-'}，风控={'通过' if risk.get('ok') else '未通过'}"
+    if risk.get("reasons"):
+        return "无可执行模拟盘计划；风控原因：" + "；".join(str(x) for x in risk.get("reasons", [])[:2])
+    return "暂无完整交易计划。"
+
+
+def _position_summary(open_orders: list[dict[str, Any]]) -> str:
+    if not open_orders:
+        return "无 pending/open 模拟盘订单。"
+    parts = []
+    for order in open_orders[:3]:
+        tps = _safe_json(order.get("take_profit_json"), [])
+        tp_text = _compact_items([tp.get("price") for tp in tps if isinstance(tp, dict)], max_items=2)
+        parts.append(
+            f"#{order['id']} {order['side']} {order['status']} 入场={order.get('entry_price') or order.get('trigger_price') or '-'} "
+            f"SL={order.get('stop_loss') or '-'} TP={tp_text or '-'}"
+        )
+    return "；".join(parts)
+
+
+def _analysis_conclusion(symbol: str, decision: dict[str, Any]) -> str:
+    summary = decision.get("summary")
+    if summary:
+        return str(summary)
+    decision_name = decision.get("decision")
+    if decision_name == "trade_plan_available":
+        return f"{symbol} 有完整模拟盘计划，但仍需按失效位执行。"
+    if decision_name and str(decision_name).startswith("wait_for"):
+        return f"{symbol} 有方向倾向，等待触发条件确认。"
+    if decision_name == "monitor_only":
+        return f"{symbol} 仅适合观察，优势不足以生成模拟盘计划。"
+    return f"{symbol} 当前无明显优势，系统仅记录本次分析。"
+
+
+def _analysis_source_text(decision: dict[str, Any]) -> str:
+    source = decision.get("analysis_source")
+    status = decision.get("llm_status")
+    if source == "llm_agent" and status == "ok":
+        return "LLM/GA Agent"
+    if source == "deterministic_fallback":
+        return "LLM/GA 失败后规则降级"
+    if source == "deterministic_sop":
+        return "规则 SOP"
+    return "GA SOP"
+
+
+def _profile_summary(decision: dict[str, Any]) -> str:
+    profiles = decision.get("profiles") or {}
+    if not isinstance(profiles, dict):
+        return ""
+    parts = []
+    for tf in ("1d", "4h", "1h", "15m", "5m"):
+        profile = profiles.get(tf)
+        if not isinstance(profile, dict):
+            continue
+        stage = profile.get("trend_stage") or "-"
+        structure = profile.get("market_structure") or "-"
+        momentum = profile.get("momentum") or "-"
+        parts.append(f"{tf}={structure}/{stage}/{momentum}")
+    return "；".join(parts[:5])
+
+
+def _opportunity_summary(decision: dict[str, Any]) -> str:
+    if decision.get("has_trade_plan") and decision.get("trade_plan"):
+        plan = decision["trade_plan"]
+        return f"有模拟盘计划，方向 {plan.get('side')}，entry={plan.get('entry_price') or plan.get('trigger_price')}，SL={plan.get('stop_loss')}"
+    watch = decision.get("opportunity_watch")
+    if isinstance(watch, dict) and watch.get("needed"):
+        conditions = _compact_items(watch.get("conditions") or [], max_items=2)
+        return f"可加入机会监控，方向 {watch.get('direction') or '-'}；条件：{conditions or watch.get('reason') or '-'}"
+    actions = decision.get("suggested_actions") or []
+    if "create_opportunity_watch" in actions:
+        return "可观察，但尚未形成完整模拟盘计划。"
+    return "暂无可执行机会。"
+
+
+def _no_opportunity_reason(decision: dict[str, Any]) -> str:
+    if decision.get("has_trade_plan"):
+        return ""
+    reasons: list[str] = []
+    grade = str(decision.get("signal_grade") or "")
+    confidence = decision.get("confidence")
+    trend_stage = decision.get("trend_stage")
+    if grade in {"C", "D"}:
+        reasons.append(f"等级 {grade} 低于推送/执行阈值")
+    if confidence is not None and float(confidence) < 0.65:
+        reasons.append(f"置信度 {float(confidence) * 100:.0f}% 未达到 B 级观察阈值")
+    if trend_stage == "range":
+        reasons.append("震荡区间内不强行判断趋势")
+    elif trend_stage == "late":
+        reasons.append("趋势末端，追价信号降级")
+    policy = ((decision.get("modules") or {}).get("trend_stage") or {}).get("strategy_policy")
+    if policy == "filter_trend_strategy":
+        reasons.append("多周期偏震荡，趋势策略被过滤")
+    elif policy == "downgrade_chasing_signal":
+        reasons.append("趋势阶段策略要求降级追单")
+    counter = decision.get("counter_evidence") or []
+    if counter:
+        reasons.append(str(counter[0]))
+    return "；".join(_dedupe(reasons)[:4])
+
+
+def _compact_items(items: Any, max_items: int = 3) -> str:
+    if isinstance(items, str):
+        return items
+    if not isinstance(items, list):
+        return ""
+    values = [str(x) for x in items if x not in (None, "")]
+    return "；".join(_dedupe(values)[:max_items])
+
+
+def _analysis_state_report_lines(state: dict[str, Any]) -> list[str]:
+    market_structure = state.get("market_structure") or {}
+    clarity = state.get("trend_clarity") or {}
+    no_trade = state.get("no_trade_reason") or {}
+    key_levels = state.get("key_levels") or {}
+    next_analysis = state.get("next_analysis") or {}
+    boundary = key_levels.get("breakout_boundary") or {}
+    permission = state.get("trade_permission") or {}
+    breakout_watch = state.get("breakout_watch") or {}
+    triggers = state.get("next_triggers") or []
+    support = _compact_items([_format_level(x) for x in key_levels.get("support") or []], max_items=3)
+    resistance = _compact_items([_format_level(x) for x in key_levels.get("resistance") or []], max_items=3)
+    trigger_text = _compact_items([t.get("condition") if isinstance(t, dict) else t for t in triggers], max_items=3)
+    reason_text = _compact_items(clarity.get("reason") or [], max_items=3)
+    permission_text = "允许" if permission.get("paper_trade_allowed") else "不允许"
+    watch_text = "建议" if state.get("opportunity_watch_recommended") else "不建议"
+    next_time = next_analysis.get("suggested_time_utc")
+    next_reason = str(next_analysis.get("reason") or "-").replace("15m/15m", "15m")
+    no_trade_text = "已有候选交易计划，等待风控和触发确认。"
+    if no_trade.get("has_no_trade"):
+        no_trade_text = f"{no_trade.get('reason_code') or '-'}：{no_trade.get('detail') or '-'}"
+    return [
+        (
+            "  - 市场结构状态："
+            f"状态={market_structure.get('structure_status') or '-'}；"
+            f"日线={market_structure.get('direction_1d') or '-'}；"
+            f"4H={market_structure.get('direction_4h') or '-'}；"
+            f"1H趋势={market_structure.get('trend_1h') or '-'}；"
+            f"15M结构={market_structure.get('structure_15m') or '-'}；"
+            f"5M触发={market_structure.get('trigger_5m') or '-'}"
+        ),
+        f"  - 趋势清晰度：{float(clarity.get('score') or 0) * 100:.0f}%（{_clarity_text(clarity.get('level'))}）；原因：{reason_text or '-'}",
+        f"  - 无交易机会归因：{no_trade_text}",
+        f"  - 关键关注点位：支撑={support or '-'}；阻力={resistance or '-'}；失效位={_format_level(key_levels.get('invalid_level'))}",
+        f"  - 下次触发条件：{trigger_text or '-'}",
+        f"  - 下次分析时间：{_format_time_utc8(next_time)}（UTC {next_time or '-'}）；{next_reason}",
+        (
+            "  - 等待突破边界："
+            f"上沿={_format_level(boundary.get('upper'))}；"
+            f"下沿={_format_level(boundary.get('lower'))}；"
+            f"确认要求={breakout_watch.get('confirmation_required') or '-'}"
+        ),
+        f"  - 模拟盘权限：{permission_text}；原因={permission.get('reason') or '-'}",
+        f"  - 机会监控建议：{watch_text}",
+    ]
+
+
+def _clarity_text(level: Any) -> str:
+    mapping = {"clear": "清晰", "mixed": "分歧", "unclear": "不清晰"}
+    return mapping.get(str(level or ""), str(level or "-"))
+
+
+def _format_level(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return f"{float(value):g}"
+    except Exception:
+        return str(value)
+
+
+def _format_time_utc8(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value) / 1000, timezone.utc)
+        else:
+            text = str(value)
+            if text.isdigit():
+                dt = datetime.fromtimestamp(int(text) / 1000, timezone.utc)
+            else:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return (dt.astimezone(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    except Exception:
+        return str(value)
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _safe_json(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default

@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: buy_point_failed
+    action: require_momentum_alignment
+  - when: zhongshu_breakout_failed
+    action: add_retest_requirement

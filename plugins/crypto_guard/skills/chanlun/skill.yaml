@@ -1,0 +1,14 @@
+skill_name: chanlun
+version: 1.0
+status: active
+description: Compute Chanlun bi/zhongshu/divergence/buy-sell-point facts with deterministic tools and GA interpretation.
+tools: [detect_bi, detect_zhongshu, detect_divergence, classify_buy_sell_point]
+output_schema: schema.json
+memory:
+  read: [skill_feedback_memory, trade_reviews, daily_review_reports]
+  write: [skill_execution_logs, skill_feedback_memory]
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true

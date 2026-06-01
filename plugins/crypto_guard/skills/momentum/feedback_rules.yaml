@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: momentum_exhaustion_loss
+    action: require_order_flow_confirmation
+  - when: late_chase_loss
+    action: lower_late_stage_confidence

@@ -1,0 +1,19 @@
+skill_name: price_action_skill
+version: 1.0
+status: active
+description: Identify price action structure with deterministic swing/BOS/CHoCH preprocessing and GA interpretation.
+tools:
+  - detect_swings
+  - identify_bos_choch
+  - detect_breakout_retest
+input:
+  required: [symbol, timeframe, closed_candles, previous_analysis_state]
+output_schema: schema.json
+memory:
+  read: [skill_memory, recent_trade_reviews, strategy_feedback]
+  write: [skill_execution_logs, skill_feedback_memory]
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true

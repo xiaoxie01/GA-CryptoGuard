@@ -829,6 +829,21 @@ def handle_message(data):
     print(f"收到消息 [{open_id}] ({message.message_type}, {len(image_paths)} images): {user_input[:200]}")
     receive_id = chat_id or open_id
     receive_id_type = "chat_id" if chat_id else "open_id"
+    if message.message_type == "text":
+        try:
+            from plugins.crypto_guard.notify.feishu_integration import enqueue_feishu_message
+
+            if enqueue_feishu_message(
+                text=user_input,
+                open_id=open_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+                message_id=message_id,
+                send_message=send_message,
+            ):
+                return
+        except Exception as e:
+            print(f"[crypto_guard] enqueue feishu message failed: {e}")
     chat_key = receive_id
     if message.message_type == "text" and user_input.startswith("/"):
         threading.Thread(
@@ -844,17 +859,65 @@ def handle_message(data):
     ).start()
 
 
+def handle_card_action(data):
+    try:
+        from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+        from plugins.crypto_guard.notify.feishu_integration import enqueue_button_callback
+
+        event = data.event
+        action_value = getattr(getattr(event, "action", None), "value", None) or {}
+        if action_value.get("plugin") != "crypto_guard":
+            return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已收到"}})
+        operator = getattr(event, "operator", None)
+        context = getattr(event, "context", None)
+        open_id = getattr(operator, "open_id", "") or ""
+        chat_id = getattr(context, "open_chat_id", "") or ""
+        receive_id = chat_id or open_id
+        receive_id_type = "chat_id" if chat_id else "open_id"
+        payload = dict(action_value)
+        payload.update({
+            "open_id": open_id,
+            "receive_id": receive_id,
+            "receive_id_type": receive_id_type,
+            "event_id": getattr(event, "token", "") or f"card:{open_id}:{action_value.get('action')}:{action_value.get('signal_id')}",
+        })
+        enqueue_button_callback(payload, send_message=send_message)
+        return P2CardActionTriggerResponse({"toast": {"type": "success", "content": "已进入 CryptoGuard 队列处理"}})
+    except Exception as e:
+        print(f"[crypto_guard] handle card action failed: {e}")
+        traceback.print_exc()
+        try:
+            from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": f"处理失败: {e}"}})
+        except Exception:
+            return None
+
+
 def main():
     global client, APP_ID, APP_SECRET, ALLOWED_USERS, PUBLIC_ACCESS, CONFIG_PATH
     APP_ID, APP_SECRET, ALLOWED_USERS, PUBLIC_ACCESS, CONFIG_PATH = _feishu_config()
     if not APP_ID or not APP_SECRET:
         print(f"错误: 请在 mykey 配置中填写 fs_app_id 和 fs_app_secret\n配置文件: {CONFIG_PATH}", flush=True)
         sys.exit(1)
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_message).build()
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(handle_message)
+        .register_p2_card_action_trigger(handle_card_action)
+        .build()
+    )
     retry_delay = 5
     while True:
         try:
             client = create_client()
+            try:
+                from plugins.crypto_guard.service_manager import start_all_services
+
+                crypto_result = start_all_services(send_message=send_message)
+                print(f"[crypto_guard] autostart: {crypto_result}", flush=True)
+            except Exception as e:
+                print(f"[crypto_guard] autostart failed: {e}", flush=True)
+                traceback.print_exc()
             cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
             print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n配置: {CONFIG_PATH}\n等待消息...\n" + "=" * 50, flush=True)
             cli.start()

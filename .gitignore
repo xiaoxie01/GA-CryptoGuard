@@ -1,5 +1,6 @@
 temp/
 tmp/
+data/
 
 __pycache__/
 *.py[cod]

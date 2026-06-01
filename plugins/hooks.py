@@ -52,9 +52,15 @@ def discover_and_load(plugin_dir=None):
     if parent not in sys.path:
         sys.path.insert(0, parent)
     for fn in sorted(os.listdir(plugin_dir)):
-        if fn.startswith('_') or not fn.endswith('.py'):
+        if fn.startswith('_'):
             continue
-        name = fn[:-3]
+        path = os.path.join(plugin_dir, fn)
+        if fn.endswith('.py'):
+            name = fn[:-3]
+        elif os.path.isdir(path) and os.path.isfile(os.path.join(path, '__init__.py')):
+            name = fn
+        else:
+            continue
         load(name)
 
 

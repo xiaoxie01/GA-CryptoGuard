@@ -1,0 +1,14 @@
+skill_name: smc_orderflow
+version: 1.0
+status: active
+description: Detect SMC and order-flow evidence with deterministic OB/FVG/liquidity/CVD tools.
+tools: [detect_order_block, detect_fvg, detect_liquidity_sweep, cvd_slope, aggressive_buy_ratio]
+output_schema: schema.json
+memory:
+  read: [skill_feedback_memory, trade_reviews, daily_review_reports]
+  write: [skill_execution_logs, skill_feedback_memory]
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true

@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: trend_reversal_missed
+    action: increase_transition_weight
+  - when: chop_as_trend
+    action: strengthen_range_filter

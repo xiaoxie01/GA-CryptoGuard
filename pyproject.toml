@@ -14,6 +14,8 @@ dependencies = [
     "bottle>=0.12",
     "simple-websocket-server>=0.4",
     "aiohttp>=3.9",
+    "PyYAML>=6.0",
+    "jsonschema>=4.18",
 ]
 
 [project.optional-dependencies]

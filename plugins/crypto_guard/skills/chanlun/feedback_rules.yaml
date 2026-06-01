@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: divergence_failed
+    action: require_price_action_confirmation
+  - when: zhongshu_break_false
+    action: increase_breakout_confirmation

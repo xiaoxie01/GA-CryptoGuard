@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: false_breakout_loss
+    action: increase_confirmation_requirement
+  - when: range_misclassified_as_trend
+    action: lower_trend_confidence
