@@ -170,10 +170,19 @@ def _build_memory_section(context: dict[str, Any]) -> dict[str, Any] | None:
         skill = item.get("skill_name") or "unknown"
         if skill not in by_skill:
             by_skill[skill] = []
+
+        # Parse suggested_adjustment_json (stored as JSON string in DB)
+        adjustment_raw = item.get("suggested_adjustment_json") or ""
+        adjustment = {}
+        if adjustment_raw:
+            try:
+                adjustment = json.loads(adjustment_raw) if isinstance(adjustment_raw, str) else adjustment_raw
+            except (json.JSONDecodeError, TypeError):
+                adjustment = {"raw": adjustment_raw}
+
         by_skill[skill].append({
-            "pattern": item.get("pattern_description"),
-            "adjustment": item.get("suggested_adjustment"),
-            "confidence_shift": item.get("confidence_shift"),
+            "pattern": item.get("finding"),  # DB field is "finding", not "pattern_description"
+            "adjustment": adjustment,
             "status": item.get("status"),
         })
 

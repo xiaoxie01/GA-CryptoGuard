@@ -11,6 +11,14 @@ def analyze_trend_stage(price_action: dict[str, Any], momentum: dict[str, Any], 
     if structure == "range":
         stage = "range"
         main_risk = "震荡区间内信号容易互相打架"
+    elif structure == "transition":
+        # Near breakout — treat as early trend if momentum confirms
+        if quality in {"healthy", "building"}:
+            stage = "early"
+            main_risk = "接近突破位，等待确认回踩"
+        else:
+            stage = "transition"
+            main_risk = "结构切换期，等待确认"
     elif quality in {"extended", "overheated", "exhausted"}:
         stage = "late"
         main_risk = "趋势末端或短线过热，追价风险高"
@@ -51,7 +59,21 @@ def fuse_trend_stage(profiles: dict[str, Any], primary_stage: dict[str, Any], *,
     primary = primary_stage.get("trend_stage", dominant_stage)
 
     high_tf_range = any((profiles.get(tf) or {}).get("trend_stage") == "range" or (profiles.get(tf) or {}).get("market_structure") == "range" for tf in ("4h",))
-    if high_tf_range or dominant_stage == "range" or dominant_structure == "range":
+    has_breakout_signal = any(
+        (profiles.get(tf) or {}).get("last_event", "").endswith(("bos", "choch"))
+        or (profiles.get(tf) or {}).get("range_status") in ("breakout", "breakout_retest", "structure_shift")
+        or (profiles.get(tf) or {}).get("market_structure") == "transition"
+        for tf in ("4h", "1h", "15m")
+    )
+    if has_breakout_signal and dominant_stage in {"early", "transition", "range"}:
+        fused = "early"
+        policy = "allow_watch_not_chase"
+        main_risk = "突破信号出现，等待回踩确认入场。"
+    elif high_tf_range and dominant_stage == "range" and dominant_structure == "range":
+        fused = "range"
+        policy = "filter_trend_strategy"
+        main_risk = "多周期偏震荡，趋势策略过滤。"
+    elif dominant_stage == "range":
         fused = "range"
         policy = "filter_trend_strategy"
         main_risk = "多周期偏震荡，趋势策略过滤。"

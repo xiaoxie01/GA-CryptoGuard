@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GADecision",
+  "type": "object",
+  "required": [
+    "symbol",
+    "analysis_time_utc",
+    "decision_type",
+    "signal_grade",
+    "confidence",
+    "decision",
+    "skill_result_refs",
+    "evidence",
+    "risk_check",
+    "feishu_actions",
+    "final_summary"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "analysis_time_utc": {
+      "type": "string"
+    },
+    "decision_type": {
+      "enum": [
+        "ad_hoc_analysis",
+        "scheduled_analysis",
+        "opportunity_trigger",
+        "paper_review",
+        "daily_review"
+      ]
+    },
+    "signal_grade": {
+      "enum": [
+        "S",
+        "A",
+        "B",
+        "C",
+        "D"
+      ]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "market_bias": {
+      "enum": [
+        "bullish",
+        "bearish",
+        "neutral",
+        "mixed"
+      ]
+    },
+    "trend_stage": {
+      "enum": [
+        "early",
+        "middle",
+        "late",
+        "range",
+        "transition",
+        "unknown"
+      ]
+    },
+    "decision": {
+      "enum": [
+        "create_paper_order",
+        "opportunity_watch",
+        "monitor_only",
+        "no_edge",
+        "close_position",
+        "adjust_stop_loss",
+        "hold_position"
+      ]
+    },
+    "skill_result_refs": {
+      "type": "object"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "counter_evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risk_check": {
+      "type": "object",
+      "required": [
+        "passed",
+        "reasons"
+      ]
+    },
+    "trade_plan": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "opportunity_watch": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "feishu_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "final_summary": {
+      "type": "string"
+    }
+  }
+}

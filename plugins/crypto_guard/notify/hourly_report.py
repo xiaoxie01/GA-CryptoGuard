@@ -386,15 +386,22 @@ def _position_summary(open_orders: list[dict[str, Any]]) -> str:
 
 def _analysis_conclusion(symbol: str, decision: dict[str, Any]) -> str:
     summary = decision.get("summary")
-    if summary:
-        return str(summary)
+    grade = str(decision.get("signal_grade") or "D").upper()
     decision_name = decision.get("decision")
-    if decision_name == "trade_plan_available":
-        return f"{symbol} 有完整模拟盘计划，但仍需按失效位执行。"
+    has_tp = decision.get("has_trade_plan")
+
+    if summary and decision_name == "trade_plan_available":
+        return str(summary)
+    if decision_name == "trade_plan_available" and has_tp:
+        return f"{symbol} 有完整模拟盘计划（{grade}级），按失效位执行。"
     if decision_name and str(decision_name).startswith("wait_for"):
-        return f"{symbol} 有方向倾向，等待触发条件确认。"
+        return f"{symbol} 有方向倾向（{grade}级），等待触发条件确认。"
+    if decision_name == "opportunity_watch" and grade in {"S", "A"}:
+        return f"{symbol} {grade}级机会，可加入机会监控或模拟盘。"
     if decision_name == "monitor_only":
         return f"{symbol} 仅适合观察，优势不足以生成模拟盘计划。"
+    if summary:
+        return str(summary)
     return f"{symbol} 当前无明显优势，系统仅记录本次分析。"
 
 
@@ -427,17 +434,18 @@ def _profile_summary(decision: dict[str, Any]) -> str:
 
 
 def _opportunity_summary(decision: dict[str, Any]) -> str:
+    grade = str(decision.get("signal_grade") or "D").upper()
     if decision.get("has_trade_plan") and decision.get("trade_plan"):
         plan = decision["trade_plan"]
-        return f"有模拟盘计划，方向 {plan.get('side')}，entry={plan.get('entry_price') or plan.get('trigger_price')}，SL={plan.get('stop_loss')}"
+        return f"{grade}级模拟盘计划，方向 {plan.get('side')}，entry={plan.get('entry_price') or plan.get('trigger_price')}，SL={plan.get('stop_loss')}"
     watch = decision.get("opportunity_watch")
     if isinstance(watch, dict) and watch.get("needed"):
         conditions = _compact_items(watch.get("conditions") or [], max_items=2)
-        return f"可加入机会监控，方向 {watch.get('direction') or '-'}；条件：{conditions or watch.get('reason') or '-'}"
+        return f"{grade}级机会监控，方向 {watch.get('direction') or '-'}；条件：{conditions or watch.get('reason') or '-'}"
     actions = decision.get("suggested_actions") or []
     if "create_opportunity_watch" in actions:
-        return "可观察，但尚未形成完整模拟盘计划。"
-    return "暂无可执行机会。"
+        return f"{grade}级可观察，但尚未形成完整模拟盘计划。"
+    return f"{grade}级暂无可执行机会。"
 
 
 def _no_opportunity_reason(decision: dict[str, Any]) -> str:

@@ -58,6 +58,103 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         signal_id = int(decision["signal_id"])
         sent = False
         target = None
+
+        # Auto-create paper order for S/A grade signals with valid trade plan
+        auto_order = None
+        grade = str(decision.get("signal_grade") or "D").upper()
+        has_plan = bool(decision.get("has_trade_plan") and decision.get("trade_plan"))
+        risk_ok = bool((decision.get("risk_check") or {}).get("ok"))
+        ga_decision_id = decision.get("ga_decision_id")
+        # Don't auto-create if there's already an open order for this symbol
+        existing_orders = repo.list_open_paper_orders_for_symbol(decision.get("symbol", ""))
+        if grade in {"S", "A"} and has_plan and risk_ok and ga_decision_id and not existing_orders:
+            try:
+                from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+                auto_order = create_paper_order_from_ga_decision(repo, int(ga_decision_id))
+                LOGGER.info("auto paper order created ga_decision_id=%s result=%s", ga_decision_id, auto_order)
+                # Send notification when order is newly created (not idempotent)
+                if auto_order.get("ok") and auto_order.get("created"):
+                    _target = resolve_report_target(repo, payload)
+                    if _target and send_message:
+                        plan = decision.get("trade_plan") or {}
+                        tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
+                        side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
+                        entry_type = str(plan.get("entry_type") or "limit")
+                        status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
+                        entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
+                        from datetime import datetime, timezone, timedelta
+                        now_utc8 = datetime.now(timezone(timedelta(hours=8)))
+                        order_text = "\n".join([
+                            "**CryptoGuard 已自动创建模拟盘订单**",
+                            "",
+                            f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)",
+                            f"- 产品：{decision.get('symbol')}",
+                            f"- 方向：{side_cn}",
+                            f"- 状态：{status_cn}",
+                            f"- 入场价：{entry_price}",
+                            f"- 止损价：{plan.get('stop_loss')}",
+                            f"- 止盈价：{tps}",
+                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
+                            "",
+                            "不构成实盘建议，仅用于模拟盘与策略研究。",
+                        ])
+                        send_markdown_alert(
+                            repo, send_message,
+                            receive_id=_target["receive_id"],
+                            receive_id_type=_target.get("receive_id_type", "chat_id"),
+                            text=order_text,
+                            alert_type="paper_order_filled",
+                            symbol=decision.get("symbol"),
+                            priority=3,
+                        )
+            except Exception as exc:
+                LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
+                auto_order = {"ok": False, "error": str(exc)}
+
+        # Position-aware analysis: check if new analysis conflicts with open position
+        open_trades = repo.list_open_paper_trades()
+        symbol_trades = [t for t in open_trades if t.get("symbol") == decision.get("symbol")]
+        if symbol_trades and send_message:
+            _pos_target = resolve_report_target(repo, payload)
+            if _pos_target:
+                for trade in symbol_trades:
+                    pos_side = str(trade.get("side") or "").upper()
+                    new_bias = str(decision.get("market_bias") or "neutral").lower()
+                    pos_cn = {"LONG": "做多", "SHORT": "做空"}.get(pos_side, pos_side)
+                    bias_cn = {
+                        "bullish": "偏多（bullish）",
+                        "bearish": "偏空（bearish）",
+                        "neutral": "中性（neutral）",
+                        "mixed": "多空混合（mixed）",
+                    }.get(new_bias, new_bias)
+                    # Direction conflict: open LONG but analysis says bearish, or vice versa
+                    if (pos_side == "LONG" and new_bias == "bearish") or (pos_side == "SHORT" and new_bias == "bullish"):
+                        summary = decision.get("summary") or ""
+                        from datetime import datetime, timezone, timedelta
+                        now_utc8 = datetime.now(timezone(timedelta(hours=8)))
+                        conflict_text = "\n".join([
+                            f"**CryptoGuard 持仓方向冲突提醒**",
+                            "",
+                            f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)",
+                            f"- 产品：{decision.get('symbol')}",
+                            f"- 当前持仓：{pos_cn}（入场价 {trade.get('entry_price')}）",
+                            f"- 最新研判：{bias_cn}",
+                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
+                            f"- 研判摘要：{summary}" if summary else "",
+                            f"- 建议：关注是否需要提前平仓或调整止损",
+                            "",
+                            "不构成实盘建议，仅用于模拟盘与策略研究。",
+                        ])
+                        send_markdown_alert(
+                            repo, send_message,
+                            receive_id=_pos_target["receive_id"],
+                            receive_id_type=_pos_target.get("receive_id_type", "chat_id"),
+                            text=conflict_text,
+                            alert_type="risk_alert",
+                            symbol=decision.get("symbol"),
+                            priority=3,
+                        )
+
         # v2: scheduled analysis is recorded into analysis_states/signals and summarized hourly.
         # Real-time Feishu alerts are reserved for paper/risk/opportunity events.
         if payload.get("allow_realtime_signal_alert") and should_push_signal(decision):
@@ -75,7 +172,7 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                         priority=5,
                     ).get("sent")
                 )
-        result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target}
+        result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target, "auto_order": auto_order}
         LOGGER.info(
             "process_job done id=%s type=%s signal_id=%s grade=%s pushed=%s decision=%s",
             job.get("id"),
@@ -101,8 +198,13 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
     if job_type == "daily_review":
         result = run_daily_review(repo, day_utc=payload.get("day_utc"))
         target = resolve_report_target(repo, payload)
+        loss_count = payload.get("loss_count")
+        loss_header = f"（今日 {loss_count} 笔止损触发复盘）\n" if loss_count else ""
+        # Build detailed evolution status
+        evolution_text = _build_evolution_status_text(repo)
+        full_text = loss_header + result["text"] + evolution_text
         if target and send_message:
-            sent_result = send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=result["text"], alert_type="daily_review", priority=5)
+            sent_result = send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=full_text, alert_type="daily_review", priority=5)
             result["sent"] = bool(sent_result.get("sent"))
             result["target"] = target
         else:
@@ -136,6 +238,10 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         return result
     if job_type == "paper_drawdown_alert":
         result = handle_paper_drawdown_alert(repo, payload, send_message=send_message)
+        LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
+        return result
+    if job_type == "evolution_trigger_alert":
+        result = handle_evolution_trigger_alert(repo, payload, send_message=send_message)
         LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
         return result
     return {"ok": False, "error": f"未知 job_type: {job_type}"}
@@ -231,19 +337,88 @@ def handle_opportunity_watch_alert(repo: CryptoGuardRepository, payload: dict[st
 def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     target = resolve_report_target(repo, payload)
     event_type = payload.get("event_type", "paper_event")
-    text = "\n".join(
-        [
-            "**CryptoGuard 模拟盘事件**",
-            "",
-            f"- 类型：{event_type}",
-            f"- 产品：{payload.get('symbol', '-')}",
-            f"- 订单：#{payload.get('order_id', '-')}",
-            f"- 成交/退出价：{payload.get('entry_price') or payload.get('exit_price') or '-'}",
-            f"- 原因：{payload.get('close_reason') or payload.get('fill_method') or '-'}",
-            "",
-            "不构成实盘建议，仅用于模拟盘与策略研究。",
-        ]
-    )
+    event_cn = {
+        "paper_order_filled": "已成交",
+        "paper_order_expired": "已过期",
+        "take_profit_hit": "止盈触发",
+        "stop_loss_hit": "止损触发",
+        "stop_loss_adjustment": "止损调整",
+        "close_position": "手动平仓",
+        "risk_alert": "风险提醒",
+        "opportunity_triggered": "机会触发",
+    }.get(event_type, event_type)
+    side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(payload.get("side") or "").upper(), payload.get("side") or "-")
+    fill_method_cn = {
+        "limit_range_touch": "限价触及",
+        "trigger_touch": "触发价触及",
+        "next_candle_open_with_slippage": "市价成交（含滑点）",
+    }.get(payload.get("fill_method"), payload.get("fill_method") or "")
+    close_reason_cn = {
+        "take_profit": "止盈",
+        "stop_loss": "止损",
+        "timeout": "超时平仓",
+        "manual": "手动平仓",
+    }.get(payload.get("close_reason"), payload.get("close_reason") or "")
+
+    # Calculate USDT P&L from R-multiple
+    pnl_r = payload.get("pnl_r")
+    pnl_usdt_text = ""
+    if pnl_r is not None:
+        order_id = payload.get("order_id")
+        if order_id:
+            try:
+                order_row = repo.conn.execute("SELECT entry_price, stop_loss FROM paper_orders WHERE id=?", (int(order_id),)).fetchone()
+                if order_row:
+                    entry = float(order_row["entry_price"] or 0)
+                    stop = float(order_row["stop_loss"] or 0)
+                    risk_per_unit = abs(entry - stop)
+                    risk_pct = 0.005  # 0.5% default
+                    risk_usdt = 10000.0 * risk_pct  # 10000U starting equity * 0.5%
+                    pnl_usdt = float(pnl_r) * risk_usdt
+                    pnl_usdt_text = f"（{pnl_usdt:+.2f}U）"
+            except Exception:
+                pass
+
+    # Build event-specific details
+    detail_lines = []
+    # Add UTC+8 timestamp
+    from datetime import datetime, timezone, timedelta
+    now_utc8 = datetime.now(timezone(timedelta(hours=8)))
+    detail_lines.append(f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)")
+    if event_type == "stop_loss_adjustment":
+        new_stop = payload.get("new_stop_loss")
+        adj_reason = payload.get("reason", "")
+        if new_stop:
+            detail_lines.append(f"- 新止损：{new_stop}")
+        if adj_reason:
+            detail_lines.append(f"- 原因：{adj_reason}")
+    elif event_type in ("take_profit_hit", "stop_loss_hit", "close_position"):
+        reason = close_reason_cn
+        detail_lines.append(f"- 原因：{reason}")
+        if pnl_r is not None:
+            detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
+    elif event_type == "paper_order_filled":
+        if fill_method_cn:
+            detail_lines.append(f"- 成交方式：{fill_method_cn}")
+    else:
+        reason = close_reason_cn or fill_method_cn
+        if reason:
+            detail_lines.append(f"- 原因：{reason}")
+        if pnl_r is not None:
+            detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
+
+    lines = [
+        f"**CryptoGuard 模拟盘 · {event_cn}**",
+        "",
+        f"- 产品：{payload.get('symbol', '-')}",
+        f"- 方向：{side_cn}",
+        f"- 订单：#{payload.get('order_id', '-')}",
+        f"- 价格：{payload.get('entry_price') or payload.get('exit_price') or '-'}",
+    ] + detail_lines + [
+        "",
+        "不构成实盘建议，仅用于模拟盘与策略研究。",
+    ]
+    text = "\n".join(lines)
     sent = False
     if target and send_message:
         sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type=str(event_type), symbol=payload.get("symbol"), priority=3).get("sent"))
@@ -268,6 +443,156 @@ def handle_paper_drawdown_alert(repo: CryptoGuardRepository, payload: dict[str, 
     sent = False
     if target and send_message:
         sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="risk_alert", priority=3).get("sent"))
+    return {"ok": True, "sent": sent, "target": target, "text": text}
+
+
+def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
+    """Build detailed evolution status text for daily review notification."""
+    import json
+    lines = []
+
+    # Get recent evolution triggers
+    triggers = repo.conn.execute(
+        "SELECT * FROM evolution_triggers WHERE status IN ('pending', 'shadow_testing') ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+
+    if not triggers:
+        return ""
+
+    lines.append("")
+    lines.append("---")
+    lines.append("**自进化状态**")
+    lines.append("")
+
+    for t in triggers:
+        t = dict(t)
+        trigger_type_cn = {
+            "consecutive_stop_losses": "连续止损",
+            "daily_loss_threshold": "单日止损",
+            "account_drawdown": "账户回撤",
+        }.get(t.get("trigger_type"), t.get("trigger_type"))
+
+        trigger_value = t.get("trigger_value", 0)
+        threshold = t.get("threshold_value", 0)
+        related_ids = []
+        try:
+            related_ids = json.loads(t.get("related_trade_ids") or "[]")
+        except Exception:
+            pass
+
+        status_cn = {
+            "pending": "待处理",
+            "shadow_testing": "影子测试中",
+            "active": "已激活",
+            "rejected": "已拒绝",
+        }.get(t.get("status"), t.get("status"))
+
+        lines.append(f"[{status_cn}] {trigger_type_cn}")
+        lines.append(f"  触发值：{trigger_value}（阈值 {threshold}）")
+        if related_ids:
+            ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
+            lines.append(f"  关联交易：{ids_str}")
+        lines.append(f"  创建时间：{t.get('created_at', '-')}")
+        lines.append("")
+
+    # Get related patches
+    patches = repo.conn.execute(
+        "SELECT * FROM strategy_patches WHERE status IN ('candidate', 'shadow_testing') ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+
+    if patches:
+        lines.append("**候选补丁**")
+        lines.append("")
+        for p in patches:
+            p = dict(p)
+            patch_json = {}
+            try:
+                patch_json = json.loads(p.get("patch_json") or "{}")
+            except Exception:
+                pass
+
+            patch_id = p.get("id")
+            version = p.get("candidate_version", "-")
+            reason = p.get("reason", "-")
+            created = p.get("created_at", "-")[:16]
+
+            # Get shadow test results if available
+            shadow_results = repo.conn.execute(
+                "SELECT COUNT(*) as total, SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins FROM paper_trades WHERE close_reason IS NOT NULL AND created_at >= ?",
+                (p.get("created_at", "2000-01-01"),)
+            ).fetchone()
+            total = int(shadow_results["total"] or 0) if shadow_results else 0
+            wins = int(shadow_results["wins"] or 0) if shadow_results else 0
+
+            if total > 0:
+                wr = wins / total * 100
+                lines.append(f"Patch #{patch_id}（{version}）：{reason}")
+                lines.append(f"  影子测试：{total}笔交易，胜率 {wr:.0f}%（{wins}W/{total - wins}L）")
+            else:
+                lines.append(f"Patch #{patch_id}（{version}）：{reason}")
+                lines.append(f"  影子测试：暂无数据")
+
+            lines.append(f"  创建时间：{created}")
+            lines.append("")
+
+    # Next steps
+    lines.append("**下一步**")
+    lines.append("- 影子测试需至少 3 个交易日数据确认效果")
+    lines.append("- 胜率和盈亏比达标后可进入 review 阶段")
+    lines.append("- review 通过后可手动确认进入 active")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Send immediate notification when evolution is triggered."""
+    import json
+    target = resolve_report_target(repo, payload)
+    trigger_type = payload.get("trigger_type", "unknown")
+    loss_count = payload.get("loss_count", 0)
+    day = payload.get("day_utc", "-")
+    trigger_id = payload.get("trigger_id")
+    patch_id = payload.get("patch_id")
+    reason = payload.get("reason", "")
+    related_ids = payload.get("related_trade_ids") or []
+    trigger_value = payload.get("trigger_value")
+    threshold = payload.get("threshold_value")
+
+    trigger_type_cn = {
+        "consecutive_stop_losses": "连续止损",
+        "daily_loss_threshold": "单日止损",
+        "account_drawdown": "账户回撤",
+    }.get(trigger_type, trigger_type)
+
+    # Build trigger detail
+    detail_lines = [f"**CryptoGuard 自进化触发**", ""]
+    detail_lines.append(f"- 触发类型：{trigger_type_cn}")
+    if trigger_value and threshold:
+        detail_lines.append(f"- 触发值：{trigger_value}（阈值 {threshold}）")
+    if loss_count:
+        detail_lines.append(f"- 今日止损：{loss_count} 笔")
+    if reason:
+        detail_lines.append(f"- 原因：{reason}")
+    if related_ids:
+        ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
+        detail_lines.append(f"- 关联交易：{ids_str}")
+    if trigger_id:
+        detail_lines.append(f"- 触发器 ID：#{trigger_id}")
+    if patch_id:
+        detail_lines.append(f"- 候选补丁 ID：#{patch_id}")
+    detail_lines.append("")
+    detail_lines.append("系统已自动创建候选补丁并进入影子测试。")
+    detail_lines.append("影子测试需至少 3 个交易日数据确认效果后方可进入 review。")
+
+    # Get full evolution status
+    evolution_text = _build_evolution_status_text(repo)
+
+    text = "\n".join(detail_lines) + "\n" + evolution_text + "\n不构成实盘建议，所有策略变更仅进入 candidate/shadow 流程。"
+
+    sent = False
+    if target and send_message:
+        sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
     return {"ok": True, "sent": sent, "target": target, "text": text}
 
 

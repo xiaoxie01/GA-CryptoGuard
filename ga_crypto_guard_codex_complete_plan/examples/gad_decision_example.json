@@ -1,0 +1,45 @@
+{
+  "symbol": "BTCUSDT",
+  "analysis_time_utc": "2026-05-26T06:15:30Z",
+  "decision_type": "ad_hoc_analysis",
+  "signal_grade": "B",
+  "confidence": 0.66,
+  "market_bias": "bullish",
+  "trend_stage": "middle",
+  "decision": "opportunity_watch",
+  "skill_result_refs": {
+    "price_action_log_id": 101,
+    "momentum_log_id": 102,
+    "trend_stage_log_id": 103,
+    "smc_orderflow_log_id": 104,
+    "chanlun_log_id": 105
+  },
+  "evidence": [
+    "4H direction bullish",
+    "15M pullback holding structure"
+  ],
+  "counter_evidence": [
+    "5M entry trigger not confirmed"
+  ],
+  "risk_check": {
+    "passed": false,
+    "reasons": [
+      "trade_plan incomplete",
+      "entry trigger not confirmed"
+    ]
+  },
+  "trade_plan": null,
+  "opportunity_watch": {
+    "watch_type": "wait_for_pullback",
+    "conditions": [
+      "5M reversal near support",
+      "CVD turns up"
+    ]
+  },
+  "feishu_actions": [
+    "add_to_opportunity_watch",
+    "add_to_long_term_pool",
+    "ignore"
+  ],
+  "final_summary": "BTCUSDT 有观察价值，但入场触发未确认，建议只加入机会监控。"
+}

@@ -1,0 +1,61 @@
+phases:
+  - phase: '01'
+    slug: stability_observability
+    name: 稳定性与可观测性
+    path: phases/phase_01_stability_observability
+  - phase: '02'
+    slug: data_loop
+    name: 数据闭环完善
+    path: phases/phase_02_data_loop
+  - phase: '03'
+    slug: signal_grading
+    name: 信号分级机制
+    path: phases/phase_03_signal_grading
+  - phase: '04'
+    slug: opportunity_watch
+    name: 机会监控强化
+    path: phases/phase_04_opportunity_watch
+  - phase: '05'
+    slug: paper_execution_quality
+    name: 模拟盘执行质量
+    path: phases/phase_05_paper_execution_quality
+  - phase: '06'
+    slug: price_action
+    name: 价格行为模块
+    path: phases/phase_06_price_action
+  - phase: '07'
+    slug: momentum
+    name: 动能模块
+    path: phases/phase_07_momentum
+  - phase: '08'
+    slug: trend_stage
+    name: 趋势阶段模块
+    path: phases/phase_08_trend_stage
+  - phase: '09'
+    slug: smc_orderflow
+    name: SMC 与订单流模块
+    path: phases/phase_09_smc_orderflow
+  - phase: '10'
+    slug: chanlun
+    name: 缠论模块
+    path: phases/phase_10_chanlun
+  - phase: '11'
+    slug: trade_review_sop
+    name: 复盘归因 SOP
+    path: phases/phase_11_trade_review_sop
+  - phase: '12'
+    slug: strategy_versioning
+    name: 策略版本管理
+    path: phases/phase_12_strategy_versioning
+  - phase: '13'
+    slug: shadow_testing
+    name: 影子测试
+    path: phases/phase_13_shadow_testing
+  - phase: '14'
+    slug: historical_replay_backtest
+    name: 历史回放 / 回测
+    path: phases/phase_14_historical_replay_backtest
+  - phase: '15'
+    slug: self_evolution_loop
+    name: 自进化闭环
+    path: phases/phase_15_self_evolution_loop

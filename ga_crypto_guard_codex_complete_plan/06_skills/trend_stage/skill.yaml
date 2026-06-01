@@ -1,0 +1,39 @@
+skill_name: trend_stage
+version: 1.0
+status: active
+ga_controlled: true
+description: >
+  趋势阶段：初期启动、中期延续、末期衰竭、震荡、转折、小级别生长为大级别趋势
+
+tools:
+  - extract_multitimeframe_structure_features
+  - detect_trend_continuation
+  - detect_range_features
+  - detect_late_stage_risk
+  - detect_tf_growth
+
+input:
+  required:
+    - symbol
+    - timeframe
+    - closed_candles
+    - previous_analysis_state
+    - skill_feedback_memory
+
+output_schema: schema.json
+
+memory:
+  read:
+    - skill_feedback_memory
+    - recent_trade_reviews
+    - previous_skill_results
+  write:
+    - skill_execution_logs
+    - skill_feedback_memory
+
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true
+  auto_promote: false

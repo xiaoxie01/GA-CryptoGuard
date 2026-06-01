@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketStateSnapshot",
+  "type": "object",
+  "required": [
+    "symbol",
+    "analysis_time_utc",
+    "timeframes",
+    "profiles",
+    "data_quality"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "analysis_time_utc": {
+      "type": "string"
+    },
+    "timeframes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "profiles": {
+      "type": "object"
+    },
+    "module_results": {
+      "type": "object"
+    },
+    "paper_context": {
+      "type": "object"
+    },
+    "data_quality": {
+      "type": "object"
+    }
+  }
+}

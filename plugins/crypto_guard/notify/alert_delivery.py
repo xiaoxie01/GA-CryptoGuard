@@ -19,6 +19,7 @@ DEFAULT_NEVER_SILENCE = {
     "opportunity_triggered",
     "paper_order_filled",
     "paper_order_expired",
+    "evolution_trigger",
 }
 
 

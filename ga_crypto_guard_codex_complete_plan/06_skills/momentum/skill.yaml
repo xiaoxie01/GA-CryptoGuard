@@ -1,0 +1,41 @@
+skill_name: momentum
+version: 1.0
+status: active
+ga_controlled: true
+description: >
+  动能：量价配合、RSI slope、MACD histogram、ATR expansion、Volume impulse、指标背离
+
+tools:
+  - calc_rsi_slope
+  - calc_macd_histogram
+  - calc_atr_state
+  - detect_volume_impulse
+  - detect_price_volume_alignment
+  - detect_indicator_divergence
+  - calc_body_strength
+
+input:
+  required:
+    - symbol
+    - timeframe
+    - closed_candles
+    - previous_analysis_state
+    - skill_feedback_memory
+
+output_schema: schema.json
+
+memory:
+  read:
+    - skill_feedback_memory
+    - recent_trade_reviews
+    - previous_skill_results
+  write:
+    - skill_execution_logs
+    - skill_feedback_memory
+
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true
+  auto_promote: false

@@ -22,10 +22,12 @@ def update_trade_path_metrics(
     market: dict[str, Any],
     *,
     event: str = "mark",
+    quantity: float | None = None,
 ) -> dict[str, Any]:
     entry = float(trade["entry_price"])
     side = str(trade["side"]).upper()
-    quantity = _quantity(trade)
+    if quantity is None:
+        quantity = _quantity(trade)
     favorable_price = float(market["high"]) if side == "LONG" else float(market["low"])
     adverse_price = float(market["low"]) if side == "LONG" else float(market["high"])
     favorable = max(0.0, _pnl(side, entry, favorable_price, quantity))
@@ -93,12 +95,17 @@ def close_quality_metrics(
     side = str(order["side"]).upper()
     entry = float(trade["entry_price"])
     stop = float(order["stop_loss"])
-    quantity = _quantity(trade)
-    risk = abs(entry - stop) * quantity or 1.0
+    # Calculate actual position size based on risk
+    risk_pct = float(order.get("risk_percent") or 0.5) / 100.0
+    account_balance = 10000.0  # starting equity
+    risk_usdt = account_balance * risk_pct  # e.g. 10000 * 0.5% = 50U
+    risk_per_unit = abs(entry - stop)
+    quantity = risk_usdt / risk_per_unit if risk_per_unit > 0 else 1.0
+    risk = risk_usdt  # actual USDT risk
     pnl = _pnl(side, entry, exit_price, quantity)
     pnl_r = pnl / risk
     pnl_percent = ((exit_price - entry) * (1 if side == "LONG" else -1)) / entry * 100 if entry else 0.0
-    path_metrics = update_trade_path_metrics(trade, market, event=close_reason)
+    path_metrics = update_trade_path_metrics(trade, market, event=close_reason, quantity=quantity)
     mfe = float(path_metrics["max_favorable_excursion"])
     mae = float(path_metrics["max_adverse_excursion"])
     entry_efficiency = _entry_efficiency(side, entry, stop, market)
@@ -131,7 +138,16 @@ def equity_snapshot(
         price = latest_prices.get(trade["symbol"])
         if price is None:
             continue
-        unrealized += _pnl(str(trade["side"]).upper(), float(trade["entry_price"]), float(price), _quantity(trade))
+        # Use stored quantity (calculated at fill time) or recalculate
+        qty = _quantity(trade)
+        if qty <= 1.0:
+            # Recalculate from risk parameters
+            entry = float(trade.get("entry_price") or 0)
+            stop = float(trade.get("stop_loss") or 0)
+            risk_per_unit = abs(entry - stop) if entry and stop else 0
+            if risk_per_unit > 0:
+                qty = (starting_equity * 0.005) / risk_per_unit  # 0.5% risk
+        unrealized += _pnl(str(trade["side"]).upper(), float(trade["entry_price"]), float(price), qty)
     equity = starting_equity + closed_realized_pnl + unrealized
     drawdown_percent = min(0.0, (equity - starting_equity) / starting_equity * 100) if starting_equity else 0.0
     return {

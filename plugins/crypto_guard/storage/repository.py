@@ -764,6 +764,7 @@ class CryptoGuardRepository:
         return [dict(r) for r in rows]
 
     def latest_feishu_target(self) -> dict[str, Any] | None:
+        # Primary: look in agent_jobs with source='feishu'
         rows = self.conn.execute(
             """
             SELECT payload_json FROM agent_jobs
@@ -784,6 +785,30 @@ class CryptoGuardRepository:
                     "receive_id_type": payload.get("receive_id_type", "open_id"),
                     "open_id": payload.get("open_id"),
                 }
+        # Fallback: look in feishu_events table (user messages via Feishu webhook)
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT payload_json FROM feishu_events
+                WHERE event_type='message'
+                ORDER BY rowid DESC
+                LIMIT 10
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except Exception:
+                    continue
+                receive_id = payload.get("receive_id")
+                if receive_id:
+                    return {
+                        "receive_id": receive_id,
+                        "receive_id_type": payload.get("receive_id_type", "chat_id"),
+                        "open_id": payload.get("open_id"),
+                    }
+        except Exception:
+            pass
         return None
 
     def latest_signals_by_symbol(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -1583,11 +1608,11 @@ class CryptoGuardRepository:
             ).fetchall()
         ]
 
-    def save_strategy_patch_candidate(self, patch: dict[str, Any], evidence: dict[str, Any] | None = None) -> int:
+    def save_strategy_patch_candidate(self, patch: dict[str, Any], evidence: dict[str, Any] | None = None, trigger_id: int | None = None) -> int:
         self.conn.execute(
             """
-            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, evidence_json, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'candidate')
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, evidence_json, trigger_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate')
             """,
             (
                 patch["strategy_name"],
@@ -1596,6 +1621,7 @@ class CryptoGuardRepository:
                 json.dumps(patch.get("patch", {}), ensure_ascii=False),
                 patch.get("change_reason"),
                 json.dumps(evidence or {}, ensure_ascii=False),
+                trigger_id,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])

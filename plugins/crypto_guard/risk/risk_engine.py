@@ -5,6 +5,7 @@ from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES
+from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
 
 
 def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -124,16 +125,17 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
 def suggested_actions(decision: dict[str, Any], risk: dict[str, Any] | None = None) -> list[str]:
     risk = risk or {"ok": False}
     grade = str(decision.get("signal_grade") or "D").upper()
+    confidence = float(decision.get("confidence") or 0)
     actions: list[str] = []
     has_plan = bool(decision.get("has_trade_plan") and decision.get("trade_plan"))
     decision_name = str(decision.get("decision") or "")
     watch = decision.get("opportunity_watch")
-    if grade in {"D", "C"}:
+    if grade in STORE_ONLY_GRADES:
         actions.extend(["add_to_watchlist", "ignore"])
-    elif has_plan and risk.get("ok") and grade in {"S", "A"}:
+    elif has_plan and risk.get("ok") and grade in PUSH_GRADES and is_paper_order_eligible(grade, confidence):
         actions.append("create_paper_order")
         actions.append("create_opportunity_watch")
-    elif grade in {"S", "A", "B"} and (watch or decision_name.startswith("wait_for") or decision_name in {"monitor_only", "trade_plan_available"}):
+    elif grade in PUSH_GRADES | WATCH_GRADES and (watch or decision_name.startswith("wait_for") or decision_name in {"monitor_only", "trade_plan_available"}):
         actions.append("create_opportunity_watch")
     actions.extend(["add_to_watchlist", "ignore"])
     out: list[str] = []

@@ -166,6 +166,14 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     should_fill = False
     entry_price = order.get("entry_price") or last_price
     fill_method = order.get("fill_method")
+    # Calculate position size based on risk
+    risk_pct = float(order.get("risk_percent") or 0.5) / 100.0
+    account_balance = 10000.0
+    risk_usdt = account_balance * risk_pct
+    stop = float(order.get("stop_loss") or 0)
+    risk_per_unit = abs(float(entry_price) - stop) if stop else 0
+    if risk_per_unit > 0:
+        order["quantity"] = risk_usdt / risk_per_unit
     if order_type == "market":
         should_fill = True
         open_price = float(market.get("open", last_price))
@@ -189,7 +197,7 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
         3,
         "paper_worker",
         f"system:paper:filled:{order['id']}",
-        {"event_type": "paper_order_filled", "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method},
+        {"event_type": "paper_order_filled", "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method, "side": order.get("side")},
     )
     return {"ok": True, "filled": True, "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method}
 
@@ -260,7 +268,7 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         3,
         "paper_worker",
         f"system:paper:closed:{trade['id']}",
-        {"event_type": event_type, "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade["id"], "exit_price": exit_price, "close_reason": close_reason, "pnl_r": quality["pnl_r"]},
+        {"event_type": event_type, "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade["id"], "exit_price": exit_price, "close_reason": close_reason, "pnl_r": quality["pnl_r"], "side": order.get("side")},
     )
     return {
         "ok": True,

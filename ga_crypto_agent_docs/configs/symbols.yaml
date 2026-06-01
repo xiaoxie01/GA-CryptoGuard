@@ -1,0 +1,42 @@
+default_universe:
+  enabled: true
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - XRPUSDT
+    - DOGEUSDT
+    - ADAUSDT
+    - AVAXUSDT
+    - LINKUSDT
+    - LTCUSDT
+
+symbol_profiles:
+  BTCUSDT:
+    category: major
+    volatility_level: medium
+    default_timeframes: ["1d", "4h", "1h", "15m", "5m"]
+    enabled: true
+    risk_multiplier: 1.0
+
+  ETHUSDT:
+    category: major
+    volatility_level: medium
+    default_timeframes: ["1d", "4h", "1h", "15m", "5m"]
+    enabled: true
+    risk_multiplier: 1.0
+
+  SOLUSDT:
+    category: high_beta
+    volatility_level: high
+    default_timeframes: ["4h", "1h", "15m", "5m", "3m"]
+    enabled: true
+    risk_multiplier: 0.75
+
+user_symbol_defaults:
+  market: binance_um_futures
+  quote_asset: USDT
+  category: custom
+  risk_profile: auto
+  default_timeframes: ["4h", "1h", "15m", "5m"]

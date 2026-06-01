@@ -380,6 +380,8 @@ CREATE TABLE IF NOT EXISTS strategy_evaluations (
     evidence_json TEXT,
     counter_evidence_json TEXT,
     is_shadow INTEGER DEFAULT 0,
+    snapshot_id INTEGER,
+    pnl_r REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -391,6 +393,7 @@ CREATE TABLE IF NOT EXISTS strategy_patches (
     patch_json TEXT NOT NULL,
     reason TEXT,
     evidence_json TEXT,
+    trigger_id INTEGER,
     status TEXT DEFAULT 'candidate',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );

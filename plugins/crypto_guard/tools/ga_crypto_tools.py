@@ -221,6 +221,163 @@ def crypto_daily_review(day_utc: str | None = None) -> dict[str, Any]:
         conn.close()
 
 
+def crypto_paper_positions(limit: int = 20, symbol: str | None = None, status: str | None = None) -> dict[str, Any]:
+    conn, repo = _repo()
+    try:
+        conditions = []
+        params: list[Any] = []
+        if symbol:
+            conditions.append("t.symbol=?")
+            params.append(symbol)
+        if status == "open":
+            conditions.append("t.exit_price IS NULL")
+        elif status == "closed":
+            conditions.append("t.exit_price IS NOT NULL")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        sql = f"""
+            SELECT t.id, t.symbol, t.side, t.entry_price, t.exit_price, t.pnl, t.pnl_percent, t.pnl_r,
+                   t.close_reason, t.created_at, t.closed_at, t.max_favorable_excursion, t.max_adverse_excursion,
+                   o.stop_loss, o.take_profit_json
+            FROM paper_trades t
+            LEFT JOIN paper_orders o ON t.order_id = o.id
+            {where}
+            ORDER BY t.id DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        trades = [dict(r) for r in rows]
+
+        total = len(trades)
+        open_trades = [t for t in trades if t.get("exit_price") is None]
+        closed_trades = [t for t in trades if t.get("exit_price") is not None]
+        wins = sum(1 for t in closed_trades if float(t.get("pnl_r") or 0) > 0.05)
+        losses = sum(1 for t in closed_trades if float(t.get("pnl_r") or 0) < -0.05)
+        breakeven = len(closed_trades) - wins - losses
+        total_pnl = sum(float(t.get("pnl") or 0) for t in closed_trades)
+        total_pnl_r = sum(float(t.get("pnl_r") or 0) for t in closed_trades)
+        win_rate = wins / len(closed_trades) * 100 if closed_trades else 0
+
+        # Win rate bar
+        bar_len = 10
+        filled = round(win_rate / 100 * bar_len)
+        bar = "+" * filled + "-" * (bar_len - filled)
+
+        # Profit factor
+        gross_profit = sum(float(t.get("pnl") or 0) for t in closed_trades if float(t.get("pnl_r") or 0) > 0.05)
+        gross_loss = abs(sum(float(t.get("pnl") or 0) for t in closed_trades if float(t.get("pnl_r") or 0) < -0.05))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf") if gross_profit > 0 else 0
+
+        # Max consecutive losses
+        max_consec_loss = 0
+        consec = 0
+        for t in closed_trades:
+            if float(t.get("pnl_r") or 0) < -0.05:
+                consec += 1
+                max_consec_loss = max(max_consec_loss, consec)
+            else:
+                consec = 0
+
+        def _pnl_indicator(pnl_r: float) -> str:
+            if pnl_r > 2:
+                return "++"
+            elif pnl_r > 0.05:
+                return "+ "
+            elif pnl_r < -0.05:
+                return "- "
+            else:
+                return "= "
+
+        def _reason_short(t: dict[str, Any]) -> str:
+            is_open = t.get("exit_price") is None
+            if is_open:
+                return "持仓"
+            return {
+                "take_profit": "TP",
+                "stop_loss": "SL",
+                "timeout": "超时",
+                "manual": "手动",
+            }.get(t.get("close_reason"), "-")
+
+        def _holding(t: dict[str, Any]) -> str:
+            created = t.get("created_at", "")
+            closed = t.get("closed_at") or ""
+            if not created:
+                return "-"
+            if not closed:
+                return "持仓中"
+            try:
+                from datetime import datetime
+                fmt = "%Y-%m-%d %H:%M:%S"
+                start = datetime.strptime(created[:19], fmt)
+                end = datetime.strptime(closed[:19], fmt)
+                mins = int((end - start).total_seconds() // 60)
+                if mins < 60:
+                    return f"{mins}m"
+                hours = mins // 60
+                return f"{hours}h{mins % 60}m"
+            except Exception:
+                return "-"
+
+        lines = [
+            "**CryptoGuard 模拟盘持仓记录**",
+            "",
+        ]
+
+        # Summary card
+        avg_win_r = sum(float(t.get("pnl_r") or 0) for t in closed_trades if float(t.get("pnl_r") or 0) > 0.05) / wins if wins else 0
+        avg_loss_r = sum(float(t.get("pnl_r") or 0) for t in closed_trades if float(t.get("pnl_r") or 0) < -0.05) / losses if losses else 0
+
+        lines.append("```")
+        lines.append(f"总览  {total}笔  持仓{len(open_trades)}  已平{len(closed_trades)}")
+        lines.append(f"胜率  [{bar}]  {win_rate:.0f}%  ({wins}W/{losses}L/{breakeven}BE)")
+        lines.append(f"累计  {total_pnl_r:+.2f}R  ({total_pnl:+.2f}U)")
+        lines.append(f"盈亏  平均盈{avg_win_r:+.2f}R  平均亏{avg_loss_r:+.2f}R  PF={profit_factor:.2f}")
+        if max_consec_loss >= 2:
+            lines.append(f"连亏  最多连续{max_consec_loss}笔")
+        lines.append("```")
+        lines.append("")
+
+        # Trade table
+        def _fmt_row(t: dict[str, Any]) -> str:
+            side_cn = "多" if str(t.get("side") or "").upper() == "LONG" else "空"
+            pnl_r = float(t.get("pnl_r") or 0)
+            pnl_u = float(t.get("pnl") or 0)
+            symbol_short = t.get("symbol", "").replace("USDT", "")
+            indicator = _pnl_indicator(pnl_r)
+            reason = _reason_short(t)
+            hold = _holding(t)
+            entry = t.get("entry_price", "-")
+            exit_p = t.get("exit_price") or "-"
+            ts = (t.get("created_at") or "-")[5:16]  # MM-DD HH:MM
+
+            if t.get("exit_price") is None:
+                # Open position
+                return f"#{t['id']:>2}  {symbol_short:<6} {side_cn}  {entry:<10}  {'---':<10}  {'持仓中':>6}  {reason}  {hold}"
+            else:
+                return f"#{t['id']:>2}  {symbol_short:<6} {side_cn}  {entry:<10}  {exit_p:<10}  {indicator}{pnl_r:+.2f}R  {reason}  {hold}"
+
+        # Header
+        lines.append("```")
+        lines.append(f"{'#':>3}  {'币种':<6} {'向':<2}  {'入场':<10}  {'出场':<10}  {'盈亏R':>7}  {'原因':<4}  {'时长':<5}")
+        lines.append("-" * 62)
+
+        # Open positions first
+        for t in open_trades:
+            lines.append(_fmt_row(t))
+
+        # Then closed
+        for t in closed_trades[:15]:
+            lines.append(_fmt_row(t))
+
+        lines.append("```")
+        lines.append("")
+        lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
+        return {"ok": True, "trades": trades, "text": "\n".join(lines), "total": total, "wins": wins, "losses": losses, "total_pnl": total_pnl, "total_pnl_r": total_pnl_r}
+    finally:
+        conn.close()
+
+
 def crypto_list_strategy_versions(strategy_name: str | None = None) -> dict[str, Any]:
     conn, repo = _repo()
     try:
@@ -340,6 +497,8 @@ def crypto_handle_text_command(text: str, user_id: str | None = None) -> dict[st
         return crypto_daily_review()
     if intent["intent"] == "list_strategy_versions":
         return crypto_list_strategy_versions()
+    if intent["intent"] == "paper_positions":
+        return crypto_paper_positions(symbol=intent.get("symbol"))
     if intent["intent"] == "list_symbols":
         return crypto_symbol_list()
     symbol = intent.get("symbol")

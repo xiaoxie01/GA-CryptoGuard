@@ -1,0 +1,25 @@
+storage:
+  sqlite:
+    path: "data/crypto_guard.db"
+    wal: true
+
+  redis:
+    enabled: false
+    url: "redis://localhost:6379/0"
+
+  parquet:
+    enabled: true
+    base_dir: "data/parquet/klines/binance_um"
+    compression: "snappy"
+    hot_data_days:
+      1m: 7
+      3m: 14
+      5m: 14
+      15m: 90
+      1h: 365
+      4h: 1095
+      1d: 3650
+
+  duckdb:
+    enabled: true
+    path: "data/crypto_guard_analytics.duckdb"

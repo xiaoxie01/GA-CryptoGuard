@@ -37,8 +37,12 @@ class GAMasterAcceptanceTest(unittest.TestCase):
         self.assertEqual(build_feishu_actions({"signal_grade": "C"}, {}), ["add_to_watchlist", "ignore"])
         self.assertEqual(build_feishu_actions({"signal_grade": "B", "opportunity_watch": {"watch_conditions": ["x"]}}, {}), ["create_opportunity_watch", "add_to_watchlist", "ignore"])
         self.assertNotIn("create_paper_order", build_feishu_actions({"signal_grade": "A", "trade_plan": None}, {"ok": True}))
-        actions = build_feishu_actions({"signal_grade": "A", "has_trade_plan": True, "trade_plan": {"entry": 1}}, {"ok": True})
+        # A/S 级别需要 confidence >= 0.72 才能创建 paper order
+        actions = build_feishu_actions({"signal_grade": "A", "confidence": 0.8, "has_trade_plan": True, "trade_plan": {"entry": 1}}, {"ok": True})
         self.assertEqual(actions[0], "create_paper_order")
+        # confidence 不足时不能创建 paper order
+        actions_low_conf = build_feishu_actions({"signal_grade": "A", "confidence": 0.65, "has_trade_plan": True, "trade_plan": {"entry": 1}}, {"ok": True})
+        self.assertNotIn("create_paper_order", actions_low_conf)
 
     def test_ga_decision_persistence(self) -> None:
         from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy

@@ -27,6 +27,7 @@ CRYPTO_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "crypto_confirm_config_update", "description": "确认并应用待处理配置热更新，写入 config_hot_reload 和 runtime_config 审计。", "parameters": {"type": "object", "properties": {"change_id": {"type": "integer"}}, "required": ["change_id"]}}},
     {"type": "function", "function": {"name": "crypto_system_status", "description": "查看 CryptoGuard 系统状态、定时任务状态、队列积压、模拟盘数量和日志路径。", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "crypto_list_recent_errors", "description": "查看最近 agent_jobs 和 scheduler_runs 错误记录。", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}}}},
+    {"type": "function", "function": {"name": "crypto_paper_positions", "description": "查询模拟盘历史持仓记录，支持按币种和状态筛选。返回交易列表、胜率、累计盈亏。", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}, "symbol": {"type": "string", "description": "按币种筛选，如 BTCUSDT"}, "status": {"type": "string", "description": "open=持仓中, closed=已平仓, 不填=全部"}}}}},
 ]
 
 

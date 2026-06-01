@@ -48,8 +48,12 @@ def build_counter_evidence(modules: dict[str, Any]) -> dict[str, Any]:
     if trend.get("trend_stage") == "range":
         neutral.append("高概率震荡，方向延续性不足")
 
-    if bullish and bearish:
+    # Require at least 2 items on each side for "high" contradiction
+    # Single-item disagreements (e.g. 4H bearish vs 1H bullish) are normal multi-TF divergence
+    if len(bullish) >= 2 and len(bearish) >= 2:
         level = "high"
+    elif bullish and bearish:
+        level = "medium"
     elif len(neutral) >= 2 or (not bullish and not bearish):
         level = "medium"
     else:

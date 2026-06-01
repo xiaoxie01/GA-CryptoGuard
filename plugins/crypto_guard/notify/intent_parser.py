@@ -39,6 +39,8 @@ def parse_intent(text: str) -> dict[str, Any]:
         intent = "analyze_once"
     elif any(k in raw for k in ("加入监控", "长期", "以后也分析", "重点分析")) and not any(k in raw for k in ("不要加入", "不加入")):
         intent = "add_symbol"
+    elif any(k in raw for k in ("历史持仓", "历史交易", "交易记录", "持仓记录", "平仓记录", "历史订单", "模拟盘记录", "模拟盘历史")):
+        intent = "paper_positions"
     elif any(k in raw for k in ("模拟盘", "加入模拟", "开模拟")):
         intent = "create_paper_order"
     elif any(k in raw for k in ("盯着", "提醒", "机会监控")):
@@ -53,7 +55,7 @@ def parse_intent(text: str) -> dict[str, Any]:
 
 def is_crypto_intent(text: str) -> bool:
     intent = parse_intent(text)
-    return intent["intent"] != "unknown" and (intent["intent"] in {"list_symbols", "system_status", "list_errors", "daily_review", "list_strategy_versions"} or intent.get("symbol"))
+    return intent["intent"] != "unknown" and (intent["intent"] in {"list_symbols", "system_status", "list_errors", "daily_review", "list_strategy_versions", "paper_positions"} or intent.get("symbol"))
 
 
 def _first_symbol(text: str) -> str | None:

@@ -28,29 +28,40 @@ def analyze_price_action(candles: list[dict[str, Any]], *, analysis_time_utc: in
     support = [x["price"] for x in lows[-3:]]
     swing_labels = label_swing_sequence(highs, lows)
 
-    higher_high = len(highs) >= 2 and highs[-1]["price"] > highs[-2]["price"]
-    higher_low = len(lows) >= 2 and lows[-1]["price"] > lows[-2]["price"]
-    lower_high = len(highs) >= 2 and highs[-1]["price"] < highs[-2]["price"]
-    lower_low = len(lows) >= 2 and lows[-1]["price"] < lows[-2]["price"]
+    # Minimum 0.3% magnitude to classify as HH/HL/LH/LL — prevents marginal noise
+    min_mag = 0.003
+    higher_high = len(highs) >= 2 and highs[-1]["price"] > highs[-2]["price"] * (1 + min_mag)
+    higher_low = len(lows) >= 2 and lows[-1]["price"] > lows[-2]["price"] * (1 + min_mag)
+    lower_high = len(highs) >= 2 and highs[-1]["price"] < highs[-2]["price"] * (1 - min_mag)
+    lower_low = len(lows) >= 2 and lows[-1]["price"] < lows[-2]["price"] * (1 - min_mag)
     range_width_pct = _range_width_pct(highs, lows, close)
-
-    if range_width_pct < 0.018 and len(highs) >= 2 and len(lows) >= 2:
-        structure = "range"
-        swing_sequence = "range_compression"
-    elif higher_high and higher_low:
-        structure = "bullish"
-        swing_sequence = "HH_HL"
-    elif lower_high and lower_low:
-        structure = "bearish"
-        swing_sequence = "LH_LL"
-    else:
-        structure = "range"
-        swing_sequence = "mixed"
 
     last_high = highs[-1]["price"] if highs else max(c["high"] for c in candles[-12:])
     last_low = lows[-1]["price"] if lows else min(c["low"] for c in candles[-12:])
     previous_high = highs[-2]["price"] if len(highs) >= 2 else last_high
     previous_low = lows[-2]["price"] if len(lows) >= 2 else last_low
+
+    # Detect if we're near a breakout (close within 1.0% of range boundary)
+    near_breakout_high = len(highs) >= 2 and close > previous_high * 0.990
+    near_breakout_low = len(lows) >= 2 and close < previous_low * 1.010
+
+    if higher_high and higher_low:
+        structure = "bullish"
+        swing_sequence = "HH_HL"
+    elif lower_high and lower_low:
+        structure = "bearish"
+        swing_sequence = "LH_LL"
+    elif range_width_pct < 0.012 and len(highs) >= 2 and len(lows) >= 2:
+        # Very tight compression — still range but with tighter threshold (1.2%)
+        structure = "range"
+        swing_sequence = "range_compression"
+    elif near_breakout_high or near_breakout_low:
+        # Near range boundary — treat as transition, not pure range
+        structure = "transition"
+        swing_sequence = "near_breakout"
+    else:
+        structure = "range"
+        swing_sequence = "mixed"
     fake_breakout_high = candles[-1]["high"] > previous_high and close < previous_high
     fake_breakout_low = candles[-1]["low"] < previous_low and close > previous_low
     retest_high = previous_high and candles[-1]["low"] <= previous_high <= candles[-1]["close"]
@@ -101,7 +112,7 @@ def analyze_price_action(candles: list[dict[str, Any]], *, analysis_time_utc: in
         range_status = "inside_range"
         entry_context = "monitor_only"
 
-    confidence = 0.68 if structure in ("bullish", "bearish") else 0.45
+    confidence = 0.68 if structure in ("bullish", "bearish") else 0.55 if structure == "transition" else 0.45
     invalid_level = last_low if structure == "bullish" else last_high if structure == "bearish" else None
     return {
         "module": "price_action",

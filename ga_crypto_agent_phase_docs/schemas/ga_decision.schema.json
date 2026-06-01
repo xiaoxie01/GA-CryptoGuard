@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GADecision",
+  "type": "object",
+  "required": [
+    "symbol",
+    "decision",
+    "signal_grade",
+    "confidence",
+    "summary",
+    "counter_evidence"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string"
+    },
+    "signal_grade": {
+      "enum": [
+        "S",
+        "A",
+        "B",
+        "C",
+        "D"
+      ]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "summary": {
+      "type": "string"
+    },
+    "bullish_evidence": {
+      "type": "array"
+    },
+    "bearish_evidence": {
+      "type": "array"
+    },
+    "neutral_or_risk_evidence": {
+      "type": "array"
+    },
+    "counter_evidence": {
+      "type": "array"
+    },
+    "contradiction_level": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "trade_plan": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "opportunity_watch": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "suggested_actions": {
+      "type": "array"
+    }
+  }
+}
