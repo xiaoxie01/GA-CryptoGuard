@@ -1947,6 +1947,130 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(result["effective_grade"], "S")
         self.assertEqual(result["effective_confidence"], 0.8)
 
+    def test_controller_performance_gate_watch_only_removes_paper_order(self) -> None:
+        """Integration test: performance gate watch-only should remove paper_order from actions."""
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_persistence import DecisionPersistence
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+
+        controller = GAMasterController(self.repo)
+        persistence = DecisionPersistence(self.repo)
+
+        # Setup: insert historical losing trades for BTCUSDT LONG to trigger gate
+        now = datetime.now(timezone.utc)
+
+        # Use persistence to create proper ga_decision + signal
+        hist_decision = {
+            "symbol": "BTCUSDT",
+            "analysis_time": 1672531200,
+            "analysis_time_utc": "2023-01-01T00:00:00Z",
+            "decision_type": "scheduled",
+            "signal_grade": "S",
+            "trend_stage": "early",
+            "market_bias": "bullish",
+            "confidence": 0.85,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_price": 100, "stop_loss": 95, "take_profit": 110},
+            "skill_result_refs": {},
+            "evidence": ["历史"],
+            "counter_evidence": [],
+            "risk_check": {"ok": True},
+            "feishu_actions": [],
+            "final_summary": "历史决策",
+            "raw_decision_json": {},
+        }
+        saved = persistence.save(hist_decision)
+        hist_signal_id = saved.get("signal_id")
+
+        # Create paper order and trades
+        self.conn.execute(
+            """
+            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
+            VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', ?)
+            """,
+            (hist_signal_id,),
+        )
+        hist_order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert 3 losing trades to trigger context_performance gate
+        for i in range(3):
+            closed_at = (now - timedelta(hours=i + 1)).isoformat().replace("+00:00", "Z")
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, order_id)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, ?)
+                """,
+                (closed_at, hist_order_id),
+            )
+
+        # Disable cooldown to isolate context_performance test
+        controller.performance_gate._config["cooldown"]["loss_count_threshold"] = 100
+
+        # Fake decision from LLM with S grade and trade_plan
+        fake_decision = {
+            "symbol": "BTCUSDT",
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_price": 50000,
+                "stop_loss": 49000,
+                "take_profit": 53000,
+            },
+            "signal_grade": "S",
+            "trend_stage": "early",
+            "confidence": 0.85,
+            "decision": "trade_plan_available",
+            "summary": "测试决策",
+            "final_summary": "测试决策",
+            "market_bias": "bullish",
+            "evidence": ["测试证据"],
+            "counter_evidence": [],
+            "risk_notes": [],
+        }
+
+        # Patch run_agent_sop_decision to return fake decision
+        with patch(
+            "plugins.crypto_guard.ga_master.controller.run_agent_sop_decision",
+            return_value=fake_decision,
+        ):
+            # Patch ContextBuilder.build to return minimal context
+            fake_context = {
+                "symbol": "BTCUSDT",
+                "snapshot": {
+                    "symbol": "BTCUSDT",
+                    "current_price": 50000,
+                    "market_structure": "bullish",
+                },
+                "analysis_time_utc": int(now.timestamp()),
+                "snapshot_id": None,
+            }
+            with patch.object(
+                controller.context_builder, "build", return_value=fake_context
+            ):
+                request = GAAnalysisRequest(
+                    symbol="BTCUSDT",
+                    decision_type="scheduled",
+                )
+                result = controller.analyze_symbol(request)
+
+        # Verify: performance_gate should be in result
+        self.assertIn("performance_gate", result)
+        perf_gate = result["performance_gate"]
+        self.assertTrue(perf_gate["performance_degraded"])
+        self.assertTrue(perf_gate["should_watch_only"])
+
+        # Verify: suggested_actions should NOT contain create_paper_order
+        actions = result.get("suggested_actions", [])
+        action_types = [a.get("action_type") if isinstance(a, dict) else a for a in actions]
+        self.assertNotIn("create_paper_order", action_types)
+
+        # Verify: decision should be opportunity_watch (not trade_plan_available)
+        self.assertEqual(result.get("decision"), "opportunity_watch")
+        self.assertFalse(result.get("has_trade_plan"))
+
 
 if __name__ == "__main__":
     unittest.main()
