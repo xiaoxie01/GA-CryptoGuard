@@ -1724,6 +1724,230 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertFalse(_has_scoring_changes(patch_no_scoring))
         self.assertAlmostEqual(_extract_score_adjustment(patch_no_scoring), 0.0)
 
+    def test_performance_gate_cooldown(self) -> None:
+        """Test symbol+side cooldown logic."""
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.ga_master.performance_gate import PerformanceGate
+
+        gate = PerformanceGate(self.repo)
+
+        # Insert 3 losing trades for BTCUSDT LONG
+        now = datetime.now(timezone.utc)
+        for i in range(3):
+            closed_at = (now - timedelta(hours=i + 1)).isoformat().replace("+00:00", "Z")
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?)
+                """,
+                (closed_at,),
+            )
+
+        # Check cooldown should be active
+        result = gate.check(
+            symbol="BTCUSDT",
+            side="LONG",
+            signal_grade="S",
+            trend_stage="early",
+            confidence=0.8,
+        )
+        self.assertTrue(result["cooldown_active"])
+        self.assertTrue(result["should_watch_only"])
+        self.assertIn("symbol_side_cooldown", result["reasons"][0])
+
+        # Check ETHUSDT should not be in cooldown
+        result_eth = gate.check(
+            symbol="ETHUSDT",
+            side="LONG",
+            signal_grade="S",
+            trend_stage="early",
+            confidence=0.8,
+        )
+        self.assertFalse(result_eth["cooldown_active"])
+        self.assertFalse(result_eth["should_watch_only"])
+
+    def test_performance_gate_context_performance(self) -> None:
+        """Test context performance gate - grade downgrade."""
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.ga_master.decision_persistence import DecisionPersistence
+        from plugins.crypto_guard.ga_master.performance_gate import PerformanceGate
+
+        gate = PerformanceGate(self.repo)
+        # Disable cooldown to test context_performance in isolation
+        gate._config["cooldown"]["loss_count_threshold"] = 100
+
+        persistence = DecisionPersistence(self.repo)
+
+        # Use repository to create ga_decision properly
+        # Must include trade_plan with side to set signals.direction correctly
+        ga_decision = {
+            "symbol": "BTCUSDT",
+            "analysis_time": 1000,
+            "analysis_time_utc": "2023-11-14T22:13:19Z",
+            "decision_type": "scheduled",
+            "signal_grade": "S",
+            "trend_stage": "early",
+            "market_bias": "bullish",
+            "confidence": 0.85,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_price": 100,
+                "stop_loss": 95,
+                "take_profit": 110,
+            },
+            "skill_result_refs": {},
+            "evidence": ["测试"],
+            "counter_evidence": [],
+            "risk_check": {"ok": True},
+            "feishu_actions": [],
+            "final_summary": "测试",
+            "raw_decision_json": {},
+        }
+        saved = persistence.save(ga_decision)
+
+        # Create paper trade linked to this decision
+        signal_id = saved.get("signal_id")
+        self.conn.execute(
+            """
+            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
+            VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', ?)
+            """,
+            (signal_id,),
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert 3 losing trades
+        now = datetime.now(timezone.utc)
+        for i in range(3):
+            closed_at = (now - timedelta(hours=i + 1)).isoformat().replace("+00:00", "Z")
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, order_id)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, ?)
+                """,
+                (closed_at, order_id),
+            )
+
+        # Clear cache to ensure fresh data is read
+        gate._cache.clear()
+
+        # Check should downgrade S -> A (avg_r = -1 < 0, sample_count = 3 >= min_samples)
+        result = gate.check(
+            symbol="BTCUSDT",
+            side="LONG",
+            signal_grade="S",
+            trend_stage="early",
+            confidence=0.85,
+        )
+        self.assertTrue(result["performance_degraded"])
+        self.assertEqual(result["effective_grade"], "A")
+        # S->A is still within paper order threshold, so should_watch_only is False
+        self.assertFalse(result["should_watch_only"])
+        self.assertIn("context_performance", result["reasons"][0])
+
+        # Test with signal_grade "B" - downgrade to "C"
+        result_b = gate.check(
+            symbol="BTCUSDT",
+            side="LONG",
+            signal_grade="B",
+            trend_stage="early",
+            confidence=0.85,
+        )
+        self.assertTrue(result_b["performance_degraded"])
+        self.assertEqual(result_b["effective_grade"], "C")
+        # B is not in {S, A}, so should_watch_only is not set even when downgraded
+        # (only S/A downgrades trigger watch_only)
+        self.assertFalse(result_b["should_watch_only"])
+        self.assertIn("context_performance", result_b["reasons"][0])
+
+        # Test with signal_grade "A" - downgrade to "B" should trigger watch_only
+        result_a = gate.check(
+            symbol="BTCUSDT",
+            side="LONG",
+            signal_grade="A",
+            trend_stage="early",
+            confidence=0.85,
+        )
+        self.assertTrue(result_a["performance_degraded"])
+        self.assertEqual(result_a["effective_grade"], "B")
+        # A->B is below paper order threshold (S/A only), so should_watch_only is True
+        self.assertTrue(result_a["should_watch_only"])
+        self.assertIn("grade_below_paper_order_threshold", result_a["reasons"])
+
+    def test_performance_gate_confidence_degradation(self) -> None:
+        """Test confidence degradation based on recent performance."""
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.ga_master.performance_gate import PerformanceGate
+
+        gate = PerformanceGate(self.repo)
+
+        # Insert trades for ETHUSDT SHORT with alternating wins/losses
+        # to trigger confidence degradation (avg_r < -0.2) but NOT cooldown
+        # Cooldown triggers: loss_window=3, loss_count_threshold=2
+        # So recent 3 trades must have <= 1 loss to avoid cooldown
+        # Confidence degradation: sample_window=5, avg_r_threshold=-0.2
+        now = datetime.now(timezone.utc)
+        trades = [
+            # Recent 3: 1 loss, 2 wins (avoids cooldown)
+            ("ETHUSDT", "SHORT", 100, 105, 105, 1, -5, -5, -1.0, "stop_loss", (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")),
+            ("ETHUSDT", "SHORT", 100, 99, 105, 1, 1, 1, 0.1, "take_profit", (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")),
+            ("ETHUSDT", "SHORT", 100, 99, 105, 1, 1, 1, 0.1, "take_profit", (now - timedelta(hours=3)).isoformat().replace("+00:00", "Z")),
+            # Older 2: both losses (drags avg_r below -0.2)
+            ("ETHUSDT", "SHORT", 100, 105, 105, 1, -5, -5, -1.0, "stop_loss", (now - timedelta(hours=4)).isoformat().replace("+00:00", "Z")),
+            ("ETHUSDT", "SHORT", 100, 105, 105, 1, -5, -5, -1.0, "stop_loss", (now - timedelta(hours=5)).isoformat().replace("+00:00", "Z")),
+        ]
+        for trade in trades:
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                trade,
+            )
+
+        # Verify trades were inserted
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE symbol='ETHUSDT' AND side='SHORT' AND closed_at IS NOT NULL"
+        ).fetchone()[0]
+        self.assertEqual(count, 5)
+
+        # Check confidence should be degraded (avg_r = (-1+0.1+0.1-1-1)/5 = -0.56)
+        result = gate.check(
+            symbol="ETHUSDT",
+            side="SHORT",
+            signal_grade="A",
+            trend_stage="middle",
+            confidence=0.8,
+        )
+        # Cooldown should NOT be active (recent 3 has only 1 loss)
+        self.assertFalse(result["cooldown_active"], "Cooldown should not be active")
+        # Confidence degradation should be applied
+        self.assertEqual(result["confidence_adjustment"], -0.10)
+        self.assertAlmostEqual(result["effective_confidence"], 0.70)
+
+    def test_performance_gate_disabled(self) -> None:
+        """Test that performance gate can be disabled via config."""
+        from plugins.crypto_guard.ga_master.performance_gate import PerformanceGate
+
+        # Override config to disable gate
+        gate = PerformanceGate(self.repo)
+        gate._config["enabled"] = False
+
+        result = gate.check(
+            symbol="BTCUSDT",
+            side="LONG",
+            signal_grade="S",
+            trend_stage="early",
+            confidence=0.8,
+        )
+        self.assertFalse(result["cooldown_active"])
+        self.assertFalse(result["performance_degraded"])
+        self.assertFalse(result["should_watch_only"])
+        self.assertEqual(result["effective_grade"], "S")
+        self.assertEqual(result["effective_confidence"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

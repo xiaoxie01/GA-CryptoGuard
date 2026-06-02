@@ -99,3 +99,23 @@ risk_language:
     - "强烈开多"
     - "强烈开空"
   required_disclaimer: "不构成实盘建议，仅用于模拟盘与策略研究。"
+
+performance_gate:
+  enabled: true
+  cooldown:
+    loss_count_threshold: 2
+    loss_window: 3
+    cooldown_hours: 24
+  confidence_degradation:
+    avg_r_threshold: -0.2
+    sample_window: 5
+    confidence_penalty: 0.10
+  context_performance:
+    min_samples: 3
+    avg_r_threshold: 0.0
+    downgrade_rules:
+      S: "A"
+      A: "B"
+      B: "C"
+      C: "D"
+      D: "D"
