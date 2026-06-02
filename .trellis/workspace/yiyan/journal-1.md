@@ -72,3 +72,37 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 修复止血逻辑 + 补集成测试
+
+**Date**: 2026-06-02
+**Task**: 修复止血逻辑 + 补集成测试
+**Branch**: `main`
+
+### Summary
+
+P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测试验证suggested_actions
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b223f91` | (see git log) |
+| `74ab9ed` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
