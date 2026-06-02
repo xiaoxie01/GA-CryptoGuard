@@ -535,9 +535,19 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
             lines.append(f"  创建时间：{created}")
             lines.append("")
 
-    # Next steps
+    # Next steps - use actual config values
+    from plugins.crypto_guard.config.loader import load_config as _load_cfg
+    _cfg = _load_cfg().trading_mode
+    _online_cfg = _cfg.get("evolution", {}).get("online_shadow", {})
+    _min_after_bt = _online_cfg.get("min_samples_after_backtest", 5)
+    _min_without_bt = _online_cfg.get("min_samples_without_backtest", 30)
+    _backtest_enabled = _cfg.get("evolution", {}).get("backtest_gate", {}).get("enabled", True)
+
     lines.append("**下一步**")
-    lines.append("- 影子测试需至少 3 个交易日数据确认效果")
+    if _backtest_enabled:
+        lines.append(f"- 影子测试需 {_min_after_bt} 个样本（通过回测门禁后）或 {_min_without_bt} 个样本（未通过回测）")
+    else:
+        lines.append(f"- 影子测试需至少 {_min_without_bt} 个样本确认效果")
     lines.append("- 胜率和盈亏比达标后可进入 review 阶段")
     lines.append("- review 通过后可手动确认进入 active")
     lines.append("")
@@ -583,7 +593,19 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
         detail_lines.append(f"- 候选补丁 ID：#{patch_id}")
     detail_lines.append("")
     detail_lines.append("系统已自动创建候选补丁并进入影子测试。")
-    detail_lines.append("影子测试需至少 3 个交易日数据确认效果后方可进入 review。")
+
+    # Use actual config values for sample requirement
+    from plugins.crypto_guard.config.loader import load_config as _load_cfg2
+    _cfg2 = _load_cfg2().trading_mode
+    _online_cfg2 = _cfg2.get("evolution", {}).get("online_shadow", {})
+    _min_after_bt2 = _online_cfg2.get("min_samples_after_backtest", 5)
+    _min_without_bt2 = _online_cfg2.get("min_samples_without_backtest", 30)
+    _backtest_enabled2 = _cfg2.get("evolution", {}).get("backtest_gate", {}).get("enabled", True)
+
+    if _backtest_enabled2:
+        detail_lines.append(f"影子测试需 {_min_after_bt2} 个样本（通过回测门禁）或 {_min_without_bt2} 个样本（未通过回测）后方可进入 review。")
+    else:
+        detail_lines.append(f"影子测试需至少 {_min_without_bt2} 个样本确认效果后方可进入 review。")
 
     # Get full evolution status
     evolution_text = _build_evolution_status_text(repo)
