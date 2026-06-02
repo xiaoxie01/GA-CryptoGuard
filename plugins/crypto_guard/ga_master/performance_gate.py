@@ -136,8 +136,14 @@ class PerformanceGate:
             result["effective_grade"] = perf["effective_grade"]
             result["reasons"].append(f"context_performance: {signal_grade}→{perf['effective_grade']}")
 
-            # If downgraded below paper order threshold, convert to watch
-            if signal_grade in {"S", "A"} and perf["effective_grade"] not in {"S", "A"}:
+            # For S/A grade signals with poor historical performance,
+            # force watch-only regardless of effective grade.
+            # This prevents S->A from still entering paper orders.
+            if signal_grade in {"S", "A"}:
+                result["should_watch_only"] = True
+                result["reasons"].append("high_grade_performance_watch_only")
+            elif perf["effective_grade"] not in {"S", "A"}:
+                # For B/C/D grades, only watch if downgraded below paper order threshold
                 result["should_watch_only"] = True
                 result["reasons"].append("grade_below_paper_order_threshold")
 

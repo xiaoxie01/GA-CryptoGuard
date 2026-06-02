@@ -1843,11 +1843,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.assertTrue(result["performance_degraded"])
         self.assertEqual(result["effective_grade"], "A")
-        # S->A is still within paper order threshold, so should_watch_only is False
-        self.assertFalse(result["should_watch_only"])
-        self.assertIn("context_performance", result["reasons"][0])
+        # S grade with poor performance -> force watch-only (止血策略)
+        self.assertTrue(result["should_watch_only"])
+        self.assertIn("high_grade_performance_watch_only", result["reasons"])
 
-        # Test with signal_grade "B" - downgrade to "C"
+        # Test with signal_grade "B" - downgrade to "C" triggers watch_only
         result_b = gate.check(
             symbol="BTCUSDT",
             side="LONG",
@@ -1857,10 +1857,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.assertTrue(result_b["performance_degraded"])
         self.assertEqual(result_b["effective_grade"], "C")
-        # B is not in {S, A}, so should_watch_only is not set even when downgraded
-        # (only S/A downgrades trigger watch_only)
-        self.assertFalse(result_b["should_watch_only"])
-        self.assertIn("context_performance", result_b["reasons"][0])
+        # B->C is below paper order threshold (S/A only)
+        self.assertTrue(result_b["should_watch_only"])
+        self.assertIn("grade_below_paper_order_threshold", result_b["reasons"])
 
         # Test with signal_grade "A" - downgrade to "B" should trigger watch_only
         result_a = gate.check(
@@ -1872,9 +1871,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.assertTrue(result_a["performance_degraded"])
         self.assertEqual(result_a["effective_grade"], "B")
-        # A->B is below paper order threshold (S/A only), so should_watch_only is True
+        # A grade with poor performance -> force watch-only (止血策略)
         self.assertTrue(result_a["should_watch_only"])
-        self.assertIn("grade_below_paper_order_threshold", result_a["reasons"])
+        self.assertIn("high_grade_performance_watch_only", result_a["reasons"])
 
     def test_performance_gate_confidence_degradation(self) -> None:
         """Test confidence degradation based on recent performance."""
