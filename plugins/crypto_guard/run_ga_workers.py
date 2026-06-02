@@ -671,6 +671,14 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                 outbox = process_alert_outbox(repo, send_message, limit=10)
                 if outbox.get("processed"):
                     return {"ok": True, "processed": True, "job_id": None, "result": outbox}
+                # Run shadow verdict runner periodically when idle in background mode
+                try:
+                    from plugins.crypto_guard.strategy.shadow_testing import run_shadow_verdict_runner
+                    verdict_result = run_shadow_verdict_runner(repo)
+                    if verdict_result.get("processed"):
+                        LOGGER.info("shadow_verdict_runner processed=%s", verdict_result.get("processed"))
+                except Exception:
+                    LOGGER.exception("shadow_verdict_runner failed")
             return {"ok": True, "processed": False}
         try:
             result = process_job(repo, job, send_message=send_message)

@@ -1612,7 +1612,7 @@ class CryptoGuardRepository:
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, evidence_json, trigger_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'shadow_testing')
             """,
             (
                 patch["strategy_name"],
@@ -1625,6 +1625,41 @@ class CryptoGuardRepository:
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def mark_duplicate_patches_rejected(self) -> dict[str, int]:
+        """Mark duplicate patches (same trigger_id + candidate_version) as rejected, keeping only the latest."""
+        # Find duplicates
+        duplicates = self.conn.execute(
+            """
+            SELECT trigger_id, candidate_version, COUNT(*) as cnt
+            FROM strategy_patches
+            WHERE trigger_id IS NOT NULL AND status NOT IN ('rejected', 'duplicate')
+            GROUP BY trigger_id, candidate_version
+            HAVING cnt > 1
+            """
+        ).fetchall()
+
+        rejected = 0
+        for dup in duplicates:
+            trigger_id = int(dup["trigger_id"])
+            candidate_version = dup["candidate_version"]
+            # Keep the latest (highest id), reject the rest
+            self.conn.execute(
+                """
+                UPDATE strategy_patches SET status='duplicate'
+                WHERE trigger_id=? AND candidate_version=? AND status NOT IN ('rejected', 'duplicate')
+                AND id NOT IN (
+                    SELECT MAX(id) FROM strategy_patches WHERE trigger_id=? AND candidate_version=?
+                )
+                """,
+                (trigger_id, candidate_version, trigger_id, candidate_version),
+            )
+            rejected += self.conn.execute("SELECT changes() AS c").fetchone()["c"]
+
+        if rejected:
+            self.conn.commit()
+
+        return {"rejected_duplicates": rejected}
 
     def list_strategy_versions(self, strategy_name: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []
@@ -1668,7 +1703,7 @@ class CryptoGuardRepository:
         change_reason: str,
         created_from_review_id: int | None = None,
     ) -> int:
-        if status not in {"active", "candidate", "shadow_testing", "deprecated"}:
+        if status not in {"active", "candidate", "shadow_testing", "deprecated", "review_required", "rejected"}:
             raise ValueError(f"invalid strategy status: {status}")
         self.conn.execute(
             """

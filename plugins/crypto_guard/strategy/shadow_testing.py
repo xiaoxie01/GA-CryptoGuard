@@ -139,6 +139,107 @@ def run_shadow_test(
     return result
 
 
+def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Scan all shadow_testing candidates and promote/reject based on verdict."""
+    from datetime import datetime, timezone, timedelta
+
+    # Throttle: only run every 30 minutes
+    last_run = repo.conn.execute(
+        "SELECT MAX(created_at) as last_at FROM shadow_test_results WHERE verdict_runner_run=1"
+    ).fetchone()
+    if last_run and last_run["last_at"]:
+        try:
+            last_time = datetime.fromisoformat(last_run["last_at"])
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - last_time < timedelta(minutes=30):
+                return {"ok": True, "processed": 0, "reason": "throttled"}
+        except Exception:
+            pass
+
+    # Find all candidates in shadow_testing status
+    candidates = repo.conn.execute(
+        """
+        SELECT DISTINCT sv.strategy_name, sv.version
+        FROM strategy_versions sv
+        WHERE sv.status = 'shadow_testing'
+        """
+    ).fetchall()
+
+    results = []
+    for row in candidates:
+        strategy_name = row["strategy_name"]
+        candidate_version = row["version"]
+
+        # Check if sample count increased since last verdict
+        last_verdict = repo.conn.execute(
+            "SELECT sample_count FROM shadow_test_results WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+            (strategy_name, candidate_version),
+        ).fetchone()
+        current_sample_count = len(_strategy_eval_rows(repo, strategy_name, candidate_version, is_shadow=True))
+        if last_verdict and last_verdict["sample_count"] and current_sample_count <= int(last_verdict["sample_count"]):
+            # No new samples, skip
+            results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "skipped_no_new_samples"})
+            continue
+
+        shadow = run_shadow_test(
+            repo,
+            strategy_name=strategy_name,
+            candidate_version=candidate_version,
+        )
+
+        verdict = shadow.get("recommendation")
+        status = shadow.get("status")
+
+        if verdict == "candidate_can_be_promoted_with_manual_confirmation":
+            # Promote to review_required
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='review_required' WHERE strategy_name=? AND version=?",
+                (strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='review_required' WHERE strategy_name=? AND candidate_version=?",
+                (strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='review_required' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+                (candidate_version,),
+            )
+            results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "promoted_to_review", "shadow": shadow})
+
+        elif verdict == "reject_candidate":
+            # Reject
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
+                ("shadow_test_verdict_rejected", strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=? AND candidate_version=?",
+                (strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+                (candidate_version,),
+            )
+            results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "rejected", "shadow": shadow})
+
+        else:
+            # insufficient_samples - keep running
+            results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "still_running", "shadow": shadow})
+
+    # Mark this as a verdict runner run for throttling
+    if results:
+        try:
+            repo.conn.execute(
+                "INSERT INTO shadow_test_results(strategy_name, candidate_version, sample_count, recommendation, status, verdict_runner_run) VALUES (?, ?, ?, ?, ?, 1)",
+                ("verdict_runner", "system", 0, "verdict_run", "completed"),
+            )
+        except Exception:
+            pass
+    repo.conn.commit()
+    return {"ok": True, "processed": len(results), "results": results}
+
+
 def run_backtest_gate(
     repo: CryptoGuardRepository,
     *,
@@ -468,7 +569,7 @@ def promote_shadow_candidate(
     if sample_count < 3:
         return {"ok": False, "error": "candidate requires at least 3 observation signals before promotion can be considered", "sample_count": sample_count}
     candidate = repo.get_strategy_version(strategy_name, candidate_version)
-    if not candidate or candidate.get("status") not in {"candidate", "shadow_testing"}:
+    if not candidate or candidate.get("status") not in {"candidate", "shadow_testing", "review_required"}:
         return {"ok": False, "error": "candidate version not found or invalid status"}
     repo.conn.execute(
         "UPDATE strategy_versions SET status='deprecated' WHERE strategy_name=? AND status='active'",

@@ -13,6 +13,9 @@ def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[s
     # Cleanup stale candidates before creating new ones
     cleaned = _cleanup_stale_candidates(repo)
 
+    # P1: 软清理历史重复补丁
+    duplicates_cleaned = repo.mark_duplicate_patches_rejected()
+
     stop_loss_trigger = _consecutive_stop_losses(repo)
     if stop_loss_trigger:
         actions.append(_record_trigger_and_candidate(repo, stop_loss_trigger))
@@ -38,14 +41,24 @@ def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[s
                 },
             )
         )
-    return {"ok": True, "triggered": bool(actions), "actions": actions, "cleaned_stale": cleaned}
+    return {"ok": True, "triggered": bool(actions), "actions": actions, "cleaned_stale": cleaned, "cleaned_duplicates": duplicates_cleaned}
 
 
 def _cleanup_stale_candidates(repo: CryptoGuardRepository) -> dict[str, Any]:
-    """Reject candidates that have been shadow_testing for > 7 days without enough samples."""
+    """Reject candidates that have been shadow_testing for > N days without enough samples."""
     from datetime import datetime, timezone, timedelta
+    from plugins.crypto_guard.config.loader import load_config
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    config = load_config()
+    stale_cfg = (config.trading_mode.get("evolution") or {}).get("stale_cleanup") or {}
+    max_days = int(stale_cfg.get("max_days", 7))
+
+    # Get backtest-status-aware thresholds from online_shadow config
+    online_shadow_cfg = (config.trading_mode.get("evolution") or {}).get("online_shadow") or {}
+    min_samples_after_backtest = int(online_shadow_cfg.get("min_samples_after_backtest", 5))
+    min_samples_without_backtest = int(online_shadow_cfg.get("min_samples_without_backtest", 30))
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_days)).isoformat()
     stale = repo.conn.execute(
         "SELECT id, strategy_name, version FROM strategy_versions WHERE status='shadow_testing' AND created_at < ?",
         (cutoff,),
@@ -53,23 +66,49 @@ def _cleanup_stale_candidates(repo: CryptoGuardRepository) -> dict[str, Any]:
 
     rejected = 0
     for row in stale:
+        version = row["version"]
+        strategy_name = row["strategy_name"]
+
+        # Check backtest status to determine correct threshold
+        backtest_row = repo.conn.execute(
+            "SELECT backtest_result_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? AND backtest_result_json IS NOT NULL",
+            (strategy_name, version),
+        ).fetchone()
+
+        effective_min_samples = min_samples_without_backtest  # Default: conservative
+        if backtest_row and backtest_row["backtest_result_json"]:
+            try:
+                import json
+                backtest = json.loads(backtest_row["backtest_result_json"])
+                if backtest.get("passed") and not backtest.get("skipped"):
+                    effective_min_samples = min_samples_after_backtest
+                elif backtest.get("gate_disabled"):
+                    effective_min_samples = min_samples_after_backtest
+            except Exception:
+                pass
+
         # Check if enough shadow evaluations exist
         count = repo.conn.execute(
             "SELECT COUNT(*) AS cnt FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
-            (row["strategy_name"], row["version"]),
+            (strategy_name, version),
         ).fetchone()
         sample_count = int(count["cnt"]) if count else 0
 
-        if sample_count < 3:
-            # Not enough samples after 7 days - reject
+        if sample_count < effective_min_samples:
+            # Not enough samples after max_days - reject
             repo.conn.execute(
                 "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-                (f"shadow_testing 超过 7 天且样本不足 ({sample_count}/3)，自动拒绝", int(row["id"])),
+                (f"shadow_testing 超过 {max_days} 天且样本不足 ({sample_count}/{effective_min_samples})，自动拒绝", int(row["id"])),
+            )
+            # Sync strategy_patches status
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate')",
+                (version,),
             )
             # Also update the trigger - use trigger_id column from strategy_patches
             repo.conn.execute(
                 "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL) AND status='shadow_testing'",
-                (row["version"],),
+                (version,),
             )
             rejected += 1
 
@@ -121,11 +160,26 @@ def _daily_loss_threshold(repo: CryptoGuardRepository) -> dict[str, Any] | None:
 
 
 def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str, Any]) -> dict[str, Any]:
-    # Check if trigger already exists before creating
+    # P0: 止住重复创建 — 已有同类型未完成 trigger 时复用，不创建新 patch
     existing = repo.conn.execute(
         "SELECT id FROM evolution_triggers WHERE trigger_type=? AND status IN ('pending','shadow_testing') AND COALESCE(symbol,'')=COALESCE(?, '') ORDER BY id DESC LIMIT 1",
         (trigger["trigger_type"], trigger.get("symbol")),
     ).fetchone()
+
+    if existing:
+        existing_id = int(existing["id"])
+        # Find the associated patch for this trigger
+        existing_patch = repo.conn.execute(
+            "SELECT id, candidate_version FROM strategy_patches WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
+            (existing_id,),
+        ).fetchone()
+        return {
+            "trigger_id": existing_id,
+            "patch_id": int(existing_patch["id"]) if existing_patch else None,
+            "status": "existing_trigger_reused",
+            "candidate_version": existing_patch["candidate_version"] if existing_patch else None,
+            "trigger": trigger,
+        }
 
     # Detect actual strategy used in related trades
     strategy_name, from_version = _detect_strategy_from_trades(repo, trigger.get("related_trade_ids") or [])
@@ -216,26 +270,25 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
             finding=trigger.get("reason", "模拟盘触发自进化，需要复盘该 Skill 权重。"),
             suggested_adjustment={"candidate_patch_id": patch_id, "shadow_testing": True},
         )
-    # Push notification if this is a new trigger (not already existing)
-    if not existing:
-        try:
-            repo.enqueue_job(
-                "evolution_trigger_alert",
-                4,
-                "paper_worker",
-                f"system:evolution:new:{trigger_id}",
-                {
-                    "trigger_type": trigger["trigger_type"],
-                    "trigger_id": trigger_id,
-                    "patch_id": patch_id,
-                    "reason": trigger.get("reason", ""),
-                    "related_trade_ids": trigger.get("related_trade_ids") or [],
-                    "trigger_value": trigger.get("trigger_value"),
-                    "threshold_value": trigger.get("threshold_value"),
-                },
-            )
-        except Exception:
-            pass
+    # Push notification for new trigger
+    try:
+        repo.enqueue_job(
+            "evolution_trigger_alert",
+            4,
+            "paper_worker",
+            f"system:evolution:new:{trigger_id}",
+            {
+                "trigger_type": trigger["trigger_type"],
+                "trigger_id": trigger_id,
+                "patch_id": patch_id,
+                "reason": trigger.get("reason", ""),
+                "related_trade_ids": trigger.get("related_trade_ids") or [],
+                "trigger_value": trigger.get("trigger_value"),
+                "threshold_value": trigger.get("threshold_value"),
+            },
+        )
+    except Exception:
+        pass
     return {"trigger_id": trigger_id, "patch_id": patch_id, "status": "shadow_testing", "trigger": trigger}
 
 

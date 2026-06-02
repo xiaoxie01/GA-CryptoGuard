@@ -96,6 +96,22 @@ def run_self_evolution_cycle(
             result["run_id"] = repo.save_self_evolution_run(result)
             return result
 
+        # P0: 止住重复创建 — 已有候选但 shadow 样本不足，等待而不是创建新补丁
+        if shadow.get("recommendation") == "insufficient_samples" or shadow.get("status") == "running":
+            result = {
+                "ok": True,
+                "status": "existing_candidate_pending_shadow",
+                "strategy_name": strategy_name,
+                "aggregation": aggregation,
+                "patch_id": None,
+                "candidate_version": existing_candidate,
+                "shadow_test": shadow,
+                "audit_steps": audit_steps,
+                "explanation": f"已有候选 {existing_candidate}，影子测试样本不足（{shadow.get('sample_count', 0)}/{min_shadow_samples}），等待积累而非创建新补丁。",
+            }
+            result["run_id"] = repo.save_self_evolution_run(result)
+            return result
+
     primary_reason = aggregation["top_reasons"][0]["reason"] if aggregation["top_reasons"] else "unknown"
     fallback_patch = build_candidate_patch({"symbol": "MULTI", "pnl_r": aggregation["avg_r"]}, primary_reason)
     agent_patch = run_agent_json_task(

@@ -84,6 +84,9 @@ evolution:
   online_shadow:
     min_samples_after_backtest: 5
     min_samples_without_backtest: 30
+  stale_cleanup:
+    max_days: 7
+    min_samples: 3
 
 market_regime:
   classifier_enabled: true

@@ -209,7 +209,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(review["ok"])
         if review["patch_id"]:
             row = self.conn.execute("SELECT status FROM strategy_patches WHERE id=?", (review["patch_id"],)).fetchone()
-            self.assertEqual(row["status"], "candidate")
+            self.assertEqual(row["status"], "shadow_testing")
 
     def test_system_status_result_uses_text_renderer(self) -> None:
         from plugins.crypto_guard.run_ga_workers import _maybe_send_feishu_result
@@ -514,7 +514,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(second["new_reviews"], 0)
         self.assertIn("每日模拟盘复盘", first["text"])
         patches = self.conn.execute("SELECT status FROM strategy_patches").fetchall()
-        self.assertTrue(all(row["status"] == "candidate" for row in patches))
+        self.assertTrue(all(row["status"] == "shadow_testing" for row in patches))
         memory_count = self.conn.execute("SELECT COUNT(*) FROM strategy_memory").fetchone()[0]
         self.assertGreaterEqual(memory_count, 1)
 
@@ -1415,7 +1415,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(review["evidence_checklist"])
         self.assertTrue(result["patch_id"])
         patch = self.conn.execute("SELECT * FROM strategy_patches WHERE id=?", (result["patch_id"],)).fetchone()
-        self.assertEqual(patch["status"], "candidate")
+        self.assertEqual(patch["status"], "shadow_testing")
         evidence = json.loads(patch["evidence_json"])
         self.assertEqual(evidence["review_id"], result["review_id"])
 
@@ -2070,6 +2070,292 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         # Verify: decision should be opportunity_watch (not trade_plan_available)
         self.assertEqual(result.get("decision"), "opportunity_watch")
         self.assertFalse(result.get("has_trade_plan"))
+
+    def test_self_evolution_returns_pending_shadow_when_candidate_exists(self) -> None:
+        """P0: self_evolution should return existing_candidate_pending_shadow instead of creating new patch."""
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.strategy.self_evolution import run_self_evolution_cycle
+
+        # Insert trade reviews to pass gates
+        for i in range(6):
+            self.conn.execute(
+                """INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at)
+                VALUES (?, 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)""",
+                (f"SYM{i}USDT",),
+            )
+            trade_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            self.conn.execute(
+                """INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context, improvement_suggestion, ga_review_json)
+                VALUES (?, 'loss', 'test_loss', '[]', '{}', 'test', '{}')""",
+                (trade_id,),
+            )
+        self.conn.commit()
+
+        # Create an existing candidate
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="test-candidate-1",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        # Run evolution - should NOT create new patch
+        result = run_self_evolution_cycle(self.repo, strategy_name="smc_pullback_long", min_reviews=3, min_symbols=1)
+        self.assertEqual(result["status"], "existing_candidate_pending_shadow")
+        self.assertEqual(result["candidate_version"], "test-candidate-1")
+
+    def test_evolution_triggers_reuses_existing_trigger(self) -> None:
+        """P0: evolution_triggers should reuse existing trigger, not create new one."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Create 3 stop loss trades
+        for i in range(3):
+            self.conn.execute(
+                """INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at)
+                VALUES ('BTCUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)"""
+            )
+        self.conn.commit()
+
+        # First trigger
+        first = evaluate_evolution_triggers(self.repo)
+        self.assertTrue(first["triggered"])
+        first_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()[0]
+
+        # Second trigger with same trades - should reuse
+        second = evaluate_evolution_triggers(self.repo)
+        # Should NOT create new trigger
+        second_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()[0]
+        self.assertEqual(first_trigger_count, second_trigger_count)
+
+    def test_controller_writes_shadow_evaluation(self) -> None:
+        """P0: controller should write shadow evaluation for candidates."""
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from unittest.mock import patch, MagicMock
+
+        now = datetime.now(timezone.utc)
+
+        # Create a candidate version
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="shadow-test-v1",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        controller = GAMasterController(self.repo)
+
+        fake_decision = {
+            "has_trade_plan": False,
+            "decision": "opportunity_watch",
+            "confidence": 0.5,
+            "signal_grade": "C",
+            "trend_stage": "transition",
+            "strategy_name": "smc_pullback_long",
+            "market_bias": "neutral",
+            "trade_plan": None,
+            "counter_evidence": [],
+            "risk_notes": [],
+            "symbol": "BTCUSDT",
+        }
+
+        fake_context = {
+            "symbol": "BTCUSDT",
+            "snapshot": {"symbol": "BTCUSDT", "current_price": 50000},
+            "analysis_time_utc": int(now.timestamp()),
+            "snapshot_id": None,
+            "previous_analysis_state": None,
+        }
+
+        with patch("plugins.crypto_guard.ga_master.controller.run_agent_sop_decision", return_value=fake_decision):
+            with patch.object(controller.context_builder, "build", return_value=fake_context):
+                request = GAAnalysisRequest(symbol="BTCUSDT", decision_type="scheduled")
+                controller.analyze_symbol(request)
+
+        # Check shadow evaluation was written
+        evals = self.conn.execute(
+            "SELECT * FROM strategy_evaluations WHERE strategy_version='shadow-test-v1' AND is_shadow=1"
+        ).fetchall()
+        self.assertGreaterEqual(len(evals), 1)
+        self.assertEqual(evals[0]["symbol"], "BTCUSDT")
+
+    def test_shadow_verdict_runner_promotes_passed_candidates(self) -> None:
+        """P1: shadow verdict runner should promote candidates that pass."""
+        from plugins.crypto_guard.strategy.shadow_testing import run_shadow_verdict_runner
+
+        # Create an active version
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="1.0",
+            status="active",
+            config={},
+            change_reason="test",
+        )
+
+        # Create a candidate with enough evaluations to pass
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="verdict-test-v1",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        # Insert active version evaluations (poor performance) - need 30 for min_samples_without_backtest
+        for i in range(30):
+            self.conn.execute(
+                """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r)
+                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', '1.0', 0.5, 'trade_plan_available', 0, -0.5)""",
+                (1700000000 + i,),
+            )
+
+        # Insert candidate evaluations (better performance)
+        for i in range(30):
+            self.conn.execute(
+                """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r)
+                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'verdict-test-v1', 0.7, 'trade_plan_available', 1, 0.3)""",
+                (1700000000 + i,),
+            )
+        self.conn.commit()
+
+        result = run_shadow_verdict_runner(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(result["processed"], 1)
+
+        # Check if promoted to review_required
+        version = self.conn.execute(
+            "SELECT status FROM strategy_versions WHERE version='verdict-test-v1'"
+        ).fetchone()
+        self.assertEqual(version["status"], "review_required")
+
+    def test_duplicate_patches_cleaned_up(self) -> None:
+        """P1: duplicate patches should be marked as duplicate."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Create 3 stop loss trades
+        for i in range(3):
+            self.conn.execute(
+                """INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at)
+                VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)"""
+            )
+        self.conn.commit()
+
+        # Run trigger - should create patches
+        result = evaluate_evolution_triggers(self.repo)
+        self.assertTrue(result["triggered"])
+
+        # Check cleanup result
+        cleaned = result.get("cleaned_duplicates", {})
+        # No duplicates yet (first run)
+        self.assertEqual(cleaned.get("rejected_duplicates", 0), 0)
+
+        # All patches should be shadow_testing (not candidate)
+        patches = self.conn.execute("SELECT status FROM strategy_patches").fetchall()
+        self.assertTrue(all(row["status"] == "shadow_testing" for row in patches))
+
+    def test_stale_cleanup_uses_config_thresholds(self) -> None:
+        """P2: stale cleanup should use config thresholds based on backtest status."""
+        from datetime import datetime, timezone, timedelta
+        from plugins.crypto_guard.review.evolution_triggers import _cleanup_stale_candidates
+        import json
+
+        # Case 1: No backtest → uses min_samples_without_backtest (30)
+        stale_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="stale-no-backtest",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+        self.conn.execute(
+            "UPDATE strategy_versions SET created_at=? WHERE version='stale-no-backtest'",
+            (stale_time,),
+        )
+        trigger_id = self.repo.create_evolution_trigger(
+            trigger_type="test_trigger", trigger_value=3, threshold_value=3,
+            related_trade_ids=[], strategy_name="smc_pullback_long", status="shadow_testing",
+        )
+        self.conn.execute(
+            """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status)
+            VALUES ('smc_pullback_long', '1.0', 'stale-no-backtest', '{}', 'test', ?, 'shadow_testing')""",
+            (trigger_id,),
+        )
+        self.conn.commit()
+
+        # Should be rejected (0 < 30)
+        result = _cleanup_stale_candidates(self.repo)
+        self.assertEqual(result["rejected_stale"], 1)
+
+        # Case 2: Backtest passed → uses min_samples_after_backtest (5)
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="stale-with-backtest",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+        self.conn.execute(
+            "UPDATE strategy_versions SET created_at=? WHERE version='stale-with-backtest'",
+            (stale_time,),
+        )
+        # Create patch with backtest passed
+        self.conn.execute(
+            """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status, backtest_result_json)
+            VALUES ('smc_pullback_long', '1.0', 'stale-with-backtest', '{}', 'test', ?, 'shadow_testing', ?)""",
+            (trigger_id, json.dumps({"ok": True, "passed": True, "skipped": False})),
+        )
+        # Add 3 shadow evaluations (less than 5 but more than 0)
+        for i in range(3):
+            self.conn.execute(
+                """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow)
+                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'stale-with-backtest', 0.5, 'trade_plan_available', 1)""",
+                (1700000000 + i,),
+            )
+        self.conn.commit()
+
+        # Should be rejected (3 < 5)
+        result = _cleanup_stale_candidates(self.repo)
+        self.assertEqual(result["rejected_stale"], 1)
+
+        # Case 3: Backtest passed with enough samples → NOT rejected
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="stale-enough-samples",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+        self.conn.execute(
+            "UPDATE strategy_versions SET created_at=? WHERE version='stale-enough-samples'",
+            (stale_time,),
+        )
+        self.conn.execute(
+            """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status, backtest_result_json)
+            VALUES ('smc_pullback_long', '1.0', 'stale-enough-samples', '{}', 'test', ?, 'shadow_testing', ?)""",
+            (trigger_id, json.dumps({"ok": True, "passed": True, "skipped": False})),
+        )
+        # Add 5 shadow evaluations (exactly min_samples_after_backtest)
+        for i in range(5):
+            self.conn.execute(
+                """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow)
+                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'stale-enough-samples', 0.5, 'trade_plan_available', 1)""",
+                (1700000000 + i,),
+            )
+        self.conn.commit()
+
+        # Should NOT be rejected (5 >= 5)
+        result = _cleanup_stale_candidates(self.repo)
+        self.assertEqual(result["rejected_stale"], 0)
+
+        # Verify the version is still shadow_testing
+        version = self.conn.execute(
+            "SELECT status FROM strategy_versions WHERE version='stale-enough-samples'"
+        ).fetchone()
+        self.assertEqual(version["status"], "shadow_testing")
 
 
 if __name__ == "__main__":

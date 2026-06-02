@@ -113,6 +113,7 @@ def _apply_decision_supplement_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "paper_trades", "fill_method", "TEXT")
     _add_column(conn, "trade_reviews", "market_regime_at_loss", "TEXT")
     _add_column(conn, "trade_reviews", "evolution_trigger_allowed", "INTEGER DEFAULT 1")
+    _add_column(conn, "shadow_test_results", "verdict_runner_run", "INTEGER DEFAULT 0")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS alert_outbox (
