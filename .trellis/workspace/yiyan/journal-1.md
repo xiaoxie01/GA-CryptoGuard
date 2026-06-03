@@ -139,3 +139,36 @@ P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 修复 evolution_review 入队逻辑
+
+**Date**: 2026-06-03
+**Task**: 修复 evolution_review 入队逻辑
+**Branch**: `main`
+
+### Summary
+
+修复 verdict_promotion 入队被 send_message 条件挡住的 bug，补发两个 review_required 通知
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `abae373` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
