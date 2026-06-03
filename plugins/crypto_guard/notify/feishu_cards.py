@@ -434,3 +434,62 @@ def _humanize_text(value: object) -> str:
     for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         text = text.replace(src, dst)
     return text
+
+
+def build_evolution_review_card(candidate_version: str, sample_count: int, reason: str) -> dict[str, Any]:
+    """Build a feishu card for evolution review with approve/reject buttons."""
+    content = f"""**CryptoGuard 自进化 - 人工审核**
+
+**候选版本**: {candidate_version}
+**影子样本数**: {sample_count}
+**触发原因**: {reason}
+
+候选策略已通过影子测试，等待人工确认升级。
+
+**请审核以下内容后决定是否批准：**
+1. 候选策略的改进逻辑是否合理
+2. 影子测试的样本量是否足够
+3. 是否存在过拟合风险
+
+不构成实盘建议，所有策略变更仅进入 candidate/shadow 流程。"""
+
+    buttons = [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "批准升级"},
+            "type": "primary",
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": {
+                        "plugin": "crypto_guard",
+                        "action": "approve_evolution",
+                        "candidate_version": candidate_version,
+                    },
+                }
+            ],
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "拒绝"},
+            "type": "danger",
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": {
+                        "plugin": "crypto_guard",
+                        "action": "reject_evolution",
+                        "candidate_version": candidate_version,
+                    },
+                }
+            ],
+        },
+    ]
+
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": content}]
+    elements.extend(buttons)
+    return {
+        "schema": "2.0",
+        "config": {"streaming_mode": False, "width_mode": "fill"},
+        "body": {"elements": elements},
+    }

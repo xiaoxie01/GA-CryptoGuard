@@ -556,7 +556,7 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
 
 
 def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
-    """Send immediate notification when evolution is triggered."""
+    """Send immediate notification when evolution is triggered or verdict promotes."""
     import json
     target = resolve_report_target(repo, payload)
     trigger_type = payload.get("trigger_type", "unknown")
@@ -568,31 +568,50 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     related_ids = payload.get("related_trade_ids") or []
     trigger_value = payload.get("trigger_value")
     threshold = payload.get("threshold_value")
+    candidate_version = payload.get("candidate_version")
+    sample_count = payload.get("sample_count", 0)
 
     trigger_type_cn = {
         "consecutive_stop_losses": "连续止损",
         "daily_loss_threshold": "单日止损",
         "account_drawdown": "账户回撤",
+        "verdict_promotion": "影子测试通过",
     }.get(trigger_type, trigger_type)
 
     # Build trigger detail
     detail_lines = [f"**CryptoGuard 自进化触发**", ""]
-    detail_lines.append(f"- 触发类型：{trigger_type_cn}")
-    if trigger_value and threshold:
-        detail_lines.append(f"- 触发值：{trigger_value}（阈值 {threshold}）")
-    if loss_count:
-        detail_lines.append(f"- 今日止损：{loss_count} 笔")
-    if reason:
+
+    if trigger_type == "verdict_promotion":
+        # Special handling for verdict promotion
+        detail_lines.append(f"- 触发类型：{trigger_type_cn}")
+        detail_lines.append(f"- 候选版本：{candidate_version}")
+        detail_lines.append(f"- 影子样本数：{sample_count}")
         detail_lines.append(f"- 原因：{reason}")
-    if related_ids:
-        ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
-        detail_lines.append(f"- 关联交易：{ids_str}")
-    if trigger_id:
-        detail_lines.append(f"- 触发器 ID：#{trigger_id}")
-    if patch_id:
-        detail_lines.append(f"- 候选补丁 ID：#{patch_id}")
-    detail_lines.append("")
-    detail_lines.append("系统已自动创建候选补丁并进入影子测试。")
+        detail_lines.append("")
+        detail_lines.append("候选策略已通过影子测试，等待人工确认升级。")
+        detail_lines.append("")
+        detail_lines.append("**请审核以下内容后决定是否批准：**")
+        detail_lines.append("1. 候选策略的改进逻辑是否合理")
+        detail_lines.append("2. 影子测试的样本量是否足够")
+        detail_lines.append("3. 是否存在过拟合风险")
+    else:
+        # Original trigger handling
+        detail_lines.append(f"- 触发类型：{trigger_type_cn}")
+        if trigger_value and threshold:
+            detail_lines.append(f"- 触发值：{trigger_value}（阈值 {threshold}）")
+        if loss_count:
+            detail_lines.append(f"- 今日止损：{loss_count} 笔")
+        if reason:
+            detail_lines.append(f"- 原因：{reason}")
+        if related_ids:
+            ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
+            detail_lines.append(f"- 关联交易：{ids_str}")
+        if trigger_id:
+            detail_lines.append(f"- 触发器 ID：#{trigger_id}")
+        if patch_id:
+            detail_lines.append(f"- 候选补丁 ID：#{patch_id}")
+        detail_lines.append("")
+        detail_lines.append("系统已自动创建候选补丁并进入影子测试。")
 
     # Use actual config values for sample requirement
     from plugins.crypto_guard.config.loader import load_config as _load_cfg2
@@ -602,10 +621,11 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     _min_without_bt2 = _online_cfg2.get("min_samples_without_backtest", 30)
     _backtest_enabled2 = _cfg2.get("evolution", {}).get("backtest_gate", {}).get("enabled", True)
 
-    if _backtest_enabled2:
-        detail_lines.append(f"影子测试需 {_min_after_bt2} 个样本（通过回测门禁）或 {_min_without_bt2} 个样本（未通过回测）后方可进入 review。")
-    else:
-        detail_lines.append(f"影子测试需至少 {_min_without_bt2} 个样本确认效果后方可进入 review。")
+    if trigger_type != "verdict_promotion":
+        if _backtest_enabled2:
+            detail_lines.append(f"影子测试需 {_min_after_bt2} 个样本（通过回测门禁）或 {_min_without_bt2} 个样本（未通过回测）后方可进入 review。")
+        else:
+            detail_lines.append(f"影子测试需至少 {_min_without_bt2} 个样本确认效果后方可进入 review。")
 
     # Get full evolution status
     evolution_text = _build_evolution_status_text(repo)
@@ -614,7 +634,13 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
 
     sent = False
     if target and send_message:
-        sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
+        if trigger_type == "verdict_promotion" and candidate_version:
+            # Send card with buttons for verdict promotion
+            from plugins.crypto_guard.notify.feishu_cards import build_evolution_review_card
+            card = build_evolution_review_card(candidate_version, sample_count, reason)
+            sent = bool(send_message(receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), msg_type="interactive", content=json.dumps(card, ensure_ascii=False)).get("message_id"))
+        else:
+            sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
     return {"ok": True, "sent": sent, "target": target, "text": text}
 
 
