@@ -205,3 +205,36 @@ P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: pending order 生命周期管理 P0
+
+**Date**: 2026-06-03
+**Task**: pending order 生命周期管理 P0
+**Branch**: `main`
+
+### Summary
+
+实现 TTL 过期、方向冲突取消、stale 清理，清理 8 笔堆积挂单
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d9b326d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
