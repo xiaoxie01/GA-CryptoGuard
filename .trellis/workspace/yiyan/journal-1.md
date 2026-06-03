@@ -106,3 +106,36 @@ P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 修复自进化审核通知闭环
+
+**Date**: 2026-06-03
+**Task**: 修复自进化审核通知闭环
+**Branch**: `main`
+
+### Summary
+
+完成自进化审核通知闭环：verdict_promotion 改走 interactive outbox，新增 approve/reject 按钮回调，卡片补充 backtest 状态和性能对比，同步更新三表状态。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `20426d3` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

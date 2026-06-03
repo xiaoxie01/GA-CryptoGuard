@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
-- **Last Active**: 2026-06-02
+- **Total Sessions**: 4
+- **Last Active**: 2026-06-03
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~108 | Active |
+| `journal-1.md` | ~141 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-06-03 | 修复自进化审核通知闭环 | `20426d3` | `main` |
 | 3 | 2026-06-02 | 修复止血逻辑 + 补集成测试 | `b223f91`, `74ab9ed` | `main` |
 | 2 | 2026-06-02 | 完成性能门禁优化实现 | `95f9c26` | `main` |
 | 1 | 2026-06-02 | 实现历史回测准入门禁加速自进化反馈 | `4c2ae11`, `1022f6b` | `main` |
