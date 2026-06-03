@@ -1408,6 +1408,28 @@ class CryptoGuardRepository:
         priority: int = 5,
         dedupe_key: str | None = None,
     ) -> int:
+        # Validation for evolution_review: must be interactive card with valid JSON
+        if alert_type == "evolution_review":
+            if payload.get("msg_type") != "interactive":
+                raise ValueError(
+                    f"evolution_review must use msg_type='interactive', got '{payload.get('msg_type')}'"
+                )
+            content_str = payload.get("content")
+            if not content_str:
+                raise ValueError("evolution_review content must not be empty")
+            try:
+                card = json.loads(content_str)
+                if not isinstance(card, dict) or "body" not in card:
+                    raise ValueError("evolution_review content must be a valid card JSON with 'body'")
+                elements = card.get("body", {}).get("elements")
+                if not isinstance(elements, list):
+                    raise ValueError("evolution_review content must have body.elements as a list")
+                has_button = any(e.get("tag") == "button" for e in elements if isinstance(e, dict))
+                if not has_button:
+                    raise ValueError("evolution_review content must contain at least one button element")
+            except (json.JSONDecodeError, TypeError) as e:
+                raise ValueError(f"evolution_review content must be valid JSON: {e}") from e
+
         self.conn.execute(
             """
             INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json, next_retry_at, dedupe_key)

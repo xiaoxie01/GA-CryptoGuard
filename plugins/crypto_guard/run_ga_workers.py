@@ -631,7 +631,7 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
 
     # Cleanup old text-type evolution_review alerts (should be interactive)
     repo.conn.execute(
-        "UPDATE alert_outbox SET status='superseded' WHERE alert_type='evolution_trigger' AND payload_json LIKE '%\"msg_type\": \"text\"%' AND status='pending'"
+        "UPDATE alert_outbox SET status='superseded' WHERE alert_type='evolution_review' AND payload_json LIKE '%\"msg_type\": \"text\"%' AND status IN ('pending', 'sent')"
     )
     repo.conn.commit()
 

@@ -2401,6 +2401,97 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(outbox_payload["receive_id"], "chat_test_123")
         self.assertEqual(outbox_payload["msg_type"], "interactive")
 
+    def test_verdict_promotion_card_has_approve_reject_buttons(self) -> None:
+        """P1: Verify evolution_review card content contains approve/reject buttons."""
+        from plugins.crypto_guard.run_ga_workers import handle_evolution_trigger_alert
+
+        # Setup
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="test-candidate-btn",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        payload = {
+            "trigger_type": "verdict_promotion",
+            "candidate_version": "test-candidate-btn",
+            "sample_count": 53,
+            "reason": "shadow 胜率 65%",
+            "receive_id": "chat_test_btn",
+            "receive_id_type": "chat_id",
+        }
+
+        result = handle_evolution_trigger_alert(self.repo, payload, send_message=None)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["queued"])
+
+        # Get the enqueued alert
+        row = self.conn.execute(
+            "SELECT * FROM alert_outbox WHERE alert_type='evolution_review' AND status='pending' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+
+        # Parse card content
+        outbox_payload = json.loads(row["payload_json"])
+        card = json.loads(outbox_payload["content"])
+
+        # Verify card structure
+        self.assertIn("body", card)
+        self.assertIn("elements", card["body"])
+
+        # Find all button elements
+        buttons = [e for e in card["body"]["elements"] if e.get("tag") == "button"]
+        self.assertGreaterEqual(len(buttons), 2, "Card must have at least 2 buttons (approve + reject)")
+
+        # Extract button actions from behaviors
+        button_actions = []
+        for btn in buttons:
+            for behavior in btn.get("behaviors", []):
+                if behavior.get("type") == "callback":
+                    value = behavior.get("value", {})
+                    if value.get("action"):
+                        button_actions.append(value["action"])
+
+        self.assertIn("approve_evolution", button_actions, "Card must have approve_evolution button")
+        self.assertIn("reject_evolution", button_actions, "Card must have reject_evolution button")
+
+    def test_enqueue_alert_rejects_text_evolution_review(self) -> None:
+        """P0: enqueue_alert must reject text-type evolution_review payloads."""
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+        # Attempt to enqueue a text-type evolution_review
+        with self.assertRaises(ValueError) as ctx:
+            self.repo.enqueue_alert(
+                alert_type="evolution_review",
+                payload={
+                    "msg_type": "text",
+                    "content": "some text",
+                    "receive_id": "chat_test",
+                },
+            )
+        self.assertIn("msg_type='interactive'", str(ctx.exception))
+
+    def test_enqueue_alert_rejects_evolution_review_without_buttons(self) -> None:
+        """P0: enqueue_alert must reject evolution_review with card missing buttons."""
+        # Card with no buttons
+        bad_card = json.dumps({
+            "schema": "2.0",
+            "body": {"elements": [{"tag": "markdown", "content": "hello"}]},
+        })
+
+        with self.assertRaises(ValueError) as ctx:
+            self.repo.enqueue_alert(
+                alert_type="evolution_review",
+                payload={
+                    "msg_type": "interactive",
+                    "content": bad_card,
+                    "receive_id": "chat_test",
+                },
+            )
+        self.assertIn("button", str(ctx.exception))
+
     def test_verdict_promotion_enqueues_outbox_with_send_message(self) -> None:
         """P0: verdict_promotion must also enqueue when send_message is provided."""
         from plugins.crypto_guard.run_ga_workers import handle_evolution_trigger_alert
