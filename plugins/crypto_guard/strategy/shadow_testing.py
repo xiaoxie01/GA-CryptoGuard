@@ -205,6 +205,25 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
                 "UPDATE evolution_triggers SET status='review_required' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
                 (candidate_version,),
             )
+            # Send notification for review_required promotion
+            try:
+                repo.enqueue_job(
+                    "evolution_trigger_alert",
+                    4,
+                    "paper_worker",
+                    f"system:verdict:review_required:{candidate_version}",
+                    {
+                        "trigger_type": "verdict_promotion",
+                        "trigger_id": None,
+                        "patch_id": None,
+                        "reason": f"影子测试通过，候选 {candidate_version} 进入人工 review（{shadow.get('sample_count', 0)} 个样本）",
+                        "candidate_version": candidate_version,
+                        "sample_count": shadow.get("sample_count", 0),
+                        "verdict": verdict,
+                    },
+                )
+            except Exception:
+                pass
             results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "promoted_to_review", "shadow": shadow})
 
         elif verdict == "reject_candidate":
