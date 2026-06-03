@@ -159,6 +159,9 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
         jobs.append("update_opportunity_watches")
     if minute % 3 == 0:
         jobs.append("update_paper_positions_3m")
+    # Pending order lifecycle: TTL expiry + conflict cancellation (every 60 minutes)
+    if minute == 0:
+        jobs.append("pending_order_management")
     # Daily review: run between 00:05-00:30 UTC (wider window for crash recovery)
     # _tick_key ensures it only runs once per day
     if hour == 0 and 5 <= minute <= 30:

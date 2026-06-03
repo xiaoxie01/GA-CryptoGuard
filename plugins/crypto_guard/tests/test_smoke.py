@@ -2553,5 +2553,256 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertFalse(result.get("queued", False), "non-verdict should not use queued flag")
 
 
+class PendingOrderManagerTest(unittest.TestCase):
+    """Tests for pending order lifecycle: TTL expiry, conflict cancellation, cleanup."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_llm_analysis = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+        initialize_database()
+        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
+        self.repo = CryptoGuardRepository(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        if self._old_llm_analysis is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm_analysis
+        self.tmp.cleanup()
+
+    def _insert_pending_order(
+        self,
+        symbol: str = "BTCUSDT",
+        side: str = "LONG",
+        order_type: str = "limit",
+        created_hours_ago: float = 0,
+    ) -> int:
+        from datetime import datetime, timedelta, timezone
+        created_at = (datetime.now(timezone.utc) - timedelta(hours=created_hours_ago)).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at)
+            VALUES (?, ?, ?, 100, 95, 1, 'pending', ?)
+            """,
+            (symbol, side, order_type, created_at),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def _insert_ga_decision(
+        self,
+        symbol: str = "BTCUSDT",
+        market_bias: str = "bullish",
+        signal_grade: str = "A",
+    ) -> int:
+        self.conn.execute(
+            """
+            INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade,
+                confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json,
+                counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json)
+            VALUES (?, 1700000000000, '2023-11-14T22:13:20', 'scheduled_analysis', ?, 0.8, ?, 'middle',
+                'wait', '{}', '{}', '{}', '{}', '{}', 'test', '{}')
+            """,
+            (symbol, signal_grade, market_bias),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def test_expire_pending_orders_ttl_expired(self) -> None:
+        """P0: Orders older than TTL should be expired."""
+        from plugins.crypto_guard.paper.pending_order_manager import expire_pending_orders
+
+        # limit_pullback TTL = 8h, create one 10h ago
+        old_id = self._insert_pending_order(order_type="limit_pullback", created_hours_ago=10)
+        # Create one 2h ago (should NOT expire)
+        fresh_id = self._insert_pending_order(order_type="limit_pullback", created_hours_ago=2)
+
+        result = expire_pending_orders(self.repo)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["expired_count"], 1)
+        self.assertEqual(result["expired_orders"][0]["id"], old_id)
+
+        # Verify old order status
+        old_row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=?", (old_id,)).fetchone()
+        self.assertEqual(old_row["status"], "expired")
+        self.assertIn("TTL expired", old_row["cancel_reason"])
+
+        # Verify fresh order is still pending
+        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (fresh_id,)).fetchone()
+        self.assertEqual(fresh_row["status"], "pending")
+
+    def test_expire_pending_orders_breakout_short_ttl(self) -> None:
+        """P0: breakout orders have 4h TTL."""
+        from plugins.crypto_guard.paper.pending_order_manager import expire_pending_orders
+
+        old_id = self._insert_pending_order(order_type="breakout", created_hours_ago=5)
+        fresh_id = self._insert_pending_order(order_type="breakout", created_hours_ago=3)
+
+        result = expire_pending_orders(self.repo)
+
+        self.assertEqual(result["expired_count"], 1)
+        self.assertEqual(result["expired_orders"][0]["id"], old_id)
+
+    def test_expire_pending_orders_swing_long_ttl(self) -> None:
+        """P0: swing orders have 24h TTL."""
+        from plugins.crypto_guard.paper.pending_order_manager import expire_pending_orders
+
+        # 20h old swing should NOT expire
+        fresh_id = self._insert_pending_order(order_type="swing", created_hours_ago=20)
+        # 25h old swing should expire
+        old_id = self._insert_pending_order(order_type="swing", created_hours_ago=25)
+
+        result = expire_pending_orders(self.repo)
+
+        self.assertEqual(result["expired_count"], 1)
+        self.assertEqual(result["expired_orders"][0]["id"], old_id)
+
+    def test_cancel_conflict_pending_short_vs_bullish(self) -> None:
+        """P0: SHORT pending + bullish A-grade GA decision = conflict cancel."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+
+        order_id = self._insert_pending_order(side="SHORT")
+        self._insert_ga_decision(market_bias="bullish", signal_grade="A")
+
+        result = cancel_conflict_pending_orders(self.repo)
+
+        self.assertEqual(result["cancelled_count"], 1)
+        self.assertEqual(result["cancelled_orders"][0]["id"], order_id)
+
+        row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertEqual(row["status"], "conflict_cancelled")
+        self.assertIn("Direction conflict", row["cancel_reason"])
+
+    def test_cancel_conflict_pending_long_vs_bearish(self) -> None:
+        """P0: LONG pending + bearish S-grade GA decision = conflict cancel."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+
+        order_id = self._insert_pending_order(side="LONG")
+        self._insert_ga_decision(market_bias="bearish", signal_grade="S")
+
+        result = cancel_conflict_pending_orders(self.repo)
+
+        self.assertEqual(result["cancelled_count"], 1)
+
+    def test_cancel_conflict_pending_no_conflict_same_direction(self) -> None:
+        """No conflict: LONG pending + bullish = keep."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+
+        self._insert_pending_order(side="LONG")
+        self._insert_ga_decision(market_bias="bullish", signal_grade="A")
+
+        result = cancel_conflict_pending_orders(self.repo)
+
+        self.assertEqual(result["cancelled_count"], 0)
+
+    def test_cancel_conflict_pending_neutral_bias_no_cancel(self) -> None:
+        """neutral/mixed bias should NOT cancel but should mark needs_recheck."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+
+        order_id = self._insert_pending_order(side="SHORT")
+        self._insert_ga_decision(market_bias="neutral", signal_grade="A")
+
+        result = cancel_conflict_pending_orders(self.repo)
+
+        self.assertEqual(result["cancelled_count"], 0)
+
+        # Verify order is marked needs_recheck, not cancelled
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertEqual(row["status"], "needs_recheck")
+
+    def test_cancel_conflict_pending_low_grade_no_cancel(self) -> None:
+        """D-grade should NOT trigger conflict cancellation."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+
+        self._insert_pending_order(side="SHORT")
+        self._insert_ga_decision(market_bias="bullish", signal_grade="D")
+
+        result = cancel_conflict_pending_orders(self.repo)
+
+        self.assertEqual(result["cancelled_count"], 0)
+
+    def test_cleanup_stale_pending(self) -> None:
+        """One-shot cleanup should expire all pending >24h old."""
+        from plugins.crypto_guard.paper.pending_order_manager import cleanup_stale_pending
+
+        old_id = self._insert_pending_order(created_hours_ago=48)
+        fresh_id = self._insert_pending_order(created_hours_ago=12)
+
+        result = cleanup_stale_pending(self.repo, max_age_hours=24)
+
+        self.assertEqual(result["cleaned"], 1)
+
+        old_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (old_id,)).fetchone()
+        self.assertEqual(old_row["status"], "expired")
+
+        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (fresh_id,)).fetchone()
+        self.assertEqual(fresh_row["status"], "pending")
+
+    def test_cleanup_stale_pending_no_stale(self) -> None:
+        """No-op when no stale orders."""
+        from plugins.crypto_guard.paper.pending_order_manager import cleanup_stale_pending
+
+        self._insert_pending_order(created_hours_ago=1)
+
+        result = cleanup_stale_pending(self.repo, max_age_hours=24)
+
+        self.assertEqual(result["cleaned"], 0)
+
+    def test_run_pending_order_management_combined(self) -> None:
+        """run_pending_order_management runs both expiry and conflict checks."""
+        from plugins.crypto_guard.paper.pending_order_manager import run_pending_order_management
+
+        # Expired by TTL
+        expired_id = self._insert_pending_order(order_type="breakout", created_hours_ago=5)
+        # Conflict cancelled
+        conflict_id = self._insert_pending_order(side="SHORT", created_hours_ago=1)
+        self._insert_ga_decision(market_bias="bullish", signal_grade="A")
+        # Should remain pending
+        safe_id = self._insert_pending_order(side="LONG", created_hours_ago=1)
+
+        result = run_pending_order_management(self.repo)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["expire"]["expired_count"], 1)
+        self.assertEqual(result["conflict"]["cancelled_count"], 1)
+
+        safe_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (safe_id,)).fetchone()
+        self.assertEqual(safe_row["status"], "pending")
+
+    def test_migration_columns_exist(self) -> None:
+        """P0: expires_at, cancelled_at, cancel_reason, invalidated_by_ga_decision_id columns exist after migration."""
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
+        self.assertIn("expires_at", cols)
+        self.assertIn("cancelled_at", cols)
+        self.assertIn("cancel_reason", cols)
+        self.assertIn("invalidated_by_ga_decision_id", cols)
+
+    def test_notify_order_cancelled_enqueues_alert(self) -> None:
+        """notify_order_cancelled should enqueue to alert_outbox."""
+        from plugins.crypto_guard.paper.pending_order_manager import notify_order_cancelled
+
+        order_id = self._insert_pending_order(symbol="ETHUSDT", side="LONG")
+        order = {"id": order_id, "symbol": "ETHUSDT", "side": "LONG"}
+
+        result = notify_order_cancelled(self.repo, order, "TTL expired (8:00:00)")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("queued"))
+
+        # Verify in outbox
+        row = self.conn.execute(
+            "SELECT * FROM alert_outbox WHERE alert_type='paper_order_expired' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+
+
 if __name__ == "__main__":
     unittest.main()

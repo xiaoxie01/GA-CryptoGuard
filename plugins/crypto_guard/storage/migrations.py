@@ -28,6 +28,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_decision_supplement_migrations(conn)
         _apply_v2_migrations(conn)
         _apply_ga_master_migrations(conn)
+        _apply_pending_order_lifecycle_migrations(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -402,6 +403,15 @@ def _apply_ga_master_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_parquet_archive_runs_recent ON parquet_archive_runs(created_at, symbol, interval)")
+
+
+def _apply_pending_order_lifecycle_migrations(conn: sqlite3.Connection) -> None:
+    """Add lifecycle columns for pending order TTL and conflict cancellation."""
+    _add_column(conn, "paper_orders", "expires_at", "TEXT")
+    _add_column(conn, "paper_orders", "cancelled_at", "TEXT")
+    _add_column(conn, "paper_orders", "cancel_reason", "TEXT")
+    _add_column(conn, "paper_orders", "invalidated_by_ga_decision_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status)")
 
 
 def _seed_symbols(conn: sqlite3.Connection, symbols_cfg: dict[str, Any]) -> None:

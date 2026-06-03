@@ -133,6 +133,25 @@ def run_job(job_name: str) -> dict:
             )
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
+        if job_name == "pending_order_management":
+            scheduled_time = (now // (60 * 1000)) * (60 * 1000)
+            result = run_scheduled_job(
+                repo,
+                job_name=job_name,
+                scheduled_time=scheduled_time,
+                task_fn=lambda: {
+                    "ok": True,
+                    "queued": repo.enqueue_job(
+                        "pending_order_management",
+                        5,
+                        "scheduler",
+                        "system:scheduled:pending_order_mgmt",
+                        {"scheduled_time": scheduled_time},
+                    ),
+                },
+            )
+            LOGGER.info("run_job done job=%s result=%s", job_name, result)
+            return result
         raise ValueError(f"未知 scheduler job: {job_name}")
     finally:
         conn.close()
