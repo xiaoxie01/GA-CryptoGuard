@@ -172,3 +172,36 @@ P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: 修复 evolution_review 必须用 interactive card
+
+**Date**: 2026-06-03
+**Task**: 修复 evolution_review 必须用 interactive card
+**Branch**: `main`
+
+### Summary
+
+修正清理查询、加校验防线、重新 enqueue 正确的 interactive card
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c929982` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

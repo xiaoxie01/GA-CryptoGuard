@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-06-03
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~174 | Active |
+| `journal-1.md` | ~207 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-06-03 | 修复 evolution_review 必须用 interactive card | `c929982` | `main` |
 | 5 | 2026-06-03 | 修复 evolution_review 入队逻辑 | `abae373` | `main` |
 | 4 | 2026-06-03 | 修复自进化审核通知闭环 | `20426d3` | `main` |
 | 3 | 2026-06-02 | 修复止血逻辑 + 补集成测试 | `b223f91`, `74ab9ed` | `main` |
