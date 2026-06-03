@@ -436,20 +436,49 @@ def _humanize_text(value: object) -> str:
     return text
 
 
-def build_evolution_review_card(candidate_version: str, sample_count: int, reason: str) -> dict[str, Any]:
+def build_evolution_review_card(
+    candidate_version: str,
+    sample_count: int,
+    reason: str,
+    backtest_status: dict[str, Any] | None = None,
+    active_stats: dict[str, Any] | None = None,
+    candidate_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a feishu card for evolution review with approve/reject buttons."""
+
+    backtest_info = ""
+    if backtest_status:
+        if backtest_status.get("passed"):
+            backtest_info = "**回测门禁**: 通过"
+        elif backtest_status.get("skipped"):
+            backtest_info = "**回测门禁**: 跳过（配置禁用或数据不足）"
+        else:
+            backtest_info = f"**回测门禁**: 未通过 ({backtest_status.get('reason', 'unknown')})"
+
+    stats_info = ""
+    if active_stats and candidate_stats:
+        stats_info = f"""
+**性能对比**:
+- Active: avg_r={active_stats.get('avg_r', '-')}, win_rate={active_stats.get('win_rate', '-')}
+- Candidate: avg_r={candidate_stats.get('avg_r', '-')}, win_rate={candidate_stats.get('win_rate', '-')}
+"""
+
     content = f"""**CryptoGuard 自进化 - 人工审核**
 
 **候选版本**: {candidate_version}
 **影子样本数**: {sample_count}
 **触发原因**: {reason}
 
+{backtest_info}
+{stats_info}
 候选策略已通过影子测试，等待人工确认升级。
 
 **请审核以下内容后决定是否批准：**
 1. 候选策略的改进逻辑是否合理
 2. 影子测试的样本量是否足够
 3. 是否存在过拟合风险
+
+注意：当前样本基于模拟盘和影子测试，非真实成交 PnL。
 
 不构成实盘建议，所有策略变更仅进入 candidate/shadow 流程。"""
 

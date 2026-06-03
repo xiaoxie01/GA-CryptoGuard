@@ -308,4 +308,85 @@ evolution:
 
 ---
 
-**Last updated**: 2026-06-01
+## 11. Evolution Review Notification Flow
+
+### Convention: verdict_promotion must use interactive outbox, not direct send
+
+**What**: When a candidate strategy passes shadow testing and enters `review_required` status, the notification must be sent via `alert_outbox` with `msg_type="interactive"` (card with buttons), not via direct `send_message()` call.
+
+**Why**: Direct `send_message()` calls have no retry capability and fail silently. Using `alert_outbox` provides:
+- Automatic retry on failure
+- Consistent delivery tracking
+- Deduplication via `dedupe_key`
+
+**Flow**:
+```
+verdict_runner promotes candidate to review_required
+  → enqueue job: evolution_trigger_alert (trigger_type=verdict_promotion)
+  → handle_evolution_trigger_alert()
+    → build_evolution_review_card() with backtest/shadow details
+    → repo.enqueue_alert(alert_type="evolution_review", msg_type="interactive", ...)
+    → alert_outbox processes and sends via Feishu API
+    → User sees card with approve/reject buttons
+    → Button callback triggers approve_evolution or reject_evolution
+```
+
+**Card content** (`feishu_cards.py:build_evolution_review_card`):
+```python
+{
+    "candidate_version": "v2-trigger-3",
+    "sample_count": 53,
+    "reason": "单日 3 笔止损...",
+    "backtest_status": {"passed": True/False/Skipped},
+    "active_stats": {"avg_r": 0.15, "win_rate": 0.6},
+    "candidate_stats": {"avg_r": 0.22, "win_rate": 0.65},
+}
+```
+
+**Button callbacks** (`run_ga_workers.py:handle_button_callback`):
+```python
+# approve_evolution
+action == "approve_evolution" →
+  1. Look up strategy_name from strategy_versions
+  2. Call promote_shadow_candidate(repo, strategy_name, candidate_version, confirm=True)
+  3. If success: update evolution_triggers.resolved_at, strategy_patches.status='active'
+
+# reject_evolution
+action == "reject_evolution" →
+  1. UPDATE strategy_versions SET status='rejected' WHERE version=?
+  2. UPDATE strategy_patches SET status='rejected' WHERE candidate_version=?
+  3. UPDATE evolution_triggers SET status='rejected', resolved_at=now WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=?)
+```
+
+**Three-table state sync**:
+| Table | Column | approve | reject |
+|-------|--------|---------|--------|
+| strategy_versions | status | 'active' | 'rejected' |
+| strategy_patches | status | 'active' | 'rejected' |
+| evolution_triggers | status | 'resolved' | 'rejected' |
+| evolution_triggers | resolved_at | now | now |
+
+**Deduplication**: Uses `dedupe_key="evolution_review:{candidate_version}"` to prevent duplicate review cards for the same candidate.
+
+**Cleanup**: Old `msg_type="text"` evolution alerts in outbox are superseded before sending new interactive cards.
+
+**Forbidden**:
+```python
+# WRONG: Direct send without retry
+send_message(receive_id, ..., msg_type="interactive", content=json.dumps(card))
+
+# CORRECT: Use outbox
+repo.enqueue_alert(
+    alert_type="evolution_review",
+    payload={
+        "msg_type": "interactive",
+        "content": json.dumps(card, ensure_ascii=False),
+        ...
+    },
+    dedupe_key=f"evolution_review:{candidate_version}",
+)
+```
+
+---
+
+**Last updated**: 2026-06-03

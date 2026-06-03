@@ -306,6 +306,61 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
     elif action == "ignore":
         marked = repo.mark_ad_hoc_analysis_status_by_signal(int(signal_id), "ignored") if signal_id else False
         result = {"ok": True, "ignored": True, "ad_hoc_marked": marked}
+    elif action == "approve_evolution":
+        candidate_version = payload.get("candidate_version")
+        if not candidate_version:
+            result = {"ok": False, "error": "missing candidate_version"}
+        else:
+            # Find strategy name from strategy_versions
+            row = repo.conn.execute(
+                "SELECT strategy_name FROM strategy_versions WHERE version=?",
+                (candidate_version,)
+            ).fetchone()
+            strategy_name = row["strategy_name"] if row else "smc_pullback_long"
+
+            from plugins.crypto_guard.strategy.shadow_testing import promote_shadow_candidate
+            result = promote_shadow_candidate(
+                repo,
+                strategy_name=strategy_name,
+                candidate_version=candidate_version,
+                confirm=True,
+                change_reason="manual approve from Feishu evolution review",
+            )
+
+            # Only update trigger and patches if promotion succeeded
+            if result.get("ok"):
+                # Update trigger resolved_at
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET resolved_at=datetime('now'), status='active' WHERE id IN "
+                    "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+                    (candidate_version,)
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='active' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate', 'active')",
+                    (candidate_version,)
+                )
+                repo.conn.commit()
+    elif action == "reject_evolution":
+        candidate_version = payload.get("candidate_version")
+        if not candidate_version:
+            result = {"ok": False, "error": "missing candidate_version"}
+        else:
+            # Update all 3 tables to rejected
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason='manual reject from Feishu' WHERE version=?",
+                (candidate_version,)
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate')",
+                (candidate_version,)
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='rejected', resolved_at=datetime('now') WHERE id IN "
+                "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+                (candidate_version,)
+            )
+            repo.conn.commit()
+            result = {"ok": True, "action": "reject_evolution", "candidate_version": candidate_version}
     else:
         result = {"ok": False, "error": f"未知按钮动作: {action}"}
     if send_message and payload.get("receive_id"):
@@ -453,7 +508,7 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
 
     # Get recent evolution triggers
     triggers = repo.conn.execute(
-        "SELECT * FROM evolution_triggers WHERE status IN ('pending', 'shadow_testing') ORDER BY id DESC LIMIT 5"
+        "SELECT * FROM evolution_triggers WHERE status IN ('pending', 'shadow_testing', 'review_required') ORDER BY id DESC LIMIT 5"
     ).fetchall()
 
     if not triggers:
@@ -555,9 +610,31 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
     return "\n".join(lines)
 
 
+def _get_backtest_status(repo: CryptoGuardRepository, candidate_version: str) -> dict[str, Any]:
+    """Get backtest result for a candidate version."""
+    import json
+    row = repo.conn.execute(
+        "SELECT backtest_result_json FROM strategy_patches WHERE candidate_version=? AND backtest_result_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (candidate_version,)
+    ).fetchone()
+    if row and row["backtest_result_json"]:
+        try:
+            return json.loads(row["backtest_result_json"])
+        except Exception:
+            pass
+    return {"status": "unknown", "skipped": True, "reason": "no_backtest_data"}
+
+
 def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     """Send immediate notification when evolution is triggered or verdict promotes."""
     import json
+
+    # Cleanup old text-type evolution_review alerts (should be interactive)
+    repo.conn.execute(
+        "UPDATE alert_outbox SET status='superseded' WHERE alert_type='evolution_trigger' AND payload_json LIKE '%\"msg_type\": \"text\"%' AND status='pending'"
+    )
+    repo.conn.commit()
+
     target = resolve_report_target(repo, payload)
     trigger_type = payload.get("trigger_type", "unknown")
     loss_count = payload.get("loss_count", 0)
@@ -635,10 +712,26 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     sent = False
     if target and send_message:
         if trigger_type == "verdict_promotion" and candidate_version:
-            # Send card with buttons for verdict promotion
+            # Send card via outbox for retry capability
             from plugins.crypto_guard.notify.feishu_cards import build_evolution_review_card
-            card = build_evolution_review_card(candidate_version, sample_count, reason)
-            sent = bool(send_message(receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), msg_type="interactive", content=json.dumps(card, ensure_ascii=False)).get("message_id"))
+            backtest_status = _get_backtest_status(repo, candidate_version)
+            card = build_evolution_review_card(candidate_version, sample_count, reason, backtest_status=backtest_status)
+
+            # Use alert_outbox for reliable delivery
+            alert_id = repo.enqueue_alert(
+                alert_type="evolution_review",
+                symbol=None,
+                priority=4,
+                payload={
+                    "receive_id": target["receive_id"],
+                    "receive_id_type": target.get("receive_id_type", "chat_id"),
+                    "msg_type": "interactive",
+                    "content": json.dumps(card, ensure_ascii=False),
+                    "fallback_text": f"CryptoGuard 自进化人工审核: {candidate_version}, {sample_count} 样本",
+                },
+                dedupe_key=f"evolution_review:{candidate_version}",
+            )
+            sent = bool(alert_id)  # Queued successfully
         else:
             sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
     return {"ok": True, "sent": sent, "target": target, "text": text}
@@ -870,6 +963,10 @@ def _button_result_text(action: str, result: dict[str, Any]) -> str:
         return "已加入机会监控。"
     if action == "add_to_watchlist":
         return "已加入长期产品池。"
+    if action == "approve_evolution":
+        return "已批准候选策略升级。"
+    if action == "reject_evolution":
+        return "已拒绝候选策略。"
     return "已忽略。"
 
 
