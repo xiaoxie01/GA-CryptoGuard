@@ -2357,6 +2357,110 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(version["status"], "shadow_testing")
 
+    def test_verdict_promotion_enqueues_outbox_without_send_message(self) -> None:
+        """P0: verdict_promotion must enqueue to outbox even when send_message is None."""
+        from plugins.crypto_guard.run_ga_workers import handle_evolution_trigger_alert
+
+        # Setup: create a strategy_version for the candidate
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="test-candidate-v1",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        # Build payload with receive_id so resolve_report_target returns a target
+        payload = {
+            "trigger_type": "verdict_promotion",
+            "candidate_version": "test-candidate-v1",
+            "sample_count": 53,
+            "reason": "单日 3 笔止损，shadow 胜率 65%",
+            "receive_id": "chat_test_123",
+            "receive_id_type": "chat_id",
+        }
+
+        # Call with send_message=None — the bug was that this would skip enqueue
+        result = handle_evolution_trigger_alert(self.repo, payload, send_message=None)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["queued"], "verdict_promotion must enqueue to outbox even without send_message")
+        self.assertTrue(result["sent"], "sent should mirror queued for backward compatibility")
+        self.assertIsNotNone(result["target"])
+
+        # Verify alert_outbox has an evolution_review pending record
+        row = self.conn.execute(
+            "SELECT * FROM alert_outbox WHERE alert_type='evolution_review' AND status='pending' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row, "alert_outbox must have a pending evolution_review record")
+        self.assertEqual(row["alert_type"], "evolution_review")
+        self.assertIn("test-candidate-v1", row["dedupe_key"])
+
+        # Verify payload contains the correct receive_id
+        outbox_payload = json.loads(row["payload_json"])
+        self.assertEqual(outbox_payload["receive_id"], "chat_test_123")
+        self.assertEqual(outbox_payload["msg_type"], "interactive")
+
+    def test_verdict_promotion_enqueues_outbox_with_send_message(self) -> None:
+        """P0: verdict_promotion must also enqueue when send_message is provided."""
+        from plugins.crypto_guard.run_ga_workers import handle_evolution_trigger_alert
+
+        # Setup
+        self.repo.save_strategy_version(
+            strategy_name="smc_pullback_long",
+            version="test-candidate-v2",
+            status="shadow_testing",
+            config={},
+            change_reason="test",
+        )
+
+        payload = {
+            "trigger_type": "verdict_promotion",
+            "candidate_version": "test-candidate-v2",
+            "sample_count": 49,
+            "reason": "连续 3 笔止损",
+            "receive_id": "chat_test_456",
+            "receive_id_type": "chat_id",
+        }
+
+        send_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def mock_send(*args: object, **kwargs: object) -> bool:
+            send_calls.append((args, kwargs))
+            return True
+
+        result = handle_evolution_trigger_alert(self.repo, payload, send_message=mock_send)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["queued"])
+        # send_message should NOT be called for verdict_promotion (uses outbox)
+        self.assertEqual(len(send_calls), 0, "verdict_promotion should use outbox, not direct send")
+
+        row = self.conn.execute(
+            "SELECT * FROM alert_outbox WHERE alert_type='evolution_review' AND dedupe_key LIKE '%test-candidate-v2%' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_non_verdict_trigger_requires_send_message(self) -> None:
+        """P0: non-verdict_promotion triggers should still require send_message."""
+        from plugins.crypto_guard.run_ga_workers import handle_evolution_trigger_alert
+
+        # consecutive_stop_losses without send_message should not enqueue
+        payload = {
+            "trigger_type": "consecutive_stop_losses",
+            "loss_count": 3,
+            "trigger_value": 3,
+            "threshold_value": 3,
+            "receive_id": "chat_test_789",
+            "receive_id_type": "chat_id",
+        }
+
+        result = handle_evolution_trigger_alert(self.repo, payload, send_message=None)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["sent"], "non-verdict without send_message should not be sent")
+        self.assertFalse(result.get("queued", False), "non-verdict should not use queued flag")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -242,7 +242,7 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         return result
     if job_type == "evolution_trigger_alert":
         result = handle_evolution_trigger_alert(repo, payload, send_message=send_message)
-        LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
+        LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s queued=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"), result.get("queued"))
         return result
     return {"ok": False, "error": f"未知 job_type: {job_type}"}
 
@@ -710,31 +710,37 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     text = "\n".join(detail_lines) + "\n" + evolution_text + "\n不构成实盘建议，所有策略变更仅进入 candidate/shadow 流程。"
 
     sent = False
-    if target and send_message:
-        if trigger_type == "verdict_promotion" and candidate_version:
-            # Send card via outbox for retry capability
-            from plugins.crypto_guard.notify.feishu_cards import build_evolution_review_card
-            backtest_status = _get_backtest_status(repo, candidate_version)
-            card = build_evolution_review_card(candidate_version, sample_count, reason, backtest_status=backtest_status)
+    queued = False
 
-            # Use alert_outbox for reliable delivery
-            alert_id = repo.enqueue_alert(
-                alert_type="evolution_review",
-                symbol=None,
-                priority=4,
-                payload={
-                    "receive_id": target["receive_id"],
-                    "receive_id_type": target.get("receive_id_type", "chat_id"),
-                    "msg_type": "interactive",
-                    "content": json.dumps(card, ensure_ascii=False),
-                    "fallback_text": f"CryptoGuard 自进化人工审核: {candidate_version}, {sample_count} 样本",
-                },
-                dedupe_key=f"evolution_review:{candidate_version}",
-            )
-            sent = bool(alert_id)  # Queued successfully
-        else:
-            sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
-    return {"ok": True, "sent": sent, "target": target, "text": text}
+    # For verdict_promotion: always enqueue to outbox if target exists (independent of send_message)
+    if target and trigger_type == "verdict_promotion" and candidate_version:
+        # Send card via outbox for retry capability
+        from plugins.crypto_guard.notify.feishu_cards import build_evolution_review_card
+        backtest_status = _get_backtest_status(repo, candidate_version)
+        card = build_evolution_review_card(candidate_version, sample_count, reason, backtest_status=backtest_status)
+
+        # Use alert_outbox for reliable delivery
+        alert_id = repo.enqueue_alert(
+            alert_type="evolution_review",
+            symbol=None,
+            priority=4,
+            payload={
+                "receive_id": target["receive_id"],
+                "receive_id_type": target.get("receive_id_type", "chat_id"),
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+                "fallback_text": f"CryptoGuard 自进化人工审核: {candidate_version}, {sample_count} 样本",
+            },
+            dedupe_key=f"evolution_review:{candidate_version}",
+        )
+        queued = bool(alert_id)
+        sent = queued  # For backward compatibility
+
+    # For other types: use send_markdown_alert (requires send_message)
+    elif target and send_message:
+        sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="evolution_trigger", priority=4).get("sent"))
+
+    return {"ok": True, "sent": sent, "queued": queued, "target": target, "text": text}
 
 
 def run_once(*, user_only: bool = False, background: bool = False, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
