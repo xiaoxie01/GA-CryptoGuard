@@ -337,3 +337,36 @@ Implemented P2 observability features: state consistency diagnostics (orphan pat
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: P2 Bug Fixes: Schema Health, Diagnostics, TTL, Time Comparison
+
+**Date**: 2026-06-04
+**Task**: P2 Bug Fixes: Schema Health, Diagnostics, TTL, Time Comparison
+**Branch**: `main`
+
+### Summary
+
+Fixed 6 critical bugs from production audit: schema health check, diagnostics coverage (duplicate patches + active_patch_but_deprecated_version), time comparison consistency, TTL protection scope, shadow data quality classification, and feedback rules loading. All 138 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e23a70d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
