@@ -5,8 +5,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
+from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+LOGGER = get_logger("crypto_guard.shadow_testing")
 
 
 def record_shadow_evaluation(
@@ -90,9 +93,24 @@ def run_shadow_test(
     active_stats = _stats(active_rows)
     candidate_stats = _stats(candidate_rows)
 
+    # P0: Block promotion when candidate has only pseudo-R data (no real pnl_r)
+    candidate_data_source = candidate_stats.get("data_source", "real_pnl")
+    pseudo_only = candidate_data_source == "pseudo_r_from_score"
+    shadow_quality_alert = False
+
     if sample_count < effective_min_samples:
         recommendation = "insufficient_samples"
         status = "running"
+    elif pseudo_only:
+        # Cannot promote based on pseudo-R data alone — block verdict
+        recommendation = "data_quality_insufficient"
+        status = "running"
+        shadow_quality_alert = sample_count >= 20
+        if shadow_quality_alert:
+            LOGGER.warning(
+                "shadow_quality_alert: %s/%s has %d samples but all pseudo_r_from_score — real pnl_r required for promotion",
+                strategy_name, candidate_version, sample_count,
+            )
     elif candidate_stats["avg_r"] > active_stats["avg_r"] and candidate_stats["win_rate"] >= active_stats["win_rate"] and candidate_stats["drawdown"] >= active_stats["drawdown"]:
         recommendation = "candidate_can_be_promoted_with_manual_confirmation"
         status = "passed"
@@ -112,6 +130,8 @@ def run_shadow_test(
         "candidate_stats": candidate_stats,
         "recommendation": recommendation,
         "status": status,
+        "data_quality": candidate_data_source,
+        "shadow_quality_alert": shadow_quality_alert,
         "auto_promoted": False,
         "promotion_allowed": bool(allow_auto_promote),
     }
@@ -134,6 +154,22 @@ def run_shadow_test(
             "必须保守处理过拟合风险；不能绕过人工确认或配置门禁。",
         ],
     )
+
+    # P0: Hard gate — enforce pseudo-only block AFTER LLM verdict.
+    # LLM may return "candidate_can_be_promoted..." but we must not allow
+    # promotion based on pseudo-R data. Only apply when samples are sufficient
+    # (insufficient_samples takes priority — we haven't accumulated enough data yet).
+    if pseudo_only and sample_count >= effective_min_samples:
+        result["recommendation"] = "data_quality_insufficient"
+        result["status"] = "running"
+        result["data_quality"] = candidate_data_source
+        result["shadow_quality_alert"] = shadow_quality_alert
+        result["hard_gate_applied"] = "pseudo_only_block"
+        LOGGER.info(
+            "hard_gate: forced data_quality_insufficient for %s/%s (pseudo_only, LLM returned %s)",
+            strategy_name, candidate_version, result.get("recommendation"),
+        )
+
     result_id = repo.save_shadow_test_result(result)
     result["shadow_test_result_id"] = result_id
     return result

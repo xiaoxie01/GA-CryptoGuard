@@ -914,14 +914,18 @@ class CryptoGuardRepository:
         source: str = "signal_compat",
         risk_check_passed: bool = False,
     ) -> tuple[int, bool]:
+        from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
+
+        expires_at = compute_expires_at(trade_plan.get("entry_type"))
         try:
             self.conn.execute(
                 """
                 INSERT INTO paper_orders(
                     signal_id, ga_decision_id, symbol, side, order_type, entry_price, trigger_price,
-                    stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed
+                    stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed,
+                    expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(signal_id) if signal_id is not None else None,
@@ -939,6 +943,7 @@ class CryptoGuardRepository:
                     trade_plan.get("fill_method"),
                     source,
                     1 if risk_check_passed else 0,
+                    expires_at,
                 ),
             )
             return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]), True

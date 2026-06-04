@@ -246,8 +246,13 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         return result
     if job_type == "pending_order_management":
         from plugins.crypto_guard.paper.pending_order_manager import run_pending_order_management
-        result = run_pending_order_management(repo)
+        result = run_pending_order_management(repo, send_message=send_message)
         LOGGER.info("process_job done id=%s type=%s ok=%s expired=%s cancelled=%s", job.get("id"), job_type, result.get("ok"), result.get("expire", {}).get("expired_count"), result.get("conflict", {}).get("cancelled_count"))
+        return result
+    if job_type == "pending_order_revalidation":
+        from plugins.crypto_guard.paper.pending_revalidator import revalidate_pending_orders
+        result = revalidate_pending_orders(repo, send_message=send_message)
+        LOGGER.info("process_job done id=%s type=%s ok=%s reviewed=%s actions=%s", job.get("id"), job_type, result.get("ok"), result.get("reviewed_count"), result.get("actions_count"))
         return result
     return {"ok": False, "error": f"未知 job_type: {job_type}"}
 

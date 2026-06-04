@@ -389,4 +389,275 @@ repo.enqueue_alert(
 
 ---
 
-**Last updated**: 2026-06-03
+## 12. Pending Order Lifecycle
+
+### Convention: TTL uses entry_type keys, expires_at computed at creation
+
+**What**: `TTL_CONFIG` keys must match `trade_plan.entry_type` values, not `order_type`:
+```python
+TTL_CONFIG = {
+    "limit": timedelta(hours=8),    # pullback/limit entries
+    "trigger": timedelta(hours=4),  # breakout/trigger entries
+    "market": timedelta(hours=0),   # immediate fill
+}
+DEFAULT_TTL = timedelta(hours=8)    # unknown types
+```
+
+**Why**: `order_type` (`limit`/`trigger`/`market`) is the execution mechanism. `entry_type` from `trade_plan` is the strategy context. Config keys must match the actual values stored in the database.
+
+**expires_at**: Computed at order creation time in `create_paper_order()` using `compute_expires_at(entry_type)`. Stored in `paper_orders.expires_at`. `expire_pending_orders()` uses `expires_at` when available, falls back to `created_at + TTL`.
+
+**Conflict cancellation**: Must write `invalidated_by_ga_decision_id` from the conflicting GA decision. `conflict_cancelled` is in `feishu.never_silence` to ensure notifications are always delivered.
+
+**Notification**: `notify_order_cancelled()` uses `resolve_report_target()` + `send_markdown_alert()` for delivery via `alert_outbox`. Never creates bare `msg_type: text` payloads without `receive_id`.
+
+**cleanup_stale_pending()**: Uses Python `datetime.fromisoformat()` parsing, NOT SQL string comparison, to avoid format mismatches between ISO timestamps and SQLite `CURRENT_TIMESTAMP`.
+
+**Forbidden**:
+```python
+# WRONG: bare outbox payload without receive_id
+repo.enqueue_alert(alert_type=..., payload={"msg_type": "text", "content": text})
+
+# CORRECT: use resolve_report_target + send_markdown_alert
+target = resolve_report_target(repo)
+send_markdown_alert(repo, send_message, receive_id=target["receive_id"], ...)
+
+# WRONG: SQL string comparison for time
+"WHERE created_at < ?" with isoformat cutoff
+
+# CORRECT: Python datetime parsing
+created_at = datetime.fromisoformat(created_at_str)
+if created_at < cutoff: ...
+```
+
+---
+
+## 13. Account Risk Guard
+
+### Convention: Three-tier account risk system with hard_risk_off and daily_loss_pause
+
+**What**: `AccountRiskGuard` implements a three-tier risk system:
+1. **risk_off** (drawdown <= -2.5%): Reduce risk_percent, block bad symbol+side combos
+2. **hard_risk_off** (drawdown <= -3.0%): Block ALL new paper orders
+3. **daily_loss_pause** (2 consecutive -1R OR daily avg_r <= -0.5): Block ALL new paper orders
+
+**Why**: Without account-level checks, the system could keep opening new trades while the account was in deep drawdown. The three-tier system provides graduated responses.
+
+**Flow**:
+```
+GAMasterController.analyze_symbol()
+  → RiskGate(repo).check()
+    → validate_trade_plan() — trade-level
+    → AccountRiskGuard(repo).check() — account-level
+      → checks drawdown vs thresholds
+      → checks daily loss conditions
+      → checks symbol+side cooldown
+      → checks symbol+side historical avg_r
+      → returns risk_off, hard_risk_off, daily_loss_pause, pause_active, blocked
+```
+
+**Tier effects**:
+- **risk_off** (`drawdown <= -2.5%`):
+  - `risk["account_risk"]["risk_off"] = True`
+  - `risk["account_risk"]["effective_risk_percent"] = 0.25`
+  - Blocked if symbol+side cooldown or negative avg_r
+- **hard_risk_off** (`drawdown <= -3.0%`):
+  - `risk["account_risk"]["hard_risk_off"] = True`
+  - `risk["account_risk"]["pause_active"] = True`
+  - ALL new paper orders blocked (only opportunity_watch allowed)
+  - Controller forces `decision = "monitor_only"`
+- **daily_loss_pause** (2 consecutive -1R OR daily avg_r <= -0.5):
+  - `risk["account_risk"]["daily_loss_pause"] = True`
+  - `risk["account_risk"]["pause_active"] = True`
+  - ALL new paper orders blocked
+  - Resets at midnight UTC
+
+**Recovery conditions**:
+- Wait 24h since last loss (`recovery_wait_hours: 24`)
+- Last N closed trades (default 10) avg_r > recovery_min_avg_r (default 0.0)
+- loss_count <= recovery_max_loss_count (default 4)
+
+**Pending order revalidation**:
+- When `pause_active` is True, `force_risk_off_pending_revalidation()` converts ALL pending/needs_recheck orders to `risk_off_cancelled`
+- Creates `opportunity_watch` entries so signals aren't lost
+
+**Config** (`trading_mode.yaml`):
+```yaml
+account_risk:
+  drawdown_risk_off_threshold: -2.5   # %
+  drawdown_hard_risk_off_threshold: -3.0  # %
+  risk_off_risk_percent: 0.25
+  recovery_min_avg_r: 0.0
+  recovery_max_loss_count: 4
+  recovery_lookback: 10
+  recovery_wait_hours: 24
+  daily_loss_pause_consecutive_losses: 2
+  daily_loss_pause_avg_r_threshold: -0.5
+  cooldown_symbols:
+    BTCUSDT_LONG: 48
+    LTCUSDT_LONG: 48
+    ETHUSDT_LONG: 48
+    BNBUSDT_SHORT: 48
+```
+
+**Forbidden**:
+```python
+# WRONG: RiskGate without repo (no account access)
+risk_gate = RiskGate()
+
+# CORRECT: RiskGate with repo
+risk_gate = RiskGate(repo)
+```
+
+---
+
+## 14. Shadow Testing Data Quality
+
+### Convention: Verdict must not promote candidates with only pseudo-R data
+
+**What**: `_stats()` returns `data_source: "real_pnl"` when `pnl_r` values exist, or `"pseudo_r_from_score"` when falling back to score-based pseudo-R. The verdict logic in `run_shadow_test()` blocks promotion when `data_source == "pseudo_r_from_score"`.
+
+**Why**: Pseudo-R (`(score - 0.5) * 2`) has no relation to actual trade outcomes. A candidate with 20 pseudo-R samples showing "high win rate" may perform terribly in real trading. Requiring real `pnl_r` data ensures promotion decisions are based on actual performance.
+
+**Verdict logic**:
+```python
+if sample_count < effective_min_samples:
+    recommendation = "insufficient_samples"
+elif pseudo_only:
+    recommendation = "data_quality_insufficient"
+    shadow_quality_alert = sample_count >= 20  # warning when enough samples but all pseudo
+elif candidate_stats better than active_stats:
+    recommendation = "candidate_can_be_promoted_with_manual_confirmation"
+else:
+    recommendation = "reject_candidate"
+```
+
+**shadow_quality_alert**: Logged when candidate has >= 20 samples but all are pseudo-R. This indicates the shadow system is accumulating samples without real trade outcomes.
+
+**Forbidden**:
+```python
+# WRONG: Promote based on pseudo-R data
+if candidate_stats["avg_r"] > active_stats["avg_r"]:
+    recommend promotion  # avg_r from pseudo_r_from_score is unreliable
+
+# CORRECT: Check data_source first
+if candidate_stats.get("data_source") == "pseudo_r_from_score":
+    recommend "data_quality_insufficient"  # block until real pnl_r available
+```
+
+---
+
+## 15. Pending Order Revalidator
+
+### Convention: Multi-dimensional review beyond TTL and conflict
+
+**What**: `pending_revalidator.py` runs hourly (offset 15 min from pending_order_management) and applies conservative rules to `pending` and `needs_recheck` orders.
+
+**Why**: TTL expiry and direction conflict are necessary but insufficient. Orders can become stale due to trend stage changes, price deviations, or BTC context shifts.
+
+**Rules** (priority order):
+1. **needs_recheck timeout**: Orders in `needs_recheck` for > 4 hours → `convert_to_watch`
+2. **Late trend stage**: GA decision has `trend_stage in {late, exhausted, transition}` → `convert_to_watch`
+3. **Price deviation**: Price moved > 3% from entry → `convert_to_watch`; > 6% → `cancel`
+4. **Conflict re-check**: `needs_recheck` order conflicting with strong GA bias → `cancel`
+
+**Actions**:
+- `keep` — no change
+- `cancel` — set status to `revalidator_cancelled`
+- `convert_to_watch` — set status to `watch_cancelled`, create `opportunity_watches` entry
+- `needs_manual_review` — set status to `needs_manual_review`
+
+**Notification**: Cancelled/converted orders send markdown alerts via `alert_outbox`.
+
+**Scheduler** (`service_manager.py`):
+```python
+if minute == 15:
+    jobs.append("pending_order_revalidation")
+```
+
+**Forbidden**:
+```python
+# WRONG: Only checking TTL and conflict
+expire_pending_orders(repo)
+cancel_conflict_pending_orders(repo)
+# Missing: trend stage, price deviation, needs_recheck timeout
+
+# CORRECT: Also run revalidator
+run_pending_order_management(repo)
+revalidate_pending_orders(repo)  # 15 min offset via scheduler
+```
+
+---
+
+## 16. Trade Quality Gates (Late Stage + Overextension)
+
+### Convention: Late trend stage and RSI overbought/oversold block trend continuation orders
+
+**What**: `validate_trade_plan()` now includes two additional hard gates:
+1. **Late trend stage gate**: `trend_stage` in `{"late", "exhausted"}` blocks trend continuation orders
+2. **Overbought/oversold gate**: RSI >= 75 blocks LONG, RSI <= 25 blocks SHORT
+
+**Why**: 
+- Late/exhausted trends have high reversal risk — continuation orders get trapped
+- Overbought/oversold RSI indicates exhaustion — chasing moves at extremes leads to poor entries
+
+**Behavior**:
+- Late stage only blocks **continuation** orders (side aligns with market structure)
+- Late stage allows **reversal** orders (side counter to structure)
+- RSI thresholds are configurable via `risk.rsi_overbought_threshold` and `risk.rsi_oversold_threshold`
+
+**Config** (`trading_mode.yaml`):
+```yaml
+risk:
+  rsi_overbought_threshold: 75
+  rsi_oversold_threshold: 25
+```
+
+**Tests**:
+- `test_late_stage_trend_continuation_blocked`
+- `test_late_stage_reversal_allowed`
+- `test_oversold_blocks_short`
+- `test_overbought_blocks_long`
+- `test_exhausted_stage_blocks_continuation`
+
+---
+
+## 17. Order Flow + Chanlun Confirmation Gates
+
+### Convention: Degraded or opposite order_flow/chanlun signals block trades
+
+**What**: `validate_trade_plan()` now includes order_flow and chanlun confirmation gates:
+1. **Order flow gate**: `signal == "degraded"` blocks as primary evidence; opposite `supports` blocks
+2. **Chanlun gate**: Opposite `supports` direction blocks trades
+
+**Why**: 
+- Degraded order flow cannot serve as primary entry confirmation
+- Opposite order_flow/chanlun signals indicate conflicting evidence — entering against them is high-risk
+
+**Behavior**:
+- `order_flow.signal == "degraded"` → blocks regardless of direction
+- `order_flow.supports == "bearish"` + side == "LONG" → blocks
+- `order_flow.supports == "bullish"` + side == "SHORT" → blocks
+- Same logic for `chanlun.supports`
+
+**Expected snapshot structure**:
+```python
+snapshot["modules"]["order_flow"] = {
+    "signal": "normal" | "degraded",
+    "supports": "bullish" | "bearish" | "neutral",
+}
+snapshot["modules"]["chanlun"] = {
+    "signal": "bullish_divergence" | "bearish_divergence" | ...,
+    "supports": "bullish" | "bearish" | "neutral",
+}
+```
+
+**Tests**:
+- `test_order_flow_degraded_blocks_long`
+- `test_order_flow_opposite_blocks_short`
+- `test_chanlun_opposite_signal_blocks_trade`
+- `test_order_flow_normal_allows_trade`
+
+---
+
+**Last updated**: 2026-06-04

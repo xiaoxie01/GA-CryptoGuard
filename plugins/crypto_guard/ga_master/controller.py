@@ -124,7 +124,7 @@ class GAMasterController:
         self.repo = repo
         self.context_builder = ContextBuilder(repo)
         self.skill_orchestrator = SkillOrchestrator(repo)
-        self.risk_gate = RiskGate()
+        self.risk_gate = RiskGate(repo)
         self.performance_gate = PerformanceGate(repo)
         self.persistence = DecisionPersistence(repo)
 
@@ -142,6 +142,26 @@ class GAMasterController:
             notes = list(legacy.get("risk_notes") or [])
             notes.append("GA Master 风控未通过：" + "；".join(risk.get("reasons") or []))
             legacy["risk_notes"] = notes
+
+        # Account risk_off state — visible in ga_decisions for monitoring
+        account_risk = risk.get("account_risk") or {}
+        legacy["account_risk_off"] = bool(account_risk.get("risk_off"))
+        legacy["hard_risk_off"] = bool(account_risk.get("hard_risk_off"))
+        legacy["daily_loss_pause"] = bool(account_risk.get("daily_loss_pause"))
+        legacy["pause_active"] = bool(account_risk.get("pause_active"))
+        legacy["account_risk_off_reason"] = account_risk.get("pause_reason") or account_risk.get("reason")
+        if account_risk.get("pause_active"):
+            # hard_risk_off 或 daily_loss_pause — 强制 monitor_only
+            legacy["has_trade_plan"] = False
+            legacy["decision"] = "monitor_only"
+            notes = list(legacy.get("risk_notes") or [])
+            notes.append(f"账户暂停开仓：{account_risk.get('pause_reason')}")
+            legacy["risk_notes"] = notes
+        elif account_risk.get("risk_off") and account_risk.get("effective_risk_percent"):
+            # Inject reduced risk percent into trade_plan if present
+            plan = legacy.get("trade_plan")
+            if plan:
+                plan["risk_percent"] = account_risk["effective_risk_percent"]
 
         # Performance gate check (context-based degradation and cooldown)
         symbol = snapshot.get("symbol", "")

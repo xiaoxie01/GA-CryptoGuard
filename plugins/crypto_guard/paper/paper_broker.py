@@ -22,6 +22,17 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
     missing = [k for k in required if k not in trade_plan or trade_plan[k] in (None, [], "")]
     if missing:
         return {"ok": False, "error": f"trade_plan 字段不完整: {missing}", "signal_id": signal_id}
+
+    # Account risk guard — hard_risk_off / daily_loss_pause 阻断
+    account_risk = _check_account_risk(repo, signal.get("symbol", ""), trade_plan.get("side", ""))
+    if account_risk.get("pause_active"):
+        return {
+            "ok": False,
+            "error": "账户暂停开仓",
+            "pause_reason": account_risk.get("pause_reason"),
+            "account_risk": account_risk,
+            "signal_id": signal_id,
+        }
     snapshot = None
     if signal.get("market_snapshot_id"):
         row = repo.get_market_snapshot(int(signal["market_snapshot_id"]))
@@ -65,6 +76,17 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
     missing = [k for k in required if k not in trade_plan or trade_plan[k] in (None, [], "")]
     if missing:
         return {"ok": False, "error": f"trade_plan 字段不完整: {missing}", "ga_decision_id": ga_decision_id}
+
+    # Account risk guard — hard_risk_off / daily_loss_pause 阻断
+    account_risk = _check_account_risk(repo, ga_decision.get("symbol", ""), trade_plan.get("side", ""))
+    if account_risk.get("pause_active"):
+        return {
+            "ok": False,
+            "error": "账户暂停开仓",
+            "pause_reason": account_risk.get("pause_reason"),
+            "account_risk": account_risk,
+            "ga_decision_id": ga_decision_id,
+        }
     raw = dict(ga_decision.get("raw_decision") or {})
     raw.update(
         {
@@ -154,6 +176,14 @@ def _json_list(raw: Any) -> list[Any]:
         return value if isinstance(value, list) else [value]
     except Exception:
         return [raw]
+
+
+def _check_account_risk(repo: CryptoGuardRepository, symbol: str, side: str) -> dict[str, Any]:
+    """Check account-level risk guard for paper order creation."""
+    from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
+
+    guard = AccountRiskGuard(repo)
+    return guard.check(symbol=symbol, side=side)
 
 
 def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], price: float | dict[str, Any]) -> dict[str, Any]:

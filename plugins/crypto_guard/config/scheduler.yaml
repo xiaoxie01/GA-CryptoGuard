@@ -90,6 +90,12 @@ jobs:
     params:
       notify_feishu: true
 
+  pending_order_revalidation:
+    cron: "15 * * * *"
+    task: "pending_order_revalidation"
+    params:
+      notify_feishu: true
+
   daily_review:
     cron: "5 0 * * *"
     task: "daily_trade_review"

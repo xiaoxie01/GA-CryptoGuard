@@ -48,6 +48,11 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
     if missing:
         reasons.append("trade_plan 字段不完整：" + ",".join(missing))
 
+    # P0-D: Check entry_trigger_confirmation quality
+    # Auto/template confirmations indicate watch_only, not hard block
+    entry_confirmation = plan.get("entry_trigger_confirmation")
+    metrics["has_entry_confirmation"] = bool(entry_confirmation and str(entry_confirmation).strip() not in ("", "auto", "template"))
+
     rr = _risk_reward(plan)
     metrics["rr"] = rr
     if rr is None or rr < min_rr:
@@ -118,6 +123,65 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
                 min_buffer = max(atr_current * 0.2, entry * float(risk_cfg.get("min_sl_distance_pct", 0.8)) / 100)
                 if distance < min_buffer:
                     reasons.append(f"止损距离 {distance:.4f} 不足 ATR 缓冲 {min_buffer:.4f}（0.2×ATR={atr_current*0.2:.4f}），易被噪音打掉")
+
+    # P0-B: Late trend stage gate — blocks trend continuation orders
+    if snapshot:
+        modules = snapshot.get("modules") or {}
+        trend_stage_data = modules.get("trend_stage") or {}
+        trend_stage = str(trend_stage_data.get("trend_stage") or "").lower()
+        if trend_stage in {"late", "exhausted"}:
+            # Check if this is a trend continuation order (not a reversal)
+            # Trend continuation: side aligns with market structure
+            modules = snapshot.get("modules") or {}
+            pa = modules.get("price_action") or {}
+            profiles = snapshot.get("profiles") or {}
+            setup_profile = profiles.get("15m") or profiles.get("1h") or {}
+            structure = str(pa.get("market_structure") or setup_profile.get("market_structure") or "unknown")
+            is_continuation = (
+                (side == "LONG" and structure in {"bullish", "range"}) or
+                (side == "SHORT" and structure in {"bearish", "range"})
+            )
+            if is_continuation:
+                reasons.append(f"趋势阶段已进入 {trend_stage}，不适合趋势延续方向开仓（{side} vs {structure}）")
+
+    # P0-B: Overbought/oversold anti-chase gate — RSI-based
+    if snapshot:
+        modules = snapshot.get("modules") or {}
+        momentum = modules.get("momentum") or {}
+        rsi_value = _safe_float(momentum.get("rsi"))
+        if rsi_value is not None:
+            rsi_ob_threshold = float(risk_cfg.get("rsi_overbought_threshold", 75))
+            rsi_os_threshold = float(risk_cfg.get("rsi_oversold_threshold", 25))
+            if side == "LONG" and rsi_value >= rsi_ob_threshold:
+                reasons.append(f"RSI {rsi_value:.1f} 超买（>={rsi_ob_threshold}），禁止追多")
+            elif side == "SHORT" and rsi_value <= rsi_os_threshold:
+                reasons.append(f"RSI {rsi_value:.1f} 超卖（<={rsi_os_threshold}），禁止追空")
+
+    # P0-C: Order flow gate — degraded or opposite order flow blocks
+    if snapshot:
+        modules = snapshot.get("modules") or {}
+        order_flow = modules.get("order_flow") or {}
+        of_signal = str(order_flow.get("signal") or "").lower()
+        of_supports = str(order_flow.get("supports") or "").lower()
+        if of_signal == "degraded":
+            reasons.append(f"订单流信号退化（degraded），不适合作为主要入场依据")
+        elif of_supports and side:
+            if side == "LONG" and of_supports == "bearish":
+                reasons.append(f"订单流偏向空方（supports={of_supports}），与做多方向冲突")
+            elif side == "SHORT" and of_supports == "bullish":
+                reasons.append(f"订单流偏向多方（supports={of_supports}），与做空方向冲突")
+
+    # P0-C: Chanlun gate — opposite chanlun signal blocks
+    if snapshot:
+        modules = snapshot.get("modules") or {}
+        chanlun = modules.get("chanlun") or {}
+        chanlun_signal = str(chanlun.get("signal") or "").lower()
+        chanlun_supports = str(chanlun.get("supports") or "").lower()
+        if chanlun_supports and side:
+            if side == "LONG" and chanlun_supports == "bearish":
+                reasons.append(f"缠论信号偏空（supports={chanlun_supports}），与做多方向冲突")
+            elif side == "SHORT" and chanlun_supports == "bullish":
+                reasons.append(f"缠论信号偏多（supports={chanlun_supports}），与做空方向冲突")
 
     return {"ok": not reasons, "reasons": reasons, "metrics": metrics}
 

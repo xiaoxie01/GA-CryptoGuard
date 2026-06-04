@@ -29,6 +29,22 @@ risk:
   min_sl_distance_pct: 0.8  # 止损距离至少占入场价的0.8%
   min_tp_distance_pct: 1.0  # 第一止盈距离至少占入场价的1.0%
 
+account_risk:
+  drawdown_risk_off_threshold: -2.5   # %
+  drawdown_hard_risk_off_threshold: -3.0  # % — 禁止所有新开仓
+  risk_off_risk_percent: 0.25         # 降低后的单笔风险
+  recovery_min_avg_r: 0.0
+  recovery_max_loss_count: 4
+  recovery_lookback: 10               # 最近 N 笔
+  recovery_wait_hours: 24             # 距离上次亏损等待小时数
+  daily_loss_pause_consecutive_losses: 2  # 连续止损笔数触发暂停
+  daily_loss_pause_avg_r_threshold: -0.5  # 当日 avg_r 触发暂停
+  cooldown_symbols:
+    BTCUSDT_LONG: 48                   # 小时
+    LTCUSDT_LONG: 48
+    ETHUSDT_LONG: 48
+    BNBUSDT_SHORT: 48
+
 paper_trading:
   price_update_interval_minutes: 3
   unrealized_pnl_price_source: "latest_price"
@@ -53,6 +69,7 @@ feishu:
       - opportunity_triggered
       - paper_order_filled
       - paper_order_expired
+      - conflict_cancelled
       - evolution_trigger
 
 alerts:

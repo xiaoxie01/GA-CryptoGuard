@@ -263,6 +263,10 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     filled_at TEXT,
     closed_at TEXT,
+    expires_at TEXT,
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    invalidated_by_ga_decision_id INTEGER,
     UNIQUE(signal_id),
     FOREIGN KEY(signal_id) REFERENCES signals(id)
 );

@@ -162,6 +162,9 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
     # Pending order lifecycle: TTL expiry + conflict cancellation (every 60 minutes)
     if minute == 0:
         jobs.append("pending_order_management")
+    # Pending order revalidation: multi-dimensional review (every 60 minutes, offset by 15)
+    if minute == 15:
+        jobs.append("pending_order_revalidation")
     # Daily review: run between 00:05-00:30 UTC (wider window for crash recovery)
     # _tick_key ensures it only runs once per day
     if hour == 0 and 5 <= minute <= 30:
