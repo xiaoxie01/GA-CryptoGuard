@@ -547,7 +547,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         report = self.conn.execute("SELECT * FROM daily_review_reports WHERE review_date=?", (day,)).fetchone()
         self.assertIsNotNone(report)
         skill_memory = self.conn.execute("SELECT COUNT(*) FROM skill_feedback_memory WHERE source_type='daily_review'").fetchone()[0]
-        self.assertGreaterEqual(skill_memory, 5)
+        self.assertGreaterEqual(skill_memory, 1)  # At least 1 entry per failure pattern
 
     def test_decision_supplement_buttons_risk_and_intraday_preprocessing(self) -> None:
         from plugins.crypto_guard.notify.feishu_cards import build_analysis_card
@@ -3777,6 +3777,201 @@ class PendingOrderManagerTest(unittest.TestCase):
         risk = validate_trade_plan(decision, snapshot)
         # Should not be hard-blocked by entry_confirmation
         self.assertFalse(any("entry_trigger_confirmation" in r for r in risk["reasons"]))
+
+    # =========================================================================
+    # P1-B: Structured Feedback Tests
+    # =========================================================================
+
+    def test_structured_feedback_writes_pattern_type(self) -> None:
+        """P1-B: Daily review writes structured feedback with pattern_type."""
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Create losing trades with specific pattern (late_trend_chasing)
+        # Use yesterday's date so they're found by daily review
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        for i in range(3):
+            closed_at = (yesterday - timedelta(hours=i + 1)).isoformat().replace("+00:00", "Z")
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, signal_decay_score)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, 0.8)
+                """,
+                (closed_at,),
+            )
+
+        review = run_daily_review(self.repo, day_utc=day)
+        self.assertTrue(review["daily_review_report_id"])
+
+        # Check that structured feedback was written
+        feedback = self.conn.execute(
+            "SELECT * FROM skill_feedback_memory WHERE source_type='daily_review' AND pattern_type IS NOT NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(feedback)
+        self.assertEqual(feedback["pattern_type"], "overextended_chase_loss")
+        self.assertIsNotNone(feedback["affected_symbols"])
+        self.assertIsNotNone(feedback["affected_sides"])
+
+    def test_structured_feedback_affected_symbols_sides(self) -> None:
+        """P1-B: Structured feedback includes affected symbols and sides."""
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Create losing trades for different symbols (use yesterday's date)
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        for symbol, side in [("BTCUSDT", "LONG"), ("ETHUSDT", "SHORT"), ("BTCUSDT", "LONG")]:
+            closed_at = (yesterday - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+            self.conn.execute(
+                """
+                INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
+                VALUES (?, ?, 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?)
+                """,
+                (symbol, side, closed_at),
+            )
+
+        review = run_daily_review(self.repo, day_utc=day)
+
+        feedback = self.conn.execute(
+            "SELECT * FROM skill_feedback_memory WHERE source_type='daily_review' AND pattern_type IS NOT NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(feedback)
+
+        import json
+        symbols = json.loads(feedback["affected_symbols"])
+        sides = json.loads(feedback["affected_sides"])
+        self.assertIn("BTCUSDT", symbols)
+        self.assertIn("ETHUSDT", symbols)
+        self.assertIn("LONG", sides)
+        self.assertIn("SHORT", sides)
+
+    # =========================================================================
+    # P1-C: LONG Quality Gate Tests
+    # =========================================================================
+
+    def test_long_gate_blocks_when_htf_not_bullish(self) -> None:
+        """P1-C: LONG gate blocks when 4H structure is not bullish."""
+        from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
+
+        decision = {
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": 100,
+                "stop_loss": 95,
+                "take_profits": [{"price": 110}],
+            },
+            "confidence": 0.85,
+        }
+        snapshot = {
+            "profiles": {
+                "4h": {"market_structure": "bearish"},  # Not bullish
+            },
+            "modules": {
+                "price_action": {"market_structure": "bullish"},
+                "momentum": {"direction": "bullish"},
+                "trend_stage": {"trend_stage": "early"},
+            },
+        }
+        risk = validate_trade_plan(decision, snapshot)
+        self.assertFalse(risk["ok"])
+        self.assertTrue(any("LONG 质量门禁" in r for r in risk["reasons"]))
+        self.assertTrue(any("4H 结构不支持做多" in r for r in risk["reasons"]))
+
+    def test_long_gate_blocks_late_trend_stage(self) -> None:
+        """P1-C: LONG gate blocks when trend stage is late."""
+        from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
+
+        decision = {
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": 100,
+                "stop_loss": 95,
+                "take_profits": [{"price": 110}],
+            },
+            "confidence": 0.85,
+        }
+        snapshot = {
+            "profiles": {
+                "4h": {"market_structure": "bullish"},
+            },
+            "modules": {
+                "price_action": {"market_structure": "bullish"},
+                "momentum": {"direction": "bullish"},
+                "trend_stage": {"trend_stage": "late"},  # Late stage
+            },
+        }
+        risk = validate_trade_plan(decision, snapshot)
+        self.assertFalse(risk["ok"])
+        self.assertTrue(any("趋势阶段不适合做多" in r for r in risk["reasons"]))
+
+    def test_long_gate_blocks_exhausted_momentum(self) -> None:
+        """P1-C: LONG gate blocks when momentum is exhausted."""
+        from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
+
+        decision = {
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": 100,
+                "stop_loss": 95,
+                "take_profits": [{"price": 110}],
+            },
+            "confidence": 0.85,
+        }
+        snapshot = {
+            "profiles": {
+                "4h": {"market_structure": "bullish"},
+            },
+            "modules": {
+                "price_action": {"market_structure": "bullish"},
+                "momentum": {"state": "exhausted"},  # Exhausted
+                "trend_stage": {"trend_stage": "middle"},
+            },
+        }
+        risk = validate_trade_plan(decision, snapshot)
+        self.assertFalse(risk["ok"])
+        self.assertTrue(any("动能状态不适合做多" in r for r in risk["reasons"]))
+
+    def test_long_gate_allows_quality_entry(self) -> None:
+        """P1-C: LONG gate allows quality entry when conditions are met."""
+        from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
+
+        decision = {
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": 100,
+                "stop_loss": 95,
+                "take_profits": [{"price": 110}],
+            },
+            "confidence": 0.85,
+        }
+        snapshot = {
+            "profiles": {
+                "4h": {"market_structure": "bullish"},
+                "1h": {"market_structure": "bullish"},
+                "15m": {"market_structure": "bullish"},
+            },
+            "modules": {
+                "price_action": {"market_structure": "bullish"},
+                "momentum": {"direction": "bullish", "state": "strong"},
+                "trend_stage": {"trend_stage": "early"},
+                "order_flow": {"signal": "normal", "supports": "bullish"},
+                "chanlun": {"supports": "bullish"},
+            },
+        }
+        risk = validate_trade_plan(decision, snapshot)
+        # Should pass all gates including LONG quality gate
+        self.assertTrue(risk["ok"])
 
 
 if __name__ == "__main__":

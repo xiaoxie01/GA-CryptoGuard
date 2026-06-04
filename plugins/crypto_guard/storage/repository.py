@@ -433,6 +433,9 @@ class CryptoGuardRepository:
         source_type: str,
         finding: str,
         source_id: int | None = None,
+        pattern_type: str | None = None,
+        affected_symbols: list[str] | None = None,
+        affected_sides: list[str] | None = None,
         suggested_adjustment: dict[str, Any] | None = None,
         status: str = "candidate",
     ) -> int:
@@ -440,9 +443,10 @@ class CryptoGuardRepository:
             """
             INSERT INTO skill_feedback_memory(
                 skill_name, skill_version, feedback_type, source_type, source_id,
+                pattern_type, affected_symbols, affected_sides,
                 finding, suggested_adjustment_json, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 skill_name,
@@ -450,6 +454,9 @@ class CryptoGuardRepository:
                 feedback_type,
                 source_type,
                 source_id,
+                pattern_type,
+                json.dumps(affected_symbols or [], ensure_ascii=False),
+                json.dumps(affected_sides or [], ensure_ascii=False),
                 finding,
                 json.dumps(suggested_adjustment or {}, ensure_ascii=False),
                 status,

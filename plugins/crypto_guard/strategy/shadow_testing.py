@@ -276,6 +276,10 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
                 "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
                 (candidate_version,),
             )
+
+            # P1-A: Shadow failure reflection
+            _write_failure_reflection(repo, strategy_name, candidate_version, shadow)
+
             results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "rejected", "shadow": shadow})
 
         else:
@@ -649,6 +653,219 @@ def _strategy_eval_rows(repo: CryptoGuardRepository, strategy_name: str, version
         (strategy_name, version, 1 if is_shadow else 0),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _write_failure_reflection(
+    repo: CryptoGuardRepository,
+    strategy_name: str,
+    candidate_version: str,
+    shadow_result: dict[str, Any],
+) -> None:
+    """Write structured feedback when shadow candidate fails.
+
+    Implements P1-A: Shadow failure reflection.
+    """
+    from plugins.crypto_guard.review.loss_classifier import classify_trade
+
+    candidate_stats = shadow_result.get("candidate_stats") or {}
+    avg_r = candidate_stats.get("avg_r", 0)
+    win_rate = candidate_stats.get("win_rate", 0)
+    drawdown = candidate_stats.get("drawdown", 0)
+    sample_count = shadow_result.get("sample_count", 0)
+
+    # Determine failure pattern
+    if avg_r < 0 and win_rate < 0.45:
+        pattern_type = "low_win_rate_negative_r"
+    elif avg_r < 0:
+        pattern_type = "negative_avg_r"
+    elif win_rate < 0.45:
+        pattern_type = "low_win_rate"
+    elif drawdown < -0.20:
+        pattern_type = "high_drawdown"
+    else:
+        pattern_type = "underperformed_active"
+
+    # Get affected symbols from strategy evaluations
+    rows = repo.conn.execute(
+        "SELECT DISTINCT symbol FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
+        (strategy_name, candidate_version),
+    ).fetchall()
+    affected_symbols = [r["symbol"] for r in rows if r.get("symbol")]
+
+    # Get affected sides from trade plans
+    sides = repo.conn.execute(
+        """
+        SELECT DISTINCT json_extract(ga.decision_json, '$.trade_plan.side') as side
+        FROM strategy_evaluations se
+        JOIN ga_decisions ga ON se.ga_decision_id = ga.id
+        WHERE se.strategy_name=? AND se.strategy_version=? AND se.is_shadow=1
+        """,
+        (strategy_name, candidate_version),
+    ).fetchall()
+    affected_sides = [r["side"] for r in sides if r.get("side")]
+
+    # Build failure report
+    finding = (
+        f"影子测试失败：{strategy_name}/{candidate_version} "
+        f"avg_r={avg_r:.3f}, win_rate={win_rate:.1%}, drawdown={drawdown:.1%}, "
+        f"samples={sample_count}"
+    )
+
+    suggested_adjustment = {
+        "candidate_version": candidate_version,
+        "avg_r": avg_r,
+        "win_rate": win_rate,
+        "drawdown": drawdown,
+        "sample_count": sample_count,
+        "failure_pattern": pattern_type,
+        "symbols": affected_symbols,
+        "sides": affected_sides,
+    }
+
+    # Write feedback to primary skill (trend_stage is often responsible for shadow failures)
+    repo.save_skill_feedback_memory(
+        skill_name="trend_stage",
+        feedback_type="shadow_failure",
+        source_type="shadow_test",
+        finding=finding,
+        pattern_type=pattern_type,
+        affected_symbols=affected_symbols,
+        affected_sides=affected_sides,
+        suggested_adjustment=suggested_adjustment,
+    )
+
+    # Also write to other relevant skills
+    for skill in ("momentum", "smc_orderflow"):
+        repo.save_skill_feedback_memory(
+            skill_name=skill,
+            feedback_type="shadow_failure",
+            source_type="shadow_test",
+            finding=finding,
+            pattern_type=pattern_type,
+            affected_symbols=affected_symbols,
+            affected_sides=affected_sides,
+            suggested_adjustment=suggested_adjustment,
+        )
+
+    LOGGER.info(
+        "shadow_failure_reflection: %s/%s pattern=%s avg_r=%.3f win_rate=%.1f%%",
+        strategy_name, candidate_version, pattern_type, avg_r, win_rate * 100,
+    )
+
+    # Check rate-limiting for draft patch generation
+    _maybe_generate_draft_patch(repo, strategy_name, candidate_version, pattern_type, shadow_result)
+
+
+def _maybe_generate_draft_patch(
+    repo: CryptoGuardRepository,
+    strategy_name: str,
+    candidate_version: str,
+    pattern_type: str,
+    shadow_result: dict[str, Any],
+) -> None:
+    """Generate draft candidate patch if rate-limit allows.
+
+    Max 2 drafts per original trigger, 24h cooldown between attempts.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    # Find original trigger
+    patch = repo.conn.execute(
+        "SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND strategy_name=?",
+        (candidate_version, strategy_name),
+    ).fetchone()
+
+    if not patch or not patch.get("trigger_id"):
+        return
+
+    trigger_id = patch["trigger_id"]
+
+    # Count existing drafts for this trigger
+    draft_count = repo.conn.execute(
+        "SELECT COUNT(*) as cnt FROM strategy_patches WHERE trigger_id=? AND status='draft'",
+        (trigger_id,),
+    ).fetchone()
+
+    if draft_count and draft_count["cnt"] >= 2:
+        LOGGER.info("shadow_failure_reflection: max drafts reached for trigger %s", trigger_id)
+        return
+
+    # Check cooldown (24h since last draft)
+    last_draft = repo.conn.execute(
+        "SELECT created_at FROM strategy_patches WHERE trigger_id=? AND status='draft' ORDER BY created_at DESC LIMIT 1",
+        (trigger_id,),
+    ).fetchone()
+
+    if last_draft and last_draft.get("created_at"):
+        try:
+            last_time = datetime.fromisoformat(last_draft["created_at"])
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - last_time < timedelta(hours=24):
+                LOGGER.info("shadow_failure_reflection: cooldown active for trigger %s", trigger_id)
+                return
+        except Exception:
+            pass
+
+    # Generate draft patch with suggested improvements
+    candidate_stats = shadow_result.get("candidate_stats") or {}
+    draft_patch = {
+        "base_version": candidate_version,
+        "failure_pattern": pattern_type,
+        "suggested_changes": _suggest_changes_for_pattern(pattern_type, candidate_stats),
+        "requires_human_approval": True,
+    }
+
+    # Create new patch entry with status='draft'
+    new_version = f"{candidate_version}.draft.{int(datetime.now(timezone.utc).timestamp())}"
+    repo.conn.execute(
+        """
+        INSERT INTO strategy_patches(strategy_name, candidate_version, patch_json, status, trigger_id, change_reason)
+        VALUES (?, ?, ?, 'draft', ?, ?)
+        """,
+        (
+            strategy_name,
+            new_version,
+            json.dumps(draft_patch, ensure_ascii=False),
+            trigger_id,
+            f"auto_draft_from_failure_{pattern_type}",
+        ),
+    )
+    repo.conn.commit()
+
+    LOGGER.info(
+        "shadow_failure_reflection: generated draft patch %s for trigger %s",
+        new_version, trigger_id,
+    )
+
+
+def _suggest_changes_for_pattern(pattern_type: str, stats: dict[str, Any]) -> dict[str, Any]:
+    """Suggest parameter changes based on failure pattern."""
+    suggestions: dict[str, Any] = {"adjustments": [], "notes": []}
+
+    if pattern_type == "low_win_rate_negative_r":
+        suggestions["adjustments"].append({"param": "min_confidence", "delta": 0.05, "reason": "低胜率需要更高置信度门槛"})
+        suggestions["adjustments"].append({"param": "require_structure_momentum_alignment", "value": True, "reason": "强制结构动能共振"})
+        suggestions["notes"].append("考虑增加订单流确认要求")
+
+    elif pattern_type == "negative_avg_r":
+        suggestions["adjustments"].append({"param": "min_rr", "delta": 0.5, "reason": "负平均R需要更高盈亏比"})
+        suggestions["adjustments"].append({"param": "min_sl_distance_pct", "delta": 0.2, "reason": "增加止损距离避免噪音打掉"})
+        suggestions["notes"].append("检查入场时机是否过早")
+
+    elif pattern_type == "low_win_rate":
+        suggestions["adjustments"].append({"param": "min_confidence", "delta": 0.03, "reason": "低胜率需要更严格入场条件"})
+        suggestions["notes"].append("考虑增加缠论买点确认")
+
+    elif pattern_type == "high_drawdown":
+        suggestions["adjustments"].append({"param": "risk_percent", "delta": -0.1, "reason": "高回撤降低单笔风险"})
+        suggestions["adjustments"].append({"param": "max_consecutive_losses", "value": 3, "reason": "限制连续亏损次数"})
+        suggestions["notes"].append("检查是否在趋势末期追单")
+
+    else:
+        suggestions["notes"].append("需要人工分析具体失败原因")
+
+    return suggestions
 
 
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -130,6 +130,9 @@ CREATE TABLE IF NOT EXISTS skill_feedback_memory (
     feedback_type TEXT NOT NULL,
     source_type TEXT NOT NULL,
     source_id INTEGER,
+    pattern_type TEXT,
+    affected_symbols TEXT,
+    affected_sides TEXT,
     finding TEXT NOT NULL,
     suggested_adjustment_json TEXT,
     status TEXT DEFAULT 'candidate',
@@ -137,6 +140,7 @@ CREATE TABLE IF NOT EXISTS skill_feedback_memory (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_skill_feedback_status ON skill_feedback_memory(skill_name, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status);
 
 CREATE TABLE IF NOT EXISTS ga_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

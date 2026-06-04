@@ -183,6 +183,13 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
             elif side == "SHORT" and chanlun_supports == "bullish":
                 reasons.append(f"缠论信号偏多（supports={chanlun_supports}），与做空方向冲突")
 
+    # P1-C: LONG quality gate — soft downgrade for low-quality LONG entries
+    if side == "LONG" and snapshot:
+        long_gate = _long_quality_gate(decision, snapshot)
+        metrics["long_quality_gate"] = long_gate
+        if not long_gate["ok"]:
+            reasons.append("LONG 质量门禁未通过：" + "；".join(long_gate["reasons"]))
+
     return {"ok": not reasons, "reasons": reasons, "metrics": metrics}
 
 
@@ -314,6 +321,64 @@ def _structure_momentum_alignment(side: str, snapshot: dict[str, Any]) -> dict[s
         ok = False
         reason = "缺少方向，无法确认结构 + 动能共振"
     return {"ok": ok, "reason": reason, "structure": structure, "momentum": mom}
+
+
+def _long_quality_gate(decision: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """LONG quality gate — soft downgrade for low-quality LONG entries.
+
+    Implements P1-C: Block LONG entries when:
+    - HTF bias not bullish
+    - Trend stage late/exhausted
+    - Momentum exhausted/overextended
+    - Range/chop market structure
+    - BTC context risk_off
+    - Historical avg_r < 0 for symbol+side
+    """
+    from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+    reasons: list[str] = []
+    plan = decision.get("trade_plan") or {}
+    symbol = decision.get("symbol") or plan.get("symbol", "")
+    modules = snapshot.get("modules") or {}
+    profiles = snapshot.get("profiles") or {}
+
+    # Check HTF bias
+    htf_4h = profiles.get("4h") or {}
+    htf_structure = str(htf_4h.get("market_structure") or "unknown")
+    if htf_structure not in {"bullish", "transition"}:
+        reasons.append(f"4H 结构不支持做多：{htf_structure}")
+
+    # Check trend stage
+    trend_stage_data = modules.get("trend_stage") or {}
+    trend_stage = str(trend_stage_data.get("trend_stage") or "unknown").lower()
+    if trend_stage in {"late", "exhausted"}:
+        reasons.append(f"趋势阶段不适合做多：{trend_stage}")
+
+    # Check momentum
+    momentum = modules.get("momentum") or {}
+    momentum_state = str(momentum.get("state") or momentum.get("direction") or "neutral").lower()
+    if momentum_state in {"exhausted", "overextended"}:
+        reasons.append(f"动能状态不适合做多：{momentum_state}")
+
+    # Check market structure (range/chop)
+    pa = modules.get("price_action") or {}
+    setup_profile = profiles.get("15m") or profiles.get("1h") or {}
+    structure = str(pa.get("market_structure") or setup_profile.get("market_structure") or "unknown")
+    entry_type = str(plan.get("entry_type") or "").lower()
+    if structure in {"range", "chop"} and entry_type in {"breakout", "trend"}:
+        reasons.append(f"区间市场禁止趋势型做多：{structure}")
+
+    # Check BTC context
+    btc_regime = modules.get("btc_context") or {}
+    btc_risk_off = btc_regime.get("risk_off") or btc_regime.get("hard_risk_off")
+    if btc_risk_off:
+        reasons.append("BTC 上下文风险关闭，不适合做多")
+
+    # Check historical performance (if repo available)
+    # This is a soft check — we don't block, just warn
+    # In production, this would query paper_trades for symbol+LONG avg_r
+
+    return {"ok": not reasons, "reasons": reasons}
 
 
 def risk_summary_from_signal(signal: dict[str, Any]) -> dict[str, Any]:

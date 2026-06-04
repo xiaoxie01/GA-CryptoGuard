@@ -29,6 +29,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_v2_migrations(conn)
         _apply_ga_master_migrations(conn)
         _apply_pending_order_lifecycle_migrations(conn)
+        _apply_p1_structured_feedback_migrations(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -460,3 +461,11 @@ def _seed_strategies(conn: sqlite3.Connection, strategies_cfg: dict[str, Any]) -
             """,
             (name, version, status, json.dumps(item, ensure_ascii=False), "seed_from_config"),
         )
+
+
+def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
+    """Add structured fields to skill_feedback_memory for pattern matching."""
+    _add_column(conn, "skill_feedback_memory", "pattern_type", "TEXT")
+    _add_column(conn, "skill_feedback_memory", "affected_symbols", "TEXT")
+    _add_column(conn, "skill_feedback_memory", "affected_sides", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status)")
