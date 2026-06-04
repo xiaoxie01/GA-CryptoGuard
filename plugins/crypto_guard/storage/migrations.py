@@ -469,3 +469,53 @@ def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "skill_feedback_memory", "affected_symbols", "TEXT")
     _add_column(conn, "skill_feedback_memory", "affected_sides", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status)")
+
+
+def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, Any]:
+    """Check production schema health - verify all required columns exist.
+
+    Returns:
+        {
+            ok: bool,
+            missing_columns: [{table, column}],
+            tables_checked: [str],
+        }
+    """
+    cfg = config or load_config()
+    conn = connect_db(cfg.database_path)
+
+    # Required columns for skill_feedback_memory
+    required_columns = {
+        "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
+    }
+
+    missing: list[dict[str, str]] = []
+    tables_checked: list[str] = []
+
+    try:
+        for table, columns in required_columns.items():
+            tables_checked.append(table)
+            # Check if table exists
+            table_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)
+            ).fetchone()
+
+            if not table_exists:
+                for col in columns:
+                    missing.append({"table": table, "column": col})
+                continue
+
+            # Check columns
+            existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for col in columns:
+                if col not in existing_cols:
+                    missing.append({"table": table, "column": col})
+
+        return {
+            "ok": len(missing) == 0,
+            "missing_columns": missing,
+            "tables_checked": tables_checked,
+        }
+    finally:
+        conn.close()

@@ -4303,6 +4303,217 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.assertIn("ttl_weight", entry)
             self.assertIn("status", entry)
 
+    # =========================================================================
+    # P2-Bugfix: Schema Health Check Tests
+    # =========================================================================
+
+    def test_schema_health_check_passes(self) -> None:
+        """P2-Bugfix: Schema health check passes when all columns exist."""
+        from plugins.crypto_guard.storage.migrations import check_schema_health
+
+        result = check_schema_health()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["missing_columns"]), 0)
+        self.assertIn("skill_feedback_memory", result["tables_checked"])
+
+    # =========================================================================
+    # P2-Bugfix: State Diagnostics - Active Patch + Deprecated Version
+    # =========================================================================
+
+    def test_state_consistency_detects_active_patch_deprecated_version(self) -> None:
+        """P2-Bugfix: Detects active patch with deprecated strategy_version."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Insert strategy_version as deprecated
+        self.conn.execute(
+            """
+            INSERT INTO strategy_versions(strategy_name, version, status, created_at, config_json)
+            VALUES ('test_strategy', 'v1.0_active_dep', 'deprecated', datetime('now'), '{}')
+            """
+        )
+        # Insert patch as active referencing the deprecated version
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_active_dep', 'active', datetime('now'), '{}')
+            """
+        )
+        self.conn.commit()
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        mismatch = next(
+            (i for i in result["issues"]
+             if i["type"] == "status_mismatch" and i["details"].get("mismatch") == "active_patch_but_deprecated_version"),
+            None
+        )
+        self.assertIsNotNone(mismatch)
+        self.assertEqual(mismatch["severity"], "error")
+
+    # =========================================================================
+    # P2-Bugfix: State Diagnostics - Duplicate Patches
+    # =========================================================================
+
+    def test_state_consistency_detects_duplicate_patches(self) -> None:
+        """P2-Bugfix: Detects duplicate patches with same strategy_name + candidate_version."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Insert two patches with same strategy_name + candidate_version
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'draft', datetime('now'), '{}')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'candidate', datetime('now'), '{}')
+            """
+        )
+        self.conn.commit()
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertGreater(result["summary"]["duplicate_patches"], 0)
+        dup = next(i for i in result["issues"] if i["type"] == "duplicate_patch")
+        self.assertEqual(dup["details"]["duplicate_count"], 2)
+        self.assertEqual(dup["severity"], "error")
+
+    # =========================================================================
+    # P2-Bugfix: TTL Protection - patch_json references
+    # =========================================================================
+
+    def test_feedback_ttl_protected_via_patch_json(self) -> None:
+        """P2-Bugfix: Feedback referenced via patch_json.feedback_id is not archived."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        # Insert old feedback
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via patch', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
+            """
+        )
+        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert active patch referencing this feedback via patch_json
+        import json
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_patch_ref', 'active', ?, '{}')
+            """,
+            (json.dumps({"feedback_id": feedback_id}),),
+        )
+        self.conn.commit()
+
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transitions"]["protected"], 1)
+
+    def test_feedback_ttl_protected_via_source_feedback_ids(self) -> None:
+        """P2-Bugfix: Feedback referenced via source_feedback_ids is not archived."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        # Insert old feedback
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via source', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
+            """
+        )
+        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert active patch referencing this feedback via source_feedback_ids in patch_json
+        import json
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_source_ref', 'active', ?, '{}')
+            """,
+            (json.dumps({"source_feedback_ids": [feedback_id]}),),
+        )
+        self.conn.commit()
+
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transitions"]["protected"], 1)
+
+    # =========================================================================
+    # P2-Bugfix: Shadow Data Quality - pnl_r = 0 is real data
+    # =========================================================================
+
+    def test_shadow_data_quality_pnl_r_zero_is_real(self) -> None:
+        """P2-Bugfix: pnl_r = 0 is counted as real data, not pseudo."""
+        from plugins.crypto_guard.notify.hourly_report import _fetch_shadow_data_quality
+
+        # Insert shadow evaluations: one with pnl_r = 0 (breakeven), one with pnl_r = NULL (pseudo)
+        self.conn.execute(
+            """
+            INSERT INTO strategy_evaluations(strategy_name, strategy_version, symbol, timeframe, analysis_time, is_shadow, pnl_r, created_at)
+            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, 1, 0.0, datetime('now'))
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO strategy_evaluations(strategy_name, strategy_version, symbol, timeframe, analysis_time, is_shadow, pnl_r, created_at)
+            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, 1, NULL, datetime('now'))
+            """
+        )
+        self.conn.commit()
+
+        result = _fetch_shadow_data_quality(self.repo)
+        self.assertFalse(result.get("error"))
+        self.assertEqual(result["real_pnl_count"], 1)  # pnl_r = 0 is real
+        self.assertEqual(result["pseudo_r_count"], 1)   # pnl_r = NULL is pseudo
+        self.assertEqual(result["total_shadow_samples"], 2)
+
+    # =========================================================================
+    # P2-Bugfix: Feedback Rules - Merge instead of overwrite
+    # =========================================================================
+
+    def test_feedback_rules_loading_merges_duplicates(self) -> None:
+        """P2-Bugfix: Feedback rules merge when same skill name encountered."""
+        import tempfile
+        import os
+        from pathlib import Path
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import _load_feedback_rules
+
+        # Create a temporary skills directory with two dirs for the same normalized skill name
+        with tempfile.TemporaryDirectory() as tmp:
+            skills_dir = Path(tmp) / "skills"
+            skills_dir.mkdir()
+
+            # Create first skill directory
+            skill1 = skills_dir / "momentum"
+            skill1.mkdir()
+            (skill1 / "feedback_rules.yaml").write_text(
+                "feedback_rules:\n  - when: momentum_loss_1\n    action: lower_confidence\n"
+            )
+
+            # Create second skill directory with _skill suffix (same normalized name)
+            skill2 = skills_dir / "momentum_skill"
+            skill2.mkdir()
+            (skill2 / "feedback_rules.yaml").write_text(
+                "feedback_rules:\n  - when: momentum_loss_2\n    action: increase_threshold\n"
+            )
+
+            # Monkey-patch SKILLS_DIR
+            import plugins.crypto_guard.diagnostics.feedback_rules_dry_run as dry_run_mod
+            old_skills_dir = dry_run_mod.SKILLS_DIR
+            dry_run_mod.SKILLS_DIR = skills_dir
+            try:
+                rules = _load_feedback_rules()
+                # Both rules should be merged under 'momentum'
+                self.assertIn("momentum", rules)
+                self.assertEqual(len(rules["momentum"]), 2)
+                whens = {r["when"] for r in rules["momentum"]}
+                self.assertIn("momentum_loss_1", whens)
+                self.assertIn("momentum_loss_2", whens)
+            finally:
+                dry_run_mod.SKILLS_DIR = old_skills_dir
+
 
 if __name__ == "__main__":
     unittest.main()

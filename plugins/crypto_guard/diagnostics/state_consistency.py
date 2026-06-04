@@ -25,7 +25,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         {
             ok: bool,
             issues: [{type, severity, details, suggested_action}],
-            summary: {orphan_patches, status_mismatches, stale_shadows, draft_limbo}
+            summary: {orphan_patches, status_mismatches, stale_shadows, draft_limbo, duplicate_patches}
         }
     """
     issues: list[dict[str, Any]] = []
@@ -34,12 +34,14 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_status_mismatches(repo))
     issues.extend(_check_stale_shadows(repo))
     issues.extend(_check_draft_limbo(repo))
+    issues.extend(_check_duplicate_patches(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
         "status_mismatches": len([i for i in issues if i["type"] == "status_mismatch"]),
         "stale_shadows": len([i for i in issues if i["type"] == "stale_shadow"]),
         "draft_limbo": len([i for i in issues if i["type"] == "draft_limbo"]),
+        "duplicate_patches": len([i for i in issues if i["type"] == "duplicate_patch"]),
     }
 
     return {
@@ -137,6 +139,64 @@ def _check_status_mismatches(repo: CryptoGuardRepository) -> list[dict[str, Any]
                 "mismatch": "version_active_but_trigger_pending",
             },
             "suggested_action": "Mark trigger as resolved",
+        })
+
+    # Check: active patch with deprecated strategy_version
+    active_patch_deprecated_version = repo.conn.execute(
+        """
+        SELECT sp.id as patch_id, sp.strategy_name, sp.candidate_version, sp.status as patch_status,
+               sv.id as version_id, sv.status as version_status
+        FROM strategy_patches sp
+        JOIN strategy_versions sv ON sp.strategy_name = sv.strategy_name AND sp.candidate_version = sv.version
+        WHERE sp.status = 'active' AND sv.status = 'deprecated'
+        """
+    ).fetchall()
+
+    for row in active_patch_deprecated_version:
+        issues.append({
+            "type": "status_mismatch",
+            "severity": "error",
+            "details": {
+                "patch_id": row["patch_id"],
+                "strategy_name": row["strategy_name"],
+                "candidate_version": row["candidate_version"],
+                "patch_status": row["patch_status"],
+                "version_id": row["version_id"],
+                "version_status": row["version_status"],
+                "mismatch": "active_patch_but_deprecated_version",
+            },
+            "suggested_action": "Deprecate the patch or reactivate the version",
+        })
+
+    return issues
+
+
+def _check_duplicate_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Find duplicate patches (same strategy_name + candidate_version)."""
+    issues: list[dict[str, Any]] = []
+
+    duplicates = repo.conn.execute(
+        """
+        SELECT strategy_name, candidate_version, COUNT(*) as count,
+               GROUP_CONCAT(id) as patch_ids, GROUP_CONCAT(status) as statuses
+        FROM strategy_patches
+        GROUP BY strategy_name, candidate_version
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    for row in duplicates:
+        issues.append({
+            "type": "duplicate_patch",
+            "severity": "error",
+            "details": {
+                "strategy_name": row["strategy_name"],
+                "candidate_version": row["candidate_version"],
+                "duplicate_count": row["count"],
+                "patch_ids": row["patch_ids"],
+                "statuses": row["statuses"],
+            },
+            "suggested_action": "Keep the most recent patch and delete older duplicates",
         })
 
     return issues

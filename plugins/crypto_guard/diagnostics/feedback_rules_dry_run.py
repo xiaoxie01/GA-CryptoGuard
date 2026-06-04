@@ -49,7 +49,7 @@ def evaluate_feedback_rules_dry_run(
         """
         SELECT id, skill_name, pattern_type, finding, created_at
         FROM skill_feedback_memory
-        WHERE created_at >= ? AND pattern_type IS NOT NULL AND pattern_type != ''
+        WHERE datetime(created_at) >= datetime(?) AND pattern_type IS NOT NULL AND pattern_type != ''
         ORDER BY created_at DESC
         """,
         (cutoff,),
@@ -135,8 +135,17 @@ def _load_feedback_rules() -> dict[str, list[dict[str, str]]]:
                     parsed_rules.append({"when": str(when), "action": str(action)})
 
             if parsed_rules:
-                rules_by_skill[skill_name] = parsed_rules
-                LOGGER.debug("Loaded %d rules from %s", len(parsed_rules), skill_dir.name)
+                # Merge rules: append to existing rules for same skill name
+                if skill_name in rules_by_skill:
+                    existing_whens = {r["when"] for r in rules_by_skill[skill_name]}
+                    for rule in parsed_rules:
+                        if rule["when"] not in existing_whens:
+                            rules_by_skill[skill_name].append(rule)
+                            existing_whens.add(rule["when"])
+                    LOGGER.debug("Merged %d rules from %s (total %d)", len(parsed_rules), skill_dir.name, len(rules_by_skill[skill_name]))
+                else:
+                    rules_by_skill[skill_name] = parsed_rules
+                    LOGGER.debug("Loaded %d rules from %s", len(parsed_rules), skill_dir.name)
 
         except Exception as exc:
             LOGGER.warning("Failed to load feedback_rules.yaml from %s: %s", skill_dir.name, exc)

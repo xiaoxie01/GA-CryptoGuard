@@ -243,13 +243,14 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch shadow data quality (real_pnl vs pseudo_r counts)."""
     try:
         # Count real pnl vs pseudo_r in shadow evaluations
+        # pnl_r = 0 is real data (breakeven), only NULL is pseudo
         real_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND pnl_r IS NOT NULL AND pnl_r != 0
+            WHERE is_shadow = 1 AND pnl_r IS NOT NULL
         """)
         pseudo_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND (pnl_r IS NULL OR pnl_r = 0)
+            WHERE is_shadow = 1 AND pnl_r IS NULL
         """)
         total = real_count + pseudo_count
         return {
@@ -265,13 +266,13 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
 def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch top 3 failure patterns this week from skill_feedback_memory."""
     try:
-        # Get feedback from last 7 days
+        # Get feedback from last 7 days - use datetime() wrapper for consistent comparison
         week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
         rows = repo.conn.execute(
             """
             SELECT pattern_type, COUNT(*) as count
             FROM skill_feedback_memory
-            WHERE created_at >= ? AND pattern_type IS NOT NULL AND pattern_type != ''
+            WHERE datetime(created_at) >= datetime(?) AND pattern_type IS NOT NULL AND pattern_type != ''
             GROUP BY pattern_type
             ORDER BY count DESC
             LIMIT 3
@@ -286,7 +287,7 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
             """
             SELECT skill_name, COUNT(*) as count
             FROM skill_feedback_memory
-            WHERE created_at >= ?
+            WHERE datetime(created_at) >= datetime(?)
             GROUP BY skill_name
             ORDER BY count DESC
             LIMIT 1
@@ -306,7 +307,7 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
 def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch LONG vs SHORT performance breakdown."""
     try:
-        # Get last 30 days performance
+        # Get last 30 days performance - use datetime() wrapper for consistent comparison
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
 
         long_stats = repo.conn.execute(
@@ -316,7 +317,7 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
                    SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
             FROM paper_trades
-            WHERE side = 'LONG' AND closed_at >= ? AND pnl_r IS NOT NULL
+            WHERE side = 'LONG' AND datetime(closed_at) >= datetime(?) AND pnl_r IS NOT NULL
             """,
             (thirty_days_ago,),
         ).fetchone()
@@ -328,7 +329,7 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
                    SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
             FROM paper_trades
-            WHERE side = 'SHORT' AND closed_at >= ? AND pnl_r IS NOT NULL
+            WHERE side = 'SHORT' AND datetime(closed_at) >= datetime(?) AND pnl_r IS NOT NULL
             """,
             (thirty_days_ago,),
         ).fetchone()

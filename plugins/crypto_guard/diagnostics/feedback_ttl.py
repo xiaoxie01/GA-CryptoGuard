@@ -143,10 +143,6 @@ def _get_protected_feedback_ids(repo: CryptoGuardRepository) -> list[int]:
 
     These feedback entries should never be archived.
     """
-    # For now, we protect feedback that is directly referenced in strategy_patches
-    # via evidence_json or other fields. This is a simplified implementation.
-    # In production, you might want to parse the JSON fields to find references.
-
     # Get all active/candidate patches
     active_patches = repo.conn.execute(
         """
@@ -156,23 +152,48 @@ def _get_protected_feedback_ids(repo: CryptoGuardRepository) -> list[int]:
         """
     ).fetchall()
 
-    protected_ids: list[int] = []
+    protected_ids: set[int] = set()
     for patch in active_patches:
-        # Parse evidence_json to find feedback references
-        evidence = patch["evidence_json"]
-        if evidence:
+        # Parse both evidence_json and patch_json
+        for json_field in ("evidence_json", "patch_json"):
+            json_str = patch[json_field]
+            if not json_str:
+                continue
             try:
                 import json
-                evidence_data = json.loads(evidence) if isinstance(evidence, str) else evidence
-                if isinstance(evidence_data, dict):
-                    # Look for feedback_id references
-                    feedback_refs = evidence_data.get("feedback_ids") or []
+                data = json.loads(json_str) if isinstance(json_str, str) else json_str
+                if isinstance(data, dict):
+                    # Look for feedback_ids (list)
+                    feedback_refs = data.get("feedback_ids")
                     if isinstance(feedback_refs, list):
-                        protected_ids.extend(int(fid) for fid in feedback_refs if fid is not None)
+                        for fid in feedback_refs:
+                            if fid is not None:
+                                try:
+                                    protected_ids.add(int(fid))
+                                except (ValueError, TypeError):
+                                    pass
+
+                    # Look for feedback_id (single)
+                    feedback_id = data.get("feedback_id")
+                    if feedback_id is not None:
+                        try:
+                            protected_ids.add(int(feedback_id))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Look for source_feedback_ids (list)
+                    source_refs = data.get("source_feedback_ids")
+                    if isinstance(source_refs, list):
+                        for fid in source_refs:
+                            if fid is not None:
+                                try:
+                                    protected_ids.add(int(fid))
+                                except (ValueError, TypeError):
+                                    pass
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
 
-    return list(set(protected_ids))
+    return list(protected_ids)
 
 
 def _count_feedback_by_status(repo: CryptoGuardRepository) -> dict[str, int]:
