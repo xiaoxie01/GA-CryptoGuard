@@ -271,3 +271,36 @@ Implemented P0-A through P0-F: account risk guard (hard_risk_off, daily_loss_pau
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: P1 Shadow Failure + Structured Feedback + LONG Gate
+
+**Date**: 2026-06-04
+**Task**: P1 Shadow Failure + Structured Feedback + LONG Gate
+**Branch**: `main`
+
+### Summary
+
+Implemented P1-A (shadow failure reflection with draft patches), P1-B (structured feedback with pattern_type column), P1-C (LONG quality gate). 112 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8402aee` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
