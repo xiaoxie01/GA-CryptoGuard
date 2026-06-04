@@ -238,3 +238,36 @@ P1: S/A级信号历史表现差时强制watch-only；P2: 补controller集成测�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: P0 Account Risk + Trade Quality Gates
+
+**Date**: 2026-06-04
+**Task**: P0 Account Risk + Trade Quality Gates
+**Branch**: `main`
+
+### Summary
+
+Implemented P0-A through P0-F: account risk guard (hard_risk_off, daily_loss_pause), trade quality gates (late stage, RSI), confirmation gates (order flow, chanlun), trade plan validation, risk-off pending revalidation, and 56 new tests. All 106 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6093f42` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

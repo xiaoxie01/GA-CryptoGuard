@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
-- **Last Active**: 2026-06-03
+- **Total Sessions**: 8
+- **Last Active**: 2026-06-04
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~240 | Active |
+| `journal-1.md` | ~273 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-06-04 | P0 Account Risk + Trade Quality Gates | `6093f42` | `main` |
 | 7 | 2026-06-03 | pending order 生命周期管理 P0 | `d9b326d` | `main` |
 | 6 | 2026-06-03 | 修复 evolution_review 必须用 interactive card | `c929982` | `main` |
 | 5 | 2026-06-03 | 修复 evolution_review 入队逻辑 | `abae373` | `main` |
