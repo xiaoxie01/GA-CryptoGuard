@@ -304,3 +304,36 @@ Implemented P1-A (shadow failure reflection with draft patches), P1-B (structure
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: P2 State Diagnostics + Reports + Rules Dry-Run + Feedback TTL
+
+**Date**: 2026-06-04
+**Task**: P2 State Diagnostics + Reports + Rules Dry-Run + Feedback TTL
+**Branch**: `main`
+
+### Summary
+
+Implemented P2 observability features: state consistency diagnostics (orphan patches, status mismatches, stale shadows, draft limbo), hourly report enhancements (risk_off state, shadow data quality, failure patterns, LONG/SHORT performance), feedback_rules.yaml dry-run evaluation, and feedback TTL/decay system (fresh→decayed→archived with protection for active patch references). All 131 tests pass including 18 new P2 tests.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `240ec80` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
