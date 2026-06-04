@@ -38,6 +38,10 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "running": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='running'"),
     }
     duckdb_stats = _duckdb_hourly_stats(now)
+    risk_state = _fetch_risk_state(repo)
+    shadow_data_quality = _fetch_shadow_data_quality(repo)
+    feedback_patterns = _fetch_feedback_patterns(repo)
+    long_short_performance = _fetch_long_short_performance(repo)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -52,11 +56,15 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "failed_jobs": failed_jobs,
         "queue_counts": queue_counts,
         "duckdb_stats": duckdb_stats,
+        "risk_state": risk_state,
+        "shadow_data_quality": shadow_data_quality,
+        "feedback_patterns": feedback_patterns,
+        "long_short_performance": long_short_performance,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance)
         ),
     }
 
@@ -71,6 +79,10 @@ def render_ga_hourly_summary(
     queue_counts: dict[str, int],
     equity_snapshot: dict[str, Any] | None = None,
     duckdb_stats: dict[str, Any] | None = None,
+    risk_state: dict[str, Any] | None = None,
+    shadow_data_quality: dict[str, Any] | None = None,
+    feedback_patterns: dict[str, Any] | None = None,
+    long_short_performance: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
@@ -88,9 +100,23 @@ def render_ga_hourly_summary(
         f"- scheduler：运行中；队列 user={queue_counts.get('pending_user', 0)} background={queue_counts.get('pending_background', 0)} running={queue_counts.get('running', 0)}",
         "- market data：SQLite 热数据；Redis/Parquet/DuckDB 状态见 /status",
         f"- Feishu queue：最近失败任务 {len(failed_jobs)}",
-        "",
-        "**二、模拟盘摘要**",
     ]
+
+    # P2-B: Add risk_off state
+    if risk_state:
+        risk_status = []
+        if risk_state.get("risk_off"):
+            risk_status.append("risk_off")
+        if risk_state.get("hard_risk_off"):
+            risk_status.append("hard_risk_off")
+        if risk_state.get("daily_loss_pause"):
+            risk_status.append("daily_loss_pause")
+        if risk_status:
+            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {risk_state.get('drawdown_pct', 0):.1f}%）")
+        else:
+            lines.append("- 风险状态：正常")
+
+    lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
         snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
         lines.append(
@@ -102,6 +128,19 @@ def render_ga_hourly_summary(
     else:
         lines.append("- 暂无净值快照")
     lines.append(f"- open/pending orders：{len(open_orders)}")
+
+    # P2-B: Add LONG vs SHORT performance
+    if long_short_performance and not long_short_performance.get("error"):
+        long = long_short_performance.get("long", {})
+        short = long_short_performance.get("short", {})
+        if long.get("count", 0) > 0 or short.get("count", 0) > 0:
+            lines.extend(["", "**模拟盘方向表现（近 30 天）**"])
+            if long.get("count", 0) > 0:
+                win_rate = long["wins"] / long["count"] * 100 if long["count"] > 0 else 0
+                lines.append(f"- LONG：{long['count']} 笔，胜率 {win_rate:.0f}%，avg R={long['avg_r']:.2f}")
+            if short.get("count", 0) > 0:
+                win_rate = short["wins"] / short["count"] * 100 if short["count"] > 0 else 0
+                lines.append(f"- SHORT：{short['count']} 笔，胜率 {win_rate:.0f}%，avg R={short['avg_r']:.2f}")
 
     lines.extend(["", "**三、高等级机会（S/A/B）**"])
     if not high_grade:
@@ -131,7 +170,35 @@ def render_ga_hourly_summary(
     else:
         lines.append("- 暂无 C/D 无优势品种")
 
-    lines.extend(["", "**六、风险事件**"])
+    # P2-B: Add shadow data quality
+    if shadow_data_quality and not shadow_data_quality.get("error"):
+        lines.extend(["", "**六、影子测试数据质量**"])
+        total = shadow_data_quality.get("total_shadow_samples", 0)
+        if total > 0:
+            real_ratio = shadow_data_quality.get("real_ratio", 0) * 100
+            lines.append(
+                f"- 样本总数：{total}；"
+                f"真实 PnL：{shadow_data_quality.get('real_pnl_count', 0)}（{real_ratio:.0f}%）；"
+                f"伪 R：{shadow_data_quality.get('pseudo_r_count', 0)}"
+            )
+        else:
+            lines.append("- 暂无影子测试样本")
+
+    # P2-B: Add top failure patterns
+    if feedback_patterns and not feedback_patterns.get("error"):
+        top_patterns = feedback_patterns.get("top_patterns", [])
+        most_active = feedback_patterns.get("most_active_skill")
+        if top_patterns or most_active:
+            lines.extend(["", "**七、本周失败模式（反馈记忆）**"])
+            if top_patterns:
+                for p in top_patterns:
+                    lines.append(f"- {p['pattern']}：{p['count']} 次")
+            else:
+                lines.append("- 暂无失败模式记录")
+            if most_active:
+                lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
+
+    lines.extend(["", "**八、风险事件**"])
     if failed_jobs:
         for job in failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
@@ -155,6 +222,135 @@ def _duckdb_hourly_stats(generated_at_utc: str) -> dict[str, Any]:
         return {"ok": False, "source": "in_memory_fallback", "error": str(exc), "signal_distribution": {}}
 
 
+def _fetch_risk_state(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Fetch current risk_off / daily_loss_pause state."""
+    try:
+        from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
+        guard = AccountRiskGuard(repo)
+        result = guard.check(symbol="BTCUSDT", side="LONG")
+        return {
+            "risk_off": result.get("risk_off", False),
+            "hard_risk_off": result.get("hard_risk_off", False),
+            "daily_loss_pause": result.get("daily_loss_pause", False),
+            "drawdown_pct": result.get("drawdown_pct", 0),
+            "effective_risk_percent": result.get("effective_risk_percent", 1.0),
+        }
+    except Exception as exc:
+        return {"risk_off": False, "error": str(exc)}
+
+
+def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Fetch shadow data quality (real_pnl vs pseudo_r counts)."""
+    try:
+        # Count real pnl vs pseudo_r in shadow evaluations
+        real_count = _count(repo, """
+            SELECT COUNT(*) FROM strategy_evaluations
+            WHERE is_shadow = 1 AND pnl_r IS NOT NULL AND pnl_r != 0
+        """)
+        pseudo_count = _count(repo, """
+            SELECT COUNT(*) FROM strategy_evaluations
+            WHERE is_shadow = 1 AND (pnl_r IS NULL OR pnl_r = 0)
+        """)
+        total = real_count + pseudo_count
+        return {
+            "real_pnl_count": real_count,
+            "pseudo_r_count": pseudo_count,
+            "total_shadow_samples": total,
+            "real_ratio": real_count / total if total > 0 else 0,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "real_pnl_count": 0, "pseudo_r_count": 0}
+
+
+def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Fetch top 3 failure patterns this week from skill_feedback_memory."""
+    try:
+        # Get feedback from last 7 days
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+        rows = repo.conn.execute(
+            """
+            SELECT pattern_type, COUNT(*) as count
+            FROM skill_feedback_memory
+            WHERE created_at >= ? AND pattern_type IS NOT NULL AND pattern_type != ''
+            GROUP BY pattern_type
+            ORDER BY count DESC
+            LIMIT 3
+            """,
+            (week_ago,),
+        ).fetchall()
+
+        top_patterns = [{"pattern": row["pattern_type"], "count": row["count"]} for row in rows]
+
+        # Most active feedback skill
+        most_active = repo.conn.execute(
+            """
+            SELECT skill_name, COUNT(*) as count
+            FROM skill_feedback_memory
+            WHERE created_at >= ?
+            GROUP BY skill_name
+            ORDER BY count DESC
+            LIMIT 1
+            """,
+            (week_ago,),
+        ).fetchone()
+
+        return {
+            "top_patterns": top_patterns,
+            "most_active_skill": most_active["skill_name"] if most_active else None,
+            "most_active_count": most_active["count"] if most_active else 0,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "top_patterns": [], "most_active_skill": None}
+
+
+def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Fetch LONG vs SHORT performance breakdown."""
+    try:
+        # Get last 30 days performance
+        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+
+        long_stats = repo.conn.execute(
+            """
+            SELECT COUNT(*) as count,
+                   AVG(pnl_r) as avg_r,
+                   SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
+            FROM paper_trades
+            WHERE side = 'LONG' AND closed_at >= ? AND pnl_r IS NOT NULL
+            """,
+            (thirty_days_ago,),
+        ).fetchone()
+
+        short_stats = repo.conn.execute(
+            """
+            SELECT COUNT(*) as count,
+                   AVG(pnl_r) as avg_r,
+                   SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
+            FROM paper_trades
+            WHERE side = 'SHORT' AND closed_at >= ? AND pnl_r IS NOT NULL
+            """,
+            (thirty_days_ago,),
+        ).fetchone()
+
+        return {
+            "long": {
+                "count": long_stats["count"] if long_stats else 0,
+                "avg_r": float(long_stats["avg_r"] or 0) if long_stats else 0,
+                "wins": long_stats["wins"] if long_stats else 0,
+                "losses": long_stats["losses"] if long_stats else 0,
+            },
+            "short": {
+                "count": short_stats["count"] if short_stats else 0,
+                "avg_r": float(short_stats["avg_r"] or 0) if short_stats else 0,
+                "wins": short_stats["wins"] if short_stats else 0,
+                "losses": short_stats["losses"] if short_stats else 0,
+            },
+        }
+    except Exception as exc:
+        return {"error": str(exc), "long": {}, "short": {}}
+
+
 def render_hourly_report_text(
     generated_at_utc: str,
     active_symbols: list[str],
@@ -165,6 +361,10 @@ def render_hourly_report_text(
     agent_brief: dict[str, Any] | None = None,
     analysis_states: list[dict[str, Any]] | None = None,
     equity_snapshot: dict[str, Any] | None = None,
+    risk_state: dict[str, Any] | None = None,
+    shadow_data_quality: dict[str, Any] | None = None,
+    feedback_patterns: dict[str, Any] | None = None,
+    long_short_performance: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
     state_by_symbol: dict[str, dict[str, Any]] = {}
@@ -182,6 +382,21 @@ def render_hourly_report_text(
         "",
         "**产品分析概览：**",
     ]
+
+    # P2-B: Add risk_off state
+    if risk_state:
+        risk_status = []
+        if risk_state.get("risk_off"):
+            risk_status.append("risk_off")
+        if risk_state.get("hard_risk_off"):
+            risk_status.append("hard_risk_off")
+        if risk_state.get("daily_loss_pause"):
+            risk_status.append("daily_loss_pause")
+        if risk_status:
+            lines.append(f"- **风险状态：{', '.join(risk_status)}**（回撤 {risk_state.get('drawdown_pct', 0):.1f}%）")
+        else:
+            lines.append("- 风险状态：正常")
+
     if agent_brief and agent_brief.get("summary"):
         lines.extend(["**GA/LLM 巡航摘要：**", str(agent_brief["summary"]), ""])
     if not active_symbols:
@@ -208,6 +423,19 @@ def render_hourly_report_text(
                 f"SL={order.get('stop_loss') or '-'} TP={tp_text}"
             )
 
+    # P2-B: Add LONG vs SHORT performance
+    if long_short_performance and not long_short_performance.get("error"):
+        long = long_short_performance.get("long", {})
+        short = long_short_performance.get("short", {})
+        if long.get("count", 0) > 0 or short.get("count", 0) > 0:
+            lines.extend(["", "**模拟盘方向表现（近 30 天）**"])
+            if long.get("count", 0) > 0:
+                win_rate = long["wins"] / long["count"] * 100 if long["count"] > 0 else 0
+                lines.append(f"- LONG：{long['count']} 笔，胜率 {win_rate:.0f}%，avg R={long['avg_r']:.2f}")
+            if short.get("count", 0) > 0:
+                win_rate = short["wins"] / short["count"] * 100 if short["count"] > 0 else 0
+                lines.append(f"- SHORT：{short['count']} 笔，胜率 {win_rate:.0f}%，avg R={short['avg_r']:.2f}")
+
     lines.extend(["", "**净值曲线摘要：**"])
     if equity_snapshot:
         try:
@@ -222,6 +450,32 @@ def render_hourly_report_text(
             lines.append("- 暂无可解析净值快照")
     else:
         lines.append("- 暂无净值快照")
+
+    # P2-B: Add shadow data quality
+    if shadow_data_quality and not shadow_data_quality.get("error"):
+        total = shadow_data_quality.get("total_shadow_samples", 0)
+        if total > 0:
+            real_ratio = shadow_data_quality.get("real_ratio", 0) * 100
+            lines.extend(["", "**影子测试数据质量：**"])
+            lines.append(
+                f"- 样本总数：{total}；"
+                f"真实 PnL：{shadow_data_quality.get('real_pnl_count', 0)}（{real_ratio:.0f}%）；"
+                f"伪 R：{shadow_data_quality.get('pseudo_r_count', 0)}"
+            )
+
+    # P2-B: Add top failure patterns
+    if feedback_patterns and not feedback_patterns.get("error"):
+        top_patterns = feedback_patterns.get("top_patterns", [])
+        most_active = feedback_patterns.get("most_active_skill")
+        if top_patterns or most_active:
+            lines.extend(["", "**本周失败模式（反馈记忆）**"])
+            if top_patterns:
+                for p in top_patterns:
+                    lines.append(f"- {p['pattern']}：{p['count']} 次")
+            else:
+                lines.append("- 暂无失败模式记录")
+            if most_active:
+                lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
     health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"

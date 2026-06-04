@@ -660,4 +660,208 @@ snapshot["modules"]["chanlun"] = {
 
 ---
 
-**Last updated**: 2026-06-04
+## 18. State Consistency Diagnostics
+
+### Convention: Proactive state monitoring prevents silent evolution loop failures
+
+**What**: `diagnose_state_consistency(repo)` detects four types of state inconsistencies:
+1. **Orphan patches**: `strategy_patches` with no matching `strategy_version`
+2. **Status mismatches**: trigger/patch/version state inconsistencies
+3. **Stale shadows**: candidates in `shadow_testing` >7 days with no new samples
+4. **Draft limbo**: patches in `draft` >72 hours (human approval timeout)
+
+**Why**: State inconsistencies can silently break the evolution loop. For example, a trigger stuck in `pending` while its patch is `rejected` prevents new triggers from being created for that pattern.
+
+**Signature**:
+```python
+def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """
+    Returns:
+        {
+            ok: bool,
+            issues: [{type, severity, details, suggested_action}],
+            summary: {orphan_patches, status_mismatches, stale_shadows, draft_limbo},
+            total_issues: int,
+        }
+    """
+```
+
+**Issue types and severity**:
+| Type | Severity | Detection |
+|------|----------|-----------|
+| `orphan_patch` | warning | No matching strategy_version |
+| `status_mismatch` | error | trigger_pending + patch_rejected |
+| `status_mismatch` | warning | version_active + trigger_pending |
+| `stale_shadow` | warning | shadow_testing >7 days, no new evals |
+| `draft_limbo` | warning | draft >72 hours |
+
+**Module**: `plugins/crypto_guard/diagnostics/state_consistency.py`
+
+**Tests**: 7 tests covering no issues, each issue type, multiple issues, severity levels
+
+---
+
+## 19. Hourly Report Enhancements
+
+### Convention: Report includes risk state, shadow quality, feedback patterns, and direction performance
+
+**What**: `build_hourly_report()` now includes four additional sections:
+1. **risk_state**: Current risk_off/hard_risk_off/daily_loss_pause state
+2. **shadow_data_quality**: real_pnl vs pseudo_r counts
+3. **feedback_patterns**: Top 3 failure patterns this week + most active feedback skill
+4. **long_short_performance**: LONG vs SHORT performance breakdown (last 30 days)
+
+**Why**: The original report lacked visibility into:
+- Whether the account was in risk_off (critical for trading decisions)
+- Shadow testing data quality (pseudo_r vs real_pnl)
+- Which failure patterns were recurring
+- Whether LONG or SHORT was performing better
+
+**New report sections**:
+```
+**风险状态：risk_off**（回撤 -2.8%）
+
+**模拟盘方向表现（近 30 天）**
+- LONG：15 笔，胜率 60%，avg R=0.25
+- SHORT：8 笔，胜率 50%，avg R=0.12
+
+**影子测试数据质量**
+- 样本总数：53；真实 PnL：20（38%）；伪 R：33
+
+**本周失败模式（反馈记忆）**
+- false_breakout_loss：3 次
+- momentum_exhaustion_loss：2 次
+- 最活跃反馈 Skill：price_action（5 条）
+```
+
+**Data sources**:
+- `risk_state`: Uses `AccountRiskGuard.check()` for real-time state
+- `shadow_data_quality`: Queries `strategy_evaluations` for pnl_r presence
+- `feedback_patterns`: Queries `skill_feedback_memory` last 7 days grouped by pattern_type
+- `long_short_performance`: Queries `paper_trades` last 30 days grouped by side
+
+**Module**: `plugins/crypto_guard/notify/hourly_report.py`
+
+**Tests**: 3 existing tests verify rendering still works
+
+---
+
+## 20. Feedback Rules Dry-Run
+
+### Convention: Rules are loaded and matched but never executed (dry-run only)
+
+**What**: `evaluate_feedback_rules_dry_run(repo, lookback_days=30)`:
+1. Loads all `feedback_rules.yaml` from skill directories
+2. Matches recent feedback entries against `when` conditions via `pattern_type`
+3. Outputs matches with `would_execute: True` action
+4. Does NOT execute any strategy changes
+
+**Why**: Before enabling rule execution, we need to validate:
+- Which rules would fire on real data
+- Whether the pattern_type → rule mapping is correct
+- Whether rule actions make sense for the matched patterns
+
+**Signature**:
+```python
+def evaluate_feedback_rules_dry_run(
+    repo: CryptoGuardRepository,
+    *,
+    lookback_days: int = 30,
+) -> dict[str, Any]:
+    """
+    Returns:
+        {
+            ok: bool,
+            matches: [{skill, pattern_type, action, feedback_id, would_execute}],
+            summary: {total_matches, by_skill, by_pattern},
+            rules_loaded: int,
+            feedback_checked: int,
+        }
+    """
+```
+
+**Rule structure** (`feedback_rules.yaml`):
+```yaml
+feedback_rules:
+  - when: false_breakout_loss
+    action: increase_confirmation_requirement
+  - when: range_misclassified_as_trend
+    action: lower_trend_confidence
+```
+
+**Skill directory normalization**: `_skill` suffix removed (e.g., `price_action_skill` → `price_action`)
+
+**Module**: `plugins/crypto_guard/diagnostics/feedback_rules_dry_run.py`
+
+**Tests**: 5 tests covering no matches, pattern matching, multiple skills, old feedback skipped, result structure
+
+---
+
+## 21. Feedback TTL/Decay
+
+### Convention: Feedback entries age through fresh → decayed → archived states
+
+**What**: `apply_feedback_ttl(repo)` manages feedback lifecycle:
+- **fresh** (0-30 days): Full weight (1.0) in context builder
+- **decayed** (30-90 days): Half weight (0.5)
+- **archived** (>90 days): Excluded from context unless referenced by active patches
+
+**Why**: Unbounded feedback accumulation:
+- Drowns recent signal in old noise
+- Makes context builder prompts too long
+- Old patterns may no longer be relevant
+
+**Protection**: Feedback referenced by active `strategy_patches` is never archived, even if >90 days old. This prevents breaking feedback chains for in-flight evolution cycles.
+
+**Signatures**:
+```python
+def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """
+    Returns:
+        {
+            ok: bool,
+            transitions: {fresh_to_decayed, decayed_to_archived, stale_to_archived, protected},
+            summary: {fresh, decayed, archived, total},
+            previous_summary: {fresh, decayed, archived, total},
+        }
+    """
+
+def get_feedback_with_ttl_weight(
+    repo: CryptoGuardRepository,
+    *,
+    limit: int = 100,
+    include_archived: bool = False,
+) -> list[dict[str, Any]]:
+    """Returns feedback entries with ttl_weight field (1.0, 0.5, or 0.0)."""
+```
+
+**Transition logic**:
+```python
+# fresh → decayed (30-90 days, not protected)
+UPDATE skill_feedback_memory
+SET status = 'decayed'
+WHERE status = 'fresh' AND created_at < fresh_cutoff AND created_at >= decayed_cutoff
+AND id NOT IN (protected_ids)
+
+# decayed → archived (>90 days, not protected)
+UPDATE skill_feedback_memory
+SET status = 'archived'
+WHERE status = 'decayed' AND created_at < decayed_cutoff
+AND id NOT IN (protected_ids)
+
+# stale candidate/active → archived (>90 days, not protected)
+UPDATE skill_feedback_memory
+SET status = 'archived'
+WHERE status IN ('candidate', 'active') AND created_at < decayed_cutoff
+AND id NOT IN (protected_ids)
+```
+
+**Protected IDs**: Extracted from `strategy_patches.evidence_json.feedback_ids` for active/candidate/draft patches.
+
+**Module**: `plugins/crypto_guard/diagnostics/feedback_ttl.py`
+
+**Tests**: 6 tests covering no transitions, fresh→decayed, decayed→archived, protected entries, summary counts, TTL weights
+
+---
+
+**Last updated**: 2026-06-04 (P2: State Diagnostics + Reports + Rules Dry-Run + Feedback TTL)

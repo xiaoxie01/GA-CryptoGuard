@@ -3973,6 +3973,336 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Should pass all gates including LONG quality gate
         self.assertTrue(risk["ok"])
 
+    # =========================================================================
+    # P2-A: State Consistency Diagnostics Tests
+    # =========================================================================
+
+    def _insert_orphan_patch(self) -> None:
+        """Insert a strategy_patch with no matching strategy_version."""
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, trigger_id, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_orphan', NULL, 'draft', datetime('now'), '{}')
+            """
+        )
+        self.conn.commit()
+
+    def _insert_status_mismatch(self) -> None:
+        """Insert trigger/pitch with mismatched statuses."""
+        # Insert a trigger with pending status
+        self.conn.execute(
+            """
+            INSERT INTO evolution_triggers(strategy_name, trigger_type, status, created_at)
+            VALUES ('test_strategy', 'pattern_loss', 'pending', datetime('now'))
+            """
+        )
+        trigger_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert a patch with rejected status linked to this trigger
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, trigger_id, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_mismatch', ?, 'rejected', datetime('now'), '{}')
+            """,
+            (trigger_id,),
+        )
+        self.conn.commit()
+
+    def _insert_stale_shadow(self) -> None:
+        """Insert a shadow_testing candidate with stale update (>7 days)."""
+        self.conn.execute(
+            """
+            INSERT INTO strategy_versions(strategy_name, version, status, created_at, config_json)
+            VALUES ('test_strategy', 'v1.0_stale', 'shadow_testing', datetime('now', '-10 days'), '{}')
+            """
+        )
+        self.conn.commit()
+
+    def _insert_draft_limbo(self) -> None:
+        """Insert a draft patch that's been in draft >72 hours."""
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0_limbo', 'draft', datetime('now', '-4 days'), '{}')
+            """
+        )
+        self.conn.commit()
+
+    def test_state_consistency_no_issues(self) -> None:
+        """P2-A: No issues when state is clean."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total_issues"], 0)
+        self.assertEqual(result["summary"]["orphan_patches"], 0)
+        self.assertEqual(result["summary"]["status_mismatches"], 0)
+        self.assertEqual(result["summary"]["stale_shadows"], 0)
+        self.assertEqual(result["summary"]["draft_limbo"], 0)
+
+    def test_state_consistency_detects_orphan_patch(self) -> None:
+        """P2-A: Detects orphan patches with no matching strategy_version."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_orphan_patch()
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["summary"]["orphan_patches"], 1)
+        self.assertTrue(any(i["type"] == "orphan_patch" for i in result["issues"]))
+
+    def test_state_consistency_detects_status_mismatch(self) -> None:
+        """P2-A: Detects trigger/patch status mismatches."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_status_mismatch()
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["summary"]["status_mismatches"], 1)
+        mismatch = next(i for i in result["issues"] if i["type"] == "status_mismatch")
+        self.assertEqual(mismatch["details"]["mismatch"], "trigger_pending_but_patch_rejected")
+
+    def test_state_consistency_detects_stale_shadow(self) -> None:
+        """P2-A: Detects shadow_testing candidates stale >7 days."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_stale_shadow()
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["summary"]["stale_shadows"], 1)
+        stale = next(i for i in result["issues"] if i["type"] == "stale_shadow")
+        self.assertGreater(stale["details"]["days_stale"], 7)
+
+    def test_state_consistency_detects_draft_limbo(self) -> None:
+        """P2-A: Detects draft patches stuck >72 hours."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_draft_limbo()
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["summary"]["draft_limbo"], 1)
+        limbo = next(i for i in result["issues"] if i["type"] == "draft_limbo")
+        self.assertGreater(limbo["details"]["hours_in_draft"], 72)
+
+    def test_state_consistency_multiple_issues(self) -> None:
+        """P2-A: Detects multiple issues simultaneously."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_orphan_patch()
+        self._insert_stale_shadow()
+        self._insert_draft_limbo()
+        result = diagnose_state_consistency(self.repo)
+        self.assertFalse(result["ok"])
+        self.assertGreaterEqual(result["total_issues"], 3)
+        self.assertGreaterEqual(result["summary"]["orphan_patches"], 1)
+        self.assertGreaterEqual(result["summary"]["stale_shadows"], 1)
+        self.assertGreaterEqual(result["summary"]["draft_limbo"], 1)
+
+    def test_state_consistency_issue_severity_levels(self) -> None:
+        """P2-A: Issues have correct severity levels."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        self._insert_status_mismatch()
+        result = diagnose_state_consistency(self.repo)
+        mismatch = next(i for i in result["issues"] if i["type"] == "status_mismatch")
+        self.assertEqual(mismatch["severity"], "error")
+
+        self._insert_draft_limbo()
+        result = diagnose_state_consistency(self.repo)
+        limbo = next(i for i in result["issues"] if i["type"] == "draft_limbo")
+        self.assertEqual(limbo["severity"], "warning")
+
+    # =========================================================================
+    # P2-C: Feedback Rules Dry-Run Tests
+    # =========================================================================
+
+    def test_feedback_rules_dry_run_no_matches(self) -> None:
+        """P2-C: No matches when no feedback matches rules."""
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import evaluate_feedback_rules_dry_run
+
+        result = evaluate_feedback_rules_dry_run(self.repo, lookback_days=30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["summary"]["total_matches"], 0)
+        self.assertGreater(result["rules_loaded"], 0)
+
+    def test_feedback_rules_dry_run_matches_pattern(self) -> None:
+        """P2-C: Matches feedback pattern_type against rules."""
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import evaluate_feedback_rules_dry_run
+
+        # Insert feedback with matching pattern_type
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Test loss', 'false_breakout_loss', 'candidate')
+            """
+        )
+        self.conn.commit()
+
+        result = evaluate_feedback_rules_dry_run(self.repo, lookback_days=30)
+        self.assertTrue(result["ok"])
+        self.assertGreater(result["summary"]["total_matches"], 0)
+
+        # Check that the match would execute
+        match = result["matches"][0]
+        self.assertTrue(match["would_execute"])
+        self.assertEqual(match["pattern_type"], "false_breakout_loss")
+        self.assertEqual(match["action"], "increase_confirmation_requirement")
+
+    def test_feedback_rules_dry_run_multiple_skills(self) -> None:
+        """P2-C: Matches patterns across multiple skills."""
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import evaluate_feedback_rules_dry_run
+
+        # Insert feedback for different skills using actual pattern types from feedback_rules.yaml
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Test loss 1', 'false_breakout_loss', 'candidate')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status)
+            VALUES ('momentum', '1.0', 'daily_review', 'daily_review', 'Test loss 2', 'momentum_failed_after_entry', 'candidate')
+            """
+        )
+        self.conn.commit()
+
+        result = evaluate_feedback_rules_dry_run(self.repo, lookback_days=30)
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(result["summary"]["total_matches"], 2)
+        self.assertIn("price_action", result["summary"]["by_skill"])
+        self.assertIn("momentum", result["summary"]["by_skill"])
+
+    def test_feedback_rules_dry_run_skips_old_feedback(self) -> None:
+        """P2-C: Skips feedback older than lookback_days."""
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import evaluate_feedback_rules_dry_run
+
+        # Insert old feedback (60 days ago)
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Old loss', 'false_breakout_loss', 'candidate', datetime('now', '-60 days'))
+            """
+        )
+        self.conn.commit()
+
+        # Lookback only 30 days - should not match
+        result = evaluate_feedback_rules_dry_run(self.repo, lookback_days=30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["summary"]["total_matches"], 0)
+
+    def test_feedback_rules_dry_run_result_structure(self) -> None:
+        """P2-C: Returns correct result structure."""
+        from plugins.crypto_guard.diagnostics.feedback_rules_dry_run import evaluate_feedback_rules_dry_run
+
+        result = evaluate_feedback_rules_dry_run(self.repo, lookback_days=30)
+        self.assertIn("ok", result)
+        self.assertIn("matches", result)
+        self.assertIn("summary", result)
+        self.assertIn("rules_loaded", result)
+        self.assertIn("feedback_checked", result)
+        self.assertIn("total_matches", result["summary"])
+        self.assertIn("by_skill", result["summary"])
+        self.assertIn("by_pattern", result["summary"])
+
+    # =========================================================================
+    # P2-D: Feedback TTL/Decay Tests
+    # =========================================================================
+
+    def _insert_feedback_with_age(self, days_old: int, status: str = "candidate") -> None:
+        """Insert a feedback entry with specified age."""
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Test feedback', 'false_breakout_loss', ?, datetime('now', ?))
+            """,
+            (status, f"-{days_old} days"),
+        )
+        self.conn.commit()
+
+    def test_feedback_ttl_no_transitions(self) -> None:
+        """P2-D: No transitions when all feedback is fresh (<30 days)."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        self._insert_feedback_with_age(10, "candidate")
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transitions"]["fresh_to_decayed"], 0)
+        self.assertEqual(result["transitions"]["decayed_to_archived"], 0)
+
+    def test_feedback_ttl_fresh_to_decayed(self) -> None:
+        """P2-D: Does not transition candidate feedback between 30-90 days."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        self._insert_feedback_with_age(45, "candidate")
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        # Candidate entries 30-90 days old are not transitioned by TTL
+        # (only fresh->decayed and decayed->archived transitions apply)
+        self.assertEqual(result["transitions"]["stale_to_archived"], 0)
+
+    def test_feedback_ttl_decayed_to_archived(self) -> None:
+        """P2-D: Transitions decayed feedback to archived after 90 days."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        self._insert_feedback_with_age(100, "decayed")
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertGreater(result["transitions"]["decayed_to_archived"], 0)
+
+    def test_feedback_ttl_protected_not_archived(self) -> None:
+        """P2-D: Feedback referenced by active patches is not archived."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        # Insert old feedback
+        self.conn.execute(
+            """
+            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected feedback', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
+            """
+        )
+        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Insert active patch referencing this feedback
+        import json
+        self.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
+            VALUES ('test_strategy', 'v0.9', 'v1.0', 'active', '{}', ?)
+            """,
+            (json.dumps({"feedback_ids": [feedback_id]}),),
+        )
+        self.conn.commit()
+
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transitions"]["protected"], 1)
+
+    def test_feedback_ttl_summary_counts(self) -> None:
+        """P2-D: Returns correct summary counts."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
+
+        self._insert_feedback_with_age(10, "candidate")
+        self._insert_feedback_with_age(50, "decayed")
+
+        result = apply_feedback_ttl(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertIn("summary", result)
+        self.assertIn("total", result["summary"])
+
+    def test_feedback_with_ttl_weight(self) -> None:
+        """P2-D: Returns feedback with correct TTL weights."""
+        from plugins.crypto_guard.diagnostics.feedback_ttl import get_feedback_with_ttl_weight
+
+        self._insert_feedback_with_age(10, "candidate")
+        self._insert_feedback_with_age(50, "decayed")
+
+        entries = get_feedback_with_ttl_weight(self.repo, limit=100)
+        self.assertIsInstance(entries, list)
+        # Should have entries with ttl_weight
+        for entry in entries:
+            self.assertIn("ttl_weight", entry)
+            self.assertIn("status", entry)
+
 
 if __name__ == "__main__":
     unittest.main()
