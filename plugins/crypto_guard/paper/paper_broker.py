@@ -33,6 +33,15 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             "account_risk": account_risk,
             "signal_id": signal_id,
         }
+
+    # Account feedback gate — shadow/annotate mode (does not block orders yet)
+    from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+    symbol = signal.get("symbol", "")
+    side = trade_plan.get("side", "")
+    confidence = float(signal.get("confidence") or 0)
+    entry_quality = _extract_entry_quality(trade_plan)
+    feedback_gate = check_account_feedback_gate(repo, symbol, side, confidence, entry_quality)
+
     snapshot = None
     if signal.get("market_snapshot_id"):
         row = repo.get_market_snapshot(int(signal["market_snapshot_id"]))
@@ -51,6 +60,11 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             "signal_id": signal_id,
         }
     ga_decision_id = signal.get("ga_decision_id") or _ensure_ga_decision_for_legacy_signal(repo, signal, trade_plan, risk)
+
+    # Save account feedback gate result to GA decision (shadow mode)
+    if feedback_gate.get("active"):
+        _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+
     order_id, created = repo.create_paper_order(
         signal_id,
         signal,
@@ -87,6 +101,15 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
             "account_risk": account_risk,
             "ga_decision_id": ga_decision_id,
         }
+
+    # Account feedback gate — shadow/annotate mode (does not block orders yet)
+    from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+    symbol = ga_decision.get("symbol", "")
+    side = trade_plan.get("side", "")
+    confidence = float(ga_decision.get("confidence") or 0)
+    entry_quality = _extract_entry_quality(trade_plan)
+    feedback_gate = check_account_feedback_gate(repo, symbol, side, confidence, entry_quality)
+
     raw = dict(ga_decision.get("raw_decision") or {})
     raw.update(
         {
@@ -118,6 +141,11 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
     }
     signal_row = repo.conn.execute("SELECT id FROM signals WHERE ga_decision_id=? ORDER BY id DESC LIMIT 1", (int(ga_decision_id),)).fetchone()
     signal_id = int(signal_row["id"]) if signal_row else None
+
+    # Save account feedback gate result to GA decision (shadow mode)
+    if feedback_gate.get("active"):
+        _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+
     order_id, created = repo.create_paper_order(
         signal_id,
         signal,
@@ -313,3 +341,45 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         "exit_efficiency": quality["exit_efficiency"],
         "signal_decay_score": quality["signal_decay_score"],
     }
+
+
+def _extract_entry_quality(trade_plan: dict[str, Any]) -> float | None:
+    """Extract entry quality score from trade_plan if available."""
+    # Check for entry_confirmation_quality field
+    quality = trade_plan.get("entry_confirmation_quality")
+    if quality is not None:
+        try:
+            return float(quality)
+        except (ValueError, TypeError):
+            pass
+
+    # Check for entry_quality in metrics
+    metrics = trade_plan.get("metrics") or {}
+    quality = metrics.get("entry_quality")
+    if quality is not None:
+        try:
+            return float(quality)
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def _save_gate_result_to_ga_decision(
+    repo: CryptoGuardRepository,
+    ga_decision_id: int,
+    gate_result: dict[str, Any],
+) -> None:
+    """Save account feedback gate result to GA decision."""
+    try:
+        repo.conn.execute(
+            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            (json.dumps(gate_result, ensure_ascii=False), ga_decision_id),
+        )
+        repo.conn.commit()
+    except Exception as exc:
+        # Non-critical: log but don't fail the order
+        import logging
+        logging.getLogger("crypto_guard.account_feedback_gate").warning(
+            "Failed to save gate result to GA decision %d: %s", ga_decision_id, exc
+        )

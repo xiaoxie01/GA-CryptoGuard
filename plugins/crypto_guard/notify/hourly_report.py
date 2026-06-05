@@ -53,6 +53,7 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     shadow_data_quality = _fetch_shadow_data_quality(repo)
     feedback_patterns = _fetch_feedback_patterns(repo)
     long_short_performance = _fetch_long_short_performance(repo)
+    account_feedback_gate = _fetch_account_feedback_gate_stats(repo)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -71,11 +72,12 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "shadow_data_quality": shadow_data_quality,
         "feedback_patterns": feedback_patterns,
         "long_short_performance": long_short_performance,
+        "account_feedback_gate": account_feedback_gate,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate)
         ),
     }
 
@@ -94,6 +96,7 @@ def render_ga_hourly_summary(
     shadow_data_quality: dict[str, Any] | None = None,
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
+    account_feedback_gate: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
@@ -208,6 +211,20 @@ def render_ga_hourly_summary(
                 lines.append("- 暂无失败模式记录")
             if most_active:
                 lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
+
+    # Account feedback gate stats
+    if account_feedback_gate and not account_feedback_gate.get("error"):
+        gate = account_feedback_gate
+        if gate.get("total_checks", 0) > 0:
+            lines.extend(["", "**账户反馈门禁（近 24 小时）**"])
+            lines.append(
+                f"- 总检查：{gate['total_checks']}；"
+                f"门禁激活：{gate['active_checks']}；"
+                f"未通过：{gate['not_passed']}"
+            )
+            if gate.get("decision_counts"):
+                decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
+                lines.append(f"- 决策分布：{decision_text}")
 
     lines.extend(["", "**八、风险事件**"])
     if failed_jobs:
@@ -363,6 +380,50 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
         return {"error": str(exc), "long": {}, "short": {}}
 
 
+def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Fetch account feedback gate statistics from recent GA decisions."""
+    try:
+        day_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+        rows = repo.conn.execute(
+            """
+            SELECT account_feedback_gate_json
+            FROM ga_decisions
+            WHERE datetime(created_at) >= datetime(?) AND account_feedback_gate_json IS NOT NULL
+            """,
+            (day_ago,),
+        ).fetchall()
+
+        if not rows:
+            return {"ok": True, "total_checks": 0, "active_checks": 0, "not_passed": 0, "decision_counts": {}}
+
+        total = len(rows)
+        active = 0
+        not_passed = 0
+        decision_counts: dict[str, int] = {}
+
+        for row in rows:
+            try:
+                gate = json.loads(row["account_feedback_gate_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if gate.get("active"):
+                active += 1
+            if gate.get("passed") is False:
+                not_passed += 1
+            decision = gate.get("decision", "unknown")
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+
+        return {
+            "ok": True,
+            "total_checks": total,
+            "active_checks": active,
+            "not_passed": not_passed,
+            "decision_counts": decision_counts,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "total_checks": 0}
+
+
 def render_hourly_report_text(
     generated_at_utc: str,
     active_symbols: list[str],
@@ -377,6 +438,7 @@ def render_hourly_report_text(
     shadow_data_quality: dict[str, Any] | None = None,
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
+    account_feedback_gate: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
     state_by_symbol: dict[str, dict[str, Any]] = {}
@@ -488,6 +550,20 @@ def render_hourly_report_text(
                 lines.append("- 暂无失败模式记录")
             if most_active:
                 lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
+
+    # Account feedback gate stats
+    if account_feedback_gate and not account_feedback_gate.get("error"):
+        gate = account_feedback_gate
+        if gate.get("total_checks", 0) > 0:
+            lines.extend(["", "**账户反馈门禁（近 24 小时）**"])
+            lines.append(
+                f"- 总检查：{gate['total_checks']}；"
+                f"门禁激活：{gate['active_checks']}；"
+                f"未通过：{gate['not_passed']}"
+            )
+            if gate.get("decision_counts"):
+                decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
+                lines.append(f"- 决策分布：{decision_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
     health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"

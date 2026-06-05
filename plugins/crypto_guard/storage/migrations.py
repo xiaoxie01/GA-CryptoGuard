@@ -30,6 +30,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_ga_master_migrations(conn)
         _apply_pending_order_lifecycle_migrations(conn)
         _apply_p1_structured_feedback_migrations(conn)
+        _apply_account_feedback_gate_migration(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -469,6 +470,11 @@ def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "skill_feedback_memory", "affected_symbols", "TEXT")
     _add_column(conn, "skill_feedback_memory", "affected_sides", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status)")
+
+
+def _apply_account_feedback_gate_migration(conn: sqlite3.Connection) -> None:
+    """Add account_feedback_gate_json column to ga_decisions for gate results."""
+    _add_column(conn, "ga_decisions", "account_feedback_gate_json", "TEXT")
 
 
 def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, Any]:

@@ -97,6 +97,17 @@ evolution:
     min_avg_r_improvement: 0.05
     max_win_rate_degradation: 0.10
     max_drawdown_increase: 0.20
+
+account_feedback_rules:
+  enabled: true
+  mode: shadow
+  lookback_hours: 24
+  actions:
+    require_stronger_confirmation:
+      enabled: true
+      min_confidence: 0.80
+      min_entry_quality: 0.70
+      on_fail: annotate_only
     min_r_count_for_performance_gate: 5
   online_shadow:
     min_samples_after_backtest: 5

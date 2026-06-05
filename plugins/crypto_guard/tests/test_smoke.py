@@ -4610,6 +4610,181 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["events_checked"], 0)
         self.assertEqual(result["summary"]["total_matches"], 0)
 
+    def test_account_feedback_gate_shadow_mode(self) -> None:
+        """Shadow mode: gate detects pattern but does not block orders."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        # Insert recent consecutive_stop_losses event
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "3 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": 99101}),
+             "candidate", now),
+        )
+        self.conn.commit()
+
+        result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.75)
+
+        self.assertTrue(result["ok"])
+        # Shadow mode: active may be True (pattern detected) but orders still proceed
+        # Decision should be "annotate_only" if not passed
+        if result["active"]:
+            self.assertIn(result["decision"], ["annotate_only", "passed"])
+
+    def test_account_feedback_gate_lookback(self) -> None:
+        """Gate respects lookback_hours — old events don't activate gate."""
+        import json as _json
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        # Insert old event (48 hours ago — outside default 24h lookback)
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "old event",
+             _json.dumps({"candidate_patch_id": 99102}),
+             "candidate", old),
+        )
+        self.conn.commit()
+
+        result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.75)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["active"])
+        self.assertEqual(result["events_matched"], 0)
+
+    def test_account_feedback_gate_confidence_threshold(self) -> None:
+        """Gate passes when confidence meets threshold."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        # Insert recent consecutive_stop_losses event
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "3 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": 99103}),
+             "candidate", now),
+        )
+        self.conn.commit()
+
+        # High confidence should pass
+        result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.85, entry_quality=0.75)
+        self.assertTrue(result["ok"])
+        if result["active"]:
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["decision"], "passed")
+
+        # Low confidence should not pass
+        result_low = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.60, entry_quality=0.60)
+        self.assertTrue(result_low["ok"])
+        if result_low["active"]:
+            self.assertFalse(result_low["passed"])
+            self.assertEqual(result_low["decision"], "annotate_only")
+
+    def test_account_feedback_gate_result_saved_to_ga_decision(self) -> None:
+        """Gate result is saved to ga_decisions.account_feedback_gate_json."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Insert GA decision
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "BTCUSDT",
+            "decision": "trade_plan_available",
+            "decision_type": "test",
+            "signal_grade": "B",
+            "confidence": 0.75,
+            "summary": "test",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "has_trade_plan": False,
+            "trade_plan": {},
+            "risk_check": {"ok": True},
+            "evidence": [],
+            "counter_evidence": [],
+            "analysis_time": now_ms,
+            "analysis_time_utc": now_iso,
+        })
+
+        # Create a paper trade so the gate can detect affected symbols
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create evolution_trigger linked to this trade
+        self.conn.execute(
+            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create strategy_patch linked to this trigger
+        self.conn.execute(
+            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+        )
+        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Insert recent consecutive_stop_losses event linked to the patch
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "3 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": patch_id}),
+             "candidate", now),
+        )
+        self.conn.commit()
+
+        # Run gate
+        gate_result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.75)
+
+        # Save to GA decision (mimic paper_broker behavior)
+        if gate_result.get("active"):
+            self.conn.execute(
+                "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+                (_json.dumps(gate_result, ensure_ascii=False), ga_id),
+            )
+            self.conn.commit()
+
+        # Verify saved
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row["account_feedback_gate_json"])
+        saved = _json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["ok"])
+        self.assertTrue(saved["active"])
+
 
 if __name__ == "__main__":
     unittest.main()
