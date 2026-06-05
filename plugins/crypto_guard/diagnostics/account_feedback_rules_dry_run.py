@@ -9,13 +9,14 @@ NOT execute any strategy or risk changes.
 from __future__ import annotations
 
 import json
-from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.account_feedback_rules_dry_run")
@@ -34,21 +35,33 @@ def evaluate_account_feedback_rules_dry_run(
         {
             ok: bool,
             matches: [{rule_when, rule_action, description, event_count, ...}],
-            summary: {total_matches, by_pattern, by_action},
+            summary: {total_matches, unique_event_count, by_pattern, by_action},
             rules_loaded: int,
             events_checked: int,
         }
     """
+    # Schema health guard
+    schema = check_schema_health()
+    if not schema["ok"]:
+        return {
+            "ok": False,
+            "error": "schema_unhealthy",
+            "missing_columns": schema["missing_columns"],
+        }
+
     # Load account-level rules
     rules = _load_account_rules()
     if not rules:
         return {
             "ok": True,
             "matches": [],
-            "summary": {"total_matches": 0, "by_pattern": {}, "by_action": {}},
+            "summary": {"total_matches": 0, "unique_event_count": 0, "by_pattern": {}, "by_action": {}},
             "rules_loaded": 0,
             "events_checked": 0,
         }
+
+    # Apply lookback filter
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat().replace("+00:00", "Z")
 
     # Query structured evolution_trigger feedback
     rows = repo.conn.execute(
@@ -57,8 +70,10 @@ def evaluate_account_feedback_rules_dry_run(
         FROM skill_feedback_memory
         WHERE source_type = 'evolution_trigger'
           AND pattern_type IS NOT NULL AND pattern_type != ''
+          AND datetime(created_at) >= datetime(?)
         ORDER BY created_at DESC
-        """
+        """,
+        (cutoff,),
     ).fetchall()
 
     # Group by pattern_type
@@ -75,7 +90,7 @@ def evaluate_account_feedback_rules_dry_run(
         if not matching_events:
             continue
 
-        # Collect patch_ids and sample info
+        # Collect all patch_ids
         patch_ids: list[int] = []
         for ev in matching_events:
             adj = ev.get("suggested_adjustment_json")
@@ -88,8 +103,8 @@ def evaluate_account_feedback_rules_dry_run(
                 except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
-        # Infer symbols/sides from related trades (via evolution_triggers)
-        inferred_symbols, inferred_sides = _infer_affected_context(repo, patch_ids[:50])
+        # Infer symbols/sides from all related trades
+        inferred_symbols, inferred_sides = _infer_affected_context(repo, patch_ids)
 
         matches.append({
             "rule_when": when,
@@ -111,11 +126,14 @@ def evaluate_account_feedback_rules_dry_run(
         by_pattern[m["rule_when"]] = by_pattern.get(m["rule_when"], 0) + m["event_count"]
         by_action[m["rule_action"]] = by_action.get(m["rule_action"], 0) + m["event_count"]
 
+    unique_event_count = sum(len(events) for events in events_by_pattern.values())
+
     return {
         "ok": True,
         "matches": matches,
         "summary": {
             "total_matches": sum(m["event_count"] for m in matches),
+            "unique_event_count": unique_event_count,
             "by_pattern": by_pattern,
             "by_action": by_action,
         },
@@ -176,46 +194,51 @@ def _infer_affected_context(
     symbols: set[str] = set()
     sides: set[str] = set()
 
-    # Get trade IDs from evolution_triggers via strategy_patches
-    placeholders = ",".join("?" for _ in patch_ids)
-    rows = repo.conn.execute(
-        f"""
-        SELECT DISTINCT et.related_trade_ids
-        FROM strategy_patches sp
-        JOIN evolution_triggers et ON et.id = sp.trigger_id
-        WHERE sp.id IN ({placeholders})
-          AND et.related_trade_ids IS NOT NULL
-          AND et.related_trade_ids != '[]'
-        """,
-        patch_ids,
-    ).fetchall()
+    # Process in batches to avoid SQLite variable limit
+    batch_size = 200
+    for i in range(0, len(patch_ids), batch_size):
+        batch = patch_ids[i:i + batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        rows = repo.conn.execute(
+            f"""
+            SELECT DISTINCT et.related_trade_ids
+            FROM strategy_patches sp
+            JOIN evolution_triggers et ON et.id = sp.trigger_id
+            WHERE sp.id IN ({placeholders})
+              AND et.related_trade_ids IS NOT NULL
+              AND et.related_trade_ids != '[]'
+            """,
+            batch,
+        ).fetchall()
 
-    trade_ids: list[int] = []
-    for row in rows:
-        try:
-            ids = json.loads(row["related_trade_ids"])
-            trade_ids.extend(int(tid) for tid in ids if tid is not None)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
+        trade_ids: list[int] = []
+        for row in rows:
+            try:
+                ids = json.loads(row["related_trade_ids"])
+                trade_ids.extend(int(tid) for tid in ids if tid is not None)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
 
-    if not trade_ids:
-        return [], []
+        if not trade_ids:
+            continue
 
-    # Get symbols/sides from paper_trades
-    trade_placeholders = ",".join("?" for _ in trade_ids[:200])
-    trade_rows = repo.conn.execute(
-        f"""
-        SELECT DISTINCT symbol, side
-        FROM paper_trades
-        WHERE id IN ({trade_placeholders})
-        """,
-        trade_ids[:200],
-    ).fetchall()
+        # Get symbols/sides from paper_trades
+        for j in range(0, len(trade_ids), batch_size):
+            trade_batch = trade_ids[j:j + batch_size]
+            trade_placeholders = ",".join("?" for _ in trade_batch)
+            trade_rows = repo.conn.execute(
+                f"""
+                SELECT DISTINCT symbol, side
+                FROM paper_trades
+                WHERE id IN ({trade_placeholders})
+                """,
+                trade_batch,
+            ).fetchall()
 
-    for tr in trade_rows:
-        if tr["symbol"]:
-            symbols.add(tr["symbol"])
-        if tr["side"]:
-            sides.add(tr["side"])
+            for tr in trade_rows:
+                if tr["symbol"]:
+                    symbols.add(tr["symbol"])
+                if tr["side"]:
+                    sides.add(tr["side"])
 
     return sorted(symbols), sorted(sides)

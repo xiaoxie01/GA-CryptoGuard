@@ -4518,9 +4518,10 @@ class PendingOrderManagerTest(unittest.TestCase):
     def test_account_feedback_rules_dry_run(self) -> None:
         """Account-level feedback rules match backfilled evolution_trigger entries."""
         import json as _json
+        from datetime import datetime, timezone
         from plugins.crypto_guard.diagnostics.account_feedback_rules_dry_run import evaluate_account_feedback_rules_dry_run
 
-        # Insert structured evolution_trigger feedback
+        # Insert structured evolution_trigger feedback (recent)
         self.conn.execute(
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
@@ -4529,7 +4530,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "3 consecutive stop losses",
              _json.dumps({"candidate_patch_id": 99001}),
-             "candidate", "2026-06-01 10:00:00"),
+             "candidate", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
         )
         self.conn.execute(
             "INSERT INTO skill_feedback_memory "
@@ -4539,7 +4540,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             ("momentum", "1.0", "evolution_trigger", "evolution_trigger",
              "daily_loss_threshold", "4 stop losses hit threshold",
              _json.dumps({"candidate_patch_id": 99002}),
-             "candidate", "2026-06-02 14:00:00"),
+             "candidate", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
         )
         self.conn.commit()
 
@@ -4549,6 +4550,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["rules_loaded"], 4)
         self.assertEqual(result["events_checked"], 2)
         self.assertGreater(result["summary"]["total_matches"], 0)
+        self.assertIn("unique_event_count", result["summary"])
+        self.assertEqual(result["summary"]["unique_event_count"], 2)
         # consecutive_stop_losses matches 2 rules, daily_loss_threshold matches 2 rules
         self.assertIn("consecutive_stop_losses", result["summary"]["by_pattern"])
         self.assertIn("daily_loss_threshold", result["summary"]["by_pattern"])
@@ -4557,6 +4560,44 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.assertTrue(m["would_apply"])
             self.assertIn("description", m)
             self.assertIn("params", m)
+
+    def test_account_feedback_rules_dry_run_lookback(self) -> None:
+        """Account-level feedback rules dry-run respects lookback_days."""
+        import json as _json
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.diagnostics.account_feedback_rules_dry_run import evaluate_account_feedback_rules_dry_run
+
+        # Insert old entry (100 days ago)
+        old = (datetime.now(timezone.utc) - timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "old event",
+             _json.dumps({"candidate_patch_id": 99003}),
+             "candidate", old),
+        )
+        # Insert recent entry
+        recent = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("momentum", "1.0", "evolution_trigger", "evolution_trigger",
+             "daily_loss_threshold", "recent event",
+             _json.dumps({"candidate_patch_id": 99004}),
+             "candidate", recent),
+        )
+        self.conn.commit()
+
+        # lookback_days=90 should exclude the old entry
+        result = evaluate_account_feedback_rules_dry_run(self.repo, lookback_days=90)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["events_checked"], 1)
+        self.assertEqual(result["summary"]["unique_event_count"], 1)
 
     def test_account_feedback_rules_dry_run_no_data(self) -> None:
         """Account-level feedback rules dry-run returns empty when no structured data."""
