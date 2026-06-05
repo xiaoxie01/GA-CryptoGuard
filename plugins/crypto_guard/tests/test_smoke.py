@@ -4515,6 +4515,60 @@ class PendingOrderManagerTest(unittest.TestCase):
             finally:
                 dry_run_mod.SKILLS_DIR = old_skills_dir
 
+    def test_account_feedback_rules_dry_run(self) -> None:
+        """Account-level feedback rules match backfilled evolution_trigger entries."""
+        import json as _json
+        from plugins.crypto_guard.diagnostics.account_feedback_rules_dry_run import evaluate_account_feedback_rules_dry_run
+
+        # Insert structured evolution_trigger feedback
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "3 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": 99001}),
+             "candidate", "2026-06-01 10:00:00"),
+        )
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("momentum", "1.0", "evolution_trigger", "evolution_trigger",
+             "daily_loss_threshold", "4 stop losses hit threshold",
+             _json.dumps({"candidate_patch_id": 99002}),
+             "candidate", "2026-06-02 14:00:00"),
+        )
+        self.conn.commit()
+
+        result = evaluate_account_feedback_rules_dry_run(self.repo)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rules_loaded"], 4)
+        self.assertEqual(result["events_checked"], 2)
+        self.assertGreater(result["summary"]["total_matches"], 0)
+        # consecutive_stop_losses matches 2 rules, daily_loss_threshold matches 2 rules
+        self.assertIn("consecutive_stop_losses", result["summary"]["by_pattern"])
+        self.assertIn("daily_loss_threshold", result["summary"]["by_pattern"])
+        # All matches have would_apply=True
+        for m in result["matches"]:
+            self.assertTrue(m["would_apply"])
+            self.assertIn("description", m)
+            self.assertIn("params", m)
+
+    def test_account_feedback_rules_dry_run_no_data(self) -> None:
+        """Account-level feedback rules dry-run returns empty when no structured data."""
+        from plugins.crypto_guard.diagnostics.account_feedback_rules_dry_run import evaluate_account_feedback_rules_dry_run
+
+        result = evaluate_account_feedback_rules_dry_run(self.repo)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rules_loaded"], 4)
+        self.assertEqual(result["events_checked"], 0)
+        self.assertEqual(result["summary"]["total_matches"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
