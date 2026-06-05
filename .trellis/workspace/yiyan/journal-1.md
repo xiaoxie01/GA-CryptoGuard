@@ -403,3 +403,36 @@ Fixed 5 blocking issues: schema migration, time comparison consistency, schema h
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: Account-level feedback rules dry-run
+
+**Date**: 2026-06-05
+**Task**: Account-level feedback rules dry-run
+**Branch**: `main`
+
+### Summary
+
+Added account-level feedback rules dry-run bridge layer. 4 rules for consecutive_stop_losses and daily_loss_threshold. 1,688 events checked, 3,376 matches. 140 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8f5673e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
