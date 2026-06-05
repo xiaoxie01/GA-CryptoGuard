@@ -469,3 +469,36 @@ Fixed lookback_days filtering, added schema health guard, added unique_event_cou
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: Account feedback gate: shadow/annotate controlled execution
+
+**Date**: 2026-06-05
+**Task**: Account feedback gate: shadow/annotate controlled execution
+**Branch**: `main`
+
+### Summary
+
+Implemented account feedback gate module, integrated into paper_broker (both order creation paths), added migration, hourly report stats, and 4 tests. 145 tests passed, state consistency = 0.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef5f3c4` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

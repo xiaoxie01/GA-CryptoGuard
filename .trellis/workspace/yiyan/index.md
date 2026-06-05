@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
+- **Total Sessions**: 15
 - **Last Active**: 2026-06-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~471 | Active |
+| `journal-1.md` | ~504 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-06-05 | Account feedback gate: shadow/annotate controlled execution | `ef5f3c4` | `main` |
 | 14 | 2026-06-05 | Account feedback rules dry-run fixes | `02d8a29` | `main` |
 | 13 | 2026-06-05 | Account-level feedback rules dry-run | `8f5673e` | `main` |
 | 12 | 2026-06-05 | P2 Hotfix: Schema Migration, Time Comparison, Test Fixes | `c3885ba` | `main` |
