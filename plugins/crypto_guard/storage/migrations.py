@@ -493,6 +493,7 @@ def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, An
     # Required columns for skill_feedback_memory
     required_columns = {
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
+        "ga_decisions": ["account_feedback_gate_json"],
     }
 
     missing: list[dict[str, str]] = []

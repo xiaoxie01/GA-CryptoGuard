@@ -34,13 +34,28 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             "signal_id": signal_id,
         }
 
-    # Account feedback gate — shadow/annotate mode (does not block orders yet)
+    # Account feedback gate — check before order creation
     from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
     symbol = signal.get("symbol", "")
     side = trade_plan.get("side", "")
     confidence = float(signal.get("confidence") or 0)
     entry_quality = _extract_entry_quality(trade_plan)
     feedback_gate = check_account_feedback_gate(repo, symbol, side, confidence, entry_quality)
+
+    # Enforce controlled-mode gate decisions
+    gate_decision = feedback_gate.get("would_decide") or feedback_gate.get("decision", "")
+    if gate_decision in ("downgrade_to_watch", "block_order"):
+        ga_id_for_gate = signal.get("ga_decision_id")
+        if ga_id_for_gate:
+            _save_gate_result_to_ga_decision(repo, int(ga_id_for_gate), feedback_gate)
+        return {
+            "ok": False,
+            "error": "gate_blocked",
+            "gate_decision": gate_decision,
+            "gate_reason": feedback_gate.get("reason"),
+            "feedback_gate": feedback_gate,
+            "signal_id": signal_id,
+        }
 
     snapshot = None
     if signal.get("market_snapshot_id"):
@@ -61,9 +76,8 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
         }
     ga_decision_id = signal.get("ga_decision_id") or _ensure_ga_decision_for_legacy_signal(repo, signal, trade_plan, risk)
 
-    # Save account feedback gate result to GA decision (shadow mode)
-    if feedback_gate.get("active"):
-        _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+    # Always persist account feedback gate result to GA decision
+    _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
 
     order_id, created = repo.create_paper_order(
         signal_id,
@@ -102,13 +116,26 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
             "ga_decision_id": ga_decision_id,
         }
 
-    # Account feedback gate — shadow/annotate mode (does not block orders yet)
+    # Account feedback gate — check before order creation
     from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
     symbol = ga_decision.get("symbol", "")
     side = trade_plan.get("side", "")
     confidence = float(ga_decision.get("confidence") or 0)
     entry_quality = _extract_entry_quality(trade_plan)
     feedback_gate = check_account_feedback_gate(repo, symbol, side, confidence, entry_quality)
+
+    # Enforce controlled-mode gate decisions
+    gate_decision = feedback_gate.get("would_decide") or feedback_gate.get("decision", "")
+    if gate_decision in ("downgrade_to_watch", "block_order"):
+        _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+        return {
+            "ok": False,
+            "error": "gate_blocked",
+            "gate_decision": gate_decision,
+            "gate_reason": feedback_gate.get("reason"),
+            "feedback_gate": feedback_gate,
+            "ga_decision_id": ga_decision_id,
+        }
 
     raw = dict(ga_decision.get("raw_decision") or {})
     raw.update(
@@ -142,9 +169,8 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
     signal_row = repo.conn.execute("SELECT id FROM signals WHERE ga_decision_id=? ORDER BY id DESC LIMIT 1", (int(ga_decision_id),)).fetchone()
     signal_id = int(signal_row["id"]) if signal_row else None
 
-    # Save account feedback gate result to GA decision (shadow mode)
-    if feedback_gate.get("active"):
-        _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+    # Always persist account feedback gate result to GA decision
+    _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
 
     order_id, created = repo.create_paper_order(
         signal_id,

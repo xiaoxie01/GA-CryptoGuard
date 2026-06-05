@@ -86,6 +86,12 @@ evolution:
   affected_strategy_observation_hours: 24
   auto_promote: false
   pause_evolution_on_extreme_market: true
+  online_shadow:
+    min_samples_after_backtest: 5
+    min_samples_without_backtest: 30
+  stale_cleanup:
+    max_days: 7
+    min_samples: 3
   trigger:
     consecutive_stop_losses: 3
     max_account_drawdown_pct: 0.10
@@ -97,24 +103,19 @@ evolution:
     min_avg_r_improvement: 0.05
     max_win_rate_degradation: 0.10
     max_drawdown_increase: 0.20
+    min_r_count_for_performance_gate: 5
 
 account_feedback_rules:
   enabled: true
   mode: shadow
   lookback_hours: 24
+  affected_scope: trigger_related_symbols
   actions:
     require_stronger_confirmation:
       enabled: true
       min_confidence: 0.80
       min_entry_quality: 0.70
       on_fail: annotate_only
-    min_r_count_for_performance_gate: 5
-  online_shadow:
-    min_samples_after_backtest: 5
-    min_samples_without_backtest: 30
-  stale_cleanup:
-    max_days: 7
-    min_samples: 3
 
 market_regime:
   classifier_enabled: true

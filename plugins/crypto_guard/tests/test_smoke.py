@@ -4636,7 +4636,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Shadow mode: active may be True (pattern detected) but orders still proceed
         # Decision should be "annotate_only" if not passed
         if result["active"]:
-            self.assertIn(result["decision"], ["annotate_only", "passed"])
+            self.assertIn(result["decision"], ["shadow_annotate_only", "passed"])
 
     def test_account_feedback_gate_lookback(self) -> None:
         """Gate respects lookback_hours — old events don't activate gate."""
@@ -4696,7 +4696,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertTrue(result_low["ok"])
         if result_low["active"]:
             self.assertFalse(result_low["passed"])
-            self.assertEqual(result_low["decision"], "annotate_only")
+            self.assertEqual(result_low["decision"], "shadow_annotate_only")
 
     def test_account_feedback_gate_result_saved_to_ga_decision(self) -> None:
         """Gate result is saved to ga_decisions.account_feedback_gate_json."""
@@ -4784,6 +4784,208 @@ class PendingOrderManagerTest(unittest.TestCase):
         saved = _json.loads(row["account_feedback_gate_json"])
         self.assertTrue(saved["ok"])
         self.assertTrue(saved["active"])
+
+
+    # ---- Broker integration: controlled-mode gate enforcement ----
+
+    def _insert_gate_triggering_chain(self) -> None:
+        """Insert paper_trade + evolution_trigger + strategy_patch + skill_feedback_memory
+        so that the account feedback gate detects a recent consecutive_stop_losses pattern
+        affecting BTCUSDT/LONG."""
+        import json as _json
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+        )
+        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "3 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": patch_id}),
+             "candidate", now),
+        )
+        self.conn.commit()
+
+    def _controlled_config(self, on_fail: str) -> object:
+        """Build a mock config with account_feedback_rules in controlled mode."""
+        from unittest.mock import MagicMock
+        cfg = MagicMock()
+        cfg.trading_mode = {
+            "account_feedback_rules": {
+                "enabled": True,
+                "mode": "controlled",
+                "lookback_hours": 24,
+                "affected_scope": "trigger_related_symbols",
+                "actions": {
+                    "require_stronger_confirmation": {
+                        "enabled": True,
+                        "min_confidence": 0.80,
+                        "min_entry_quality": 0.70,
+                        "on_fail": on_fail,
+                    }
+                },
+            }
+        }
+        return cfg
+
+    def _create_signal_with_ga_decision(self) -> tuple[int, int]:
+        """Create a signal with a full trade_plan linked to a GA decision.
+        Returns (signal_id, ga_decision_id)."""
+        now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
+        now_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "LONG", "entry_type": "limit", "stop_loss": 49000.0,
+            "take_profits": [51000.0], "risk_percent": 0.5,
+            "invalid_condition": "below 49000", "reason": "test setup",
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.75,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        self.conn.execute(
+            "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", 0.75, ga_id,
+             json.dumps(trade_plan, ensure_ascii=False),
+             json.dumps({"confidence": 0.75, "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
+        )
+        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+        return signal_id, ga_id
+
+    def test_broker_blocks_order_on_gate_downgrade(self) -> None:
+        """Controlled mode on_fail=downgrade_to_watch blocks paper order creation."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertEqual(result["gate_decision"], "downgrade_to_watch")
+
+        # Gate result persisted to GA decision
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["active"])
+        self.assertIn("downgrade_to_watch", saved["would_decide"])
+
+    def test_broker_blocks_order_on_gate_block(self) -> None:
+        """Controlled mode on_fail=block_order blocks paper order creation."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("block_order")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertEqual(result["gate_decision"], "block_order")
+
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["active"])
+        self.assertEqual(saved["would_decide"], "block_order")
+
+    def test_broker_shadow_mode_proceeds_with_gate_persisted(self) -> None:
+        """Shadow mode (default config): order proceeds, gate result still persisted."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+
+        # Patch risk validation to pass — we're testing gate behavior, not risk
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan", return_value={"ok": True, "reasons": [], "metrics": {}}):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # Shadow mode does NOT block — order should proceed
+        self.assertTrue(result["ok"], f"Shadow mode should not block: {result}")
+
+        # Gate result persisted
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["account_feedback_gate_json"])
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["active"])
+        self.assertFalse(saved["passed"])  # Low confidence/quality doesn't pass
+        self.assertTrue(saved["decision"].startswith("shadow_"))
+
+    def test_broker_ga_decision_entry_gate_enforcement(self) -> None:
+        """create_paper_order_from_ga_decision also enforces controlled-mode gate."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+
+        self._insert_gate_triggering_chain()
+        now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
+        now_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "LONG", "entry_type": "limit", "stop_loss": 49000.0,
+            "take_profits": [51000.0], "risk_percent": 0.5,
+            "invalid_condition": "below 49000", "reason": "test setup",
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.75,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+            "feishu_actions": ["create_paper_order"],
+        })
+        mock_cfg = self._controlled_config("block_order")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_ga_decision(self.repo, ga_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertEqual(result["gate_decision"], "block_order")
+
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["active"])
+        self.assertEqual(saved["would_decide"], "block_order")
 
 
 if __name__ == "__main__":

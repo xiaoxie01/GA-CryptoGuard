@@ -3,7 +3,11 @@
 Checks recent account-level feedback patterns (consecutive_stop_losses,
 daily_loss_threshold) and applies quality gates before paper order creation.
 
-Current mode: shadow/annotate_only — records gate results but does not block orders.
+Modes:
+- shadow: records gate results but does not block orders
+- annotate_only: records and annotates but no behavior change
+- downgrade_to_watch: blocks order and creates opportunity watch
+- block_order: blocks order with explicit audit reason
 """
 
 from __future__ import annotations
@@ -39,38 +43,43 @@ def check_account_feedback_gate(
     Returns:
         {
             "ok": bool,
-            "active": bool,  # Whether gate is active (pattern detected)
-            "action": str,   # Action being checked
+            "active": bool,
+            "action": str,
             "required": {"min_confidence": float, "min_entry_quality": float},
             "actual": {"confidence": float, "entry_quality": float},
-            "passed": bool,  # Whether current trade passes the gate
-            "decision": str, # "annotate_only" / "downgrade_to_watch" / "block_order"
+            "passed": bool,
+            "decision": str,
+            "would_decide": str,  # shadow mode: what controlled mode would decide
             "reason": str,
             "lookback_hours": int,
             "events_matched": int,
+            "affected_pairs": [{"symbol": str, "side": str}],
+            "entry_quality_status": str,  # "ok" / "below_threshold" / "data_quality_insufficient"
+            "mode": str,
         }
     """
     # Schema health guard
     schema = check_schema_health()
     if not schema["ok"]:
-        return {"ok": False, "error": "schema_unhealthy", "active": False, "passed": True}
+        return {"ok": False, "error": "schema_unhealthy", "active": False, "passed": True, "decision": "error", "would_decide": "error"}
 
     # Load config
     cfg = load_config().trading_mode
     gate_cfg = cfg.get("account_feedback_rules", {})
 
     if not gate_cfg.get("enabled", False):
-        return {"ok": True, "active": False, "passed": True, "decision": "disabled"}
+        return {"ok": True, "active": False, "passed": True, "decision": "disabled", "would_decide": "disabled"}
 
     mode = gate_cfg.get("mode", "shadow")
     lookback_hours = int(gate_cfg.get("lookback_hours", 24))
+    scope = gate_cfg.get("affected_scope", "trigger_related_symbols")
 
     # Get action config
     actions_cfg = gate_cfg.get("actions", {})
     confirm_cfg = actions_cfg.get("require_stronger_confirmation", {})
 
     if not confirm_cfg.get("enabled", False):
-        return {"ok": True, "active": False, "passed": True, "decision": "action_disabled"}
+        return {"ok": True, "active": False, "passed": True, "decision": "action_disabled", "would_decide": "action_disabled"}
 
     min_confidence = float(confirm_cfg.get("min_confidence", 0.80))
     min_entry_quality = float(confirm_cfg.get("min_entry_quality", 0.70))
@@ -79,7 +88,6 @@ def check_account_feedback_gate(
     # Query recent consecutive_stop_losses events
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat().replace("+00:00", "Z")
 
-    # Check if there are recent consecutive_stop_losses events affecting this symbol/side
     events = repo.conn.execute(
         """
         SELECT sfm.id, sfm.pattern_type, sfm.created_at,
@@ -101,21 +109,19 @@ def check_account_feedback_gate(
             "active": False,
             "passed": True,
             "decision": "no_recent_pattern",
+            "would_decide": "no_recent_pattern",
             "events_matched": 0,
+            "mode": mode,
         }
 
-    # Check if affected trades include current symbol/side
-    affected_symbols, affected_sides = _get_affected_symbols_sides(repo, events)
+    # Check if affected trades include current symbol/side (paired, not cross-product)
+    affected_pairs = _get_affected_symbol_side_pairs(repo, events)
 
-    # Gate is active if:
-    # 1. There are recent consecutive_stop_losses events
-    # 2. Current symbol/side is in affected scope (or scope is "all")
-    scope = confirm_cfg.get("affected_scope", "trigger_related_symbols")
+    # Gate is active if scope matches
     is_affected = (
         scope == "all"
-        or (symbol in affected_symbols and side in affected_sides)
-        or (symbol in affected_symbols and not affected_sides)
-        or (not affected_symbols and side in affected_sides)
+        or {"symbol": symbol, "side": side} in affected_pairs
+        or (not affected_pairs and scope == "trigger_related_symbols")
     )
 
     if not is_affected:
@@ -124,12 +130,13 @@ def check_account_feedback_gate(
             "active": False,
             "passed": True,
             "decision": "not_affected",
+            "would_decide": "not_affected",
             "events_matched": len(events),
-            "affected_symbols": affected_symbols,
-            "affected_sides": affected_sides,
+            "affected_pairs": affected_pairs,
+            "mode": mode,
         }
 
-    # Gate is active - check thresholds
+    # Gate is active — check thresholds
     actual = {
         "confidence": confidence,
         "entry_quality": entry_quality,
@@ -139,17 +146,41 @@ def check_account_feedback_gate(
         "min_entry_quality": min_entry_quality,
     }
 
-    # Check if current trade passes the gate
+    # Check confidence threshold
     confidence_ok = confidence >= min_confidence
-    quality_ok = entry_quality is None or entry_quality >= min_entry_quality
+
+    # Check entry quality — missing quality fails closed in controlled mode
+    entry_quality_status = "ok"
+    if entry_quality is None:
+        if mode == "shadow":
+            quality_ok = True
+            entry_quality_status = "data_quality_insufficient"
+        else:
+            quality_ok = False
+            entry_quality_status = "data_quality_insufficient"
+    elif entry_quality < min_entry_quality:
+        quality_ok = False
+        entry_quality_status = "below_threshold"
+    else:
+        quality_ok = True
+
     passed = confidence_ok and quality_ok
 
     # Build reason
     reasons = []
     if not confidence_ok:
         reasons.append(f"confidence {confidence:.2f} < {min_confidence:.2f}")
-    if not quality_ok:
+    if entry_quality_status == "data_quality_insufficient":
+        reasons.append("entry_quality missing (data_quality_insufficient)")
+    elif not quality_ok:
         reasons.append(f"entry_quality {entry_quality:.2f} < {min_entry_quality:.2f}")
+
+    # Determine what controlled mode would decide
+    would_decide = on_fail if not passed else "passed"
+
+    # In shadow mode, record what would happen but don't enforce
+    # In controlled mode, the decision IS the enforcement
+    decision = would_decide if mode != "shadow" else ("shadow_" + would_decide if not passed else "passed")
 
     result = {
         "ok": True,
@@ -158,37 +189,42 @@ def check_account_feedback_gate(
         "required": required,
         "actual": actual,
         "passed": passed,
-        "decision": on_fail if not passed else "passed",
+        "decision": decision,
+        "would_decide": would_decide,
         "reason": "; ".join(reasons) if reasons else "thresholds met",
         "lookback_hours": lookback_hours,
         "events_matched": len(events),
-        "affected_symbols": affected_symbols,
-        "affected_sides": affected_sides,
+        "affected_pairs": affected_pairs,
+        "entry_quality_status": entry_quality_status,
         "mode": mode,
     }
 
     # Log based on mode
     if mode == "shadow":
         LOGGER.info(
-            "account_feedback_gate [shadow]: symbol=%s side=%s passed=%s events=%d reason=%s",
-            symbol, side, passed, len(events), result["reason"],
+            "account_feedback_gate [shadow]: symbol=%s side=%s passed=%s would_decide=%s events=%d reason=%s",
+            symbol, side, passed, would_decide, len(events), result["reason"],
         )
     elif mode == "controlled" and not passed:
         LOGGER.warning(
             "account_feedback_gate [controlled]: symbol=%s side=%s decision=%s reason=%s",
-            symbol, side, on_fail, result["reason"],
+            symbol, side, would_decide, result["reason"],
         )
 
     return result
 
 
-def _get_affected_symbols_sides(
+def _get_affected_symbol_side_pairs(
     repo: CryptoGuardRepository,
     events: list[Any],
-) -> tuple[list[str], list[str]]:
-    """Get affected symbols and sides from event-related trades."""
-    symbols: set[str] = set()
-    sides: set[str] = set()
+) -> list[dict[str, str]]:
+    """Get affected symbol-side pairs from event-related trades.
+
+    Returns paired records [{"symbol": "BTCUSDT", "side": "LONG"}], not
+    independent sets, to prevent cross-product false positives.
+    """
+    pairs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
 
     for event in events:
         trade_ids_str = event["related_trade_ids"] if "related_trade_ids" in event.keys() else None
@@ -203,7 +239,7 @@ def _get_affected_symbols_sides(
         if not trade_ids:
             continue
 
-        # Get symbols/sides from paper_trades
+        # Get symbol-side pairs from paper_trades
         placeholders = ",".join("?" for _ in trade_ids[:50])
         try:
             rows = repo.conn.execute(
@@ -216,11 +252,14 @@ def _get_affected_symbols_sides(
             ).fetchall()
 
             for r in rows:
-                if r["symbol"]:
-                    symbols.add(r["symbol"])
-                if r["side"]:
-                    sides.add(r["side"])
+                sym = r["symbol"]
+                sd = r["side"]
+                if sym and sd:
+                    key = (sym, sd)
+                    if key not in seen:
+                        seen.add(key)
+                        pairs.append({"symbol": sym, "side": sd})
         except Exception:
             pass
 
-    return sorted(symbols), sorted(sides)
+    return pairs
