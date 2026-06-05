@@ -61,7 +61,7 @@ def _check_orphan_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
         SELECT sp.id, sp.strategy_name, sp.candidate_version, sp.status, sp.created_at
         FROM strategy_patches sp
         LEFT JOIN strategy_versions sv ON sp.strategy_name = sv.strategy_name AND sp.candidate_version = sv.version
-        WHERE sv.id IS NULL
+        WHERE sv.id IS NULL AND sp.status NOT IN ('duplicate', 'rejected')
         """
     ).fetchall()
 
@@ -172,7 +172,7 @@ def _check_status_mismatches(repo: CryptoGuardRepository) -> list[dict[str, Any]
 
 
 def _check_duplicate_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    """Find duplicate patches (same strategy_name + candidate_version)."""
+    """Find duplicate patches (same strategy_name + candidate_version) that are not already soft-cleaned."""
     issues: list[dict[str, Any]] = []
 
     duplicates = repo.conn.execute(
@@ -180,6 +180,7 @@ def _check_duplicate_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]
         SELECT strategy_name, candidate_version, COUNT(*) as count,
                GROUP_CONCAT(id) as patch_ids, GROUP_CONCAT(status) as statuses
         FROM strategy_patches
+        WHERE status NOT IN ('duplicate', 'rejected', 'deprecated')
         GROUP BY strategy_name, candidate_version
         HAVING COUNT(*) > 1
         """
@@ -196,7 +197,7 @@ def _check_duplicate_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]
                 "patch_ids": row["patch_ids"],
                 "statuses": row["statuses"],
             },
-            "suggested_action": "Keep the most recent patch and delete older duplicates",
+            "suggested_action": "Mark older duplicates as duplicate/rejected, keep the latest",
         })
 
     return issues
