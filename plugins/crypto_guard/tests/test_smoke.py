@@ -3382,8 +3382,9 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         self._setup_paper_account(equity=9800.0, initial=10000.0)
         # Only 1 stop loss (threshold is 2) — insert a winning trade first to keep avg_r positive
-        self._insert_closed_trade(pnl_r=1.0, hours_ago=2)
-        self._insert_closed_trade(pnl_r=-1.0, hours_ago=1)
+        # Use small hours_ago to avoid crossing midnight boundary
+        self._insert_closed_trade(pnl_r=1.0, hours_ago=0.5)
+        self._insert_closed_trade(pnl_r=-1.0, hours_ago=0.1)
 
         guard = AccountRiskGuard(self.repo)
         result = guard.check(symbol="BTCUSDT", side="LONG")

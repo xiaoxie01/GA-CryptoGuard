@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.feedback_rules_dry_run")
@@ -39,6 +40,15 @@ def evaluate_feedback_rules_dry_run(
             feedback_checked: int,
         }
     """
+    # Check schema health first
+    schema = check_schema_health()
+    if not schema["ok"]:
+        return {
+            "ok": False,
+            "error": "schema_unhealthy",
+            "missing_columns": schema["missing_columns"],
+        }
+
     # Load all feedback rules
     rules_by_skill = _load_feedback_rules()
     total_rules = sum(len(rules) for rules in rules_by_skill.values())

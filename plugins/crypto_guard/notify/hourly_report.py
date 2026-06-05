@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
+from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 
@@ -23,6 +24,16 @@ def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] |
 
 
 def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
+    # Check schema health first
+    schema = check_schema_health()
+    if not schema["ok"]:
+        return {
+            "ok": False,
+            "error": "schema_unhealthy",
+            "missing_columns": schema["missing_columns"],
+            "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     active_symbols = repo.active_analysis_symbols()
     ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120)

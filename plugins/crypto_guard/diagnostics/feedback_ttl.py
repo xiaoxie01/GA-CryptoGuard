@@ -11,10 +11,12 @@ Protection:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.feedback_ttl")
@@ -34,6 +36,15 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
             summary: {fresh, decayed, archived, total},
         }
     """
+    # Check schema health first
+    schema = check_schema_health()
+    if not schema["ok"]:
+        return {
+            "ok": False,
+            "error": "schema_unhealthy",
+            "missing_columns": schema["missing_columns"],
+        }
+
     now = datetime.now(timezone.utc)
     fresh_cutoff = (now - timedelta(days=FRESH_DAYS)).isoformat().replace("+00:00", "Z")
     decayed_cutoff = (now - timedelta(days=DECAYED_DAYS)).isoformat().replace("+00:00", "Z")
@@ -49,10 +60,10 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
         """
         UPDATE skill_feedback_memory
         SET status = 'decayed', updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'fresh' AND created_at < ? AND created_at >= ?
+        WHERE status = 'fresh' AND datetime(created_at) < datetime(?) AND datetime(created_at) >= datetime(?)
         AND id NOT IN (SELECT value FROM json_each(?))
         """,
-        (fresh_cutoff, decayed_cutoff, str(protected_ids)),
+        (fresh_cutoff, decayed_cutoff, json.dumps(protected_ids)),
     ).rowcount
 
     # Transition decayed → archived (>90 days, not protected)
@@ -60,10 +71,10 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
         """
         UPDATE skill_feedback_memory
         SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'decayed' AND created_at < ?
+        WHERE status = 'decayed' AND datetime(created_at) < datetime(?)
         AND id NOT IN (SELECT value FROM json_each(?))
         """,
-        (decayed_cutoff, str(protected_ids)),
+        (decayed_cutoff, json.dumps(protected_ids)),
     ).rowcount
 
     # Also archive entries still in 'candidate' or 'active' status that are >90 days old
@@ -72,10 +83,10 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
         """
         UPDATE skill_feedback_memory
         SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-        WHERE status IN ('candidate', 'active') AND created_at < ?
+        WHERE status IN ('candidate', 'active') AND datetime(created_at) < datetime(?)
         AND id NOT IN (SELECT value FROM json_each(?))
         """,
-        (decayed_cutoff, str(protected_ids)),
+        (decayed_cutoff, json.dumps(protected_ids)),
     ).rowcount
 
     repo.conn.commit()

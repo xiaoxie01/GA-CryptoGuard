@@ -199,7 +199,7 @@ class AccountRiskGuard:
         rows = self.repo.conn.execute(
             """
             SELECT pnl_r, closed_at FROM paper_trades
-            WHERE pnl_r IS NOT NULL AND closed_at IS NOT NULL AND closed_at >= ?
+            WHERE pnl_r IS NOT NULL AND closed_at IS NOT NULL AND datetime(closed_at) >= datetime(?)
             ORDER BY closed_at DESC
             """,
             (today_start_iso,),
