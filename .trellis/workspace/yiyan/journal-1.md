@@ -436,3 +436,36 @@ Added account-level feedback rules dry-run bridge layer. 4 rules for consecutive
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: Account feedback rules dry-run fixes
+
+**Date**: 2026-06-05
+**Task**: Account feedback rules dry-run fixes
+**Branch**: `main`
+
+### Summary
+
+Fixed lookback_days filtering, added schema health guard, added unique_event_count, infer symbols/sides from all patches. 141 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `02d8a29` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
