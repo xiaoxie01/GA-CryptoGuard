@@ -46,13 +46,19 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
     if feedback_gate.get("mode") != "shadow":
         gate_decision = feedback_gate.get("would_decide") or feedback_gate.get("decision", "")
         if gate_decision in ("downgrade_to_watch", "block_order"):
-            # Create opportunity watch so user can monitor the missed signal
-            if gate_decision == "downgrade_to_watch":
-                _create_opportunity_watch_from_gate(repo, symbol, side, signal.get("ga_decision_id"), feedback_gate)
-            # Persist gate result even when blocking (for shadow reporting accuracy)
+            # Resolve ga_decision_id for audit persistence (legacy compatibility)
             ga_id_for_gate = signal.get("ga_decision_id")
-            if ga_id_for_gate:
-                _save_gate_result_to_ga_decision(repo, int(ga_id_for_gate), feedback_gate)
+            if not ga_id_for_gate:
+                # Create a pending GA decision with honest risk status
+                ga_id_for_gate = _ensure_ga_decision_for_legacy_signal(
+                    repo, signal, trade_plan,
+                    {"ok": False, "reasons": ["gate_blocked_before_risk_validation"], "metrics": {}, "pending": True},
+                )
+            # Always persist gate result to GA decision
+            _save_gate_result_to_ga_decision(repo, int(ga_id_for_gate), feedback_gate)
+            # Create opportunity watch linked to the GA decision
+            if gate_decision == "downgrade_to_watch":
+                _create_opportunity_watch_from_gate(repo, symbol, side, int(ga_id_for_gate), feedback_gate)
             return {
                 "ok": False,
                 "error": "gate_blocked",
@@ -60,19 +66,10 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
                 "gate_reason": feedback_gate.get("reason"),
                 "feedback_gate": feedback_gate,
                 "signal_id": signal_id,
+                "ga_decision_id": int(ga_id_for_gate),
             }
 
-    # Resolve ga_decision_id early so gate result is persisted before risk validation
-    ga_decision_id = signal.get("ga_decision_id")
-    if not ga_decision_id:
-        ga_decision_id = _ensure_ga_decision_for_legacy_signal(
-            repo, signal, trade_plan, {"ok": True, "reasons": [], "metrics": {}},
-        )
-
-    # Always persist account feedback gate result to GA decision BEFORE risk validation
-    _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
-
-    # Snapshot + risk validation
+    # Snapshot + risk validation (must run before creating compatibility GA decision)
     snapshot = None
     if signal.get("market_snapshot_id"):
         row = repo.get_market_snapshot(int(signal["market_snapshot_id"]))
@@ -82,6 +79,17 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
     decision["trade_plan"] = trade_plan
     decision["has_trade_plan"] = True
     risk = validate_trade_plan(decision, snapshot or {})
+
+    # Now resolve ga_decision_id with REAL risk result (no synthetic approval)
+    ga_decision_id = signal.get("ga_decision_id")
+    if not ga_decision_id:
+        ga_decision_id = _ensure_ga_decision_for_legacy_signal(
+            repo, signal, trade_plan, risk,
+        )
+
+    # Always persist account feedback gate result to GA decision
+    _save_gate_result_to_ga_decision(repo, int(ga_decision_id), feedback_gate)
+
     if not risk["ok"]:
         return {
             "ok": False,
@@ -414,24 +422,47 @@ def _create_opportunity_watch_from_gate(
     side: str,
     ga_decision_id: int | None,
     gate_result: dict[str, Any],
-) -> None:
-    """Create opportunity_watches record when gate downgrades order to watch."""
+) -> int | None:
+    """Idempotent opportunity watch creation when gate downgrades to watch.
+
+    Deduplicates on (ga_decision_id, watch_reason) to prevent duplicate
+    active watches on retry/re-entry.
+
+    Returns watch_id or None on failure.
+    """
+    if not ga_decision_id:
+        return None
+
+    watch_reason = f"account_feedback_gate: {gate_result.get('reason', '')}"
+    watch_condition = json.dumps(gate_result, ensure_ascii=False)
+
     try:
-        repo.conn.execute(
+        # Check for existing watch (idempotent)
+        existing = repo.conn.execute(
+            "SELECT id FROM opportunity_watches "
+            "WHERE ga_decision_id = ? AND watch_reason = ? AND status = 'active' "
+            "LIMIT 1",
+            (int(ga_decision_id), watch_reason),
+        ).fetchone()
+
+        if existing:
+            return int(existing["id"])
+
+        cursor = repo.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id) "
             "VALUES (?, ?, ?, ?, 'active', ?)",
-            (
-                symbol,
-                side,
-                f"account_feedback_gate: {gate_result.get('reason', '')}",
-                json.dumps(gate_result, ensure_ascii=False),
-                int(ga_decision_id) if ga_decision_id else None,
-            ),
+            (symbol, side, watch_reason, watch_condition, int(ga_decision_id)),
         )
         repo.conn.commit()
+        return int(cursor.lastrowid)
     except Exception:
-        pass  # Non-critical
+        import logging
+        logging.getLogger("crypto_guard.paper_broker").warning(
+            "Failed to create opportunity watch from gate: ga_decision_id=%s", ga_decision_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _save_gate_result_to_ga_decision(

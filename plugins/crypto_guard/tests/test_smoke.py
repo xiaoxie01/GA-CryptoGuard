@@ -5193,6 +5193,172 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertNotIn("stale_cleanup", feedback,
                          "stale_cleanup must NOT be under account_feedback_rules")
 
+    # ---- P0 round 2 regression tests ----
+
+    def test_legacy_signal_block_persists_gate_audit(self) -> None:
+        """P1-1: Legacy signal (no ga_decision_id) blocked by gate persists audit trail."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        # Create a legacy signal WITHOUT ga_decision_id
+        trade_plan = {
+            "side": "LONG", "entry_type": "limit", "stop_loss": 49000.0,
+            "take_profits": [51000.0], "risk_percent": 0.5,
+            "invalid_condition": "below 49000", "reason": "test setup",
+        }
+        signal_id = self.repo.create_signal({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "signal_grade": "B", "confidence": 0.75,
+            "summary": "test", "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_notes": [],
+        })
+        mock_cfg = self._controlled_config("block_order")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertIsNotNone(result.get("ga_decision_id"), "Legacy signal must get a GA decision ID")
+
+        # Verify the GA decision was created with honest risk status
+        ga_id = result["ga_decision_id"]
+        ga_row = self.conn.execute(
+            "SELECT account_feedback_gate_json, risk_check_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(ga_row["account_feedback_gate_json"])
+        saved_gate = json.loads(ga_row["account_feedback_gate_json"])
+        self.assertEqual(saved_gate["would_decide"], "block_order")
+
+        # Risk check should be the pending marker (not fake approval)
+        risk_check = json.loads(ga_row["risk_check_json"])
+        self.assertFalse(risk_check["ok"], "Risk check must be honest (pending/false), not synthetic True")
+        self.assertTrue(risk_check.get("pending"), "Risk check should have pending marker")
+
+    def test_legacy_signal_risk_rejection_has_honest_audit(self) -> None:
+        """P1-2: Legacy signal risk rejection persists honest risk result, not synthetic approval."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        # Create a legacy signal WITHOUT ga_decision_id
+        trade_plan = {
+            "side": "LONG", "entry_type": "limit", "stop_loss": 49000.0,
+            "take_profits": [51000.0], "risk_percent": 0.5,
+            "invalid_condition": "below 49000", "reason": "test setup",
+        }
+        signal_id = self.repo.create_signal({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "signal_grade": "B", "confidence": 0.75,
+            "summary": "test", "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_notes": [],
+        })
+
+        # Patch risk validation to FAIL
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                    return_value={"ok": False, "reasons": ["止损距离不足"], "metrics": {}}):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("风控", result["error"])
+
+        # The GA decision should have been created with the REAL risk result
+        ga_rows = self.conn.execute(
+            "SELECT id, account_feedback_gate_json, risk_check_json FROM ga_decisions "
+            "WHERE decision_type = 'legacy_signal_compat' ORDER BY id DESC LIMIT 1"
+        ).fetchall()
+        self.assertGreaterEqual(len(ga_rows), 1, "GA decision must be created for legacy signal")
+        risk_check = json.loads(ga_rows[0]["risk_check_json"])
+        self.assertFalse(risk_check["ok"], "Risk check must show actual failure, not synthetic True")
+        self.assertIn("止损距离不足", risk_check["reasons"])
+
+        # Gate result should still be persisted
+        self.assertIsNotNone(ga_rows[0]["account_feedback_gate_json"],
+                             "Gate result must be persisted even when risk fails")
+
+    def test_downgrade_to_watch_is_idempotent(self) -> None:
+        """P1-3: downgrade_to_watch creates exactly 1 watch, idempotent on retry."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result1 = create_paper_order_from_signal(self.repo, signal_id)
+            result2 = create_paper_order_from_signal(self.repo, signal_id)
+
+        # Both calls should return gate_blocked
+        self.assertFalse(result1["ok"])
+        self.assertEqual(result1["error"], "gate_blocked")
+        self.assertFalse(result2["ok"])
+        self.assertEqual(result2["error"], "gate_blocked")
+
+        # Exactly 1 watch record, not 2
+        watch_rows = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            (ga_id,),
+        ).fetchall()
+        self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
+
+    def test_controlled_projection_in_shadow_gate(self) -> None:
+        """P2: Shadow mode gate result includes controlled_projection field."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        # Insert a consecutive_stop_losses pattern so gate activates
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+        )
+        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "2 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
+        )
+        self.conn.commit()
+
+        # Patch config to shadow mode
+        from unittest.mock import patch as _patch
+        mock_cfg = self._shadow_config("block_order")
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.60, None)
+
+        # Shadow mode: confidence 0.60 < 0.80, so passed=False (even in shadow)
+        # But controlled_projection must exist
+        self.assertFalse(result["passed"], "Confidence 0.60 < 0.80 threshold")
+        self.assertTrue(result["active"])
+
+        # controlled_projection must exist
+        self.assertIn("controlled_projection", result)
+        proj = result["controlled_projection"]
+        self.assertFalse(proj["would_pass"], "Controlled mode would block due to low confidence")
+        self.assertEqual(proj["would_decide"], "block_order")
+        self.assertFalse(proj["shadow_passed"], "Shadow mode also reports not passed for low confidence")
+        self.assertIsNotNone(proj["gating_factor"])
+        self.assertEqual(proj["gating_factor"], "confidence")
+
 
 if __name__ == "__main__":
     unittest.main()

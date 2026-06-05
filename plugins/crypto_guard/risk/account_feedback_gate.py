@@ -208,6 +208,22 @@ def check_account_feedback_gate(
         "mode": mode,
     }
 
+    # Controlled projection: what controlled mode would decide, even in shadow mode
+    controlled_projection = {
+        "would_pass": controlled_passed,
+        "would_decide": would_decide,
+        "shadow_passed": passed,  # what shadow mode reports
+        "gating_factor": None,
+    }
+    if not controlled_passed:
+        if not controlled_confidence_ok:
+            controlled_projection["gating_factor"] = "confidence"
+        elif not controlled_quality_ok and entry_quality is None:
+            controlled_projection["gating_factor"] = "missing_entry_quality"
+        elif not controlled_quality_ok:
+            controlled_projection["gating_factor"] = "entry_quality_below_threshold"
+    result["controlled_projection"] = controlled_projection
+
     # Log based on mode
     if mode == "shadow":
         LOGGER.info(
