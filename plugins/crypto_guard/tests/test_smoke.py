@@ -4848,6 +4848,28 @@ class PendingOrderManagerTest(unittest.TestCase):
         }
         return cfg
 
+    def _shadow_config(self, on_fail: str) -> object:
+        """Build a mock config with account_feedback_rules in shadow mode."""
+        from unittest.mock import MagicMock
+        cfg = MagicMock()
+        cfg.trading_mode = {
+            "account_feedback_rules": {
+                "enabled": True,
+                "mode": "shadow",
+                "lookback_hours": 24,
+                "affected_scope": "trigger_related_symbols",
+                "actions": {
+                    "require_stronger_confirmation": {
+                        "enabled": True,
+                        "min_confidence": 0.80,
+                        "min_entry_quality": 0.70,
+                        "on_fail": on_fail,
+                    }
+                },
+            }
+        }
+        return cfg
+
     def _create_signal_with_ga_decision(self) -> tuple[int, int]:
         """Create a signal with a full trade_plan linked to a GA decision.
         Returns (signal_id, ga_decision_id)."""
@@ -4986,6 +5008,190 @@ class PendingOrderManagerTest(unittest.TestCase):
         saved = json.loads(row["account_feedback_gate_json"])
         self.assertTrue(saved["active"])
         self.assertEqual(saved["would_decide"], "block_order")
+
+    # ---- P2 regression tests for P0 feedback gate hotfix ----
+
+    def test_shadow_mode_does_not_block_even_with_block_order_on_fail(self) -> None:
+        """Shadow mode: even with on_fail=block_order, orders proceed (P1-1 regression)."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._shadow_config("block_order")
+
+        # Patch risk validation to pass — we're testing gate behavior, not risk
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan", return_value={"ok": True, "reasons": [], "metrics": {}}):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # Shadow mode MUST NOT block — order should proceed
+        self.assertTrue(result["ok"], f"Shadow mode should not block even with on_fail=block_order: {result}")
+
+        # Gate result should still be persisted
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["account_feedback_gate_json"])
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["active"])
+        # would_decide reflects controlled mode (would block)
+        self.assertEqual(saved["would_decide"], "block_order")
+        # But actual decision is shadow-prefixed since mode=shadow
+        self.assertTrue(saved["decision"].startswith("shadow_"))
+
+    def test_risk_rejection_still_persists_gate_result(self) -> None:
+        """When risk validation fails, gate result is still persisted (P1-3 regression)."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+
+        # Patch risk validation to FAIL
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan", return_value={"ok": False, "reasons": ["止损距离不足"], "metrics": {}}):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # Risk should have blocked the order
+        self.assertFalse(result["ok"])
+        self.assertIn("风控", result["error"])
+
+        # But gate result MUST be persisted (P1-3 fix: persistence before risk validation)
+        row = self.conn.execute(
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["account_feedback_gate_json"], "Gate result must be persisted even when risk validation fails")
+        saved = json.loads(row["account_feedback_gate_json"])
+        self.assertTrue(saved["ok"])
+        self.assertIn("mode", saved)
+
+    def test_downgrade_to_watch_creates_opportunity_watch(self) -> None:
+        """Controlled mode downgrade_to_watch creates opportunity_watches record (P1-2)."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # Order should be blocked
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertEqual(result["gate_decision"], "downgrade_to_watch")
+
+        # Opportunity watch MUST be created (P1-2 fix)
+        watch_rows = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE symbol = ? AND direction = ?",
+            ("BTCUSDT", "LONG"),
+        ).fetchall()
+        self.assertGreaterEqual(len(watch_rows), 1, "downgrade_to_watch must create an opportunity_watches record")
+        watch = watch_rows[0]
+        self.assertEqual(watch["status"], "active")
+        self.assertIn("account_feedback_gate", watch["watch_reason"])
+        self.assertIsNotNone(watch["ga_decision_id"])
+
+    def test_symbol_side_pairs_no_cross_product(self) -> None:
+        """_get_affected_symbol_side_pairs returns exact pairs, not cross product (D4 regression)."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import _get_affected_symbol_side_pairs
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Create two trades: BTCUSDT/LONG and ETHUSDT/SHORT
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+        )
+        trade_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("ETHUSDT", "SHORT", 3000.0, 0.1, now),
+        )
+        trade_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create evolution trigger referencing both trades
+        self.conn.execute(
+            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) VALUES (?, ?, ?, ?)",
+            ("consecutive_stop_losses", "active", _json.dumps([trade_id_1, trade_id_2]), now),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+        )
+        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create events referencing the patch
+        events_raw = self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "2 consecutive stop losses",
+             _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
+        )
+        self.conn.commit()
+
+        # Fetch the events as the gate would
+        events = self.conn.execute(
+            "SELECT sfm.id, sfm.pattern_type, sfm.created_at, sp.candidate_version, et.related_trade_ids "
+            "FROM skill_feedback_memory sfm "
+            "LEFT JOIN strategy_patches sp ON sp.id = json_extract(sfm.suggested_adjustment_json, '$.candidate_patch_id') "
+            "LEFT JOIN evolution_triggers et ON et.id = sp.trigger_id "
+            "WHERE sfm.pattern_type = 'consecutive_stop_losses' ORDER BY sfm.created_at DESC"
+        ).fetchall()
+
+        pairs = _get_affected_symbol_side_pairs(self.repo, events)
+
+        # Must be exactly 2 pairs, not 4 (cross product)
+        self.assertEqual(len(pairs), 2, f"Expected 2 pairs, got {len(pairs)}: {pairs}")
+
+        pair_set = {(p["symbol"], p["side"]) for p in pairs}
+        self.assertIn(("BTCUSDT", "LONG"), pair_set)
+        self.assertIn(("ETHUSDT", "SHORT"), pair_set)
+        # Cross product would also include these — verify they're absent
+        self.assertNotIn(("BTCUSDT", "SHORT"), pair_set, "Cross product false positive: BTCUSDT/SHORT should not exist")
+        self.assertNotIn(("ETHUSDT", "LONG"), pair_set, "Cross product false positive: ETHUSDT/LONG should not exist")
+
+    def test_config_hierarchy_evolution_keys(self) -> None:
+        """Config hierarchy: min_r_count, online_shadow, stale_cleanup under evolution (D1 regression)."""
+        import yaml
+
+        config_path = os.path.join(os.path.dirname(__file__), "..", "config", "trading_mode.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        # These keys must be under evolution, NOT under account_feedback_rules
+        evolution = cfg.get("evolution", {})
+        feedback = cfg.get("account_feedback_rules", {})
+
+        # min_r_count_for_performance_gate under evolution.backtest_gate
+        self.assertIn("backtest_gate", evolution, "evolution.backtest_gate must exist")
+        self.assertIn("min_r_count_for_performance_gate", evolution["backtest_gate"],
+                      "min_r_count_for_performance_gate must be under evolution.backtest_gate")
+        self.assertEqual(evolution["backtest_gate"]["min_r_count_for_performance_gate"], 5)
+
+        # online_shadow under evolution
+        self.assertIn("online_shadow", evolution, "online_shadow must be under evolution")
+        self.assertIn("min_samples_after_backtest", evolution["online_shadow"])
+        self.assertEqual(evolution["online_shadow"]["min_samples_after_backtest"], 5)
+
+        # stale_cleanup under evolution
+        self.assertIn("stale_cleanup", evolution, "stale_cleanup must be under evolution")
+        self.assertIn("max_days", evolution["stale_cleanup"])
+
+        # These keys must NOT be under account_feedback_rules
+        feedback_actions = feedback.get("actions", {})
+        self.assertNotIn("min_r_count_for_performance_gate", feedback_actions,
+                         "min_r_count_for_performance_gate must NOT be under account_feedback_rules.actions")
+        self.assertNotIn("online_shadow", feedback,
+                         "online_shadow must NOT be under account_feedback_rules")
+        self.assertNotIn("stale_cleanup", feedback,
+                         "stale_cleanup must NOT be under account_feedback_rules")
 
 
 if __name__ == "__main__":

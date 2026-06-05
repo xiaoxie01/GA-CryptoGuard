@@ -175,8 +175,17 @@ def check_account_feedback_gate(
     elif not quality_ok:
         reasons.append(f"entry_quality {entry_quality:.2f} < {min_entry_quality:.2f}")
 
-    # Determine what controlled mode would decide
-    would_decide = on_fail if not passed else "passed"
+    # Compute would_decide based on controlled-mode logic (fail-closed)
+    # so shadow mode accurately reports what controlled mode would do
+    controlled_confidence_ok = confidence >= min_confidence
+    if entry_quality is None:
+        controlled_quality_ok = False  # fail-closed in controlled mode
+    elif entry_quality < min_entry_quality:
+        controlled_quality_ok = False
+    else:
+        controlled_quality_ok = True
+    controlled_passed = controlled_confidence_ok and controlled_quality_ok
+    would_decide = on_fail if not controlled_passed else "passed"
 
     # In shadow mode, record what would happen but don't enforce
     # In controlled mode, the decision IS the enforcement
