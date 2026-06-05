@@ -5359,6 +5359,150 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIsNotNone(proj["gating_factor"])
         self.assertEqual(proj["gating_factor"], "confidence")
 
+    # ---- P0 round 3 regression tests ----
+
+    def test_watch_condition_is_valid_structure(self) -> None:
+        """P1-1: _create_opportunity_watch_from_gate stores valid watch condition, not raw gate JSON."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+        self.assertEqual(result["gate_decision"], "downgrade_to_watch")
+
+        # Read back the created watch
+        watch_rows = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            (ga_id,),
+        ).fetchall()
+        self.assertEqual(len(watch_rows), 1, "Must be exactly 1 watch")
+
+        watch = watch_rows[0]
+        watch_condition = json.loads(watch["watch_condition_json"])
+
+        # Assert: watch_condition_json has structured manual_review format
+        self.assertIsInstance(watch_condition, dict, "watch_condition must be a dict")
+        self.assertEqual(watch_condition.get("type"), "manual_review",
+                         "Must be type='manual_review', not raw gate JSON")
+        self.assertEqual(watch_condition.get("source"), "account_feedback_gate")
+
+        # Assert: contains gate detail fields
+        self.assertIn("gate_decision", watch_condition)
+        self.assertIn("gate_reason", watch_condition)
+        self.assertIn("actual_confidence", watch_condition)
+        self.assertIn("required_min_confidence", watch_condition)
+
+        # Assert: does NOT contain raw gate top-level fields
+        self.assertNotIn("ok", watch_condition,
+                         "watch_condition must NOT contain raw gate field 'ok'")
+        self.assertNotIn("active", watch_condition,
+                         "watch_condition must NOT contain raw gate field 'active'")
+        self.assertNotIn("mode", watch_condition,
+                         "watch_condition must NOT contain raw gate field 'mode'")
+
+        # Assert: has expires_at (sqlite3.Row uses index access, not .get())
+        self.assertIsNotNone(watch["expires_at"] if "expires_at" in watch.keys() else None,
+                             "Gate-downgraded watch must have expires_at")
+
+    def test_controlled_projection_in_gate_stats(self) -> None:
+        """P1-2: _fetch_account_feedback_gate_stats reports controlled_projection."""
+        import json as _json
+        from plugins.crypto_guard.notify.hourly_report import _fetch_account_feedback_gate_stats
+
+        # Create a GA decision with a saved gate result that has
+        # controlled_projection.would_pass = false
+        gate_json = _json.dumps({
+            "ok": True,
+            "active": True,
+            "action": "require_stronger_confirmation",
+            "required": {"min_confidence": 0.80, "min_entry_quality": 0.70},
+            "actual": {"confidence": 0.60, "entry_quality": 0.50},
+            "passed": False,
+            "decision": "shadow_require_stronger_confirmation",
+            "would_decide": "block_order",
+            "reason": "confidence 0.60 < 0.80; entry_quality 0.50 < 0.70",
+            "lookback_hours": 24,
+            "events_matched": 1,
+            "affected_pairs": [{"symbol": "BTCUSDT", "side": "LONG"}],
+            "entry_quality_status": "below_threshold",
+            "mode": "shadow",
+            "controlled_projection": {
+                "would_pass": False,
+                "would_decide": "block_order",
+                "shadow_passed": False,
+                "gating_factor": "confidence",
+            },
+        }, ensure_ascii=False)
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "LONG", "entry_type": "limit", "stop_loss": 49000.0,
+            "take_profits": [51000.0], "risk_percent": 0.5,
+            "invalid_condition": "below 49000", "reason": "test",
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.60,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": 1700000000000, "analysis_time_utc": now,
+        })
+        # account_feedback_gate_json is not in the standard create_ga_decision INSERT,
+        # so we set it via direct UPDATE
+        self.conn.execute(
+            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            (gate_json, ga_id),
+        )
+        self.conn.commit()
+
+        stats = _fetch_account_feedback_gate_stats(self.repo)
+
+        self.assertEqual(stats["total_checks"], 1)
+        self.assertEqual(stats["active_checks"], 1)
+        self.assertGreater(stats["controlled_blocked"], 0,
+                           "controlled_blocked must be > 0 when would_pass=false")
+        self.assertIsNotNone(stats.get("controlled_gating_factors"))
+        self.assertIn("confidence", stats["controlled_gating_factors"])
+
+    def test_downgrade_to_watch_condition_structure_on_idempotent_retry(self) -> None:
+        """P1-1 + P1-3: idempotent retry still uses structured watch condition."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result1 = create_paper_order_from_signal(self.repo, signal_id)
+            result2 = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result1["ok"])
+        self.assertFalse(result2["ok"])
+
+        # Exactly 1 watch record
+        watch_rows = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            (ga_id,),
+        ).fetchall()
+        self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
+
+        # Verify the stored watch condition is the new structured format
+        watch_condition = json.loads(watch_rows[0]["watch_condition_json"])
+        self.assertEqual(watch_condition.get("type"), "manual_review")
+        self.assertEqual(watch_condition.get("source"), "account_feedback_gate")
+        self.assertNotIn("ok", watch_condition,
+                         "watch_condition must NOT contain raw gate field 'ok' on idempotent retry")
+
 
 if __name__ == "__main__":
     unittest.main()

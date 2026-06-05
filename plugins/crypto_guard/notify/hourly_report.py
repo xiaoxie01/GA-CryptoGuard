@@ -225,6 +225,14 @@ def render_ga_hourly_summary(
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
+            # Controlled projection for shadow mode (P1-2: report would-block stats)
+            if gate.get("controlled_blocked", 0) > 0:
+                lines.append(f"- 受控模式预判会被阻止：{gate['controlled_blocked']} 次")
+                if gate.get("controlled_gating_factors"):
+                    factor_text = "，".join(
+                        f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
+                    )
+                    lines.append(f"  - 受阻因素：{factor_text}")
 
     lines.extend(["", "**八、风险事件**"])
     if failed_jobs:
@@ -400,6 +408,8 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
         active = 0
         not_passed = 0
         decision_counts: dict[str, int] = {}
+        controlled_blocked = 0
+        controlled_gating_factors: dict[str, int] = {}
 
         for row in rows:
             try:
@@ -413,12 +423,22 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
             decision = gate.get("decision", "unknown")
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
 
+            # Extract controlled_projection for shadow mode reporting
+            controlled_proj = gate.get("controlled_projection", {})
+            if controlled_proj:
+                if not controlled_proj.get("would_pass"):
+                    controlled_blocked += 1
+                    gating_factor = controlled_proj.get("gating_factor", "unknown")
+                    controlled_gating_factors[gating_factor] = controlled_gating_factors.get(gating_factor, 0) + 1
+
         return {
             "ok": True,
             "total_checks": total,
             "active_checks": active,
             "not_passed": not_passed,
             "decision_counts": decision_counts,
+            "controlled_blocked": controlled_blocked,
+            "controlled_gating_factors": controlled_gating_factors,
         }
     except Exception as exc:
         return {"error": str(exc), "total_checks": 0}
@@ -564,6 +584,14 @@ def render_hourly_report_text(
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
+            # Controlled projection for shadow mode (P1-2: report would-block stats)
+            if gate.get("controlled_blocked", 0) > 0:
+                lines.append(f"- 受控模式预判会被阻止：{gate['controlled_blocked']} 次")
+                if gate.get("controlled_gating_factors"):
+                    factor_text = "，".join(
+                        f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
+                    )
+                    lines.append(f"  - 受阻因素：{factor_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
     health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"

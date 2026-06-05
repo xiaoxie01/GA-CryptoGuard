@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy
@@ -428,16 +429,40 @@ def _create_opportunity_watch_from_gate(
     Deduplicates on (ga_decision_id, watch_reason) to prevent duplicate
     active watches on retry/re-entry.
 
+    Stores a structured manual_review watch condition (not raw gate JSON)
+    so the opportunity watcher can evaluate it. Raw gate JSON objects are
+    not valid watch conditions and can never trigger.
+
     Returns watch_id or None on failure.
     """
     if not ga_decision_id:
         return None
 
     watch_reason = f"account_feedback_gate: {gate_result.get('reason', '')}"
-    watch_condition = json.dumps(gate_result, ensure_ascii=False)
+
+    # Store a proper watch condition that the watcher can evaluate.
+    # Since this is a gate-downgraded signal, the watch should be a
+    # manual-review watch (not auto-triggering). Store structured data
+    # so the watcher can recognize it.
+    watch_condition = json.dumps({
+        "type": "manual_review",
+        "source": "account_feedback_gate",
+        "gate_decision": gate_result.get("would_decide", ""),
+        "gate_reason": gate_result.get("reason", ""),
+        "gate_mode": gate_result.get("mode", ""),
+        "entry_quality_status": gate_result.get("entry_quality_status", ""),
+        "actual_confidence": gate_result.get("actual", {}).get("confidence"),
+        "actual_entry_quality": gate_result.get("actual", {}).get("entry_quality"),
+        "required_min_confidence": gate_result.get("required", {}).get("min_confidence"),
+        "required_min_entry_quality": gate_result.get("required", {}).get("min_entry_quality"),
+    }, ensure_ascii=False)
+
+    # 24-hour TTL for gate-downgraded watches
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
 
     try:
-        # Check for existing watch (idempotent)
+        # Use IMMEDIATE transaction for concurrent safety (P2 fix)
+        repo.conn.execute("BEGIN IMMEDIATE")
         existing = repo.conn.execute(
             "SELECT id FROM opportunity_watches "
             "WHERE ga_decision_id = ? AND watch_reason = ? AND status = 'active' "
@@ -446,17 +471,22 @@ def _create_opportunity_watch_from_gate(
         ).fetchone()
 
         if existing:
+            repo.conn.execute("COMMIT")
             return int(existing["id"])
 
         cursor = repo.conn.execute(
             "INSERT INTO opportunity_watches "
-            "(symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id) "
-            "VALUES (?, ?, ?, ?, 'active', ?)",
-            (symbol, side, watch_reason, watch_condition, int(ga_decision_id)),
+            "(symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id, expires_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            (symbol, side, watch_reason, watch_condition, int(ga_decision_id), expires_at),
         )
         repo.conn.commit()
         return int(cursor.lastrowid)
     except Exception:
+        try:
+            repo.conn.execute("ROLLBACK")
+        except Exception:
+            pass
         import logging
         logging.getLogger("crypto_guard.paper_broker").warning(
             "Failed to create opportunity watch from gate: ga_decision_id=%s", ga_decision_id,
