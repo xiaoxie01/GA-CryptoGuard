@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 11
-- **Last Active**: 2026-06-04
+- **Total Sessions**: 12
+- **Last Active**: 2026-06-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~372 | Active |
+| `journal-1.md` | ~405 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-06-05 | P2 Hotfix: Schema Migration, Time Comparison, Test Fixes | `c3885ba` | `main` |
 | 11 | 2026-06-04 | P2 Bug Fixes: Schema Health, Diagnostics, TTL, Time Comparison | `e23a70d` | `main` |
 | 10 | 2026-06-04 | P2 State Diagnostics + Reports + Rules Dry-Run + Feedback TTL | `240ec80` | `main` |
 | 9 | 2026-06-04 | P1 Shadow Failure + Structured Feedback + LONG Gate | `8402aee` | `main` |
