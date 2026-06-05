@@ -475,10 +475,20 @@ def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
 def _apply_account_feedback_gate_migration(conn: sqlite3.Connection) -> None:
     """Add account_feedback_gate_json column to ga_decisions for gate results."""
     _add_column(conn, "ga_decisions", "account_feedback_gate_json", "TEXT")
+    # dedupe_key for opportunity_watches (P0 hotfix: Fix 4)
+    _add_column(conn, "opportunity_watches", "dedupe_key", "TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe "
+        "ON opportunity_watches(dedupe_key)"
+    )
 
 
-def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, Any]:
+def check_schema_health(config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
+
+    Args:
+        config: Optional config for database path. If conn is provided, config is ignored.
+        conn: Optional existing connection. If provided, this is used instead of creating a new one.
 
     Returns:
         {
@@ -487,13 +497,19 @@ def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, An
             tables_checked: [str],
         }
     """
-    cfg = config or load_config()
-    conn = connect_db(cfg.database_path)
+    if conn is not None:
+        own_conn = None
+        _conn = conn
+    else:
+        cfg = config or load_config()
+        _conn = connect_db(cfg.database_path)
+        own_conn = _conn
 
     # Required columns for skill_feedback_memory
     required_columns = {
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
         "ga_decisions": ["account_feedback_gate_json"],
+        "opportunity_watches": ["dedupe_key"],
     }
 
     missing: list[dict[str, str]] = []
@@ -503,7 +519,7 @@ def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, An
         for table, columns in required_columns.items():
             tables_checked.append(table)
             # Check if table exists
-            table_exists = conn.execute(
+            table_exists = _conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (table,)
             ).fetchone()
@@ -514,7 +530,7 @@ def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, An
                 continue
 
             # Check columns
-            existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            existing_cols = {row["name"] for row in _conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for col in columns:
                 if col not in existing_cols:
                     missing.append({"table": table, "column": col})
@@ -525,4 +541,5 @@ def check_schema_health(config: CryptoGuardConfig | None = None) -> dict[str, An
             "tables_checked": tables_checked,
         }
     finally:
-        conn.close()
+        if own_conn is not None:
+            own_conn.close()

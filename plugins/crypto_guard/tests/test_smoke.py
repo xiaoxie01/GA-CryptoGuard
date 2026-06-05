@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import json
 import tempfile
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 
 class CryptoGuardSmokeTest(unittest.TestCase):
@@ -5387,17 +5389,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         watch = watch_rows[0]
         watch_condition = json.loads(watch["watch_condition_json"])
 
-        # Assert: watch_condition_json has structured manual_review format
+        # Assert: watch_condition_json has structured account_feedback_recheck format
         self.assertIsInstance(watch_condition, dict, "watch_condition must be a dict")
-        self.assertEqual(watch_condition.get("type"), "manual_review",
-                         "Must be type='manual_review', not raw gate JSON")
+        self.assertEqual(watch_condition.get("type"), "account_feedback_recheck",
+                         "Must be type='account_feedback_recheck', not raw gate JSON")
         self.assertEqual(watch_condition.get("source"), "account_feedback_gate")
 
         # Assert: contains gate detail fields
         self.assertIn("gate_decision", watch_condition)
         self.assertIn("gate_reason", watch_condition)
-        self.assertIn("actual_confidence", watch_condition)
-        self.assertIn("required_min_confidence", watch_condition)
+        self.assertIn("original_confidence", watch_condition)
+        self.assertIn("min_confidence", watch_condition)
 
         # Assert: does NOT contain raw gate top-level fields
         self.assertNotIn("ok", watch_condition,
@@ -5498,10 +5500,464 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify the stored watch condition is the new structured format
         watch_condition = json.loads(watch_rows[0]["watch_condition_json"])
-        self.assertEqual(watch_condition.get("type"), "manual_review")
+        self.assertEqual(watch_condition.get("type"), "account_feedback_recheck")
         self.assertEqual(watch_condition.get("source"), "account_feedback_gate")
         self.assertNotIn("ok", watch_condition,
                          "watch_condition must NOT contain raw gate field 'ok' on idempotent retry")
+
+    # =========================================================================
+    # P0 Hotfix: 10 new tests (Fix 1-10)
+    # =========================================================================
+
+    def test_outer_transaction_not_rolled_back(self) -> None:
+        """Fix 1: Creating a watch inside an existing transaction doesn't roll back outer work."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "gate_blocked")
+
+        # Verify the signal still exists (outer work not rolled back)
+        signal = self.repo.get_signal(signal_id)
+        self.assertIsNotNone(signal, "Signal must still exist after gate block")
+
+        # Verify the GA decision was created
+        ga_row = self.conn.execute(
+            "SELECT id FROM ga_decisions WHERE id = ?", (ga_id,)
+        ).fetchone()
+        self.assertIsNotNone(ga_row, "GA decision must exist after gate block")
+
+    def test_concurrent_watch_creation_single_record(self) -> None:
+        """Fix 1: Two calls with same dedupe_key produce exactly 1 watch (via UPSERT)."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            create_paper_order_from_signal(self.repo, signal_id)
+            create_paper_order_from_signal(self.repo, signal_id)
+
+        # Exactly 1 watch
+        watch_rows = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            (ga_id,),
+        ).fetchall()
+        self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
+
+    def test_repeat_watch_updates_ttl_and_condition(self) -> None:
+        """Fix 1: Second call with same dedupe_key updates expires_at and watch_condition_json."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+
+        self._insert_gate_triggering_chain()
+        signal_id, ga_id = self._create_signal_with_ga_decision()
+        mock_cfg = self._controlled_config("downgrade_to_watch")
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            create_paper_order_from_signal(self.repo, signal_id)
+
+        # Get the first watch
+        watch1 = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            (ga_id,),
+        ).fetchone()
+        first_expires = watch1["expires_at"]
+        first_id = watch1["id"]
+
+        # Modify the expires_at to an old value to force refresh
+        old_expires = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        self.conn.execute(
+            "UPDATE opportunity_watches SET expires_at = ? WHERE id = ?",
+            (old_expires, first_id),
+        )
+        self.conn.commit()
+
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+            create_paper_order_from_signal(self.repo, signal_id)
+
+        watch2 = self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            (ga_id,),
+        ).fetchone()
+
+        # Only 1 row (UPSERT, not INSERT)
+        watch_rows = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM opportunity_watches WHERE ga_decision_id = ?",
+            (ga_id,),
+        ).fetchone()
+        self.assertEqual(watch_rows["cnt"], 1)
+
+        # expires_at should be refreshed (not the old value)
+        self.assertIsNotNone(watch2["expires_at"])
+        self.assertNotEqual(old_expires, watch2["expires_at"],
+                           "UPSERT should refresh expires_at on repeat call")
+
+    def test_account_feedback_recheck_deterministic(self) -> None:
+        """Fix 3: The recheck function returns correct statuses."""
+        from plugins.crypto_guard.scheduler.opportunity_watcher import _check_account_feedback_recheck
+
+        # Create a watch with account_feedback_recheck condition
+        condition = {
+            "type": "account_feedback_recheck",
+            "source": "account_feedback_gate",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "original_confidence": 0.60,
+            "min_confidence": 0.80,
+            "min_entry_quality": 0.70,
+            "gate_decision": "downgrade_to_watch",
+            "gate_reason": "test",
+            "created_at": "2026-06-05T00:00:00+00:00",
+        }
+        watch_condition_json = json.dumps(condition, ensure_ascii=False)
+        from datetime import datetime, timedelta, timezone
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+
+        self.conn.execute(
+            "INSERT INTO opportunity_watches "
+            "(symbol, direction, watch_reason, watch_condition_json, status, expires_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?)",
+            ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at),
+        )
+        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+
+        watch = dict(self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+        ).fetchone())
+
+        # No GA decision exists yet -- should return "waiting"
+        result = _check_account_feedback_recheck(self.repo, watch, condition)
+        self.assertEqual(result["status"], "waiting")
+        self.assertIn("等待新的 GA", result["reason"])
+
+        # Create a GA decision with low confidence (below threshold)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "monitor_only",
+            "decision_type": "test", "signal_grade": "C", "confidence": 0.55,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": False, "trade_plan": {},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        self.conn.commit()
+
+        result2 = _check_account_feedback_recheck(self.repo, watch, condition)
+        self.assertEqual(result2["status"], "waiting")
+        self.assertIn("0.55", result2["reason"])  # confidence value appears in reason
+
+        # Create a GA decision with high confidence (above threshold)
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.85,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": {"side": "LONG"},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms + 1, "analysis_time_utc": now_iso,
+        })
+        self.conn.commit()
+
+        result3 = _check_account_feedback_recheck(self.repo, watch, condition)
+        self.assertEqual(result3["status"], "triggered")
+        self.assertIn("account_feedback_recheck", result3["reason"])
+
+    def test_waiting_watch_skips_llm(self) -> None:
+        """Fix 3: Verify the watcher doesn't call LLM for waiting-status watches."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.scheduler.opportunity_watcher import update_opportunity_watches
+
+        # Create a watch that will be "waiting" (no candles, no conditions met)
+        self.conn.execute(
+            "INSERT INTO opportunity_watches "
+            "(symbol, direction, watch_reason, watch_condition_json, status) "
+            "VALUES (?, ?, ?, ?, 'active')",
+            ("BTCUSDT", "LONG", "test", json.dumps({"type": "price_above", "level": 999999.0}),),
+        )
+        self.conn.commit()
+
+        # Mock the LLM call to verify it's NOT called for waiting watches
+        with _patch("plugins.crypto_guard.scheduler.opportunity_watcher.run_agent_json_task") as mock_llm:
+            result = update_opportunity_watches(self.repo)
+
+        self.assertTrue(result["ok"])
+        # LLM should NOT be called for waiting watches
+        mock_llm.assert_not_called()
+
+    def test_annotate_only_not_counted_as_blocked(self) -> None:
+        """Fix 5: projected_annotate_only is separate from projected blocked count."""
+        from plugins.crypto_guard.notify.hourly_report import _fetch_account_feedback_gate_stats
+
+        # Create GA decisions with gate results
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # annotate_only gate result
+        gate_annotate = json.dumps({
+            "ok": True, "active": True, "passed": False,
+            "decision": "shadow_annotate_only", "would_decide": "annotate_only",
+            "mode": "shadow",
+            "controlled_projection": {
+                "would_pass": False, "would_decide": "annotate_only",
+                "shadow_passed": False, "gating_factor": "confidence",
+            },
+        }, ensure_ascii=False)
+
+        # block_order gate result
+        gate_block = json.dumps({
+            "ok": True, "active": True, "passed": False,
+            "decision": "shadow_block_order", "would_decide": "block_order",
+            "mode": "shadow",
+            "controlled_projection": {
+                "would_pass": False, "would_decide": "block_order",
+                "shadow_passed": False, "gating_factor": "confidence",
+            },
+        }, ensure_ascii=False)
+
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "monitor_only",
+            "decision_type": "test", "signal_grade": "C", "confidence": 0.55,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": False, "trade_plan": {},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": 1700000000000, "analysis_time_utc": now,
+        })
+        ga_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            (gate_annotate, ga_id_1),
+        )
+
+        self.repo.create_ga_decision({
+            "symbol": "ETHUSDT", "decision": "monitor_only",
+            "decision_type": "test", "signal_grade": "C", "confidence": 0.55,
+            "summary": "test", "market_bias": "bearish", "trend_stage": "middle",
+            "has_trade_plan": False, "trade_plan": {},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": 1700000000000, "analysis_time_utc": now,
+        })
+        ga_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            (gate_block, ga_id_2),
+        )
+        self.conn.commit()
+
+        stats = _fetch_account_feedback_gate_stats(self.repo)
+
+        self.assertEqual(stats["total_checks"], 2)
+        self.assertEqual(stats["projected_annotate_only"], 1)
+        self.assertEqual(stats["projected_block_order"], 1)
+        self.assertEqual(stats["projected_downgrade_to_watch"], 0)
+        # controlled_blocked = downgrade + block only (not annotate)
+        self.assertEqual(stats["controlled_blocked"], 1,
+                        "controlled_blocked must exclude annotate_only")
+
+    def test_downgrade_and_block_separately_counted(self) -> None:
+        """Fix 5: projected_downgrade_to_watch and projected_block_order tracked separately."""
+        from plugins.crypto_guard.notify.hourly_report import _fetch_account_feedback_gate_stats
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        gate_downgrade = json.dumps({
+            "ok": True, "active": True, "passed": False,
+            "decision": "shadow_downgrade_to_watch", "would_decide": "downgrade_to_watch",
+            "mode": "shadow",
+            "controlled_projection": {
+                "would_pass": False, "would_decide": "downgrade_to_watch",
+                "shadow_passed": False, "gating_factor": "missing_entry_quality",
+            },
+        }, ensure_ascii=False)
+
+        gate_block = json.dumps({
+            "ok": True, "active": True, "passed": False,
+            "decision": "shadow_block_order", "would_decide": "block_order",
+            "mode": "shadow",
+            "controlled_projection": {
+                "would_pass": False, "would_decide": "block_order",
+                "shadow_passed": False, "gating_factor": "entry_quality_below_threshold",
+            },
+        }, ensure_ascii=False)
+
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "monitor_only",
+            "decision_type": "test", "signal_grade": "C", "confidence": 0.55,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": False, "trade_plan": {},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": 1700000000000, "analysis_time_utc": now,
+        })
+        ga_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+                          (gate_downgrade, ga_id_1))
+
+        self.repo.create_ga_decision({
+            "symbol": "ETHUSDT", "decision": "monitor_only",
+            "decision_type": "test", "signal_grade": "C", "confidence": 0.55,
+            "summary": "test", "market_bias": "bearish", "trend_stage": "middle",
+            "has_trade_plan": False, "trade_plan": {},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": 1700000000000, "analysis_time_utc": now,
+        })
+        ga_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+                          (gate_block, ga_id_2))
+        self.conn.commit()
+
+        stats = _fetch_account_feedback_gate_stats(self.repo)
+
+        self.assertEqual(stats["projected_downgrade_to_watch"], 1)
+        self.assertEqual(stats["projected_block_order"], 1)
+        self.assertEqual(stats["controlled_blocked"], 2)
+
+    def test_schema_unhealthy_fail_closed_in_controlled(self) -> None:
+        """Fix 7: Controlled mode with unhealthy schema returns passed=False."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        # Mock schema health to return unhealthy
+        with _patch("plugins.crypto_guard.risk.account_feedback_gate.check_schema_health",
+                    return_value={"ok": False, "missing_columns": [{"table": "test", "column": "test"}]}):
+            # Default config is shadow mode
+            result_shadow = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.75)
+            self.assertTrue(result_shadow["ok"])
+            self.assertTrue(result_shadow["passed"])
+            self.assertEqual(result_shadow["decision"], "data_quality_insufficient")
+
+            # With controlled mode config
+            mock_cfg = self._controlled_config("downgrade_to_watch")
+            with _patch("plugins.crypto_guard.risk.account_feedback_gate.load_config", return_value=mock_cfg):
+                result_controlled = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.75)
+                self.assertFalse(result_controlled["ok"])
+                self.assertFalse(result_controlled["passed"])
+                self.assertEqual(result_controlled["would_decide"], "downgrade_to_watch")
+                self.assertEqual(result_controlled["reason"], "schema unhealthy")
+
+    def test_duplicate_feedback_deduped_by_trigger(self) -> None:
+        """Fix 8: Multiple feedback rows for same trigger count as 1 unique event."""
+        import json as _json
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.risk.account_feedback_gate import check_account_feedback_gate
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Create one trade
+        self.conn.execute(
+            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create one evolution trigger
+        self.conn.execute(
+            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create one strategy_patch
+        self.conn.execute(
+            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+        )
+        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create TWO feedback rows for the same patch (duplicate by candidate_patch_id)
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "loss 1",
+             _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
+        )
+        self.conn.execute(
+            "INSERT INTO skill_feedback_memory "
+            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+            "suggested_adjustment_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+             "consecutive_stop_losses", "loss 2",
+             _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
+        )
+        self.conn.commit()
+
+        result = check_account_feedback_gate(self.repo, "BTCUSDT", "LONG", 0.60, None)
+
+        self.assertTrue(result["active"])
+        # feedback_row_count should be 2 (raw rows)
+        self.assertEqual(result["feedback_row_count"], 2)
+        # unique_event_count should be 1 (deduped by candidate_patch_id)
+        self.assertEqual(result["unique_event_count"], 1)
+        # events_matched should be 1 (deduped)
+        self.assertEqual(result["events_matched"], 1)
+
+    def test_both_report_renderers_consistent(self) -> None:
+        """Fix 5+10: render_ga_hourly_summary and render_hourly_report_text produce consistent gate stats."""
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary,
+            render_hourly_report_text,
+        )
+
+        gate_stats = {
+            "ok": True,
+            "total_checks": 10,
+            "valid_checks": 9,
+            "invalid_json_count": 1,
+            "active_checks": 5,
+            "not_passed": 3,
+            "decision_counts": {"shadow_annotate_only": 2, "shadow_block_order": 1},
+            "controlled_blocked": 2,
+            "projected_annotate_only": 1,
+            "projected_downgrade_to_watch": 1,
+            "projected_block_order": 1,
+            "controlled_gating_factors": {"confidence": 1, "missing_entry_quality": 1},
+        }
+
+        summary_text = render_ga_hourly_summary(
+            "2026-06-05T00:00:00Z",
+            ["BTCUSDT"], [], [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            account_feedback_gate=gate_stats,
+        )
+        report_text = render_hourly_report_text(
+            "2026-06-05T00:00:00Z",
+            ["BTCUSDT"], [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            account_feedback_gate=gate_stats,
+        )
+
+        # Both should contain the gate section
+        self.assertIn("账户反馈门禁", summary_text)
+        self.assertIn("账户反馈门禁", report_text)
+
+        # Both should show the breakdown
+        self.assertIn("仅注释=1", summary_text)
+        self.assertIn("降级观察=1", summary_text)
+        self.assertIn("阻止=1", summary_text)
+        self.assertIn("合计会被阻止=2", summary_text)
+
+        self.assertIn("仅注释=1", report_text)
+        self.assertIn("降级观察=1", report_text)
+        self.assertIn("阻止=1", report_text)
+        self.assertIn("合计会被阻止=2", report_text)
+
+        # Both should show invalid JSON count
+        self.assertIn("JSON 解析失败", summary_text)
+        self.assertIn("JSON 解析失败", report_text)
 
 
 if __name__ == "__main__":

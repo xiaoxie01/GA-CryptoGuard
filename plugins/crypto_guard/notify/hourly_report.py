@@ -222,17 +222,26 @@ def render_ga_hourly_summary(
                 f"门禁激活：{gate['active_checks']}；"
                 f"未通过：{gate['not_passed']}"
             )
+            if gate.get("invalid_json_count", 0) > 0:
+                lines.append(f"- JSON 解析失败：{gate['invalid_json_count']} 条（有效：{gate.get('valid_checks', 0)}）")
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
-            # Controlled projection for shadow mode (P1-2: report would-block stats)
-            if gate.get("controlled_blocked", 0) > 0:
-                lines.append(f"- 受控模式预判会被阻止：{gate['controlled_blocked']} 次")
-                if gate.get("controlled_gating_factors"):
-                    factor_text = "，".join(
-                        f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
-                    )
-                    lines.append(f"  - 受阻因素：{factor_text}")
+            # Controlled projection breakdown (Fix 5)
+            projected_blocks = gate.get("controlled_blocked", 0)
+            pao = gate.get("projected_annotate_only", 0)
+            pdw = gate.get("projected_downgrade_to_watch", 0)
+            pbo = gate.get("projected_block_order", 0)
+            if pao > 0 or pdw > 0 or pbo > 0:
+                lines.append(
+                    f"- 受控模式预判：仅注释={pao}；降级观察={pdw}；阻止={pbo}；"
+                    f"合计会被阻止={projected_blocks}"
+                )
+            if gate.get("controlled_gating_factors"):
+                factor_text = "，".join(
+                    f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
+                )
+                lines.append(f"  - 受阻因素：{factor_text}")
 
     lines.extend(["", "**八、风险事件**"])
     if failed_jobs:
@@ -410,12 +419,21 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
         decision_counts: dict[str, int] = {}
         controlled_blocked = 0
         controlled_gating_factors: dict[str, int] = {}
+        projected_annotate_only = 0
+        projected_downgrade_to_watch = 0
+        projected_block_order = 0
+        valid_checks = 0
+        invalid_json_count = 0
 
         for row in rows:
             try:
                 gate = json.loads(row["account_feedback_gate_json"])
             except (json.JSONDecodeError, TypeError):
+                invalid_json_count += 1
                 continue
+
+            valid_checks += 1
+
             if gate.get("active"):
                 active += 1
             if gate.get("passed") is False:
@@ -423,9 +441,17 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
             decision = gate.get("decision", "unknown")
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
 
-            # Extract controlled_projection for shadow mode reporting
+            # Extract controlled_projection for shadow mode reporting (Fix 5)
             controlled_proj = gate.get("controlled_projection", {})
             if controlled_proj:
+                would_decide = controlled_proj.get("would_decide", "")
+                if would_decide == "annotate_only":
+                    projected_annotate_only += 1
+                elif would_decide == "downgrade_to_watch":
+                    projected_downgrade_to_watch += 1
+                elif would_decide == "block_order":
+                    projected_block_order += 1
+
                 if not controlled_proj.get("would_pass"):
                     controlled_blocked += 1
                     gating_factor = controlled_proj.get("gating_factor", "unknown")
@@ -434,10 +460,15 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
         return {
             "ok": True,
             "total_checks": total,
+            "valid_checks": valid_checks,
+            "invalid_json_count": invalid_json_count,
             "active_checks": active,
             "not_passed": not_passed,
             "decision_counts": decision_counts,
-            "controlled_blocked": controlled_blocked,
+            "controlled_blocked": projected_downgrade_to_watch + projected_block_order,
+            "projected_annotate_only": projected_annotate_only,
+            "projected_downgrade_to_watch": projected_downgrade_to_watch,
+            "projected_block_order": projected_block_order,
             "controlled_gating_factors": controlled_gating_factors,
         }
     except Exception as exc:
@@ -581,17 +612,26 @@ def render_hourly_report_text(
                 f"门禁激活：{gate['active_checks']}；"
                 f"未通过：{gate['not_passed']}"
             )
+            if gate.get("invalid_json_count", 0) > 0:
+                lines.append(f"- JSON 解析失败：{gate['invalid_json_count']} 条（有效：{gate.get('valid_checks', 0)}）")
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
-            # Controlled projection for shadow mode (P1-2: report would-block stats)
-            if gate.get("controlled_blocked", 0) > 0:
-                lines.append(f"- 受控模式预判会被阻止：{gate['controlled_blocked']} 次")
-                if gate.get("controlled_gating_factors"):
-                    factor_text = "，".join(
-                        f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
-                    )
-                    lines.append(f"  - 受阻因素：{factor_text}")
+            # Controlled projection breakdown (Fix 5)
+            projected_blocks = gate.get("controlled_blocked", 0)
+            pao = gate.get("projected_annotate_only", 0)
+            pdw = gate.get("projected_downgrade_to_watch", 0)
+            pbo = gate.get("projected_block_order", 0)
+            if pao > 0 or pdw > 0 or pbo > 0:
+                lines.append(
+                    f"- 受控模式预判：仅注释={pao}；降级观察={pdw}；阻止={pbo}；"
+                    f"合计会被阻止={projected_blocks}"
+                )
+            if gate.get("controlled_gating_factors"):
+                factor_text = "，".join(
+                    f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
+                )
+                lines.append(f"  - 受阻因素：{factor_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
     health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"

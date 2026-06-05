@@ -228,10 +228,12 @@ CREATE TABLE IF NOT EXISTS opportunity_watches (
     ga_decision_id INTEGER,
     created_by_user_action INTEGER DEFAULT 0,
     source_button_action TEXT,
+    dedupe_key TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_opportunity_status_symbol ON opportunity_watches(status, symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe ON opportunity_watches(dedupe_key);
 
 CREATE TABLE IF NOT EXISTS paper_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

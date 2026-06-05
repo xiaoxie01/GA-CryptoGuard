@@ -61,16 +61,44 @@ def check_account_feedback_gate(
     # Schema health guard
     schema = check_schema_health()
     if not schema["ok"]:
-        return {"ok": False, "error": "schema_unhealthy", "active": False, "passed": True, "decision": "error", "would_decide": "error"}
+        # Load config to determine mode
+        cfg_schema = load_config().trading_mode
+        gate_cfg_schema = cfg_schema.get("account_feedback_rules", {})
+        mode_schema = gate_cfg_schema.get("mode", "shadow")
+
+        if mode_schema == "shadow":
+            return {
+                "ok": True,
+                "active": False,
+                "passed": True,
+                "decision": "data_quality_insufficient",
+                "would_decide": "data_quality_insufficient",
+                "entry_quality_status": "schema_unhealthy",
+                "mode": mode_schema,
+            }
+        else:
+            # Controlled mode: fail closed
+            return {
+                "ok": False,
+                "active": True,
+                "passed": False,
+                "decision": "downgrade_to_watch",
+                "would_decide": "downgrade_to_watch",
+                "reason": "schema unhealthy",
+                "entry_quality_status": "schema_unhealthy",
+                "mode": mode_schema,
+                "events_matched": 0,
+                "affected_pairs": [],
+            }
 
     # Load config
     cfg = load_config().trading_mode
     gate_cfg = cfg.get("account_feedback_rules", {})
+    mode = gate_cfg.get("mode", "shadow")
 
     if not gate_cfg.get("enabled", False):
         return {"ok": True, "active": False, "passed": True, "decision": "disabled", "would_decide": "disabled"}
 
-    mode = gate_cfg.get("mode", "shadow")
     lookback_hours = int(gate_cfg.get("lookback_hours", 24))
     scope = gate_cfg.get("affected_scope", "trigger_related_symbols")
 
@@ -114,8 +142,28 @@ def check_account_feedback_gate(
             "mode": mode,
         }
 
+    # Deduplicate events by candidate_patch_id (Fix 8)
+    feedback_row_count = len(events)
+    unique_patch_ids: set[str] = set()
+    unique_events: list[Any] = []
+    for event in events:
+        patch_id = None
+        try:
+            candidate_version = event["candidate_version"] if "candidate_version" in event.keys() else None
+            if candidate_version:
+                patch_id = f"cv:{candidate_version}"
+        except Exception:
+            pass
+        if patch_id is not None and patch_id in unique_patch_ids:
+            continue
+        if patch_id is not None:
+            unique_patch_ids.add(patch_id)
+        unique_events.append(event)
+
+    unique_event_count = len(unique_events)
+
     # Check if affected trades include current symbol/side (paired, not cross-product)
-    affected_pairs = _get_affected_symbol_side_pairs(repo, events)
+    affected_pairs = _get_affected_symbol_side_pairs(repo, unique_events)
 
     # Gate is active if scope matches
     is_affected = (
@@ -131,7 +179,9 @@ def check_account_feedback_gate(
             "passed": True,
             "decision": "not_affected",
             "would_decide": "not_affected",
-            "events_matched": len(events),
+            "events_matched": unique_event_count,
+            "feedback_row_count": feedback_row_count,
+            "unique_event_count": unique_event_count,
             "affected_pairs": affected_pairs,
             "mode": mode,
         }
@@ -202,7 +252,9 @@ def check_account_feedback_gate(
         "would_decide": would_decide,
         "reason": "; ".join(reasons) if reasons else "thresholds met",
         "lookback_hours": lookback_hours,
-        "events_matched": len(events),
+        "events_matched": unique_event_count,
+        "feedback_row_count": feedback_row_count,
+        "unique_event_count": unique_event_count,
         "affected_pairs": affected_pairs,
         "entry_quality_status": entry_quality_status,
         "mode": mode,
@@ -228,7 +280,7 @@ def check_account_feedback_gate(
     if mode == "shadow":
         LOGGER.info(
             "account_feedback_gate [shadow]: symbol=%s side=%s passed=%s would_decide=%s events=%d reason=%s",
-            symbol, side, passed, would_decide, len(events), result["reason"],
+            symbol, side, passed, would_decide, unique_event_count, result["reason"],
         )
     elif mode == "controlled" and not passed:
         LOGGER.warning(
@@ -247,25 +299,33 @@ def _get_affected_symbol_side_pairs(
 
     Returns paired records [{"symbol": "BTCUSDT", "side": "LONG"}], not
     independent sets, to prevent cross-product false positives.
+
+    Batches through all trade IDs in chunks of 50 (Fix 9).
     """
     pairs: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
+    # Collect all trade IDs from all events
+    all_trade_ids: list[int] = []
     for event in events:
         trade_ids_str = event["related_trade_ids"] if "related_trade_ids" in event.keys() else None
         if not trade_ids_str:
             continue
-
         try:
             trade_ids = json.loads(trade_ids_str)
         except (json.JSONDecodeError, TypeError):
             continue
-
         if not trade_ids:
             continue
+        all_trade_ids.extend(trade_ids)
 
-        # Get symbol-side pairs from paper_trades
-        placeholders = ",".join("?" for _ in trade_ids[:50])
+    if not all_trade_ids:
+        return pairs
+
+    # Batch through all trade IDs in chunks of 50
+    for i in range(0, len(all_trade_ids), 50):
+        batch = all_trade_ids[i:i + 50]
+        placeholders = ",".join("?" for _ in batch)
         try:
             rows = repo.conn.execute(
                 f"""
@@ -273,7 +333,7 @@ def _get_affected_symbol_side_pairs(
                 FROM paper_trades
                 WHERE id IN ({placeholders})
                 """,
-                trade_ids[:50],
+                batch,
             ).fetchall()
 
             for r in rows:

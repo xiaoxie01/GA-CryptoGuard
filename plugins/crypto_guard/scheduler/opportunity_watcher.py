@@ -20,7 +20,16 @@ def update_opportunity_watches(repo: CryptoGuardRepository, *, analysis_time_utc
     for watch in repo.list_active_opportunity_watches():
         checked += 1
         result = evaluate_watch(repo, watch, analysis_time_utc=analysis_time)
-        result = _agent_review_watch_result(watch, result)
+        # Skip LLM for waiting-status watches (Fix 3: no LLM for waiting)
+        if result["status"] == "waiting":
+            result["agent_review"] = {
+                "summary": result.get("reason") or "机会监控状态已更新。",
+                "status": "waiting",
+                "action": "keep_waiting",
+                "risk_notes": [],
+            }
+        else:
+            result = _agent_review_watch_result(watch, result)
         result["analysis_time_utc"] = analysis_time
         results.append(result)
         status = result["status"]
@@ -66,6 +75,11 @@ def update_opportunity_watches(repo: CryptoGuardRepository, *, analysis_time_utc
 def evaluate_watch(repo: CryptoGuardRepository, watch: dict[str, Any], *, analysis_time_utc: int) -> dict[str, Any]:
     if _is_expired(watch.get("expires_at")):
         return _result(watch, "expired", "监控已过期")
+
+    # Check for account_feedback_recheck condition first (deterministic, no LLM path)
+    condition_raw = _load_json(watch.get("watch_condition_json"), None)
+    if isinstance(condition_raw, dict) and condition_raw.get("type") == "account_feedback_recheck":
+        return _check_account_feedback_recheck(repo, watch, condition_raw)
 
     timeframe = _watch_timeframe(watch)
     candles = repo.get_candles(watch["symbol"], timeframe, analysis_time_utc=analysis_time_utc, limit=3)
@@ -130,6 +144,91 @@ def _agent_review_watch_result(watch: dict[str, Any], result: dict[str, Any]) ->
     if agent.get("summary"):
         enriched["reason"] = str(agent["summary"])
     return enriched
+
+
+def _check_account_feedback_recheck(
+    repo: CryptoGuardRepository,
+    watch: dict[str, Any],
+    condition: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministic re-check for account_feedback_recheck watches.
+
+    Checks whether the original gate conditions have improved enough to allow
+    the trade to proceed. No LLM needed -- pure logic.
+
+    Returns status: "waiting", "triggered", "invalidated", or "expired".
+    """
+    symbol = condition.get("symbol", watch.get("symbol", ""))
+    side = condition.get("side", watch.get("direction", ""))
+    min_confidence = condition.get("min_confidence")
+    min_entry_quality = condition.get("min_entry_quality")
+
+    # 1. Check if expired
+    if _is_expired(watch.get("expires_at")):
+        return _result(watch, "expired", "account_feedback_recheck TTL expired")
+
+    # 2. Check risk status
+    try:
+        from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
+        guard = AccountRiskGuard(repo)
+        risk = guard.check(symbol=symbol, side=side)
+        if risk.get("pause_active"):
+            return _result(watch, "waiting", "账户仍处于暂停状态")
+    except Exception:
+        pass
+
+    # 3. Query latest GA decision for the same symbol
+    try:
+        ga_row = repo.conn.execute(
+            """
+            SELECT confidence, trade_plan_json, decision, trend_stage, market_bias
+            FROM ga_decisions
+            WHERE symbol = ?
+            ORDER BY analysis_time DESC, id DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+    except Exception:
+        ga_row = None
+
+    if not ga_row:
+        return _result(watch, "waiting", "等待新的 GA 分析决策")
+
+    # Convert sqlite3.Row to dict for easier access
+    ga_dict = dict(ga_row)
+
+    # 4. Re-check confidence
+    confidence = float(ga_dict["confidence"] or 0)
+    if min_confidence is not None and confidence < min_confidence:
+        return _result(watch, "waiting",
+                       f"confidence {confidence:.2f} < {min_confidence:.2f} (gate threshold)")
+
+    # 5. Re-check for entry_quality improvements
+    # (entry_quality is not in ga_decisions directly, rely on confidence gate)
+    if min_entry_quality is not None:
+        trade_plan = _load_json(ga_dict.get("trade_plan_json"), None)
+        if isinstance(trade_plan, dict):
+            eq = trade_plan.get("entry_confirmation_quality")
+            if eq is not None and float(eq) < min_entry_quality:
+                return _result(watch, "waiting",
+                               f"entry_quality {eq:.2f} < {min_entry_quality:.2f} (gate threshold)")
+
+    # 6. Check trend/direction alignment
+    trend_stage = ga_dict.get("trend_stage") or ""
+    market_bias = ga_dict.get("market_bias") or ""
+    if trend_stage in ("late", "exhausted"):
+        return _result(watch, "invalidated", f"趋势进入 {trend_stage} 阶段，原始入场条件已失效")
+
+    if side.upper() == "LONG" and market_bias == "bearish":
+        return _result(watch, "invalidated", "市场倾向转为偏空，LONG 条件已失效")
+    if side.upper() == "SHORT" and market_bias == "bullish":
+        return _result(watch, "invalidated", "市场倾向转为偏多，SHORT 条件已失效")
+
+    # 7. All checks passed -- signal is now viable
+    return _result(watch, "triggered",
+                   f"account_feedback_recheck: confidence {confidence:.2f} meets gate threshold, "
+                   f"trend_stage={trend_stage}, market_bias={market_bias}")
 
 
 def _condition_hit(condition: Any, latest: dict[str, Any], previous: dict[str, Any] | None, watch: dict[str, Any]) -> dict[str, Any]:

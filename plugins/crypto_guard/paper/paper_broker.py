@@ -426,70 +426,65 @@ def _create_opportunity_watch_from_gate(
 ) -> int | None:
     """Idempotent opportunity watch creation when gate downgrades to watch.
 
-    Deduplicates on (ga_decision_id, watch_reason) to prevent duplicate
-    active watches on retry/re-entry.
+    Uses dedupe_key + UPSERT (ON CONFLICT) to prevent duplicate active watches
+    on retry/re-entry. No manual transaction needed.
 
-    Stores a structured manual_review watch condition (not raw gate JSON)
-    so the opportunity watcher can evaluate it. Raw gate JSON objects are
-    not valid watch conditions and can never trigger.
+    Stores a structured account_feedback_recheck watch condition so the
+    opportunity watcher can evaluate it deterministically.
 
     Returns watch_id or None on failure.
     """
+    from datetime import datetime as _datetime
+
     if not ga_decision_id:
         return None
 
-    watch_reason = f"account_feedback_gate: {gate_result.get('reason', '')}"
+    dedupe_key = f"account_feedback_gate:{ga_decision_id}"
 
-    # Store a proper watch condition that the watcher can evaluate.
-    # Since this is a gate-downgraded signal, the watch should be a
-    # manual-review watch (not auto-triggering). Store structured data
-    # so the watcher can recognize it.
+    # Store structured account_feedback_recheck condition for deterministic watcher evaluation
     watch_condition = json.dumps({
-        "type": "manual_review",
+        "type": "account_feedback_recheck",
         "source": "account_feedback_gate",
+        "symbol": symbol,
+        "side": side,
+        "original_confidence": gate_result.get("actual", {}).get("confidence"),
+        "original_entry_quality": gate_result.get("actual", {}).get("entry_quality"),
+        "min_confidence": gate_result.get("required", {}).get("min_confidence"),
+        "min_entry_quality": gate_result.get("required", {}).get("min_entry_quality"),
         "gate_decision": gate_result.get("would_decide", ""),
         "gate_reason": gate_result.get("reason", ""),
-        "gate_mode": gate_result.get("mode", ""),
-        "entry_quality_status": gate_result.get("entry_quality_status", ""),
-        "actual_confidence": gate_result.get("actual", {}).get("confidence"),
-        "actual_entry_quality": gate_result.get("actual", {}).get("entry_quality"),
-        "required_min_confidence": gate_result.get("required", {}).get("min_confidence"),
-        "required_min_entry_quality": gate_result.get("required", {}).get("min_entry_quality"),
+        "created_at": _datetime.now(timezone.utc).isoformat(),
     }, ensure_ascii=False)
+
+    watch_reason = f"account_feedback_gate: {gate_result.get('reason', '')}"
 
     # 24-hour TTL for gate-downgraded watches
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
 
     try:
-        # Use IMMEDIATE transaction for concurrent safety (P2 fix)
-        repo.conn.execute("BEGIN IMMEDIATE")
-        existing = repo.conn.execute(
-            "SELECT id FROM opportunity_watches "
-            "WHERE ga_decision_id = ? AND watch_reason = ? AND status = 'active' "
-            "LIMIT 1",
-            (int(ga_decision_id), watch_reason),
-        ).fetchone()
-
-        if existing:
-            repo.conn.execute("COMMIT")
-            return int(existing["id"])
-
-        cursor = repo.conn.execute(
-            "INSERT INTO opportunity_watches "
-            "(symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id, expires_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
-            (symbol, side, watch_reason, watch_condition, int(ga_decision_id), expires_at),
+        repo.conn.execute(
+            """
+            INSERT INTO opportunity_watches
+            (symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id, expires_at, dedupe_key)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+            ON CONFLICT(dedupe_key) DO UPDATE SET
+                watch_condition_json = excluded.watch_condition_json,
+                expires_at = excluded.expires_at,
+                watch_reason = excluded.watch_reason,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (symbol, side, watch_reason, watch_condition, int(ga_decision_id), expires_at, dedupe_key),
         )
         repo.conn.commit()
-        return int(cursor.lastrowid)
+        # Return the ID of the upserted row
+        row = repo.conn.execute(
+            "SELECT id FROM opportunity_watches WHERE dedupe_key = ?", (dedupe_key,)
+        ).fetchone()
+        return int(row["id"]) if row else None
     except Exception:
-        try:
-            repo.conn.execute("ROLLBACK")
-        except Exception:
-            pass
         import logging
         logging.getLogger("crypto_guard.paper_broker").warning(
-            "Failed to create opportunity watch from gate: ga_decision_id=%s", ga_decision_id,
+            "Failed to create/update opportunity watch from gate: ga_decision_id=%s", ga_decision_id,
             exc_info=True,
         )
         return None
