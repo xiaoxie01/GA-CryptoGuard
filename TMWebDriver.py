@@ -29,7 +29,7 @@ class Session:
         self.connect_at = time.time()
         self.disconnect_at = None
     def mark_disconnected(self):
-        if self.is_active(): print(f"Tab disconnected: {self.url} (Session: {self.id})")
+        if self.disconnect_at is None: print(f"Tab disconnected: {self.url} (Session: {self.id})")
         self.disconnect_at = time.time()
 
 
@@ -93,12 +93,11 @@ class TMWebDriver:
                 session_id = data.get('sessionId')
                 code = data.get('code')
                 timeout = float(data.get('timeout', 10.0))
-                try:
-                    result = self.execute_js(code, timeout=timeout, session_id=session_id)
-                    print('[remote result]', (str(code)[:50] + ' RESULT:' +str(result)[:50]).replace('\n', ' '))
-                    return json.dumps({'r': result}, ensure_ascii=False)
-                except Exception as e:
-                    return json.dumps({'r': {'error': str(e)}}, ensure_ascii=False)
+                try: result = self.execute_js(code, timeout=timeout, session_id=session_id)
+                except Exception as e: return json.dumps({'r': {'error': str(e)}}, ensure_ascii=False)
+                try: print('[remote result]', (str(code)[:50] + ' RESULT:' +str(result)[:50]).replace('\n', ' '))
+                except Exception: pass
+                return json.dumps({'r': result}, ensure_ascii=False)
             return 'ok'
         def run():
             from wsgiref.simple_server import make_server, WSGIServer, WSGIRequestHandler
@@ -245,7 +244,7 @@ class TMWebDriver:
     def _remote_cmd(self, cmd):
         try: return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=30).json()
         except (ConnectionError, requests.exceptions.ConnectionError):
-            raise ConnectionError("TMWebDriver master未运行，看tmwebdriver_sop启动master")
+            raise ConnectionError("TMWebDriver master未运行，看tmwebdriver_sop后台启动一个TMWebDriver")
 
     def get_all_sessions(self):  
         if self.is_remote:
