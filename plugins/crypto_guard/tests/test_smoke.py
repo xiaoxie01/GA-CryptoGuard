@@ -6412,6 +6412,106 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(stats.get("projected_downgrade_to_watch", 0), 0)
         self.assertEqual(stats.get("projected_annotate_only", 0), 0)
 
+    # =========================================================================
+    # P1/P2 review fixes: 2 new tests (Fix 2, Fix 3)
+    # =========================================================================
+
+    def test_recheck_missing_trade_plan_side_returns_waiting(self) -> None:
+        """Fix 2: recheck returns 'waiting' when trade_plan has no side field."""
+        from plugins.crypto_guard.scheduler.opportunity_watcher import _check_account_feedback_recheck
+
+        condition = {
+            "type": "account_feedback_recheck",
+            "source": "account_feedback_gate",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "min_confidence": 0.80,
+            "min_entry_quality": 0.70,
+        }
+        watch_condition_json = json.dumps(condition, ensure_ascii=False)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+        # Set watch created_at in the past so GA decisions appear newer
+        watch_created_at = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        self.conn.execute(
+            "INSERT INTO opportunity_watches "
+            "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
+        )
+        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+        watch = dict(self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+        ).fetchone())
+
+        # Create a GA decision with trade_plan_available but trade_plan has NO side field
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.85,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True,
+            "trade_plan": {"metrics": {"entry_quality": 0.75}},  # no side field
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        self.conn.commit()
+
+        result = _check_account_feedback_recheck(self.repo, watch, condition)
+        self.assertEqual(result["status"], "waiting",
+                         "Missing trade_plan side should return waiting, not triggered")
+        self.assertIn("side", result["reason"].lower())
+
+    def test_recheck_none_min_entry_quality_returns_waiting(self) -> None:
+        """Fix 2: recheck returns 'waiting' when min_entry_quality is None (legacy watch)."""
+        from plugins.crypto_guard.scheduler.opportunity_watcher import _check_account_feedback_recheck
+
+        condition = {
+            "type": "account_feedback_recheck",
+            "source": "account_feedback_gate",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "min_confidence": 0.80,
+            "min_entry_quality": None,  # legacy watch with no quality threshold
+        }
+        watch_condition_json = json.dumps(condition, ensure_ascii=False)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+        # Set watch created_at in the past so GA decisions appear newer
+        watch_created_at = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        self.conn.execute(
+            "INSERT INTO opportunity_watches "
+            "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
+        )
+        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+        watch = dict(self.conn.execute(
+            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+        ).fetchone())
+
+        # Create a valid GA decision with all the right fields
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.repo.create_ga_decision({
+            "symbol": "BTCUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.85,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "metrics": {"entry_quality": 0.75}},
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        self.conn.commit()
+
+        result = _check_account_feedback_recheck(self.repo, watch, condition)
+        self.assertEqual(result["status"], "waiting",
+                         "None min_entry_quality should return waiting, not triggered")
+        self.assertIn("min_entry_quality", result["reason"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

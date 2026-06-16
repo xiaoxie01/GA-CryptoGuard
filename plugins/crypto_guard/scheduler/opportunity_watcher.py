@@ -239,7 +239,9 @@ def _check_account_feedback_recheck(
     if isinstance(trade_plan, dict):
         plan_side = str(trade_plan.get("side", "")).upper()
         watch_side = str(side).upper()
-        if plan_side and watch_side and plan_side != watch_side:
+        if not plan_side:
+            return _result(watch, "waiting", "trade_plan 缺少 side 字段，无法执行")
+        if plan_side != watch_side:
             return _result(watch, "invalidated",
                            f"交易计划方向 {plan_side} 与监控方向 {watch_side} 不匹配")
 
@@ -270,6 +272,9 @@ def _check_account_feedback_recheck(
                                f"entry_quality {eq_val:.2f} < {min_entry_quality:.2f} (gate threshold)")
         else:
             return _result(watch, "waiting", "交易计划缺失，无法检查 entry_quality")
+    else:
+        # min_entry_quality is None — quality threshold cannot be evaluated, fail-closed
+        return _result(watch, "waiting", "min_entry_quality 未配置，无法验证质量门禁")
 
     # 10. Check trend/direction alignment
     trend_stage = ga_dict.get("trend_stage") or ""

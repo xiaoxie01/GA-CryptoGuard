@@ -233,7 +233,6 @@ CREATE TABLE IF NOT EXISTS opportunity_watches (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_opportunity_status_symbol ON opportunity_watches(status, symbol);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe ON opportunity_watches(dedupe_key);
 
 CREATE TABLE IF NOT EXISTS paper_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
