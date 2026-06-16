@@ -156,6 +156,7 @@ def _check_account_feedback_recheck(
     Checks whether the original gate conditions have improved enough to allow
     the trade to proceed. No LLM needed -- pure logic.
 
+    Fail-closed: any doubt returns "waiting" (not "triggered").
     Returns status: "waiting", "triggered", "invalidated", or "expired".
     """
     symbol = condition.get("symbol", watch.get("symbol", ""))
@@ -167,21 +168,26 @@ def _check_account_feedback_recheck(
     if _is_expired(watch.get("expires_at")):
         return _result(watch, "expired", "account_feedback_recheck TTL expired")
 
-    # 2. Check risk status
+    # 2. Check account risk guard — fail-closed: blocked → invalidated
     try:
         from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
         guard = AccountRiskGuard(repo)
         risk = guard.check(symbol=symbol, side=side)
+        if risk.get("blocked"):
+            return _result(watch, "invalidated",
+                           f"账户被阻止开仓: {risk.get('pause_reason', 'unknown')}")
         if risk.get("pause_active"):
             return _result(watch, "waiting", "账户仍处于暂停状态")
     except Exception:
-        pass
+        # Don't swallow exceptions — treat as "still waiting" (fail-closed)
+        return _result(watch, "waiting", "无法检查账户风险状态，等待下次评估")
 
     # 3. Query latest GA decision for the same symbol
     try:
         ga_row = repo.conn.execute(
             """
-            SELECT confidence, trade_plan_json, decision, trend_stage, market_bias
+            SELECT id, confidence, trade_plan_json, decision, trend_stage, market_bias,
+                   analysis_time_utc, risk_check_json
             FROM ga_decisions
             WHERE symbol = ?
             ORDER BY analysis_time DESC, id DESC
@@ -198,23 +204,74 @@ def _check_account_feedback_recheck(
     # Convert sqlite3.Row to dict for easier access
     ga_dict = dict(ga_row)
 
-    # 4. Re-check confidence
+    # 4. Require GA decision to be newer than watch creation time
+    watch_created_at = watch.get("created_at")
+    ga_analysis_time = ga_dict.get("analysis_time_utc")
+    if watch_created_at and ga_analysis_time:
+        try:
+            watch_ts_str = str(watch_created_at).replace("Z", "+00:00")
+            ga_ts_str = str(ga_analysis_time).replace("Z", "+00:00")
+            watch_ts = datetime.fromisoformat(watch_ts_str)
+            ga_ts = datetime.fromisoformat(ga_ts_str)
+            # Normalize: if one is naive and the other is aware, make both UTC-aware
+            if watch_ts.tzinfo is None and ga_ts.tzinfo is not None:
+                watch_ts = watch_ts.replace(tzinfo=timezone.utc)
+            elif watch_ts.tzinfo is not None and ga_ts.tzinfo is None:
+                ga_ts = ga_ts.replace(tzinfo=timezone.utc)
+            if ga_ts <= watch_ts:
+                return _result(watch, "waiting", "等待比监控创建时间更新的 GA 决策")
+        except (ValueError, TypeError):
+            pass
+
+    # 5. Require decision == "trade_plan_available" (not monitor_only)
+    decision = ga_dict.get("decision") or ""
+    if decision != "trade_plan_available":
+        return _result(watch, "waiting",
+                       f"GA 决策为 {decision}，不是 trade_plan_available")
+
+    # 6. Require risk_check_json to contain ok: true
+    risk_check = _load_json(ga_dict.get("risk_check_json"), {})
+    if isinstance(risk_check, dict) and risk_check.get("ok") is not True:
+        return _result(watch, "waiting", "GA 风控未通过，等待改善")
+
+    # 7. Verify trade plan side matches the watch side
+    trade_plan = _load_json(ga_dict.get("trade_plan_json"), None)
+    if isinstance(trade_plan, dict):
+        plan_side = str(trade_plan.get("side", "")).upper()
+        watch_side = str(side).upper()
+        if plan_side and watch_side and plan_side != watch_side:
+            return _result(watch, "invalidated",
+                           f"交易计划方向 {plan_side} 与监控方向 {watch_side} 不匹配")
+
+    # 8. Re-check confidence
     confidence = float(ga_dict["confidence"] or 0)
     if min_confidence is not None and confidence < min_confidence:
         return _result(watch, "waiting",
                        f"confidence {confidence:.2f} < {min_confidence:.2f} (gate threshold)")
 
-    # 5. Re-check for entry_quality improvements
-    # (entry_quality is not in ga_decisions directly, rely on confidence gate)
+    # 9. Re-check entry_quality — read from metrics.entry_quality in trade plan
+    #    Missing entry_quality does NOT pass (fail-closed)
     if min_entry_quality is not None:
-        trade_plan = _load_json(ga_dict.get("trade_plan_json"), None)
         if isinstance(trade_plan, dict):
-            eq = trade_plan.get("entry_confirmation_quality")
-            if eq is not None and float(eq) < min_entry_quality:
+            metrics = trade_plan.get("metrics") or {}
+            eq = metrics.get("entry_quality")
+            if eq is None:
+                eq = trade_plan.get("entry_confirmation_quality")
+            if eq is None:
                 return _result(watch, "waiting",
-                               f"entry_quality {eq:.2f} < {min_entry_quality:.2f} (gate threshold)")
+                               "entry_quality 缺失，无法验证门禁阈值")
+            try:
+                eq_val = float(eq)
+            except (ValueError, TypeError):
+                return _result(watch, "waiting",
+                               f"entry_quality 值无效: {eq}")
+            if eq_val < min_entry_quality:
+                return _result(watch, "waiting",
+                               f"entry_quality {eq_val:.2f} < {min_entry_quality:.2f} (gate threshold)")
+        else:
+            return _result(watch, "waiting", "交易计划缺失，无法检查 entry_quality")
 
-    # 6. Check trend/direction alignment
+    # 10. Check trend/direction alignment
     trend_stage = ga_dict.get("trend_stage") or ""
     market_bias = ga_dict.get("market_bias") or ""
     if trend_stage in ("late", "exhausted"):
@@ -225,7 +282,7 @@ def _check_account_feedback_recheck(
     if side.upper() == "SHORT" and market_bias == "bullish":
         return _result(watch, "invalidated", "市场倾向转为偏多，SHORT 条件已失效")
 
-    # 7. All checks passed -- signal is now viable
+    # 11. All checks passed -- signal is now viable
     return _result(watch, "triggered",
                    f"account_feedback_recheck: confidence {confidence:.2f} meets gate threshold, "
                    f"trend_stage={trend_stage}, market_bias={market_bias}")

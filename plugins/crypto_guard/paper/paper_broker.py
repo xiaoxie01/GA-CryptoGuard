@@ -475,7 +475,7 @@ def _create_opportunity_watch_from_gate(
             """,
             (symbol, side, watch_reason, watch_condition, int(ga_decision_id), expires_at, dedupe_key),
         )
-        repo.conn.commit()
+        # No commit here — caller owns the transaction
         # Return the ID of the upserted row
         row = repo.conn.execute(
             "SELECT id FROM opportunity_watches WHERE dedupe_key = ?", (dedupe_key,)
@@ -501,7 +501,7 @@ def _save_gate_result_to_ga_decision(
             "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
             (json.dumps(gate_result, ensure_ascii=False), ga_decision_id),
         )
-        repo.conn.commit()
+        # No commit here — caller owns the transaction
     except Exception as exc:
         # Non-critical: log but don't fail the order
         import logging

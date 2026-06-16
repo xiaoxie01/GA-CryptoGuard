@@ -227,15 +227,23 @@ def render_ga_hourly_summary(
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
-            # Controlled projection breakdown (Fix 5)
-            projected_blocks = gate.get("controlled_blocked", 0)
-            pao = gate.get("projected_annotate_only", 0)
-            pdw = gate.get("projected_downgrade_to_watch", 0)
-            pbo = gate.get("projected_block_order", 0)
-            if pao > 0 or pdw > 0 or pbo > 0:
+            # Shadow projection (what WOULD have happened)
+            shadow_proj = gate.get("shadow_projection", {})
+            if any(shadow_proj.get(k, 0) > 0 for k in ("annotate_only", "downgrade_to_watch", "block_order")):
+                sp = shadow_proj
                 lines.append(
-                    f"- 受控模式预判：仅注释={pao}；降级观察={pdw}；阻止={pbo}；"
-                    f"合计会被阻止={projected_blocks}"
+                    f"- 影子预判（会被执行的动作）：仅注释={sp.get('annotate_only', 0)}；"
+                    f"降级观察={sp.get('downgrade_to_watch', 0)}；阻止={sp.get('block_order', 0)}；"
+                    f"合计会被阻止={sp.get('total_blocked', 0)}"
+                )
+            # Controlled actual (what DID happen)
+            controlled_act = gate.get("controlled_actual", {})
+            if any(controlled_act.get(k, 0) > 0 for k in ("passed", "annotate_only", "downgrade_to_watch", "block_order")):
+                ca = controlled_act
+                lines.append(
+                    f"- 受控实际（已执行的动作）：通过={ca.get('passed', 0)}；"
+                    f"仅注释={ca.get('annotate_only', 0)}；降级观察={ca.get('downgrade_to_watch', 0)}；"
+                    f"阻止={ca.get('block_order', 0)}"
                 )
             if gate.get("controlled_gating_factors"):
                 factor_text = "，".join(
@@ -398,7 +406,11 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
 
 
 def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str, Any]:
-    """Fetch account feedback gate statistics from recent GA decisions."""
+    """Fetch account feedback gate statistics from recent GA decisions.
+
+    Separates shadow projections (what WOULD have happened) from controlled actuals
+    (what DID happen). Only counts controlled_projection for shadow-mode records.
+    """
     try:
         day_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat().replace("+00:00", "Z")
         rows = repo.conn.execute(
@@ -417,11 +429,17 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
         active = 0
         not_passed = 0
         decision_counts: dict[str, int] = {}
-        controlled_blocked = 0
         controlled_gating_factors: dict[str, int] = {}
-        projected_annotate_only = 0
-        projected_downgrade_to_watch = 0
-        projected_block_order = 0
+        # Shadow projection (what WOULD have happened)
+        shadow_projection_annotate_only = 0
+        shadow_projection_downgrade_to_watch = 0
+        shadow_projection_block_order = 0
+        shadow_projection_controlled_blocked = 0
+        # Controlled actual (what DID happen)
+        controlled_actual_passed = 0
+        controlled_actual_annotate_only = 0
+        controlled_actual_downgrade_to_watch = 0
+        controlled_actual_block_order = 0
         valid_checks = 0
         invalid_json_count = 0
 
@@ -441,21 +459,35 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
             decision = gate.get("decision", "unknown")
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
 
-            # Extract controlled_projection for shadow mode reporting (Fix 5)
-            controlled_proj = gate.get("controlled_projection", {})
-            if controlled_proj:
-                would_decide = controlled_proj.get("would_decide", "")
-                if would_decide == "annotate_only":
-                    projected_annotate_only += 1
-                elif would_decide == "downgrade_to_watch":
-                    projected_downgrade_to_watch += 1
-                elif would_decide == "block_order":
-                    projected_block_order += 1
+            mode = gate.get("mode", "shadow")
 
-                if not controlled_proj.get("would_pass"):
-                    controlled_blocked += 1
-                    gating_factor = controlled_proj.get("gating_factor", "unknown")
-                    controlled_gating_factors[gating_factor] = controlled_gating_factors.get(gating_factor, 0) + 1
+            if mode == "shadow":
+                # Shadow mode: extract controlled_projection (what WOULD have happened)
+                controlled_proj = gate.get("controlled_projection", {})
+                if controlled_proj:
+                    would_decide = controlled_proj.get("would_decide", "")
+                    if would_decide == "annotate_only":
+                        shadow_projection_annotate_only += 1
+                    elif would_decide == "downgrade_to_watch":
+                        shadow_projection_downgrade_to_watch += 1
+                    elif would_decide == "block_order":
+                        shadow_projection_block_order += 1
+
+                    if not controlled_proj.get("would_pass"):
+                        shadow_projection_controlled_blocked += 1
+                        gating_factor = controlled_proj.get("gating_factor", "unknown")
+                        controlled_gating_factors[gating_factor] = controlled_gating_factors.get(gating_factor, 0) + 1
+            else:
+                # Controlled mode: count actual decisions (what DID happen)
+                actual_decision = gate.get("decision", "")
+                if actual_decision == "passed":
+                    controlled_actual_passed += 1
+                elif actual_decision == "annotate_only":
+                    controlled_actual_annotate_only += 1
+                elif actual_decision == "downgrade_to_watch":
+                    controlled_actual_downgrade_to_watch += 1
+                elif actual_decision == "block_order":
+                    controlled_actual_block_order += 1
 
         return {
             "ok": True,
@@ -465,11 +497,26 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
             "active_checks": active,
             "not_passed": not_passed,
             "decision_counts": decision_counts,
-            "controlled_blocked": projected_downgrade_to_watch + projected_block_order,
-            "projected_annotate_only": projected_annotate_only,
-            "projected_downgrade_to_watch": projected_downgrade_to_watch,
-            "projected_block_order": projected_block_order,
+            # Legacy fields for backward compatibility (shadow projection)
+            "controlled_blocked": shadow_projection_downgrade_to_watch + shadow_projection_block_order,
+            "projected_annotate_only": shadow_projection_annotate_only,
+            "projected_downgrade_to_watch": shadow_projection_downgrade_to_watch,
+            "projected_block_order": shadow_projection_block_order,
             "controlled_gating_factors": controlled_gating_factors,
+            # New: shadow projection breakdown
+            "shadow_projection": {
+                "annotate_only": shadow_projection_annotate_only,
+                "downgrade_to_watch": shadow_projection_downgrade_to_watch,
+                "block_order": shadow_projection_block_order,
+                "total_blocked": shadow_projection_controlled_blocked,
+            },
+            # New: controlled actual breakdown
+            "controlled_actual": {
+                "passed": controlled_actual_passed,
+                "annotate_only": controlled_actual_annotate_only,
+                "downgrade_to_watch": controlled_actual_downgrade_to_watch,
+                "block_order": controlled_actual_block_order,
+            },
         }
     except Exception as exc:
         return {"error": str(exc), "total_checks": 0}
@@ -617,15 +664,23 @@ def render_hourly_report_text(
             if gate.get("decision_counts"):
                 decision_text = "，".join(f"{k}={v}" for k, v in gate["decision_counts"].items())
                 lines.append(f"- 决策分布：{decision_text}")
-            # Controlled projection breakdown (Fix 5)
-            projected_blocks = gate.get("controlled_blocked", 0)
-            pao = gate.get("projected_annotate_only", 0)
-            pdw = gate.get("projected_downgrade_to_watch", 0)
-            pbo = gate.get("projected_block_order", 0)
-            if pao > 0 or pdw > 0 or pbo > 0:
+            # Shadow projection (what WOULD have happened)
+            shadow_proj = gate.get("shadow_projection", {})
+            if any(shadow_proj.get(k, 0) > 0 for k in ("annotate_only", "downgrade_to_watch", "block_order")):
+                sp = shadow_proj
                 lines.append(
-                    f"- 受控模式预判：仅注释={pao}；降级观察={pdw}；阻止={pbo}；"
-                    f"合计会被阻止={projected_blocks}"
+                    f"- 影子预判（会被执行的动作）：仅注释={sp.get('annotate_only', 0)}；"
+                    f"降级观察={sp.get('downgrade_to_watch', 0)}；阻止={sp.get('block_order', 0)}；"
+                    f"合计会被阻止={sp.get('total_blocked', 0)}"
+                )
+            # Controlled actual (what DID happen)
+            controlled_act = gate.get("controlled_actual", {})
+            if any(controlled_act.get(k, 0) > 0 for k in ("passed", "annotate_only", "downgrade_to_watch", "block_order")):
+                ca = controlled_act
+                lines.append(
+                    f"- 受控实际（已执行的动作）：通过={ca.get('passed', 0)}；"
+                    f"仅注释={ca.get('annotate_only', 0)}；降级观察={ca.get('downgrade_to_watch', 0)}；"
+                    f"阻止={ca.get('block_order', 0)}"
                 )
             if gate.get("controlled_gating_factors"):
                 factor_text = "，".join(

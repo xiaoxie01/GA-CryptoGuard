@@ -59,7 +59,7 @@ def check_account_feedback_gate(
         }
     """
     # Schema health guard
-    schema = check_schema_health()
+    schema = check_schema_health(conn=repo.conn)
     if not schema["ok"]:
         # Load config to determine mode
         cfg_schema = load_config().trading_mode
@@ -119,7 +119,8 @@ def check_account_feedback_gate(
     events = repo.conn.execute(
         """
         SELECT sfm.id, sfm.pattern_type, sfm.created_at,
-               sp.candidate_version, et.related_trade_ids
+               sp.candidate_version, sp.id AS candidate_patch_id, sp.trigger_id AS patch_trigger_id,
+               et.related_trade_ids
         FROM skill_feedback_memory sfm
         LEFT JOIN strategy_patches sp ON sp.id = json_extract(sfm.suggested_adjustment_json, '$.candidate_patch_id')
         LEFT JOIN evolution_triggers et ON et.id = sp.trigger_id
@@ -142,22 +143,23 @@ def check_account_feedback_gate(
             "mode": mode,
         }
 
-    # Deduplicate events by candidate_patch_id (Fix 8)
+    # Deduplicate events by trigger_id (each trigger is a unique event).
+    # If trigger_id is NULL, fall back to candidate_patch_id.
     feedback_row_count = len(events)
-    unique_patch_ids: set[str] = set()
+    seen_triggers: set[str] = set()
     unique_events: list[Any] = []
     for event in events:
-        patch_id = None
-        try:
-            candidate_version = event["candidate_version"] if "candidate_version" in event.keys() else None
-            if candidate_version:
-                patch_id = f"cv:{candidate_version}"
-        except Exception:
-            pass
-        if patch_id is not None and patch_id in unique_patch_ids:
+        trigger_id = event["patch_trigger_id"] if "patch_trigger_id" in event.keys() else None
+        patch_id = event["candidate_patch_id"] if "candidate_patch_id" in event.keys() else None
+        if trigger_id is not None:
+            key = f"trigger:{trigger_id}"
+        elif patch_id is not None:
+            key = f"patch:{patch_id}"
+        else:
+            key = f"row:{event['id']}"
+        if key in seen_triggers:
             continue
-        if patch_id is not None:
-            unique_patch_ids.add(patch_id)
+        seen_triggers.add(key)
         unique_events.append(event)
 
     unique_event_count = len(unique_events)
