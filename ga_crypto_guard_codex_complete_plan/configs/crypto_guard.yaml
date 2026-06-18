@@ -1,0 +1,104 @@
+trading_mode:
+  live_trading_enabled: false
+  paper_trading_enabled: true
+  real_order_api_enabled: false
+
+windows_paths:
+  redis_install_dir: "D:/Program Files/Redis"
+  duckdb_dir: "D:/Program Files/duckdb"
+  duckdb_database: "D:/Program Files/duckdb/crypto_guard_analytics.duckdb"
+  parquet_base_dir: "data/parquet/klines/binance_um"
+
+redis:
+  enabled: true
+  url: "redis://localhost:6379/0"
+  install_dir: "D:/Program Files/Redis"
+  fallback_to_sqlite: true
+
+sqlite:
+  path: "data/crypto_guard.db"
+  wal_enabled: true
+
+parquet:
+  enabled: true
+  base_dir: "data/parquet/klines/binance_um"
+  compression: "snappy"
+  partition: "symbol_interval_month"
+
+duckdb:
+  enabled: true
+  path: "D:/Program Files/duckdb/crypto_guard_analytics.duckdb"
+
+analysis:
+  ga_master_required: true
+  mode: intraday
+  require_closed_htf_candles: true
+  timeframes:
+    background: ["1d"]
+    direction: "4h"
+    trend: ["1h", "15m"]
+    entry: ["5m", "1m"]
+  weights:
+    daily: 0.10
+    4h: 0.30
+    1h: 0.25
+    15m: 0.20
+    5m: 0.15
+  pure_intraday_weights:
+    4h: 0.35
+    1h: 0.25
+    15m: 0.20
+    5m: 0.20
+
+risk:
+  min_rr: 2.0
+  min_confidence: 0.72
+  require_structure_momentum_alignment: true
+  allow_manual_bypass: false
+
+paper_trading:
+  price_update_interval_minutes: 3
+  unrealized_pnl_price_source: "latest_price"
+  market_fill_method: "next_candle_open_with_slippage"
+  market_slippage_pct: 0.001
+  limit_fill_method: "entry_price_between_high_low"
+  limit_order_slippage_pct: 0.0
+
+feishu:
+  hourly_summary_enabled: true
+  use_rich_card_summary: true
+  detailed_analysis_requires_user_request: true
+  quiet_period:
+    normal_duplicate_alert_minutes: 5
+    suppress_add_position_alerts: true
+    never_silence:
+      - open_position
+      - close_position
+      - stop_loss_adjustment
+      - take_profit_hit
+      - stop_loss_hit
+      - risk_alert
+      - opportunity_triggered
+      - paper_order_filled
+
+scheduler:
+  timezone: "UTC"
+  jobs:
+    fetch_4h: "0 */4 * * *"
+    fetch_1h: "0 * * * *"
+    analyze_15m: "*/15 * * * *"
+    update_paper_prices: "*/3 * * * *"
+    hourly_report: "0 * * * *"
+    daily_review: "5 0 * * *"
+
+evolution:
+  shadow_testing_enabled: true
+  allow_double_llm_cost: true
+  min_observation_signals: 3
+  preferred_promotion_sample_size: 30
+  affected_strategy_observation_hours: 24
+  auto_promote: false
+  pause_evolution_on_extreme_market: true
+  trigger:
+    consecutive_stop_losses: 3
+    max_account_drawdown_pct: 0.10

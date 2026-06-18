@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: sweep_without_reclaim_failed
+    action: require_reclaim_confirmation
+  - when: cvd_divergence_ignored
+    action: raise_divergence_penalty

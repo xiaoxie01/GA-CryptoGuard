@@ -1,0 +1,41 @@
+skill_name: price_action
+version: 1.0
+status: active
+ga_controlled: true
+description: >
+  价格行为：支撑阻力、Swing、BOS/CHoCH、突破回踩、假突破、形态识别
+
+tools:
+  - detect_swing_points
+  - detect_bos_choch
+  - detect_range
+  - detect_breakout_retest
+  - detect_fake_breakout
+  - detect_support_resistance
+  - detect_patterns
+
+input:
+  required:
+    - symbol
+    - timeframe
+    - closed_candles
+    - previous_analysis_state
+    - skill_feedback_memory
+
+output_schema: schema.json
+
+memory:
+  read:
+    - skill_feedback_memory
+    - recent_trade_reviews
+    - previous_skill_results
+  write:
+    - skill_execution_logs
+    - skill_feedback_memory
+
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true
+  auto_promote: false

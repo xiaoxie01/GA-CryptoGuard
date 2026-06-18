@@ -1,0 +1,1 @@
+{"type":"object","required":["skill","stage","clarity","confidence"],"properties":{"skill":{"type":"string"},"stage":{"type":"string"},"clarity":{"type":"number"},"features":{"type":"array"},"late_stage_risk":{"type":"boolean"},"next_evolution":{"type":"string"},"confidence":{"type":"number"}}}

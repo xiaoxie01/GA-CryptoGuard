@@ -1,0 +1,17 @@
+trading_mode:
+  live_trading_enabled: false
+  paper_trading_enabled: true
+  real_order_api_enabled: false
+  allow_withdraw_api: false
+  allow_trade_api: false
+  require_public_market_data_only: true
+
+risk_language:
+  banned_phrases:
+    - "一定上涨"
+    - "必涨"
+    - "稳赚"
+    - "放心持有"
+    - "强烈开多"
+    - "强烈开空"
+  required_disclaimer: "不构成实盘建议，仅用于模拟盘与策略研究。"

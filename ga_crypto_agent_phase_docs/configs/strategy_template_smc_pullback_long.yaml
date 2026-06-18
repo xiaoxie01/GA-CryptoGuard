@@ -1,0 +1,43 @@
+strategy_name: smc_pullback_long
+version: "1.0"
+status: active
+
+market_regime_required:
+  - trend
+  - breakout_retest
+  - early
+  - middle
+
+higher_tf_filter:
+  direction_allowed: ["bullish", "neutral_bullish"]
+  disallow_if:
+    - trend_stage: "late"
+    - btc_context: "risk_off"
+
+required_evidence:
+  - "price_action.bos == bullish"
+  - "smc.liquidity.last_event in [sell_side_sweep, discount_retest]"
+  - "smc.fvg.direction == bullish"
+  - "momentum.direction == bullish"
+
+optional_evidence:
+  - "order_flow.flow_confirmation == supports_long"
+  - "chanlun.signal in [class_2_buy_candidate, class_3_buy_candidate]"
+
+risk_filters:
+  - "entry_distance_to_invalid <= 1.2 * atr"
+  - "contradiction_level <= medium"
+  - "funding_state != extreme_positive"
+
+scoring:
+  htf_alignment: 0.20
+  price_action: 0.20
+  smc: 0.20
+  order_flow: 0.15
+  momentum: 0.15
+  risk_reward: 0.10
+
+actions:
+  score_above_0_80: "paper_trade_candidate"
+  score_0_65_to_0_80: "opportunity_watch"
+  score_below_0_65: "no_action"

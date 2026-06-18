@@ -1,0 +1,27 @@
+feedback_rules:
+  - when: consecutive_stop_losses
+    action: raise_account_risk_sensitivity
+    description: "连续止损后提升账户风控敏感度"
+    params:
+      severity_multiplier: 1.5
+      cooldown_hours: 4
+
+  - when: consecutive_stop_losses
+    action: require_stronger_confirmation
+    description: "连续止损后要求更强的信号确认"
+    params:
+      min_confidence: 0.80
+      min_entry_quality: 0.7
+
+  - when: daily_loss_threshold
+    action: cooldown_recent_loss_symbols
+    description: "日内亏损阈值触发后冷却近期亏损标的"
+    params:
+      cooldown_hours: 8
+      affected_scope: "trigger_related_symbols"
+
+  - when: daily_loss_threshold
+    action: downgrade_trade_to_watch_when_recent_pattern_active
+    description: "日内亏损阈值活跃时降级 trade_plan 为 watch_only"
+    params:
+      lookback_hours: 24

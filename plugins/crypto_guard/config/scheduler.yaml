@@ -1,0 +1,116 @@
+timezone: UTC
+
+jobs:
+  fetch_1d_klines:
+    cron: "1 0 * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "1d"
+      lookback: 3
+      update_market_profile: true
+      summarize: true
+
+  fetch_4h_klines:
+    cron: "1 0,4,8,12,16,20 * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "4h"
+      lookback: 6
+      update_market_profile: true
+      summarize: true
+
+  fetch_1h_klines:
+    cron: "1 * * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "1h"
+      lookback: 12
+      update_market_profile: true
+      summarize: false
+
+  fetch_15m_klines:
+    cron: "1,16,31,46 * * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "15m"
+      lookback: 12
+      update_market_profile: true
+      summarize: false
+
+  fetch_5m_klines:
+    cron: "1,6,11,16,21,26,31,36,41,46,51,56 * * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "5m"
+      lookback: 24
+      update_market_profile: true
+      summarize: false
+
+  hourly_feishu_report:
+    cron: "1-10 * * * *"
+    task: "hourly_feishu_report"
+    params:
+      notify_feishu: true
+      include_symbols: true
+      include_paper_positions: true
+      include_queue_status: true
+
+  alert_outbox_retry:
+    cron: "* * * * *"
+    task: "alert_outbox_retry"
+    params:
+      limit: 10
+
+  analyze_market_15m:
+    cron: "1,16,31,46 * * * *"
+    task: "analyze_market"
+    params:
+      primary_interval: "15m"
+      timeframes: ["4h", "1h", "15m", "5m"]
+      allow_signal: true
+      allow_paper_order: true
+      notify_feishu: true
+
+  update_opportunity_watches:
+    cron: "3,18,33,48 * * * *"
+    task: "update_opportunity_watches"
+    params:
+      notify_feishu: true
+
+  update_paper_positions_3m:
+    cron: "*/3 * * * *"
+    task: "update_paper_positions"
+    params:
+      notify_on_close: true
+      notify_on_large_drawdown: true
+
+  pending_order_management:
+    cron: "0 * * * *"
+    task: "pending_order_management"
+    params:
+      notify_feishu: true
+
+  pending_order_revalidation:
+    cron: "15 * * * *"
+    task: "pending_order_revalidation"
+    params:
+      notify_feishu: true
+
+  daily_review:
+    cron: "5 0 * * *"
+    task: "daily_trade_review"
+    params:
+      summarize_trades: true
+      update_strategy_memory: true
+      notify_feishu: true
+
+queues:
+  priorities:
+    user_message: 1
+    user_button_callback: 2
+    alert_retry: 2
+    critical_alert: 3
+    trade_review: 4
+    scheduled_market_analysis: 5
+    higher_timeframe_summary: 7
+    shadow_testing: 9

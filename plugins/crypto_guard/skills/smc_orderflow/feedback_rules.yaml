@@ -1,0 +1,5 @@
+feedback_rules:
+  - when: fvg_without_followthrough
+    action: require_order_flow_confirmation
+  - when: liquidity_sweep_failed
+    action: reduce_sweep_confidence

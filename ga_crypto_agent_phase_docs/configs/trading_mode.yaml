@@ -1,0 +1,7 @@
+trading_mode:
+  live_trading_enabled: false
+  paper_trading_enabled: true
+  real_order_api_enabled: false
+  allow_withdraw_api: false
+  allow_trade_api: false
+  require_public_market_data_only: true

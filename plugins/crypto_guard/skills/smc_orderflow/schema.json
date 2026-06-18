@@ -1,0 +1,1 @@
+{"type":"object","required":["skill","confidence"],"properties":{"skill":{"type":"string"},"liquidity_event":{"type":"object"},"order_block":{"type":"object"},"fvg":{"type":"object"},"order_flow":{"type":"object"},"setup":{"type":"string"},"confidence":{"type":"number"}}}

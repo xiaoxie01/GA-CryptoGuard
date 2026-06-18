@@ -1,0 +1,24 @@
+skill_name: smc_orderflow
+feedback_sources:
+  - trade_review
+  - daily_review
+  - user_feedback
+  - shadow_test
+
+learnable_items:
+  - prompt_interpretation_rule
+  - tool_parameter
+  - confidence_adjustment
+  - filter_condition
+
+patch_policy:
+  create_candidate_only: true
+  require_shadow_testing: true
+  auto_promote: false
+  min_observation_signals: 3
+  preferred_sample_size: 30
+
+blocked_actions:
+  - direct_active_override
+  - direct_paper_order
+  - direct_feishu_action

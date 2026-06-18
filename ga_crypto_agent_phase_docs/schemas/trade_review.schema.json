@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TradeReview",
+  "type": "object",
+  "required": [
+    "trade_id",
+    "result",
+    "primary_reason",
+    "secondary_reasons",
+    "should_have_action"
+  ],
+  "properties": {
+    "trade_id": {
+      "type": "integer"
+    },
+    "result": {
+      "enum": [
+        "win",
+        "loss",
+        "breakeven"
+      ]
+    },
+    "primary_reason": {
+      "type": "string"
+    },
+    "secondary_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "should_have_action": {
+      "type": "string"
+    },
+    "strategy_patch_suggestion": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "evidence": {
+      "type": "object"
+    }
+  }
+}

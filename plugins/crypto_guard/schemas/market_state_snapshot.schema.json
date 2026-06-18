@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketStateSnapshot",
+  "type": "object",
+  "required": ["symbol", "analysis_time_utc", "mode", "profiles", "modules", "counter_evidence"],
+  "properties": {
+    "symbol": {"type": "string"},
+    "analysis_time_utc": {"type": "integer"},
+    "mode": {"type": "string", "enum": ["scheduled", "ad_hoc", "opportunity_watch", "paper_review", "shadow_test"]},
+    "profiles": {"type": "object"},
+    "modules": {
+      "type": "object",
+      "properties": {
+        "price_action": {"type": ["object", "null"]},
+        "smc": {"type": ["object", "null"]},
+        "order_flow": {"type": ["object", "null"]},
+        "momentum": {"type": ["object", "null"]},
+        "trend_stage": {"type": ["object", "null"]},
+        "chanlun": {"type": ["object", "null"]}
+      }
+    },
+    "counter_evidence": {
+      "type": "object",
+      "required": ["bullish_evidence", "bearish_evidence", "neutral_or_risk_evidence", "contradiction_level"],
+      "properties": {
+        "bullish_evidence": {"type": "array", "items": {"type": "string"}},
+        "bearish_evidence": {"type": "array", "items": {"type": "string"}},
+        "neutral_or_risk_evidence": {"type": "array", "items": {"type": "string"}},
+        "contradiction_level": {"type": "string", "enum": ["low", "medium", "high"]}
+      }
+    },
+    "paper_context": {"type": "object"},
+    "global_context": {"type": "object"}
+  }
+}

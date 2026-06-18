@@ -1,0 +1,153 @@
+trading_mode:
+  live_trading_enabled: false
+  paper_trading_enabled: true
+  real_order_api_enabled: false
+  allow_withdraw_api: false
+  allow_trade_api: false
+  require_public_market_data_only: true
+
+analysis:
+  mode: intraday
+  timeframes:
+    direction: "4h"
+    trend: ["1h", "15m"]
+    entry: "5m"
+  weights:
+    4h: 0.35
+    1h: 0.25
+    15m: 0.20
+    5m: 0.20
+  require_closed_htf_candles: true
+
+risk:
+  min_rr: 1.5
+  min_confidence_for_paper_order: 0.72
+  min_confidence: 0.72
+  require_structure_momentum_alignment: true
+  allow_manual_bypass: false
+  breakeven_after_rr: 2.0  # MFE >= 2R 才移止损到保本
+  min_sl_distance_pct: 0.8  # 止损距离至少占入场价的0.8%
+  min_tp_distance_pct: 1.0  # 第一止盈距离至少占入场价的1.0%
+
+account_risk:
+  drawdown_risk_off_threshold: -2.5   # %
+  drawdown_hard_risk_off_threshold: -3.0  # % — 禁止所有新开仓
+  risk_off_risk_percent: 0.25         # 降低后的单笔风险
+  recovery_min_avg_r: 0.0
+  recovery_max_loss_count: 4
+  recovery_lookback: 10               # 最近 N 笔
+  recovery_wait_hours: 24             # 距离上次亏损等待小时数
+  daily_loss_pause_consecutive_losses: 2  # 连续止损笔数触发暂停
+  daily_loss_pause_avg_r_threshold: -0.5  # 当日 avg_r 触发暂停
+  cooldown_symbols:
+    BTCUSDT_LONG: 48                   # 小时
+    LTCUSDT_LONG: 48
+    ETHUSDT_LONG: 48
+    BNBUSDT_SHORT: 48
+
+paper_trading:
+  price_update_interval_minutes: 3
+  unrealized_pnl_price_source: "latest_price"
+  market_fill_method: "next_candle_open_with_slippage"
+  market_slippage_pct: 0.001
+  limit_fill_method: "entry_price_between_high_low"
+  limit_order_slippage_pct: 0.0
+
+feishu:
+  hourly_summary_enabled: true
+  use_rich_card_summary: true
+  quiet_period:
+    normal_duplicate_alert_minutes: 5
+    suppress_add_position_alerts: true
+    never_silence:
+      - open_position
+      - close_position
+      - stop_loss_adjustment
+      - take_profit_hit
+      - stop_loss_hit
+      - risk_alert
+      - opportunity_triggered
+      - paper_order_filled
+      - paper_order_expired
+      - conflict_cancelled
+      - evolution_trigger
+
+alerts:
+  retry_enabled: true
+  retry_max_attempts: 3
+  retry_backoff: "exponential"
+  store_failed_alerts: true
+
+evolution:
+  shadow_testing_enabled: true
+  allow_double_llm_cost: true
+  min_observation_signals: 3
+  preferred_promotion_sample_size: 30
+  affected_strategy_observation_hours: 24
+  auto_promote: false
+  pause_evolution_on_extreme_market: true
+  online_shadow:
+    min_samples_after_backtest: 5
+    min_samples_without_backtest: 30
+  stale_cleanup:
+    max_days: 7
+    min_samples: 3
+  trigger:
+    consecutive_stop_losses: 3
+    max_account_drawdown_pct: 0.10
+  backtest_gate:
+    enabled: true
+    lookback_days: 60
+    min_simulated_trades: 30
+    min_decision_samples: 80
+    min_avg_r_improvement: 0.05
+    max_win_rate_degradation: 0.10
+    max_drawdown_increase: 0.20
+    min_r_count_for_performance_gate: 5
+
+account_feedback_rules:
+  enabled: true
+  mode: shadow
+  lookback_hours: 24
+  affected_scope: trigger_related_symbols
+  actions:
+    require_stronger_confirmation:
+      enabled: true
+      min_confidence: 0.80
+      min_entry_quality: 0.70
+      on_fail: annotate_only
+
+market_regime:
+  classifier_enabled: true
+  atr_percentile_extreme_threshold: 0.90
+  funding_shock_detection: true
+
+risk_language:
+  banned_phrases:
+    - "一定上涨"
+    - "必涨"
+    - "稳赚"
+    - "放心持有"
+    - "强烈开多"
+    - "强烈开空"
+  required_disclaimer: "不构成实盘建议，仅用于模拟盘与策略研究。"
+
+performance_gate:
+  enabled: true
+  cooldown:
+    loss_count_threshold: 2
+    loss_window: 3
+    cooldown_hours: 24
+  confidence_degradation:
+    avg_r_threshold: -0.2
+    sample_window: 5
+    confidence_penalty: 0.10
+  context_performance:
+    min_samples: 3
+    avg_r_threshold: 0.0
+    downgrade_rules:
+      S: "A"
+      A: "B"
+      B: "C"
+      C: "D"
+      D: "D"

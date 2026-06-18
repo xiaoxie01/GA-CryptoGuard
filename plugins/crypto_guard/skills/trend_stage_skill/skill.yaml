@@ -1,0 +1,16 @@
+skill_name: trend_stage_skill
+version: 1.0
+status: active
+description: Classify early, middle, late, range, and transition stages from structure and momentum evidence.
+tools: [trend_stage_classifier, late_stage_risk_detector, stage_transition_detector]
+input:
+  required: [symbol, timeframe, closed_candles, previous_analysis_state]
+output_schema: schema.json
+memory:
+  read: [skill_memory, recent_trade_reviews, strategy_feedback]
+  write: [skill_execution_logs, skill_feedback_memory]
+evolution:
+  enabled: true
+  allow_prompt_patch: true
+  allow_tool_param_patch: true
+  require_shadow_testing: true

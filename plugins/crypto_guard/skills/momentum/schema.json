@@ -1,0 +1,1 @@
+{"type":"object","required":["skill","direction","momentum_score","confidence"],"properties":{"skill":{"type":"string"},"direction":{"type":"string"},"momentum_score":{"type":"number"},"quality":{"type":"string"},"volume_price_alignment":{"type":"boolean"},"indicator_divergence":{"type":"boolean"},"confidence":{"type":"number"}}}

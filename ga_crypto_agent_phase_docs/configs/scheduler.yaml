@@ -1,0 +1,54 @@
+timezone: UTC
+
+jobs:
+  fetch_1d_klines:
+    cron: "1 0 * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "1d"
+      lookback: 3
+      update_market_profile: true
+      summarize: true
+
+  fetch_4h_klines:
+    cron: "1 0,4,8,12,16,20 * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "4h"
+      lookback: 6
+      update_market_profile: true
+      summarize: true
+
+  fetch_1h_klines:
+    cron: "1 * * * *"
+    task: "fetch_closed_klines"
+    params:
+      interval: "1h"
+      lookback: 12
+      update_market_profile: true
+      summarize: false
+
+  analyze_market_15m:
+    cron: "1,16,31,46 * * * *"
+    task: "analyze_market"
+    params:
+      primary_interval: "15m"
+      timeframes: ["1d", "4h", "1h", "15m", "5m"]
+      allow_signal: true
+      allow_paper_order: true
+      notify_feishu: true
+
+  update_paper_positions_3m:
+    cron: "*/3 * * * *"
+    task: "update_paper_positions"
+    params:
+      notify_on_close: true
+      notify_on_large_drawdown: true
+
+  daily_review:
+    cron: "8 0 * * *"
+    task: "daily_trade_review"
+    params:
+      summarize_trades: true
+      update_strategy_memory: true
+      notify_feishu: true

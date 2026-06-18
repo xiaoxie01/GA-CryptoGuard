@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TradeReview",
+  "type": "object",
+  "required": ["trade_id", "result", "primary_reason", "summary", "improvement_suggestion"],
+  "properties": {
+    "trade_id": {"type": "integer"},
+    "result": {"type": "string", "enum": ["win", "loss", "breakeven", "cancelled"]},
+    "primary_reason": {
+      "type": "string",
+      "enum": [
+        "wrong_direction",
+        "trend_stage_misclassified",
+        "late_trend_chasing",
+        "range_misread_as_trend",
+        "ignored_counter_evidence",
+        "ignored_btc_context",
+        "entry_chasing",
+        "entry_too_early",
+        "entry_too_late",
+        "stop_loss_too_tight",
+        "take_profit_too_far",
+        "orderflow_not_confirmed",
+        "smc_false_signal",
+        "chanlun_divergence_missed",
+        "volatility_spike",
+        "news_like_move",
+        "good_execution",
+        "unknown"
+      ]
+    },
+    "secondary_reasons": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"},
+    "metrics": {"type": "object"},
+    "improvement_suggestion": {"type": "object"},
+    "strategy_patch_candidate": {"type": ["object", "null"]}
+  }
+}
