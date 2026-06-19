@@ -5,6 +5,7 @@ Detects:
 - Status mismatches (trigger/patch/version state inconsistencies)
 - Stale shadows (candidates in shadow_testing >7 days with no new samples)
 - Draft limbo (patches in draft >72 hours)
+- Duplicate open trades (same order_id with multiple open paper_trades)
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_stale_shadows(repo))
     issues.extend(_check_draft_limbo(repo))
     issues.extend(_check_duplicate_patches(repo))
+    issues.extend(_check_duplicate_open_trades(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -42,6 +44,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "stale_shadows": len([i for i in issues if i["type"] == "stale_shadow"]),
         "draft_limbo": len([i for i in issues if i["type"] == "draft_limbo"]),
         "duplicate_patches": len([i for i in issues if i["type"] == "duplicate_patch"]),
+        "duplicate_open_trades": len([i for i in issues if i["type"] == "duplicate_open_trade"]),
     }
 
     return {
@@ -285,5 +288,42 @@ def _check_draft_limbo(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
                 })
         except (ValueError, TypeError):
             continue
+
+    return issues
+
+
+def _check_duplicate_open_trades(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Find orders that have multiple open paper_trades (distorts equity/PnL)."""
+    issues: list[dict[str, Any]] = []
+
+    duplicates = repo.conn.execute(
+        """
+        SELECT order_id, symbol, COUNT(*) as open_count,
+               GROUP_CONCAT(id) as trade_ids,
+               GROUP_CONCAT(entry_price) as entry_prices,
+               GROUP_CONCAT(quantity) as quantities,
+               GROUP_CONCAT(created_at) as created_ats
+        FROM paper_trades
+        WHERE closed_at IS NULL
+        GROUP BY order_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    for row in duplicates:
+        issues.append({
+            "type": "duplicate_open_trade",
+            "severity": "error",
+            "details": {
+                "order_id": row["order_id"],
+                "symbol": row["symbol"],
+                "open_count": row["open_count"],
+                "trade_ids": row["trade_ids"],
+                "entry_prices": row["entry_prices"],
+                "quantities": row["quantities"],
+                "created_ats": row["created_ats"],
+            },
+            "suggested_action": "Close all but the oldest open trade for this order; verify equity correction",
+        })
 
     return issues

@@ -96,7 +96,12 @@ def evaluate_watch(repo: CryptoGuardRepository, watch: dict[str, Any], *, analys
     conditions = _load_json(watch.get("watch_condition_json"), [])
     if isinstance(conditions, dict):
         conditions = [conditions]
-    if not isinstance(conditions, list) or not conditions:
+    # Empty/unstructured conditions expire after creation TTL; fail-closed
+    if not conditions or conditions == [{}]:
+        if _is_expired(watch.get("expires_at")):
+            return _result(watch, "expired", "无结构化监控条件，已过期")
+        return _result(watch, "waiting", "监控条件为空，等待过期")
+    if not isinstance(conditions, list):
         return _result(watch, "waiting", "监控条件为空或无法解析")
 
     hits = [_condition_hit(condition, latest, previous, watch) for condition in conditions]
@@ -372,7 +377,10 @@ def _is_expired(expires_at: Any) -> bool:
         return False
     try:
         raw = str(expires_at).replace("Z", "+00:00")
-        return datetime.fromisoformat(raw) <= datetime.now(timezone.utc)
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt <= datetime.now(timezone.utc)
     except Exception:
         return False
 

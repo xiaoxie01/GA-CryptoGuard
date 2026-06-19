@@ -100,6 +100,56 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             "signal_id": signal_id,
         }
 
+    # Market regime gate — soft downgrade/restrict counter-regime entries
+    regime_gate = _apply_regime_gate_if_enabled(
+        repo,
+        symbol=signal["symbol"],
+        side=str(trade_plan.get("side", "")).upper(),
+        signal_grade=str(decision.get("signal_grade", "D")).upper(),
+        confidence=float(decision.get("confidence") or 0),
+        analysis_time_utc=utc_ms(),
+        order_type=str(trade_plan.get("entry_type", "")),
+    )
+    # Always save regime result for audit (even in shadow mode)
+    if regime_gate:
+        _save_regime_gate_to_ga_decision(repo, int(ga_decision_id), regime_gate)
+    if regime_gate and regime_gate.get("regime_gate_applied"):
+        adjustments = regime_gate.get("adjustments", {})
+        regime_mode = regime_gate.get("mode", "shadow")
+        if adjustments.get("watch_only") and regime_mode == "controlled":
+            # Create opportunity watch instead of paper order
+            _create_opportunity_watch_from_gate(repo, signal["symbol"],
+                trade_plan.get("side", ""), int(ga_decision_id),
+                {"reason": f"counter_regime_watch_only: {regime_gate.get('market_regime', {}).get('market_phase')}",
+                 "would_decide": "downgrade_to_watch",
+                 "regime_gate": regime_gate})
+            return {
+                "ok": False,
+                "error": "regime_gate_watch_only",
+                "regime_gate": regime_gate,
+                "signal_id": signal_id,
+                "ga_decision_id": int(ga_decision_id),
+            }
+        # In shadow mode or non-watch_only: apply adjustments but proceed
+        if regime_mode == "controlled" and not adjustments.get("watch_only"):
+            # Check allowed_order_types and min_rr before applying adjustments
+            downgrade_reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+            if downgrade_reason:
+                _create_opportunity_watch_from_gate(repo, signal["symbol"],
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_downgrade: {downgrade_reason}",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "signal_id": signal_id,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": downgrade_reason,
+                }
+            trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
+
     order_id, created = repo.create_paper_order(
         signal_id,
         signal,
@@ -190,6 +240,55 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
             "risk_check": risk,
             "ga_decision_id": ga_decision_id,
         }
+
+    # Market regime gate — soft downgrade/restrict counter-regime entries
+    regime_gate = _apply_regime_gate_if_enabled(
+        repo,
+        symbol=ga_decision.get("symbol", ""),
+        side=str(trade_plan.get("side", "")).upper(),
+        signal_grade=str(ga_decision.get("signal_grade", "D")).upper(),
+        confidence=float(ga_decision.get("confidence") or 0),
+        analysis_time_utc=utc_ms(),
+        order_type=str(trade_plan.get("entry_type", "")),
+    )
+    # Always save regime result for audit (even in shadow mode)
+    if regime_gate:
+        _save_regime_gate_to_ga_decision(repo, int(ga_decision_id), regime_gate)
+    if regime_gate and regime_gate.get("regime_gate_applied"):
+        adjustments = regime_gate.get("adjustments", {})
+        regime_mode = regime_gate.get("mode", "shadow")
+        if adjustments.get("watch_only") and regime_mode == "controlled":
+            # Create opportunity watch instead of paper order
+            _create_opportunity_watch_from_gate(repo, ga_decision.get("symbol", ""),
+                trade_plan.get("side", ""), int(ga_decision_id),
+                {"reason": f"counter_regime_watch_only: {regime_gate.get('market_regime', {}).get('market_phase')}",
+                 "would_decide": "downgrade_to_watch",
+                 "regime_gate": regime_gate})
+            return {
+                "ok": False,
+                "error": "regime_gate_watch_only",
+                "regime_gate": regime_gate,
+                "ga_decision_id": ga_decision_id,
+            }
+        # In shadow mode or non-watch_only: apply adjustments but proceed
+        if regime_mode == "controlled" and not adjustments.get("watch_only"):
+            # Check allowed_order_types and min_rr before applying adjustments
+            downgrade_reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+            if downgrade_reason:
+                _create_opportunity_watch_from_gate(repo, symbol,
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_downgrade: {downgrade_reason}",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": downgrade_reason,
+                }
+            trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
+
     signal = {
         "symbol": ga_decision["symbol"],
         "market_snapshot_id": ga_decision.get("snapshot_id"),
@@ -300,6 +399,11 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
         fill_method = "trigger_touch" if should_fill else fill_method
     if not should_fill:
         return {"ok": True, "filled": False}
+    # Guard: don't create duplicate trades for the same order
+    existing_trade = repo.get_open_trade_for_order(order["id"])
+    if existing_trade:
+        return {"ok": True, "filled": False, "existing_trade_id": existing_trade["id"],
+                "reason": "order already has an open trade"}
     trade_id = repo.create_paper_trade(order, float(entry_price), fill_method=fill_method)
     repo.update_paper_order_status(order["id"], "open", filled_at=utc_iso())
     repo.enqueue_job(
@@ -307,7 +411,20 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
         3,
         "paper_worker",
         f"system:paper:filled:{order['id']}",
-        {"event_type": "paper_order_filled", "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method, "side": order.get("side")},
+        {
+            "event_type": "paper_order_filled",
+            "symbol": order["symbol"],
+            "order_id": order["id"],
+            "trade_id": trade_id,
+            "entry_price": float(entry_price),
+            "fill_method": fill_method,
+            "side": order.get("side"),
+            "stop_loss": order.get("stop_loss"),
+            "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "filled_at": utc_iso(),
+            "quantity": order.get("quantity"),
+            "order_type": order.get("order_type"),
+        },
     )
     return {"ok": True, "filled": True, "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method}
 
@@ -351,6 +468,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         stop_take_path=stop_take_path,
     )
     repo.update_paper_order_status(order["id"], "closed", closed_at=utc_iso())
+    # Backfill real pnl_r to shadow strategy_evaluations for this trade
+    repo.backfill_shadow_evaluation_pnl_r(trade, quality["pnl_r"])
     repo.upsert_paper_position_from_trade(
         account_id=int(repo.ensure_paper_account()["id"]),
         trade={**trade, "current_price": exit_price},
@@ -378,7 +497,22 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         3,
         "paper_worker",
         f"system:paper:closed:{trade['id']}",
-        {"event_type": event_type, "symbol": order["symbol"], "order_id": order["id"], "trade_id": trade["id"], "exit_price": exit_price, "close_reason": close_reason, "pnl_r": quality["pnl_r"], "side": order.get("side")},
+        {
+            "event_type": event_type,
+            "symbol": order["symbol"],
+            "order_id": order["id"],
+            "trade_id": trade["id"],
+            "exit_price": exit_price,
+            "close_reason": close_reason,
+            "pnl_r": quality["pnl_r"],
+            "side": order.get("side"),
+            "entry_price": order.get("entry_price"),
+            "stop_loss": order.get("stop_loss"),
+            "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "filled_at": order.get("filled_at"),
+            "quantity": trade.get("quantity"),
+            "order_type": order.get("order_type"),
+        },
     )
     return {
         "ok": True,
@@ -501,10 +635,122 @@ def _save_gate_result_to_ga_decision(
             "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
             (json.dumps(gate_result, ensure_ascii=False), ga_decision_id),
         )
-        # No commit here — caller owns the transaction
     except Exception as exc:
-        # Non-critical: log but don't fail the order
         import logging
         logging.getLogger("crypto_guard.account_feedback_gate").warning(
             "Failed to save gate result to GA decision %d: %s", ga_decision_id, exc
         )
+
+
+def _apply_regime_gate_if_enabled(
+    repo: CryptoGuardRepository,
+    *,
+    symbol: str,
+    side: str,
+    signal_grade: str,
+    confidence: float,
+    analysis_time_utc: int,
+    order_type: str = "",
+) -> dict[str, Any] | None:
+    """Apply market regime gate if enabled in config."""
+    from plugins.crypto_guard.config.loader import load_config
+    cfg = load_config().trading_mode
+    regime_cfg = cfg.get("market_regime", {})
+    if not regime_cfg.get("enabled", True):
+        return None
+    from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+    return apply_regime_gate(
+        repo,
+        symbol=symbol,
+        side=side,
+        signal_grade=signal_grade,
+        confidence=confidence,
+        analysis_time_utc=analysis_time_utc,
+        order_type=order_type,
+    )
+
+
+def _save_regime_gate_to_ga_decision(
+    repo: CryptoGuardRepository,
+    ga_decision_id: int,
+    regime_gate: dict[str, Any],
+) -> None:
+    """Save market regime gate result to GA decision for audit trail."""
+    try:
+        repo.conn.execute(
+            "UPDATE ga_decisions SET market_regime_gate_json = ? WHERE id = ?",
+            (json.dumps(regime_gate, ensure_ascii=False), ga_decision_id),
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger("crypto_guard.market_regime").warning(
+            "Failed to save regime gate result to GA decision %d: %s", ga_decision_id, exc
+        )
+
+
+def _apply_regime_adjustments(
+    trade_plan: dict[str, Any],
+    adjustments: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply regime gate adjustments to trade_plan in controlled mode.
+
+    Returns a modified copy of trade_plan with:
+    - risk_percent scaled by risk_multiplier
+    - min_rr and allowed_order_types set as audit fields (enforced by caller)
+    - confidence and grade updated for downstream audit
+    """
+    plan = dict(trade_plan)
+
+    # Apply risk_multiplier
+    risk_mult = float(adjustments.get("risk_multiplier", 1.0))
+    if risk_mult != 1.0:
+        original_risk = float(plan.get("risk_percent", 0.5))
+        plan["risk_percent"] = round(original_risk * risk_mult, 4)
+        plan["regime_risk_multiplier_applied"] = risk_mult
+
+    # Apply effective_confidence (for audit only — doesn't change trade_plan)
+    effective_conf = adjustments.get("effective_confidence")
+    if effective_conf is not None:
+        plan["regime_effective_confidence"] = effective_conf
+
+    # Apply effective_grade (for audit only)
+    effective_grade = adjustments.get("effective_grade")
+    if effective_grade:
+        plan["regime_effective_grade"] = effective_grade
+
+    # Store min_rr and allowed_order_types as audit fields
+    min_rr = adjustments.get("min_rr")
+    if min_rr is not None:
+        plan["regime_min_rr"] = min_rr
+    allowed_types = adjustments.get("allowed_order_types")
+    if allowed_types is not None:
+        plan["regime_allowed_order_types"] = allowed_types
+
+    return plan
+
+
+def _should_downgrade_to_watch_by_regime(
+    trade_plan: dict[str, Any],
+    adjustments: dict[str, Any],
+) -> str | None:
+    """Check if regime adjustments require downgrading to opportunity watch.
+
+    Returns reason string if downgrade needed, None otherwise.
+    Checks: allowed_order_types and min_rr.
+    """
+    # Check allowed_order_types
+    allowed_types = adjustments.get("allowed_order_types")
+    entry_type = str(trade_plan.get("entry_type") or "").lower()
+    if allowed_types is not None and entry_type:
+        if not allowed_types or entry_type not in [t.lower() for t in allowed_types]:
+            return f"entry_type={entry_type} not in allowed_order_types={allowed_types}"
+
+    # Check min_rr
+    min_rr = float(adjustments.get("min_rr", 0))
+    if min_rr > 0:
+        from plugins.crypto_guard.risk.risk_engine import _risk_reward
+        rr = _risk_reward(trade_plan)
+        if rr is not None and rr < min_rr:
+            return f"RR={rr:.2f} below regime min_rr={min_rr:.1f}"
+
+    return None

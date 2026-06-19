@@ -162,7 +162,7 @@ class PerformanceGate:
             return {"active": False, "reason": None, "until": None}
 
         # Count losses in recent window
-        loss_count = sum(1 for t in recent_trades if t.get("pnl_r", 0) < 0)
+        loss_count = sum(1 for t in recent_trades if (t.get("pnl_r") or 0) < 0)
         if loss_count < loss_count_threshold:
             return {"active": False, "reason": None, "until": None}
 
@@ -201,7 +201,7 @@ class PerformanceGate:
             return 0.0
 
         # Calculate average R for recent window
-        pnl_rs = [t.get("pnl_r", 0) for t in recent_trades]
+        pnl_rs = [(t.get("pnl_r") or 0) for t in recent_trades]
         avg_r = sum(pnl_rs) / len(pnl_rs) if pnl_rs else 0.0
 
         # If avg_r below threshold, degrade confidence
@@ -251,6 +251,8 @@ class PerformanceGate:
                     t.closed_at
                 FROM paper_trades t
                 WHERE t.symbol = ? AND t.side = ? AND t.closed_at IS NOT NULL
+                  AND t.pnl_r IS NOT NULL
+                  AND (t.close_reason IS NULL OR t.close_reason != 'duplicate_cleanup')
                 ORDER BY t.closed_at DESC
                 LIMIT ?
                 """,
@@ -285,6 +287,8 @@ class PerformanceGate:
                 WHERE gd.symbol = ?
                   AND UPPER(s.direction) = UPPER(?)
                   AND gd.trend_stage = ?
+                  AND t.pnl_r IS NOT NULL
+                  AND (t.close_reason IS NULL OR t.close_reason != 'duplicate_cleanup')
                 """,
                 (symbol, side, trend_stage),
             ).fetchone()

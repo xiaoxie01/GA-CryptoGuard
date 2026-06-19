@@ -85,7 +85,7 @@ def enqueue_market_analysis(
         skipped_pending = 0
         priority = 6 if primary_interval == "5m" else 5
         for symbol in repo.active_analysis_symbols():
-            session_id = f"system:scheduled:{primary_interval}:{symbol}"
+            session_id = f"system:scheduled:{primary_interval}:{symbol}:{analysis_time}"
             pending = conn.execute(
                 """
                 SELECT 1

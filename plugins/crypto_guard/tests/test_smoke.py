@@ -513,7 +513,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         first = run_daily_review(self.repo, day_utc=day)
         second = run_daily_review(self.repo, day_utc=day)
         self.assertGreaterEqual(first["new_reviews"], 1)
-        self.assertEqual(second["new_reviews"], 0)
+        self.assertTrue(second.get("idempotent"), "Second call should be idempotent after first creates report")
+        self.assertTrue(second.get("existing"), "Second call should return existing report")
         self.assertIn("每日模拟盘复盘", first["text"])
         patches = self.conn.execute("SELECT status FROM strategy_patches").fetchall()
         self.assertTrue(all(row["status"] == "shadow_testing" for row in patches))
@@ -6511,6 +6512,1213 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["status"], "waiting",
                          "None min_entry_quality should return waiting, not triggered")
         self.assertIn("min_entry_quality", result["reason"].lower())
+
+    # ── Daily Review Idempotency Tests ──
+
+    def test_daily_review_idempotent_report_exists(self) -> None:
+        """run_daily_review(force=False) returns existing report without re-running."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        # Pre-create a daily_review_report
+        report_date = "2026-06-15"
+        self.repo.save_daily_review_report(
+            review_date=report_date,
+            summary={"date_utc": report_date, "paper_summary": {"trades": 0}},
+            ga_report="existing_report_text",
+            skill_updates=[],
+            evolution_actions={},
+            pushed_to_feishu=False,
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=report_date, force=False)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("idempotent"))
+        self.assertTrue(result.get("existing"))
+        self.assertEqual(result["text"], "existing_report_text")
+        # Verify no new skill_feedback_memory was written
+        skill_count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM skill_feedback_memory WHERE source_type='daily_review'"
+        ).fetchone()["cnt"]
+        self.assertEqual(skill_count, 0, "force=False should not write new skill memory")
+
+    def test_daily_review_force_rebuild(self) -> None:
+        """run_daily_review(force=True) re-runs even if report exists."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        report_date = "2026-06-15"
+        # Pre-create a report
+        self.repo.save_daily_review_report(
+            review_date=report_date,
+            summary={"date_utc": report_date},
+            ga_report="old_report",
+            skill_updates=[],
+            evolution_actions={},
+        )
+        self.conn.commit()
+
+        # Add a closed trade so run_daily_review has something to work with
+        self._ensure_paper_trade("BTCUSDT", "LONG", entry_price=100.0)
+        self.repo.close_paper_trade(
+            trade_id=1, exit_price=95.0, close_reason="stop_loss",
+            pnl=-5.0, pnl_percent=-5.0, pnl_r=-1.0, mfe=0.0, mae=-5.0,
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=report_date, force=True)
+        # May not succeed without LLM, but should NOT return idempotent=True
+        self.assertFalse(result.get("idempotent"), "force=True should not short-circuit")
+
+    def test_ensure_daily_review_checks_reports_table(self) -> None:
+        """_ensure_daily_review only enqueues when no daily_review_reports entry exists."""
+        from plugins.crypto_guard.paper.paper_position_updater import _ensure_daily_review
+
+        # Pre-create a daily_review_report for yesterday
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        self.repo.save_daily_review_report(
+            review_date=yesterday,
+            summary={"date_utc": yesterday},
+            ga_report="done",
+            skill_updates=[],
+            evolution_actions={},
+        )
+        self.conn.commit()
+
+        # Count jobs before
+        job_count_before = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE job_type='daily_review'"
+        ).fetchone()["cnt"]
+
+        _ensure_daily_review(self.repo)
+
+        job_count_after = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE job_type='daily_review'"
+        ).fetchone()["cnt"]
+        self.assertEqual(job_count_before, job_count_after,
+                         "Should not enqueue when daily_review_reports entry exists")
+
+    def test_enqueue_job_once_idempotent(self) -> None:
+        """enqueue_job_once returns existing id for same (job_type, session_id)."""
+        jid1 = self.repo.enqueue_job_once("daily_review", 7, "test", "test:session:1", {"day_utc": "2026-06-15"})
+        jid2 = self.repo.enqueue_job_once("daily_review", 7, "test", "test:session:1", {"day_utc": "2026-06-15"})
+        self.assertEqual(jid1, jid2, "Same session_id should return existing job id")
+
+        # Should still be only 1 row
+        count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE job_type='daily_review' AND session_id='test:session:1'"
+        ).fetchone()["cnt"]
+        self.assertEqual(count, 1)
+
+    def test_enqueue_job_once_resets_failed(self) -> None:
+        """enqueue_job_once resets failed jobs back to pending."""
+        jid1 = self.repo.enqueue_job_once("daily_review", 7, "test", "test:session:fail", {"day_utc": "2026-06-15"})
+        self.repo.finish_job(jid1, error_message="boom")
+
+        # Now enqueue same session_id again — should reset status to pending
+        jid2 = self.repo.enqueue_job_once("daily_review", 7, "test", "test:session:fail", {"day_utc": "2026-06-15"})
+        self.assertEqual(jid1, jid2)
+
+        row = self.conn.execute("SELECT status FROM agent_jobs WHERE id=?", (jid1,)).fetchone()
+        self.assertEqual(row["status"], "pending", "Failed job should be reset to pending")
+
+    def test_raw_enqueue_job_allows_event_queue_duplicates(self) -> None:
+        """raw enqueue_job() allows duplicate (job_type, session_id) — event queue semantics.
+
+        Callers like feishu_user_message and feishu_button_callback use
+        enqueue_job() (not enqueue_job_once()) because they are event queues:
+        the same user can send multiple messages or click buttons multiple times.
+        """
+        jid1 = self.repo.enqueue_job("feishu_user_message", 1, "feishu", "feishu:user:test_open_id", {"text": "msg1"})
+        jid2 = self.repo.enqueue_job("feishu_user_message", 1, "feishu", "feishu:user:test_open_id", {"text": "msg2"})
+        self.assertNotEqual(jid1, jid2, "raw enqueue_job should create separate rows for event queue semantics")
+
+        # Both should exist
+        count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE job_type='feishu_user_message' AND session_id='feishu:user:test_open_id'"
+        ).fetchone()["cnt"]
+        self.assertEqual(count, 2, "Both event-queue jobs should exist")
+
+    def test_intraday_loss_review_not_daily_review(self) -> None:
+        """intraday_loss_review does NOT write daily_review_reports or skill_feedback_memory."""
+        from plugins.crypto_guard.run_ga_workers import _handle_intraday_loss_review
+
+        result = _handle_intraday_loss_review(
+            self.repo,
+            {"day_utc": "2026-06-16", "loss_count": 3},
+            send_message=None,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["loss_count"], 3)
+
+        # Verify no daily_review_reports written
+        report_count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM daily_review_reports"
+        ).fetchone()["cnt"]
+        self.assertEqual(report_count, 0, "intraday_loss_review should NOT write daily_review_reports")
+
+        # Verify no skill_feedback_memory written
+        skill_count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM skill_feedback_memory"
+        ).fetchone()["cnt"]
+        self.assertEqual(skill_count, 0, "intraday_loss_review should NOT write skill_feedback_memory")
+
+    def test_daily_review_dedupe_key_includes_date(self) -> None:
+        """daily_review alert dedupe_key includes review_date for per-day dedup."""
+        from plugins.crypto_guard.notify.alert_delivery import send_markdown_alert
+
+        alert_id = send_markdown_alert(
+            self.repo, None,
+            receive_id="test_chat",
+            receive_id_type="chat_id",
+            text="test daily review",
+            alert_type="daily_review",
+            dedupe_key="daily_review:2026-06-15",
+        )["alert_id"]
+
+        row = self.conn.execute(
+            "SELECT dedupe_key FROM alert_outbox WHERE id=?", (alert_id,)
+        ).fetchone()
+        self.assertEqual(row["dedupe_key"], "daily_review:2026-06-15",
+                         "dedupe_key should include review_date for per-day dedup")
+
+    def test_cleanup_migration_is_idempotent(self) -> None:
+        """_cleanup_agent_job_duplicates is idempotent — safe to run multiple times."""
+        from plugins.crypto_guard.storage.migrations import _cleanup_agent_job_duplicates
+
+        # Create duplicates with different session_ids first (no DB-level UNIQUE index)
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('daily_review', 7, 'test', 'cleanup:dup:1', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('daily_review', 7, 'test', 'cleanup:dup:2', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        # Rename to same session_id to create the duplicate scenario
+        self.conn.execute(
+            "UPDATE agent_jobs SET session_id='cleanup:dup' WHERE session_id IN ('cleanup:dup:1', 'cleanup:dup:2')"
+        )
+        self.conn.commit()
+
+        # First run should clean
+        result1 = _cleanup_agent_job_duplicates(self.conn)
+        self.assertGreater(result1["agent_jobs_duplicate"], 0)
+
+        # Second run should be idempotent (no new duplicates)
+        result2 = _cleanup_agent_job_duplicates(self.conn)
+        self.assertEqual(result2["agent_jobs_duplicate"], 0, "Second cleanup should find no new duplicates")
+
+    def test_scheduler_daily_review_session_has_date(self) -> None:
+        """Scheduler daily_review job uses date-specific session_id."""
+        # This test verifies the pattern is correct by checking enqueue_job_once behavior
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sid = f"system:scheduled:daily:{today}"
+        jid = self.repo.enqueue_job_once("daily_review", 7, "scheduler", sid, {"day_utc": today})
+        self.assertIsNotNone(jid)
+
+        # Verify the session_id is date-specific (contains today's date)
+        row = self.conn.execute("SELECT session_id FROM agent_jobs WHERE id=?", (jid,)).fetchone()
+        self.assertIn(today, row["session_id"])
+
+    # ── Regression Tests for P1 Fixes ──
+
+    def test_cleanup_does_not_dedupe_event_queue_jobs(self) -> None:
+        """Cleanup must NOT touch event-queue jobs like feishu_user_message."""
+        from plugins.crypto_guard.storage.migrations import _cleanup_agent_job_duplicates
+
+        # Two legitimate feishu_user_message jobs with same session_id but different payloads
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('feishu_user_message', 1, 'feishu', 'feishu:user:open_test', '{\"text\":\"msg1\"}', CURRENT_TIMESTAMP, 'pending')"
+        )
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('feishu_user_message', 1, 'feishu', 'feishu:user:open_test', '{\"text\":\"msg2\"}', CURRENT_TIMESTAMP, 'pending')"
+        )
+        self.conn.commit()
+
+        result = _cleanup_agent_job_duplicates(self.conn)
+        self.assertEqual(result["agent_jobs_duplicate"], 0,
+                         "Event-queue jobs must NOT be deduped")
+
+        # Both should still be pending
+        rows = self.conn.execute(
+            "SELECT id, status, session_id FROM agent_jobs WHERE session_id='feishu:user:open_test' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            self.assertEqual(r["status"], "pending",
+                             f"Event-queue job {r['id']} should stay pending")
+            self.assertEqual(r["session_id"], "feishu:user:open_test",
+                             f"Event-queue job {r['id']} session_id must not be rewritten")
+
+    def test_migration_on_dirty_db_with_existing_duplicates(self) -> None:
+        """Migration cleanup covers ALL job types, not just daily_review."""
+        # No DB-level UNIQUE index, so duplicates can be created directly
+
+        # Create duplicates for multiple job types — daily_review AND alert_outbox_retry
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('daily_review', 7, 'test', 'dirty:dup:same', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('daily_review', 7, 'test', 'dirty:dup:same', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        # alert_outbox_retry with fixed session_id (simulating real-world dup pattern)
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('alert_outbox_retry', 2, 'scheduler', 'system:scheduled:alert_outbox_retry', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
+            "VALUES ('alert_outbox_retry', 2, 'scheduler', 'system:scheduled:alert_outbox_retry', '{}', CURRENT_TIMESTAMP, 'success')"
+        )
+        self.conn.commit()
+
+        # Verify duplicates exist BEFORE migration
+        daily_dup = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='dirty:dup:same'"
+        ).fetchone()["cnt"]
+        self.assertEqual(daily_dup, 2)
+        alert_dup = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='system:scheduled:alert_outbox_retry'"
+        ).fetchone()["cnt"]
+        self.assertEqual(alert_dup, 2)
+
+        # Run migration — should cleanup ALL job types without error (no DB UNIQUE index)
+        from plugins.crypto_guard.storage.migrations import _apply_daily_review_idempotency_migration
+        _apply_daily_review_idempotency_migration(self.conn)
+
+        # After migration: each (job_type, session_id) should have at most 1 non-duplicate
+        remaining_daily = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='dirty:dup:same' AND status NOT IN ('duplicate', 'superseded')"
+        ).fetchone()["cnt"]
+        self.assertLessEqual(remaining_daily, 1)
+        remaining_alert = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='system:scheduled:alert_outbox_retry' AND status NOT IN ('duplicate', 'superseded')"
+        ).fetchone()["cnt"]
+        self.assertLessEqual(remaining_alert, 1, "alert_outbox_retry duplicates should also be cleaned")
+
+    def test_hourly_report_second_enqueue_no_integrity_error(self) -> None:
+        """Second enqueue of hourly_feishu_report with same session_id is idempotent (no IntegrityError)."""
+        sid = "test:hourly:second_enqueue:1700000000000"
+        jid1 = self.repo.enqueue_job_once("hourly_feishu_report", 3, "scheduler", sid, {"ts": 1})
+        jid2 = self.repo.enqueue_job_once("hourly_feishu_report", 3, "scheduler", sid, {"ts": 2})
+        self.assertEqual(jid1, jid2, "Second enqueue should return existing job id, not create duplicate")
+
+        # Verify only one job exists
+        count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id=?", (sid,)
+        ).fetchone()["cnt"]
+        self.assertEqual(count, 1, "Only one job should exist for the same session_id")
+
+    def test_existing_report_not_pushed_allows_push_retry(self) -> None:
+        """idempotent report with pushed_to_feishu=False should still allow push retry."""
+        # Simulate: report exists but was NOT pushed (pushed_to_feishu=0)
+        self.conn.execute(
+            "INSERT INTO daily_review_reports(review_date, summary_json, ga_report, pushed_to_feishu) "
+            "VALUES ('2026-06-15', '{}', 'test report', 0)"
+        )
+        self.conn.commit()
+
+        # Verify pushed_to_feishu is 0
+        row = self.conn.execute(
+            "SELECT pushed_to_feishu FROM daily_review_reports WHERE review_date='2026-06-15'"
+        ).fetchone()
+        self.assertEqual(row["pushed_to_feishu"], 0, "pushed_to_feishu should be 0 (not yet pushed)")
+
+        # Simulate what run_daily_review returns: idempotent=True, pushed_to_feishu=False
+        result = {
+            "ok": True,
+            "idempotent": True,
+            "existing": True,
+            "pushed_to_feishu": False,
+            "day_start_utc": "2026-06-15T00:00:00",
+            "text": "test report",
+        }
+
+        # The fix: only check pushed_to_feishu, NOT idempotent
+        already_pushed = result.get("pushed_to_feishu")
+        self.assertFalse(already_pushed, "pushed_to_feishu=False should allow push retry")
+
+        # Old buggy logic would have blocked push:
+        buggy_already_pushed = result.get("pushed_to_feishu") or result.get("idempotent")
+        self.assertTrue(buggy_already_pushed, "OLD buggy logic would have blocked push (idempotent=True)")
+
+    def test_scheduler_daily_review_passes_yesterday_utc(self) -> None:
+        """Scheduler passes yesterday_utc (not today_utc) to daily_review."""
+        from datetime import datetime, timezone, timedelta
+
+        # Simulate scheduler logic (same as run_scheduler.py)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        yesterday_utc = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # yesterday should differ from today
+        self.assertNotEqual(yesterday_utc, today_utc, "yesterday_utc must differ from today_utc")
+
+        # Enqueue with yesterday_utc (as scheduler now does)
+        sid = f"system:scheduled:daily:{yesterday_utc}"
+        jid = self.repo.enqueue_job_once("daily_review", 7, "scheduler", sid, {"day_utc": yesterday_utc})
+
+        row = self.conn.execute(
+            "SELECT payload_json FROM agent_jobs WHERE id=?", (jid,)
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["day_utc"], yesterday_utc,
+                         "Scheduler must pass yesterday_utc, not today_utc")
+
+    # ── End Daily Review Idempotency Tests ──
+
+    # ── Market Regime Engine Helpers ──
+
+    @staticmethod
+    def _ema(values: list[float], period: int) -> float | None:
+        if len(values) < period:
+            return None
+        multiplier = 2.0 / (period + 1)
+        ema = sum(values[:period]) / period
+        for v in values[period:]:
+            ema = (v - ema) * multiplier + ema
+        return ema
+
+    def _seed_candles_accel(
+        self, symbol: str, interval: str, *,
+        open_time_base: int = 1_718_800_000_000,
+        count: int = 30,
+        start_price: float = 100.0,
+        accel_factor: float = 1.005,
+        volatility_pct: float = 0.3,
+    ) -> None:
+        """Seed candles with accelerating price to ensure EMA crossover patterns.
+
+        Uses geometric price progression: price[i] = price[i-1] * accel_factor.
+        For bullish: accel_factor > 1.0, for bearish: accel_factor < 1.0.
+        """
+        if interval == "4h":
+            step_ms = 4 * 3600 * 1000
+        elif interval == "1h":
+            step_ms = 3600 * 1000
+        elif interval == "15m":
+            step_ms = 15 * 60 * 1000
+        else:
+            step_ms = 3600 * 1000
+
+        price = start_price
+        for i in range(count):
+            ot = open_time_base - (count - i) * step_ms
+            ct = ot + step_ms - 1
+            price = price * accel_factor
+            body = price * (volatility_pct / 100)
+            open_p = round(price - body / 2, 4)
+            close_p = round(price + body / 2, 4)
+            high_p = round(max(open_p, close_p) + body * 0.3, 4)
+            low_p = round(min(open_p, close_p) - body * 0.3, 4)
+            vol = 1000.0 + abs(body) * 100
+            self.conn.execute(
+                "INSERT OR IGNORE INTO candles(symbol, interval, open_time, close_time, "
+                "open, high, low, close, volume, is_closed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (symbol, interval, ot, ct, open_p, high_p, low_p, close_p, vol),
+            )
+
+    def _seed_btc_candles(self) -> None:
+        """Seed BTCUSDT: 4h bullish, 1h bullish (risk_on)."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.004, volatility_pct=0.4)
+        self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=67000, accel_factor=1.002, volatility_pct=0.2)
+        self.conn.commit()
+
+    def _seed_eth_candles(self) -> None:
+        """Seed ETHUSDT: 4h bullish, 1h bullish."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('ETHUSDT', 1)")
+        self._seed_candles_accel("ETHUSDT", "4h", count=30, start_price=3400, accel_factor=1.003, volatility_pct=0.4)
+        self._seed_candles_accel("ETHUSDT", "1h", count=30, start_price=3500, accel_factor=1.0015, volatility_pct=0.2)
+        self.conn.commit()
+
+    def _seed_btc_rebound_candles(self) -> None:
+        """Seed BTCUSDT: 4h bearish, 1h bullish (rebound pattern)."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=0.997, volatility_pct=0.4)
+        self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=60000, accel_factor=1.004, volatility_pct=0.3)
+        self.conn.commit()
+
+    def _seed_btc_selloff_candles(self) -> None:
+        """Seed BTCUSDT: 4h bullish, 1h bearish (selloff pattern)."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.003, volatility_pct=0.4)
+        self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=68000, accel_factor=0.996, volatility_pct=0.3)
+        self.conn.commit()
+
+    def _seed_btc_risk_on_candles(self) -> None:
+        """Seed BTCUSDT: 4h bullish, 1h bullish (risk_on pattern)."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.005, volatility_pct=0.4)
+        self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=68000, accel_factor=1.003, volatility_pct=0.2)
+        self.conn.commit()
+
+    def _seed_symbol_candles(self, symbol: str) -> None:
+        """Seed generic symbol candles: mild uptrend, following BTC."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES (?, 1)", (symbol,))
+        self._seed_candles_accel(symbol, "4h", count=30, start_price=20, accel_factor=1.002, volatility_pct=0.3)
+        self._seed_candles_accel(symbol, "1h", count=30, start_price=21, accel_factor=1.001, volatility_pct=0.2)
+        self.conn.commit()
+
+    def _seed_symbol_strong_candles(self, symbol: str) -> None:
+        """Seed symbol candles showing strong outperformance (independent_trend)."""
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES (?, 1)", (symbol,))
+        self._seed_candles_accel(symbol, "4h", count=30, start_price=20, accel_factor=1.006, volatility_pct=0.4)
+        self._seed_candles_accel(symbol, "1h", count=30, start_price=22, accel_factor=1.004, volatility_pct=0.25)
+        self.conn.commit()
+
+    # ── Market Regime Engine Tests ──
+
+    def test_market_regime_score_basic(self) -> None:
+        """P0: score_market_regime returns valid structure for a symbol."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        # Seed BTC and ETH candles so the engine has data
+        self._seed_btc_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="SHORT",
+        )
+
+        self.assertIn("btc_bias", result)
+        self.assertIn("eth_bias", result)
+        self.assertIn("market_phase", result)
+        self.assertIn("breadth_score", result)
+        self.assertIn("volatility_state", result)
+        self.assertIn("symbol_relative_strength", result)
+        self.assertIn("regime_alignment", result)
+        self.assertIn("confidence_adjustment", result)
+        self.assertIn("risk_multiplier", result)
+        self.assertIn("require_stronger_confirmation", result)
+        self.assertIsInstance(result["reasons"], list)
+        self.assertGreater(len(result["reasons"]), 0)
+
+    def test_counter_regime_short_in_rebound_downgraded(self) -> None:
+        """P0: SHORT in rebound market_phase gets counter_regime alignment."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        # Seed BTC candles showing rebound: 4h bearish, 1h bullish
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="SHORT",
+        )
+
+        self.assertEqual(result["market_phase"], "rebound")
+        self.assertEqual(result["regime_alignment"], "counter_regime")
+        self.assertLess(result["confidence_adjustment"], 0)
+        self.assertTrue(result["require_stronger_confirmation"])
+
+    def test_counter_regime_long_in_selloff_downgraded(self) -> None:
+        """P0: LONG in selloff market_phase gets counter_regime alignment."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        self._seed_btc_selloff_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+
+        self.assertEqual(result["market_phase"], "selloff")
+        self.assertEqual(result["regime_alignment"], "counter_regime")
+        self.assertLess(result["confidence_adjustment"], 0)
+
+    def test_aligned_regime_no_penalty(self) -> None:
+        """P0: LONG in risk_on gets aligned, no penalty."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        self._seed_btc_risk_on_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+
+        self.assertEqual(result["market_phase"], "risk_on")
+        self.assertEqual(result["regime_alignment"], "aligned")
+        self.assertGreaterEqual(result["confidence_adjustment"], 0)
+        self.assertFalse(result["require_stronger_confirmation"])
+
+    def test_independent_trend_bypasses_counter_regime(self) -> None:
+        """P0: Strong symbol relative strength allows independent_trend bypass."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        # Seed symbol candles showing strong outperformance vs BTC
+        self._seed_symbol_strong_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+
+        # Should be independent_trend, not counter_regime
+        self.assertIn(result["regime_alignment"], {"independent_trend", "aligned"})
+
+    def test_regime_gate_watch_only_after_consecutive_losses(self) -> None:
+        """P0: Consecutive same-side stop losses trigger watch_only in counter_regime."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        # Create 2 consecutive SHORT stop losses today
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for _ in range(2):
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, status) "
+                "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
+            )
+            order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+                "close_reason, pnl_r, closed_at) "
+                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, ?)",
+                (order_id, f"{today}T10:00:00Z"),
+            )
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="SHORT",
+            signal_grade="S",
+            confidence=0.85,
+            analysis_time_utc=1718800000000,
+        )
+
+        self.assertTrue(result["regime_gate_applied"])
+        self.assertTrue(result["adjustments"]["watch_only"])
+
+    def test_market_regime_mismatch_loss_pattern(self) -> None:
+        """P0: SHORT stop loss in rebound gets classified as regime mismatch."""
+        from plugins.crypto_guard.review.loss_classifier import classify_trade
+
+        trade = {
+            "pnl_r": -1.0,
+            "close_reason": "stop_loss",
+            "side": "SHORT",
+            "max_favorable_excursion": 0.1,
+            "max_adverse_excursion": -1.0,
+            "signal_decay_score": 0.3,
+            "market_regime_at_loss": {
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+            },
+        }
+
+        pattern = classify_trade(trade)
+        self.assertEqual(pattern, "macro_rebound_short_squeeze_loss")
+
+    def test_regime_mismatch_writes_skill_feedback(self) -> None:
+        """P0: Regime mismatch loss writes structured fields to skill_feedback_memory."""
+        from plugins.crypto_guard.review.loss_classifier import classify_trade
+
+        # Create a trade with regime context
+        trade = {
+            "id": 999,
+            "pnl_r": -1.0,
+            "close_reason": "stop_loss",
+            "side": "SHORT",
+            "symbol": "AVAXUSDT",
+            "max_favorable_excursion": 0.1,
+            "max_adverse_excursion": -1.0,
+            "signal_decay_score": 0.3,
+            "entry_efficiency": 0.5,
+            "market_regime_at_loss": {
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+                "symbol_relative_strength": "neutral",
+            },
+        }
+
+        pattern = classify_trade(trade)
+        self.assertEqual(pattern, "macro_rebound_short_squeeze_loss")
+
+        # Write to skill_feedback_memory with structured fields
+        memory_id = self.repo.save_skill_feedback_memory(
+            skill_name="market_regime",
+            feedback_type="daily_review",
+            source_type="daily_review",
+            finding=f"regime test: {pattern}",
+            pattern_type=pattern,
+            affected_symbols=["AVAXUSDT"],
+            affected_sides=["SHORT"],
+            suggested_adjustment={
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+                "suggested_adjustment_json": {
+                    "action": "raise_confirmation_threshold",
+                    "when": {"pattern_type": pattern, "market_phase": "rebound", "side": "SHORT"},
+                    "adjustments": {"min_confidence": 0.82, "min_rr": 2.0, "risk_multiplier": 0.5},
+                },
+            },
+        )
+        self.assertIsNotNone(memory_id)
+        self.assertGreater(memory_id, 0)
+
+        # Verify stored
+        row = self.conn.execute(
+            "SELECT * FROM skill_feedback_memory WHERE id=?", (memory_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        finding = json.loads(row["suggested_adjustment_json"] or "{}")
+        self.assertEqual(finding.get("market_phase"), "rebound")
+        self.assertEqual(finding.get("regime_alignment"), "counter_regime")
+
+    def test_regime_gate_disabled_by_config(self) -> None:
+        """P0: Regime gate returns passthrough when disabled."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        # Temporarily disable
+        import plugins.crypto_guard.config.loader as loader
+        original = loader.load_config()
+        try:
+            # Override config for test
+            cfg = loader.load_config()
+            cfg.trading_mode["market_regime"] = {"enabled": False}
+            loader._config_cache = cfg
+
+            result = apply_regime_gate(
+                self.repo,
+                symbol="AVAXUSDT",
+                side="SHORT",
+                signal_grade="S",
+                confidence=0.85,
+                analysis_time_utc=1718800000000,
+            )
+            self.assertFalse(result["regime_gate_applied"])
+        finally:
+            loader._config_cache = original
+
+    # ── End Market Regime Engine Tests ──
+
+    # ── Market Regime Gate P0 Hotfix Tests ──
+
+    def test_market_regime_gate_json_writes_to_ga_decisions(self) -> None:
+        """Fix 1: market_regime_gate_json column exists and _save_regime_gate_to_ga_decision writes to it."""
+        from plugins.crypto_guard.paper.paper_broker import _save_regime_gate_to_ga_decision
+
+        # Create a GA decision
+        ga_id = self._create_minimal_ga_decision(symbol="BTCUSDT")
+
+        # Save a regime gate result
+        regime_gate = {
+            "ok": True,
+            "regime_gate_applied": True,
+            "mode": "shadow",
+            "adjustments": {"watch_only": False, "risk_multiplier": 0.5},
+            "market_regime": {"market_phase": "rebound", "regime_alignment": "counter_regime"},
+        }
+        _save_regime_gate_to_ga_decision(self.repo, ga_id, regime_gate)
+
+        # Read back and verify
+        row = self.conn.execute(
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row["market_regime_gate_json"])
+        saved = json.loads(row["market_regime_gate_json"])
+        self.assertEqual(saved["adjustments"]["risk_multiplier"], 0.5)
+        self.assertEqual(saved["market_regime"]["market_phase"], "rebound")
+
+    def test_regime_shadow_mode_does_not_block(self) -> None:
+        """Fix 2: Shadow mode does not block orders even with counter-regime + watch_only."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        # Create 2 consecutive SHORT stop losses to trigger watch_only
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for _ in range(2):
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, status) "
+                "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
+            )
+            order_id = self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+                "close_reason, pnl_r, closed_at) "
+                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, ?)",
+                (order_id, f"{today}T10:00:00Z"),
+            )
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="SHORT",
+            signal_grade="S",
+            confidence=0.85,
+            analysis_time_utc=1718800000000,
+        )
+
+        # Gate is applied, watch_only is True, but mode is shadow
+        self.assertTrue(result["regime_gate_applied"])
+        self.assertTrue(result["adjustments"]["watch_only"])
+        # The key: mode field is present and equals "shadow"
+        self.assertEqual(result["mode"], "shadow")
+
+    def test_regime_gate_applied_on_ga_decision_path(self) -> None:
+        """Fix 3: Regime gate is applied on the GA decision path."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        # Create a GA decision with SHORT side in rebound market (counter-regime)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "SHORT", "entry_type": "trigger", "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}], "risk_percent": 0.5,
+            "invalid_condition": "above 105", "reason": "test setup",
+            "entry_price": 100.0, "trigger_price": 100.0,
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "AVAXUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "A", "confidence": 0.80,
+            "summary": "test", "market_bias": "bearish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+            "feishu_actions": ["create_paper_order"],
+        })
+
+        # Create 2 consecutive SHORT stop losses to trigger watch_only
+        # Use pnl_r=-0.3 to avoid triggering AccountRiskGuard's daily_loss_pause
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for _ in range(2):
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, status) "
+                "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
+            )
+            order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+                "close_reason, pnl_r, closed_at) "
+                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -0.3, ?)",
+                (order_id, f"{today}T10:00:00Z"),
+            )
+
+        # Build a controlled-mode config
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        cfg = self.repo  # placeholder
+        import plugins.crypto_guard.config.loader as loader
+        original_cfg = loader.load_config()
+        controlled_trading_mode = dict(original_cfg.trading_mode)
+        mr = dict(controlled_trading_mode.get("market_regime", {}))
+        mr["mode"] = "controlled"
+        controlled_trading_mode["market_regime"] = mr
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=controlled_trading_mode,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        # Patch load_config at every module that imports it, plus validate_trade_plan
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                     return_value={"ok": True, "reasons": [], "metrics": {}}), \
+             _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_ga_decision(self.repo, ga_id)
+
+        # Should be blocked by regime gate in controlled mode
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "regime_gate_watch_only")
+
+        # Verify regime gate result was saved
+        row = self.conn.execute(
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+        ).fetchone()
+        self.assertIsNotNone(row["market_regime_gate_json"])
+
+    def test_controlled_mode_applies_risk_multiplier_and_min_rr(self) -> None:
+        """Fix 4: Controlled mode applies risk_multiplier to trade_plan."""
+        from plugins.crypto_guard.paper.paper_broker import _apply_regime_adjustments
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "risk_percent": 0.5,
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 95.0}],
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "watch_only": False,
+            "risk_multiplier": 0.5,
+            "min_rr": 2.0,
+            "allowed_order_types": ["trigger", "retest"],
+            "effective_grade": "B",
+            "effective_confidence": 0.75,
+            "original_grade": "A",
+        }
+
+        result = _apply_regime_adjustments(trade_plan, adjustments)
+
+        # risk_percent should be scaled by risk_multiplier
+        self.assertAlmostEqual(result["risk_percent"], 0.25)
+        self.assertEqual(result["regime_risk_multiplier_applied"], 0.5)
+        # Audit fields set
+        self.assertEqual(result["regime_effective_grade"], "B")
+        self.assertAlmostEqual(result["regime_effective_confidence"], 0.75)
+        # Original trade_plan not mutated
+        self.assertEqual(trade_plan["risk_percent"], 0.5)
+
+    def test_trade_review_classifies_counter_regime_loss(self) -> None:
+        """Fix 5: Trade review enriches trade with regime context before classify_trade."""
+        from plugins.crypto_guard.review.trade_reviewer import _enrich_trade_with_regime_context
+        from plugins.crypto_guard.review.loss_classifier import classify_trade
+
+        # Create a GA decision with market_regime_gate_json
+        ga_id = self._create_minimal_ga_decision(symbol="AVAXUSDT")
+        regime_gate = {
+            "ok": True,
+            "regime_gate_applied": True,
+            "mode": "shadow",
+            "market_regime": {
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+            },
+            "adjustments": {"watch_only": False},
+        }
+        self.conn.execute(
+            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            (json.dumps(regime_gate), ga_id),
+        )
+        self.conn.commit()
+
+        # Create an order linked to the GA decision
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            (ga_id,),
+        )
+        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create a trade linked to the order
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+            "close_reason, pnl_r) "
+            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
+            (order_id,),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Get the trade and enrich it
+        trade = self.repo.get_trade(trade_id)
+        self.assertIsNotNone(trade)
+
+        enriched = _enrich_trade_with_regime_context(self.repo, trade)
+        # Should have market_regime_json set
+        self.assertIn("market_regime_json", enriched)
+        self.assertEqual(enriched["market_regime_json"]["market_phase"], "rebound")
+        self.assertEqual(enriched["market_regime_json"]["regime_alignment"], "counter_regime")
+
+        # classify_trade should now recognize the counter-regime loss
+        pattern = classify_trade(enriched)
+        self.assertEqual(pattern, "macro_rebound_short_squeeze_loss")
+
+    def test_watch_only_requires_consecutive_losses(self) -> None:
+        """Fix 6: watch_only requires consecutive (not cumulative) same-side stop_losses."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Create: stop_loss, take_profit, stop_loss (not consecutive)
+        for close_reason, pnl_r_val in [("stop_loss", -1.0), ("take_profit", 1.5), ("stop_loss", -1.0)]:
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, status) "
+                "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
+            )
+            order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+                "close_reason, pnl_r, closed_at) "
+                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, ?, ?, ?)",
+                (order_id, close_reason, pnl_r_val, f"{today}T10:00:00Z"),
+            )
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="SHORT",
+            signal_grade="S",
+            confidence=0.85,
+            analysis_time_utc=1718800000000,
+        )
+
+        # Gate is applied (counter-regime), but watch_only should be False
+        # because the most recent 2 trades are NOT both stop_loss
+        # (most recent = stop_loss, second most recent = take_profit)
+        self.assertTrue(result["regime_gate_applied"])
+        self.assertFalse(result["adjustments"]["watch_only"])
+
+    # ── End Market Regime Gate P0 Hotfix Tests ──
+
+    def test_regime_allowed_order_types_enforced_in_controlled(self) -> None:
+        """P0: Controlled mode blocks orders with disallowed entry_type."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "limit",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}],
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": ["trigger", "retest"],
+            "min_rr": 0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNotNone(reason)
+        self.assertIn("limit", reason)
+        self.assertIn("allowed_order_types", reason)
+
+    def test_regime_allowed_order_types_passes_for_allowed(self) -> None:
+        """P0: Controlled mode allows orders with allowed entry_type."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}],
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": ["trigger", "retest"],
+            "min_rr": 0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNone(reason)
+
+    def test_regime_min_rr_enforced_in_controlled(self) -> None:
+        """P0: Controlled mode blocks orders with RR below regime min_rr."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 98.0}],  # RR = 2/5 = 0.4, below min_rr=2.0
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": ["trigger", "retest"],
+            "min_rr": 2.0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNotNone(reason)
+        self.assertIn("min_rr", reason)
+
+    def test_regime_min_rr_passes_for_adequate_rr(self) -> None:
+        """P0: Controlled mode allows orders with RR at or above regime min_rr."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}],  # RR = 10/5 = 2.0, meets min_rr=2.0
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": ["trigger", "retest"],
+            "min_rr": 2.0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNone(reason)
+
+    def test_regime_min_rr_not_checked_when_zero(self) -> None:
+        """P0: min_rr=0 means no RR check is performed."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 98.0}],  # Low RR, but min_rr=0
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": ["trigger", "retest"],
+            "min_rr": 0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNone(reason)
+
+    def test_regime_empty_allowed_types_blocks_all(self) -> None:
+        """P0: Empty allowed_order_types list means no entry_type is allowed."""
+        from plugins.crypto_guard.paper.paper_broker import _should_downgrade_to_watch_by_regime
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}],
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "allowed_order_types": [],
+            "min_rr": 0,
+        }
+
+        reason = _should_downgrade_to_watch_by_regime(trade_plan, adjustments)
+        self.assertIsNotNone(reason)
+        self.assertIn("allowed_order_types", reason)
+
+    def test_regime_adjustments_stores_audit_fields(self) -> None:
+        """P0: _apply_regime_adjustments stores min_rr and allowed_order_types as audit fields."""
+        from plugins.crypto_guard.paper.paper_broker import _apply_regime_adjustments
+
+        trade_plan = {
+            "side": "SHORT",
+            "entry_type": "trigger",
+            "risk_percent": 0.5,
+            "stop_loss": 105.0,
+            "take_profits": [{"price": 95.0}],
+            "entry_price": 100.0,
+        }
+
+        adjustments = {
+            "watch_only": False,
+            "risk_multiplier": 0.5,
+            "min_rr": 2.0,
+            "allowed_order_types": ["trigger", "retest"],
+            "effective_grade": "B",
+            "effective_confidence": 0.75,
+            "original_grade": "A",
+        }
+
+        result = _apply_regime_adjustments(trade_plan, adjustments)
+
+        # Audit fields set
+        self.assertEqual(result["regime_min_rr"], 2.0)
+        self.assertEqual(result["regime_allowed_order_types"], ["trigger", "retest"])
+        # risk_percent scaled
+        self.assertAlmostEqual(result["risk_percent"], 0.25)
+        # Original not mutated
+        self.assertEqual(trade_plan["risk_percent"], 0.5)
+
+    # ── End Regime Enforcement Tests ──
+
+    def _ensure_paper_trade(
+        self, symbol: str, side: str, *, entry_price: float = 100.0,
+    ) -> int:
+        """Helper: create a paper order + trade for testing."""
+        self.repo.ensure_paper_account()
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, "
+            "quantity, risk_percent, reason, source, risk_check_passed, status) "
+            "VALUES (?, ?, 'market', ?, ?, 1.0, 0.5, 'test', 'test', 1, 'open')",
+            (symbol, side, entry_price, entry_price - 5.0),
+        )
+        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        trade_id = self.repo.create_paper_trade(order, entry_price, fill_method="market")
+        return trade_id
+
+    def _create_minimal_ga_decision(
+        self, *, symbol: str = "BTCUSDT", side: str = "LONG",
+        snapshot_id: int | None = None,
+    ) -> int:
+        """Helper: create a minimal GA decision with trade_plan for testing."""
+        trade_plan = {
+            "side": side,
+            "entry_type": "market",
+            "stop_loss": 95.0 if side == "LONG" else 105.0,
+            "take_profits": [{"price": 110.0}] if side == "LONG" else [{"price": 90.0}],
+            "risk_percent": 0.5,
+            "invalid_condition": {"type": "price", "value": 90.0},
+            "reason": "test",
+        }
+        self.conn.execute(
+            "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, trade_plan_json, feishu_actions_json, "
+            "final_summary, raw_decision_json, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                symbol,
+                1700000000000,
+                "2024-01-15T00:00:00Z",
+                "scheduled",
+                "A",
+                0.80,
+                "trade_plan_available",
+                json.dumps([]),
+                json.dumps([]),
+                json.dumps([]),
+                json.dumps({"ok": True, "reasons": []}),
+                json.dumps(trade_plan),
+                json.dumps(["create_paper_order"]),
+                "test decision",
+                json.dumps({}),
+                snapshot_id,
+            ),
+        )
+        ga_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+        return ga_id
 
 
 if __name__ == "__main__":

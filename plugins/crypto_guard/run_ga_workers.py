@@ -203,14 +203,39 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         # Build detailed evolution status
         evolution_text = _build_evolution_status_text(repo)
         full_text = loss_header + result["text"] + evolution_text
-        if target and send_message:
-            sent_result = send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=full_text, alert_type="daily_review", priority=5)
+
+        # Three-layer push defense:
+        # L1: run_daily_review(force=False) already returns idempotent if report exists
+        # L2: check pushed_to_feishu before sending
+        # L3: alert dedupe_key includes review_date
+        review_date = result.get("day_start_utc", "")[:10]
+        already_pushed = result.get("pushed_to_feishu")
+        if target and send_message and not already_pushed:
+            sent_result = send_markdown_alert(
+                repo, send_message,
+                receive_id=target["receive_id"],
+                receive_id_type=target.get("receive_id_type", "chat_id"),
+                text=full_text,
+                alert_type="daily_review",
+                priority=5,
+                dedupe_key=f"daily_review:{review_date}",
+            )
             result["sent"] = bool(sent_result.get("sent"))
             result["target"] = target
+            # Mark pushed_to_feishu on successful send
+            if sent_result.get("sent") and review_date:
+                repo.conn.execute(
+                    "UPDATE daily_review_reports SET pushed_to_feishu=1 WHERE review_date=?",
+                    (review_date,),
+                )
         else:
             result["sent"] = False
             result["target"] = target
-        LOGGER.info("process_job done id=%s type=%s ok=%s reviews=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("new_reviews"), result.get("sent"))
+        LOGGER.info("process_job done id=%s type=%s ok=%s reviews=%s sent=%s idempotent=%s", job.get("id"), job_type, result.get("ok"), result.get("new_reviews"), result.get("sent"), result.get("idempotent"))
+        return result
+    if job_type == "intraday_loss_review":
+        result = _handle_intraday_loss_review(repo, payload, send_message=send_message)
+        LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
         return result
     if job_type == "hourly_feishu_report":
         report = build_hourly_report(repo)
@@ -255,6 +280,59 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         LOGGER.info("process_job done id=%s type=%s ok=%s reviewed=%s actions=%s", job.get("id"), job_type, result.get("ok"), result.get("reviewed_count"), result.get("actions_count"))
         return result
     return {"ok": False, "error": f"未知 job_type: {job_type}"}
+
+
+def _handle_intraday_loss_review(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Handle intraday loss threshold alert — risk warning only, NOT daily review.
+
+    Does NOT write daily_review_reports or skill_feedback_memory.
+    Only pushes a risk alert and optionally evaluates evolution triggers.
+    """
+    from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+    day_utc = payload.get("day_utc", "")
+    loss_count = int(payload.get("loss_count") or 0)
+    target = resolve_report_target(repo, payload)
+
+    # Evaluate evolution triggers (creates/updates trigger, does NOT create candidate)
+    evolution = evaluate_evolution_triggers(repo)
+
+    # Build risk alert text
+    lines = [
+        "**CryptoGuard 盘中风险提醒 · 止损阈值触发**",
+        "",
+        f"- 日期：{day_utc}",
+        f"- 今日止损：{loss_count} 笔",
+        f"- 进化状态：{'已触发' if evolution.get('triggered') else '未触发'}",
+        "",
+        "系统将继续监控，不影响现有模拟盘持仓。",
+        "",
+        "不构成实盘建议，仅用于模拟盘与策略研究。",
+    ]
+    text = "\n".join(lines)
+
+    sent = False
+    if target and send_message:
+        loss_bucket = "3_loss" if loss_count <= 3 else "5_loss"
+        sent_result = send_markdown_alert(
+            repo, send_message,
+            receive_id=target["receive_id"],
+            receive_id_type=target.get("receive_id_type", "chat_id"),
+            text=text,
+            alert_type="intraday_loss_review",
+            priority=4,
+            dedupe_key=f"intraday_loss_review:{day_utc}:{loss_bucket}",
+        )
+        sent = bool(sent_result.get("sent"))
+
+    return {
+        "ok": True,
+        "sent": sent,
+        "target": target,
+        "loss_count": loss_count,
+        "day_utc": day_utc,
+        "evolution": evolution,
+    }
 
 
 def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
@@ -460,11 +538,44 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
     elif event_type in ("take_profit_hit", "stop_loss_hit", "close_position"):
         reason = close_reason_cn
         detail_lines.append(f"- 原因：{reason}")
+        # Entry details
+        entry_price = payload.get("entry_price")
+        if entry_price:
+            detail_lines.append(f"- 入场价：{float(entry_price):.4f}")
+        filled_at = payload.get("filled_at")
+        if filled_at:
+            try:
+                # filled_at is UTC ISO string, convert to UTC+8 for display
+                from datetime import datetime as _dt
+                filled_dt = _dt.fromisoformat(str(filled_at).replace("Z", "+00:00"))
+                filled_cn = filled_dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+                detail_lines.append(f"- 入场时间：{filled_cn} (UTC+8)")
+            except Exception:
+                detail_lines.append(f"- 入场时间：{filled_at}")
+        # TP/SL prices
+        stop_loss = payload.get("stop_loss")
+        if stop_loss:
+            detail_lines.append(f"- 止损价：{float(stop_loss):.4f}")
+        take_profits = payload.get("take_profits") or []
+        if take_profits:
+            tp_prices = [f"{float(tp.get('price', tp)):.4f}" if isinstance(tp, dict) else f"{float(tp):.4f}" for tp in take_profits]
+            detail_lines.append(f"- 止盈价：{', '.join(tp_prices)}")
+        # Exit price
+        exit_price = payload.get("exit_price")
+        if exit_price:
+            detail_lines.append(f"- 退出价：{float(exit_price):.4f}")
         if pnl_r is not None:
             detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
     elif event_type == "paper_order_filled":
         if fill_method_cn:
             detail_lines.append(f"- 成交方式：{fill_method_cn}")
+        stop_loss = payload.get("stop_loss")
+        if stop_loss:
+            detail_lines.append(f"- 止损价：{float(stop_loss):.4f}")
+        take_profits = payload.get("take_profits") or []
+        if take_profits:
+            tp_prices = [f"{float(tp.get('price', tp)):.4f}" if isinstance(tp, dict) else f"{float(tp):.4f}" for tp in take_profits]
+            detail_lines.append(f"- 止盈价：{', '.join(tp_prices)}")
     else:
         reason = close_reason_cn or fill_method_cn
         if reason:
@@ -472,13 +583,15 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         if pnl_r is not None:
             detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
 
+    # Price: use exit_price for close events, entry_price for fill events
+    display_price = payload.get("exit_price") or payload.get("entry_price") or "-"
     lines = [
         f"**CryptoGuard 模拟盘 · {event_cn}**",
         "",
         f"- 产品：{payload.get('symbol', '-')}",
         f"- 方向：{side_cn}",
         f"- 订单：#{payload.get('order_id', '-')}",
-        f"- 价格：{payload.get('entry_price') or payload.get('exit_price') or '-'}",
+        f"- 价格：{display_price}",
     ] + detail_lines + [
         "",
         "不构成实盘建议，仅用于模拟盘与策略研究。",

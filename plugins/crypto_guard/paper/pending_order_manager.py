@@ -311,14 +311,15 @@ def force_risk_off_pending_revalidation(repo: CryptoGuardRepository) -> dict[str
 def _create_watch_from_risk_off(repo: CryptoGuardRepository, order: dict[str, Any], reason: str, now: datetime) -> None:
     """Create an opportunity_watch entry from a risk_off cancelled order."""
     now_iso = now.isoformat()
+    expires_iso = (now + timedelta(hours=24)).isoformat()
     try:
         repo.conn.execute(
             """
-            INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at)
-            VALUES (?, ?, ?, ?, '{}', 'active', ?)
+            INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at, expires_at)
+            VALUES (?, ?, ?, ?, '{}', 'active', ?, ?)
             """,
             (order.get("symbol", ""), order.get("side", ""), order.get("ga_decision_id"),
-             f"账户风控暂停：{reason}", now_iso),
+             f"账户风控暂停：{reason}", now_iso, expires_iso),
         )
     except Exception as e:
         LOGGER.debug("_create_watch_from_risk_off failed: %s", e)

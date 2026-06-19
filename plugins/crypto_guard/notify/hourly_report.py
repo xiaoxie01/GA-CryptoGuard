@@ -8,6 +8,7 @@ from typing import Any
 from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
 from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
 
 
 def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -54,6 +55,7 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     feedback_patterns = _fetch_feedback_patterns(repo)
     long_short_performance = _fetch_long_short_performance(repo)
     account_feedback_gate = _fetch_account_feedback_gate_stats(repo)
+    state_consistency = _fetch_state_consistency(repo)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -73,11 +75,12 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "feedback_patterns": feedback_patterns,
         "long_short_performance": long_short_performance,
         "account_feedback_gate": account_feedback_gate,
+        "state_consistency": state_consistency,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, state_consistency=state_consistency)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, state_consistency=state_consistency)
         ),
     }
 
@@ -97,6 +100,7 @@ def render_ga_hourly_summary(
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
     account_feedback_gate: dict[str, Any] | None = None,
+    state_consistency: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
@@ -113,7 +117,7 @@ def render_ga_hourly_summary(
         "**一、系统状态**",
         f"- scheduler：运行中；队列 user={queue_counts.get('pending_user', 0)} background={queue_counts.get('pending_background', 0)} running={queue_counts.get('running', 0)}",
         "- market data：SQLite 热数据；Redis/Parquet/DuckDB 状态见 /status",
-        f"- Feishu queue：最近失败任务 {len(failed_jobs)}",
+        f"- 任务队列：最近失败任务 {len(failed_jobs)}",
     ]
 
     # P2-B: Add risk_off state
@@ -159,10 +163,38 @@ def render_ga_hourly_summary(
     lines.extend(["", "**三、高等级机会（S/A/B）**"])
     if not high_grade:
         lines.append("- 暂无 S/A/B 级机会")
+    # Index open orders by symbol for position-aware display
+    open_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for o in open_orders:
+        open_by_symbol.setdefault(o["symbol"], []).append(o)
     for row in high_grade[:10]:
+        symbol = row["symbol"]
+        # signal side: trade_plan.side > market_bias mapping
+        trade_plan = row.get("trade_plan") or {}
+        signal_side = str(trade_plan.get("side", "")).upper()
+        if not signal_side:
+            bias = str(row.get("market_bias") or "").lower()
+            signal_side = {"bullish": "LONG", "bearish": "SHORT"}.get(bias, "")
+        symbol_orders = open_by_symbol.get(symbol, [])
+        position_status = ""
+        if symbol_orders:
+            open_orders_list = [o for o in symbol_orders if o.get("status") == "open"]
+            pending_orders = [o for o in symbol_orders if o.get("status") == "pending"]
+            recheck_orders = [o for o in symbol_orders if o.get("status") == "needs_recheck"]
+            if open_orders_list:
+                order_sides = {str(o.get("side", "")).upper() for o in open_orders_list}
+                order_ids = [f"#{o['id']}" for o in open_orders_list]
+                if signal_side and signal_side not in order_sides:
+                    position_status = f"，**已持仓 {'/'.join(sorted(order_sides))} {'/'.join(order_ids)} / 当前信号 {signal_side}，方向冲突需复核**"
+                else:
+                    position_status = f"，已持仓 {'/'.join(sorted(order_sides))} {'/'.join(order_ids)}"
+            elif pending_orders:
+                position_status = "，挂单等待"
+            elif recheck_orders:
+                position_status = "，等待重检"
         lines.append(
-            f"- {row['symbol']}：{row.get('signal_grade')}，{float(row.get('confidence') or 0) * 100:.0f}%；"
-            f"{_decision_text(row.get('decision'))}；{row.get('final_summary') or '-'}"
+            f"- {symbol}：{row.get('signal_grade')}，{float(row.get('confidence') or 0) * 100:.0f}%；"
+            f"{_decision_text(row.get('decision'))}{position_status}；{row.get('final_summary') or '-'}"
         )
 
     lines.extend(["", "**四、当前机会监控**"])
@@ -198,12 +230,38 @@ def render_ga_hourly_summary(
         else:
             lines.append("- 暂无影子测试样本")
 
+    # P2: Add state consistency diagnostics
+    if state_consistency and not state_consistency.get("error"):
+        summary = state_consistency.get("summary", {})
+        total = state_consistency.get("total_issues", 0)
+        if total > 0:
+            lines.extend(["", "**状态一致性诊断**"])
+            alert_parts = []
+            if summary.get("duplicate_open_trades", 0) > 0:
+                alert_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
+            if summary.get("orphan_patches", 0) > 0:
+                alert_parts.append(f"孤儿补丁={summary['orphan_patches']}")
+            if summary.get("status_mismatches", 0) > 0:
+                alert_parts.append(f"状态不一致={summary['status_mismatches']}")
+            if summary.get("duplicate_patches", 0) > 0:
+                alert_parts.append(f"重复补丁={summary['duplicate_patches']}")
+            if summary.get("stale_shadows", 0) > 0:
+                alert_parts.append(f"过期影子={summary['stale_shadows']}")
+            if summary.get("draft_limbo", 0) > 0:
+                alert_parts.append(f"草稿滞留={summary['draft_limbo']}")
+            if alert_parts:
+                lines.append(f"- 发现问题 {total} 个：{'，'.join(alert_parts)}")
+            else:
+                lines.append(f"- 发现问题 {total} 个（非关键）")
+        else:
+            lines.extend(["", "**状态一致性诊断**", "- 全部正常，未发现状态不一致"])
+
     # P2-B: Add top failure patterns
     if feedback_patterns and not feedback_patterns.get("error"):
         top_patterns = feedback_patterns.get("top_patterns", [])
         most_active = feedback_patterns.get("most_active_skill")
         if top_patterns or most_active:
-            lines.extend(["", "**七、本周失败模式（反馈记忆）**"])
+            lines.extend(["", "**八、本周失败模式（反馈记忆）**"])
             if top_patterns:
                 for p in top_patterns:
                     lines.append(f"- {p['pattern']}：{p['count']} 次")
@@ -251,7 +309,7 @@ def render_ga_hourly_summary(
                 )
                 lines.append(f"  - 受阻因素：{factor_text}")
 
-    lines.extend(["", "**八、风险事件**"])
+    lines.extend(["", "**九、风险事件**"])
     if failed_jobs:
         for job in failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
@@ -316,6 +374,20 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         return {"error": str(exc), "real_pnl_count": 0, "pseudo_r_count": 0}
 
 
+def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Run state consistency diagnostics for the hourly report."""
+    try:
+        result = diagnose_state_consistency(repo)
+        return {
+            "ok": result["ok"],
+            "summary": result["summary"],
+            "total_issues": result["total_issues"],
+            "issues": result["issues"],
+        }
+    except Exception as exc:
+        return {"error": str(exc), "ok": True, "summary": {}, "total_issues": 0, "issues": []}
+
+
 def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch top 3 failure patterns this week from skill_feedback_memory."""
     try:
@@ -325,7 +397,9 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
             """
             SELECT pattern_type, COUNT(*) as count
             FROM skill_feedback_memory
-            WHERE datetime(created_at) >= datetime(?) AND pattern_type IS NOT NULL AND pattern_type != ''
+            WHERE datetime(created_at) >= datetime(?)
+              AND pattern_type IS NOT NULL AND pattern_type != ''
+              AND status='candidate'
             GROUP BY pattern_type
             ORDER BY count DESC
             LIMIT 3
@@ -335,12 +409,13 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         top_patterns = [{"pattern": row["pattern_type"], "count": row["count"]} for row in rows]
 
-        # Most active feedback skill
+        # Most active feedback skill (only candidate status)
         most_active = repo.conn.execute(
             """
             SELECT skill_name, COUNT(*) as count
             FROM skill_feedback_memory
             WHERE datetime(created_at) >= datetime(?)
+              AND status='candidate'
             GROUP BY skill_name
             ORDER BY count DESC
             LIMIT 1
@@ -537,6 +612,7 @@ def render_hourly_report_text(
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
     account_feedback_gate: dict[str, Any] | None = None,
+    state_consistency: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
     state_by_symbol: dict[str, dict[str, Any]] = {}
@@ -635,6 +711,32 @@ def render_hourly_report_text(
                 f"伪 R：{shadow_data_quality.get('pseudo_r_count', 0)}"
             )
 
+    # P2: Add state consistency diagnostics
+    if state_consistency and not state_consistency.get("error"):
+        summary = state_consistency.get("summary", {})
+        total = state_consistency.get("total_issues", 0)
+        if total > 0:
+            lines.extend(["", "**状态一致性诊断：**"])
+            alert_parts = []
+            if summary.get("duplicate_open_trades", 0) > 0:
+                alert_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
+            if summary.get("orphan_patches", 0) > 0:
+                alert_parts.append(f"孤儿补丁={summary['orphan_patches']}")
+            if summary.get("status_mismatches", 0) > 0:
+                alert_parts.append(f"状态不一致={summary['status_mismatches']}")
+            if summary.get("duplicate_patches", 0) > 0:
+                alert_parts.append(f"重复补丁={summary['duplicate_patches']}")
+            if summary.get("stale_shadows", 0) > 0:
+                alert_parts.append(f"过期影子={summary['stale_shadows']}")
+            if summary.get("draft_limbo", 0) > 0:
+                alert_parts.append(f"草稿滞留={summary['draft_limbo']}")
+            if alert_parts:
+                lines.append(f"- 发现问题 {total} 个：{'，'.join(alert_parts)}")
+            else:
+                lines.append(f"- 发现问题 {total} 个（非关键）")
+        else:
+            lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])
+
     # P2-B: Add top failure patterns
     if feedback_patterns and not feedback_patterns.get("error"):
         top_patterns = feedback_patterns.get("top_patterns", [])
@@ -707,6 +809,7 @@ def _count(repo: CryptoGuardRepository, sql: str) -> int:
 
 def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
     raw = _safe_json(row.get("raw_decision_json"), {})
+    trade_plan = _safe_json(row.get("trade_plan_json"), {})
     return {
         "ga_decision_id": row.get("id"),
         "symbol": row.get("symbol"),
@@ -719,6 +822,7 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "final_summary": row.get("final_summary"),
         "risk_check": _safe_json(row.get("risk_check_json"), {}),
         "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
+        "trade_plan": trade_plan,
     }
 
 

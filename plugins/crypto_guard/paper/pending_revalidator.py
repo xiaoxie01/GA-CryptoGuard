@@ -203,13 +203,14 @@ def _create_watch_from_order(repo: CryptoGuardRepository, order: dict[str, Any],
                 ga_decision_id = sig["ga_decision_id"]
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    expires_iso = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
     try:
         repo.conn.execute(
             """
-            INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at)
-            VALUES (?, ?, ?, ?, '{}', 'active', ?)
+            INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at, expires_at)
+            VALUES (?, ?, ?, ?, '{}', 'active', ?, ?)
             """,
-            (symbol, side, ga_decision_id, f"pending转观察：{reason}", now_iso),
+            (symbol, side, ga_decision_id, f"pending转观察：{reason}", now_iso, expires_iso),
         )
     except Exception as e:
         LOGGER.debug("create_watch_from_order failed: %s", e)

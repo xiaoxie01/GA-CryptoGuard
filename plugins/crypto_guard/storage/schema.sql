@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS ga_decisions (
     analysis_state_id INTEGER,
     snapshot_id INTEGER,
     account_feedback_gate_json TEXT,
+    market_regime_gate_json TEXT,
     created_by TEXT DEFAULT 'ga_master_controller',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );

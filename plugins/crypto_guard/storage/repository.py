@@ -10,6 +10,23 @@ def utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _extract_strategy_name(raw: dict[str, Any]) -> str | None:
+    """Extract strategy_name from ga_decision raw_decision_json.
+
+    Real data has strategy_name at raw_decision_json.raw_legacy_decision.strategy_name.
+    Also supports top-level strategy_name for forward compatibility.
+    """
+    name = raw.get("strategy_name")
+    if name:
+        return name
+    legacy = raw.get("raw_legacy_decision")
+    if isinstance(legacy, dict):
+        name = legacy.get("strategy_name")
+        if name:
+            return name
+    return None
+
+
 class CryptoGuardRepository:
     """Repository 层隔离所有 SQL，业务模块不直接拼 SQL。"""
 
@@ -439,6 +456,20 @@ class CryptoGuardRepository:
         suggested_adjustment: dict[str, Any] | None = None,
         status: str = "candidate",
     ) -> int:
+        # Dedup: skip auto_analysis if same (skill_name, finding) written in last 24h
+        if feedback_type == "auto_analysis":
+            existing = self.conn.execute(
+                """
+                SELECT id FROM skill_feedback_memory
+                WHERE skill_name=? AND feedback_type=? AND finding=? AND status='candidate'
+                  AND created_at > datetime('now', '-1 day')
+                LIMIT 1
+                """,
+                (skill_name, finding),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+
         self.conn.execute(
             """
             INSERT INTO skill_feedback_memory(
@@ -660,13 +691,61 @@ class CryptoGuardRepository:
             (job_type, int(priority), source, session_id, json.dumps(payload, ensure_ascii=False), scheduled_at),
         )
         job_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self._enqueue_job_redis(job_id, job_type, priority, source, session_id, payload)
+        return job_id
+
+    def enqueue_job_once(self, job_type: str, priority: int, source: str, session_id: str, payload: dict[str, Any], scheduled_at: str | None = None) -> int:
+        """Enqueue a job with idempotency: if a job with the same (job_type, session_id)
+        already exists and is pending/running/success, return the existing id.
+        If it's failed/cancelled/duplicate, reset to pending and return the existing id.
+        Otherwise insert a new job.
+        """
+        existing = self.conn.execute(
+            "SELECT id, status FROM agent_jobs WHERE job_type=? AND session_id=?",
+            (job_type, session_id),
+        ).fetchone()
+        if existing:
+            existing_id = int(existing["id"])
+            status = existing["status"]
+            if status in ("pending", "running", "success"):
+                return existing_id
+            # Reset failed/cancelled/duplicate to pending
+            self.conn.execute(
+                "UPDATE agent_jobs SET status='pending', priority=?, source=?, payload_json=?, started_at=NULL, error_message=NULL, finished_at=NULL, scheduled_at=COALESCE(?, CURRENT_TIMESTAMP) WHERE id=?",
+                (int(priority), source, json.dumps(payload, ensure_ascii=False), scheduled_at, existing_id),
+            )
+            self._enqueue_job_redis(existing_id, job_type, priority, source, session_id, payload)
+            return existing_id
+        # No existing job — insert new
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at)
+                VALUES (?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                """,
+                (job_type, int(priority), source, session_id, json.dumps(payload, ensure_ascii=False), scheduled_at),
+            )
+        except sqlite3.IntegrityError:
+            # Race condition: another process inserted between our SELECT and INSERT
+            existing = self.conn.execute(
+                "SELECT id FROM agent_jobs WHERE job_type=? AND session_id=?",
+                (job_type, session_id),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            raise
+        job_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self._enqueue_job_redis(job_id, job_type, priority, source, session_id, payload)
+        return job_id
+
+    def _enqueue_job_redis(self, job_id: int, job_type: str, priority: int, source: str, session_id: str, payload: dict[str, Any]) -> None:
         try:
             db_row = self.conn.execute("PRAGMA database_list").fetchone()
             database_path = db_row["file"] if db_row and "file" in db_row.keys() else None
             from plugins.crypto_guard.storage.redis_adapter import RedisAdapter, should_use_redis_for_path
 
             if not should_use_redis_for_path(database_path):
-                return job_id
+                return
             redis = RedisAdapter()
             redis_payload = {
                 "sqlite_job_id": job_id,
@@ -683,7 +762,6 @@ class CryptoGuardRepository:
                 redis.enqueue_background_job(redis_payload)
         except Exception:
             pass
-        return job_id
 
     def has_pending_user_jobs(self) -> bool:
         row = self.conn.execute(
@@ -963,13 +1041,13 @@ class CryptoGuardRepository:
             return int(row["id"]), False
 
     def list_open_paper_orders(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.conn.execute("SELECT * FROM paper_orders WHERE status IN ('pending','open') ORDER BY id").fetchall()]
+        return [dict(r) for r in self.conn.execute("SELECT * FROM paper_orders WHERE status IN ('pending','open','needs_recheck') ORDER BY id").fetchall()]
 
     def list_open_paper_orders_for_symbol(self, symbol: str) -> list[dict[str, Any]]:
         return [
             dict(r)
             for r in self.conn.execute(
-                "SELECT * FROM paper_orders WHERE status IN ('pending','open') AND symbol=? ORDER BY id",
+                "SELECT * FROM paper_orders WHERE status IN ('pending','open','needs_recheck') AND symbol=? ORDER BY id",
                 (symbol,),
             ).fetchall()
         ]
@@ -999,6 +1077,13 @@ class CryptoGuardRepository:
             )
 
     def create_paper_trade(self, order: dict[str, Any], entry_price: float, *, fill_method: str | None = None) -> int:
+        # Guard: one order can only have one open trade
+        existing = self.conn.execute(
+            "SELECT id FROM paper_trades WHERE order_id=? AND closed_at IS NULL LIMIT 1",
+            (int(order["id"]),),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
         signal_id = order.get("signal_id")
         market_snapshot_id = None
         if signal_id:
@@ -1104,6 +1189,109 @@ class CryptoGuardRepository:
                 int(trade_id),
             ),
         )
+
+    def backfill_shadow_evaluation_pnl_r(self, trade: dict[str, Any], pnl_r: float) -> int:
+        """Backfill real pnl_r to shadow strategy_evaluations linked to this trade.
+
+        When a paper trade closes, find all shadow candidate evaluations (is_shadow=1)
+        for the same strategy_name, symbol, and nearby analysis_time, and backfill
+        the real pnl_r.
+
+        Returns number of evaluation rows updated.
+        """
+        order_id = trade.get("order_id")
+        if not order_id:
+            return 0
+
+        order = self.conn.execute(
+            "SELECT ga_decision_id, symbol FROM paper_orders WHERE id=?",
+            (int(order_id),),
+        ).fetchone()
+        if not order:
+            return 0
+
+        # Get analysis_time and strategy_name from ga_decision
+        analysis_time = None
+        strategy_name = None
+        if order["ga_decision_id"]:
+            gd = self.conn.execute(
+                "SELECT analysis_time, raw_decision_json FROM ga_decisions WHERE id=?",
+                (int(order["ga_decision_id"]),),
+            ).fetchone()
+            if gd:
+                try:
+                    analysis_time = int(gd["analysis_time"])
+                except (ValueError, TypeError):
+                    pass
+                # Extract strategy_name from raw_decision_json
+                # real data: raw_decision_json.raw_legacy_decision.strategy_name
+                try:
+                    raw = json.loads(gd["raw_decision_json"] or "{}")
+                    strategy_name = _extract_strategy_name(raw)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        if analysis_time is None:
+            return 0
+
+        # Backfill pnl_r to candidate shadow evaluations for the same strategy + symbol + time window
+        if strategy_name:
+            self.conn.execute(
+                """
+                UPDATE strategy_evaluations
+                SET pnl_r=?
+                WHERE symbol=? AND strategy_name=? AND is_shadow=1 AND pnl_r IS NULL
+                  AND ABS(analysis_time - ?) < 3600000
+                """,
+                (float(pnl_r), order["symbol"], strategy_name, analysis_time),
+            )
+        else:
+            # Fallback: match by symbol + time only (no strategy_name in ga_decision)
+            self.conn.execute(
+                """
+                UPDATE strategy_evaluations
+                SET pnl_r=?
+                WHERE symbol=? AND is_shadow=1 AND pnl_r IS NULL
+                  AND ABS(analysis_time - ?) < 3600000
+                """,
+                (float(pnl_r), order["symbol"], analysis_time),
+            )
+        updated = int(self.conn.execute("SELECT changes() AS c").fetchone()["c"])
+        if updated:
+            self.conn.commit()
+        return updated
+
+    def backfill_historical_shadow_pnl_r(self) -> dict[str, int]:
+        """One-shot: backfill pnl_r from all closed paper_trades to shadow evaluations.
+
+        Iterates closed trades with real pnl_r, traces to ga_decision for
+        strategy_name + analysis_time, and backfills matching shadow evals.
+
+        Returns {trades_processed, evaluations_updated}.
+        """
+        closed_trades = self.conn.execute(
+            """
+            SELECT pt.id, pt.order_id, pt.pnl_r
+            FROM paper_trades pt
+            WHERE pt.closed_at IS NOT NULL
+              AND pt.pnl_r IS NOT NULL
+              AND (pt.close_reason IS NULL OR pt.close_reason != 'duplicate_cleanup')
+            """
+        ).fetchall()
+
+        trades_processed = 0
+        total_updated = 0
+
+        for trade_row in closed_trades:
+            updated = self.backfill_shadow_evaluation_pnl_r(
+                {"order_id": trade_row["order_id"]},
+                float(trade_row["pnl_r"]),
+            )
+            if updated > 0:
+                trades_processed += 1
+                total_updated += updated
+
+        return {"trades_processed": trades_processed, "evaluations_updated": total_updated}
 
     def save_equity_snapshot(self, snapshot: dict[str, Any]) -> int:
         self.conn.execute(
@@ -1694,6 +1882,31 @@ class CryptoGuardRepository:
             self.conn.commit()
 
         return {"rejected_duplicates": rejected}
+
+    def cleanup_orphan_patches(self) -> dict[str, int]:
+        """Mark strategy_patches as rejected when they have no matching strategy_version.
+        Returns counts of {orphans_marked, versions_backfilled}."""
+        orphans = self.conn.execute(
+            """
+            SELECT sp.id, sp.strategy_name, sp.candidate_version, sp.status
+            FROM strategy_patches sp
+            LEFT JOIN strategy_versions sv ON sp.strategy_name = sv.strategy_name AND sp.candidate_version = sv.version
+            WHERE sv.id IS NULL AND sp.status NOT IN ('duplicate', 'rejected')
+            """
+        ).fetchall()
+
+        cleaned = 0
+        for row in orphans:
+            self.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE id=?",
+                (row["id"],),
+            )
+            cleaned += 1
+
+        if cleaned:
+            self.conn.commit()
+
+        return {"orphans_cleaned": cleaned}
 
     def list_strategy_versions(self, strategy_name: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []

@@ -20,6 +20,8 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
         return {"ok": False, "error": "trade 不存在", "trade_id": trade_id}
     pnl_r = float(trade.get("pnl_r") or 0)
     result = "win" if pnl_r > 0.05 else "loss" if pnl_r < -0.05 else "breakeven"
+    # Enrich trade with regime context BEFORE classifying
+    trade = _enrich_trade_with_regime_context(repo, trade)
     primary = classify_trade(trade)
     patch = build_candidate_patch(trade, primary)
     metrics = _trade_metrics(trade)
@@ -56,6 +58,14 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
     review_id = repo.save_trade_review(trade_id, review)
     review_patch = review.get("strategy_patch_candidate") if isinstance(review.get("strategy_patch_candidate"), dict) else patch
     patch_id = repo.save_strategy_patch_candidate(review_patch, {"trade_id": trade_id, "review_id": review_id}) if review_patch and review.get("evolution_trigger_allowed", True) else None
+    if patch_id and review_patch:
+        repo.save_strategy_version(
+            strategy_name=review_patch["strategy_name"],
+            version=review_patch["candidate_version"],
+            status="shadow_testing",
+            config=review_patch.get("patch", {}),
+            change_reason=review_patch.get("change_reason", "trade_review"),
+        )
     repo.update_strategy_memory_from_review(
         strategy_name=(review_patch or {}).get("strategy_name", "paper_trade_sop"),
         condition_hash=f"{trade.get('symbol')}:{primary}",
@@ -127,6 +137,52 @@ def _improvement_suggestion(primary: str) -> dict[str, Any]:
 
 def _summary(trade: dict[str, Any], result: str, primary: str, pnl_r: float) -> str:
     return f"{trade.get('symbol')} 模拟盘交易已平仓，结果 {result}，R 值 {pnl_r:.2f}，主要归因：{primary}。"
+
+
+def _enrich_trade_with_regime_context(repo: CryptoGuardRepository, trade: dict[str, Any]) -> dict[str, Any]:
+    """Enrich trade dict with market regime context from ga_decisions.market_regime_gate_json.
+
+    The flow: trade -> order_id -> paper_orders.ga_decision_id -> ga_decisions.market_regime_gate_json.
+    If found, sets trade["market_regime_json"] which classify_trade._get_regime_context() checks.
+    """
+    order_id = trade.get("order_id")
+    if not order_id:
+        return trade
+
+    try:
+        order = repo.conn.execute(
+            "SELECT ga_decision_id FROM paper_orders WHERE id=?",
+            (int(order_id),),
+        ).fetchone()
+    except Exception:
+        return trade
+
+    if not order or not order["ga_decision_id"]:
+        return trade
+
+    try:
+        gd = repo.conn.execute(
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?",
+            (int(order["ga_decision_id"]),),
+        ).fetchone()
+    except Exception:
+        return trade
+
+    if not gd or not gd["market_regime_gate_json"]:
+        return trade
+
+    try:
+        regime_data = json.loads(gd["market_regime_gate_json"])
+        # Extract the regime info from the gate result structure
+        # regime_gate has: market_regime (the scoring), adjustments, regime_gate_applied, mode
+        market_regime = regime_data.get("market_regime", {})
+        if market_regime:
+            trade = dict(trade)
+            trade["market_regime_json"] = market_regime
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return trade
 
 
 def _snapshot_context(repo: CryptoGuardRepository, trade: dict[str, Any]) -> dict[str, Any]:

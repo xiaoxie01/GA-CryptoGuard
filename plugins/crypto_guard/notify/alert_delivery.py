@@ -33,6 +33,7 @@ def send_markdown_alert(
     alert_type: str,
     symbol: str | None = None,
     priority: int = 5,
+    dedupe_key: str | None = None,
 ) -> dict[str, Any]:
     cfg = load_config().trading_mode
     feishu_cfg = cfg.get("feishu", {})
@@ -66,7 +67,7 @@ def send_markdown_alert(
         symbol=symbol,
         priority=priority,
         payload=payload,
-        dedupe_key=f"{symbol or '-'}:{alert_type}",
+        dedupe_key=dedupe_key or f"{symbol or '-'}:{alert_type}",
     )
     if not send_message:
         return {"ok": True, "sent": False, "queued": True, "alert_id": alert_id}

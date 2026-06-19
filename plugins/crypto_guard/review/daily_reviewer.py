@@ -9,8 +9,37 @@ from plugins.crypto_guard.review.trade_reviewer import review_trade
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 
-def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None) -> dict[str, Any]:
+def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None, force: bool = False) -> dict[str, Any]:
     start, end = _review_window(day_utc)
+    report_date = start[:10]
+
+    # Idempotency: if report already exists and not forced, return existing
+    existing = repo.conn.execute(
+        "SELECT id, summary_json, ga_report, pushed_to_feishu FROM daily_review_reports WHERE review_date=?",
+        (report_date,),
+    ).fetchone()
+    if existing and not force:
+        import json
+        summary = json.loads(existing["summary_json"] or "{}")
+        return {
+            "ok": True,
+            "idempotent": True,
+            "existing": True,
+            "day_start_utc": start,
+            "day_end_utc": end,
+            "daily_review_report_id": int(existing["id"]),
+            "text": existing["ga_report"],
+            "summary": summary,
+            "pushed_to_feishu": bool(existing["pushed_to_feishu"]),
+        }
+
+    # If force=True and existing report, archive old skill_feedback_memory
+    if force and existing:
+        repo.conn.execute(
+            "UPDATE skill_feedback_memory SET status='archived' WHERE source_type='daily_review' AND finding LIKE ?",
+            (f"每日复盘：%{report_date}%",),
+        )
+
     trades = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=True)
     reviewed: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -204,13 +233,50 @@ def _write_skill_memory_updates(
         if evolution.get("triggered"):
             finding += "，自进化触发器已启动"
 
+        # Build structured suggested_adjustment with regime context
+        regime_info: dict[str, Any] = {}
+        for t in pattern_trades:
+            ctx = t.get("market_regime_at_loss")
+            if ctx and isinstance(ctx, dict):
+                regime_info = {
+                    "market_phase": ctx.get("market_phase"),
+                    "regime_alignment": ctx.get("regime_alignment"),
+                    "btc_bias": ctx.get("btc_bias"),
+                    "eth_bias": ctx.get("eth_bias"),
+                    "symbol_relative_strength": ctx.get("symbol_relative_strength"),
+                }
+                break
+
         suggested_adjustment = {
             "loss_count": len(pattern_trades),
             "pattern": pattern,
             "symbols": affected_symbols,
             "sides": affected_sides,
             "evolution_triggered": bool(evolution.get("triggered")),
+            "market_phase": regime_info.get("market_phase"),
+            "regime_alignment": regime_info.get("regime_alignment"),
+            "btc_bias": regime_info.get("btc_bias"),
+            "eth_bias": regime_info.get("eth_bias"),
+            "symbol_relative_strength": regime_info.get("symbol_relative_strength"),
         }
+
+        # Add action-oriented suggested_adjustment_json for regime-mismatch patterns
+        if "regime_mismatch" in pattern or "counter_regime" in pattern or "macro_" in pattern:
+            suggested_adjustment["suggested_adjustment_json"] = {
+                "action": "raise_confirmation_threshold",
+                "when": {
+                    "pattern_type": pattern,
+                    "market_phase": regime_info.get("market_phase"),
+                    "side": affected_sides[0] if len(affected_sides) == 1 else affected_sides,
+                },
+                "adjustments": {
+                    "min_confidence": 0.82,
+                    "min_rr": 2.0,
+                    "risk_multiplier": 0.5,
+                    "allow_order_types": ["trigger", "retest"],
+                    "downgrade_to_watch_if_no_independent_trend": True,
+                },
+            }
 
         # Write to primary skill based on pattern
         primary_skill = _primary_skill_for_pattern(pattern)
@@ -264,6 +330,18 @@ def _map_pattern_to_rule(pattern: str, trades: list[dict[str, Any]]) -> str:
     """Map loss_classifier pattern to feedback_rules.yaml condition."""
     # Check market regime context if available
     regimes = [t.get("market_regime_at_loss") for t in trades if t.get("market_regime_at_loss")]
+
+    # New regime-mismatch patterns
+    if pattern == "macro_rebound_short_squeeze_loss":
+        return "macro_rebound_short_squeeze_loss"
+    if pattern == "macro_selloff_long_trap_loss":
+        return "macro_selloff_long_trap_loss"
+    if pattern == "counter_regime_entry_loss":
+        return "counter_regime_entry_loss"
+    if pattern == "market_regime_mismatch_short_loss":
+        return "market_regime_mismatch_short_loss"
+    if pattern == "market_regime_mismatch_long_loss":
+        return "market_regime_mismatch_long_loss"
 
     if pattern == "late_trend_chasing":
         return "overextended_chase_loss"

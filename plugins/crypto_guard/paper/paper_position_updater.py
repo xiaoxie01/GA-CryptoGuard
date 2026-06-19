@@ -128,14 +128,14 @@ def _ensure_daily_review(repo: CryptoGuardRepository) -> None:
     if now.hour < 1:
         return
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    # Check if daily review already exists for yesterday
+    # Check if daily_review_reports already exists for yesterday (source of truth)
     existing = repo.conn.execute(
-        "SELECT id FROM agent_jobs WHERE job_type='daily_review' AND created_at >= ? AND created_at < ? LIMIT 1",
-        (yesterday, now.strftime("%Y-%m-%d")),
+        "SELECT id FROM daily_review_reports WHERE review_date=? LIMIT 1",
+        (yesterday,),
     ).fetchone()
     if existing:
         return
-    # Also check scheduler_runs
+    # Also check scheduler_runs for success
     existing_run = repo.conn.execute(
         "SELECT id FROM scheduler_runs WHERE job_name='daily_review' AND status='success' AND started_at >= ? AND started_at < ? LIMIT 1",
         (yesterday, now.strftime("%Y-%m-%d")),
@@ -143,7 +143,7 @@ def _ensure_daily_review(repo: CryptoGuardRepository) -> None:
     if existing_run:
         return
     LOGGER.info("daily review fallback: enqueuing for %s", yesterday)
-    repo.enqueue_job(
+    repo.enqueue_job_once(
         "daily_review",
         7,
         "paper_worker",
@@ -170,20 +170,20 @@ def _check_daily_loss_trigger(repo: CryptoGuardRepository, results: list[dict[st
     if 3 <= daily_losses <= 5:
         # Check if we already triggered today
         existing = repo.conn.execute(
-            "SELECT id FROM agent_jobs WHERE job_type='daily_review' AND session_id LIKE 'system:paper:daily_loss:%' AND created_at >= ?",
-            (today,),
+            "SELECT id FROM agent_jobs WHERE job_type='intraday_loss_review' AND session_id LIKE ? AND created_at >= ?",
+            (f"system:paper:intraday_loss:{today}:%", today),
         ).fetchone()
         if not existing:
-            repo.enqueue_job(
-                "daily_review",
+            repo.enqueue_job_once(
+                "intraday_loss_review",
                 5,  # high priority
                 "paper_worker",
-                f"system:paper:daily_loss:{today}",
+                f"system:paper:intraday_loss:{today}:{daily_losses}",
                 {"day_utc": today, "trigger": "daily_loss_threshold", "loss_count": daily_losses},
             )
             LOGGER.info("daily review triggered by loss threshold: %s losses today", daily_losses)
             # Enqueue evolution trigger notification
-            repo.enqueue_job(
+            repo.enqueue_job_once(
                 "evolution_trigger_alert",
                 4,  # high priority
                 "paper_worker",

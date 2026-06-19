@@ -31,6 +31,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_pending_order_lifecycle_migrations(conn)
         _apply_p1_structured_feedback_migrations(conn)
         _apply_account_feedback_gate_migration(conn)
+        _apply_daily_review_idempotency_migration(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -475,12 +476,417 @@ def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
 def _apply_account_feedback_gate_migration(conn: sqlite3.Connection) -> None:
     """Add account_feedback_gate_json column to ga_decisions for gate results."""
     _add_column(conn, "ga_decisions", "account_feedback_gate_json", "TEXT")
+    _add_column(conn, "ga_decisions", "market_regime_gate_json", "TEXT")
     # dedupe_key for opportunity_watches (P0 hotfix: Fix 4)
     _add_column(conn, "opportunity_watches", "dedupe_key", "TEXT")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe "
         "ON opportunity_watches(dedupe_key)"
     )
+
+
+def _apply_daily_review_idempotency_migration(conn: sqlite3.Connection) -> None:
+    """Cleanup duplicate agent_jobs from the pre-idempotency era.
+
+    Idempotency is enforced at the application layer via enqueue_job_once()
+    (SELECT-then-INSERT with IntegrityError catch), NOT via a DB-level UNIQUE
+    index.  A global UNIQUE(job_type, session_id) would break event-queue
+    callers like feishu_user_message / feishu_button_callback that legitimately
+    reuse session_ids across events.
+
+    The cleanup here soft-deduplicates historical duplicates so the data is
+    tidy, but does not create a hard constraint.
+    """
+    _cleanup_agent_job_duplicates(conn)
+    _cleanup_orphan_patches(conn)
+    _cleanup_noisy_auto_analysis(conn)
+    _cleanup_duplicate_open_trades(conn)
+    _backfill_historical_shadow_pnl_r(conn)
+    _cleanup_stale_empty_watches(conn)
+    # Partial unique index: one order can only have one open trade.
+    # Unlike the global UNIQUE on agent_jobs(job_type, session_id) which was
+    # rejected because event-queue callers legitimately reuse session_ids,
+    # this is scoped to open trades only — a genuine data integrity rule.
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_trade_per_order
+        ON paper_trades(order_id)
+        WHERE closed_at IS NULL
+        """
+    )
+
+
+def _cleanup_orphan_patches(conn: sqlite3.Connection) -> dict[str, int]:
+    """Mark strategy_patches as rejected when they have no matching strategy_version."""
+    orphans = conn.execute(
+        """
+        SELECT sp.id, sp.strategy_name, sp.candidate_version
+        FROM strategy_patches sp
+        LEFT JOIN strategy_versions sv ON sp.strategy_name = sv.strategy_name AND sp.candidate_version = sv.version
+        WHERE sv.id IS NULL AND sp.status NOT IN ('duplicate', 'rejected')
+        """
+    ).fetchall()
+
+    for row in orphans:
+        conn.execute(
+            "UPDATE strategy_patches SET status='rejected' WHERE id=?",
+            (row["id"],),
+        )
+
+    if orphans:
+        conn.commit()
+
+    return {"orphans_cleaned": len(orphans)}
+
+
+def _cleanup_noisy_auto_analysis(conn: sqlite3.Connection) -> dict[str, int]:
+    """Dedup auto_analysis skill_feedback_memory: keep only the latest per (skill_name, finding) per day."""
+    # Mark older duplicates as 'superseded' — keep the latest per group
+    conn.execute(
+        """
+        UPDATE skill_feedback_memory
+        SET status='superseded'
+        WHERE feedback_type='auto_analysis'
+          AND status='candidate'
+          AND id NOT IN (
+              SELECT MAX(id) FROM skill_feedback_memory
+              WHERE feedback_type='auto_analysis' AND status='candidate'
+              GROUP BY skill_name, finding, date(created_at)
+          )
+        """
+    )
+    cleaned = int(conn.execute("SELECT changes() AS c").fetchone()["c"])
+    if cleaned:
+        conn.commit()
+    return {"auto_analysis_deduped": cleaned}
+
+
+def _cleanup_duplicate_open_trades(conn: sqlite3.Connection) -> dict[str, int]:
+    """Close duplicate open trades (same order_id, multiple open paper_trades).
+
+    Keeps the oldest trade (lowest id), closes others with reason 'duplicate_cleanup'.
+    Also marks duplicate paper_positions as closed.
+    """
+    # Find order_ids with multiple open trades
+    dup_orders = conn.execute(
+        """
+        SELECT order_id, COUNT(*) as cnt
+        FROM paper_trades
+        WHERE closed_at IS NULL
+        GROUP BY order_id
+        HAVING cnt > 1
+        """
+    ).fetchall()
+
+    trades_closed = 0
+    positions_closed = 0
+
+    for row in dup_orders:
+        order_id = int(row["order_id"])
+        # Find all open trades for this order, keep the oldest
+        trades = conn.execute(
+            "SELECT id FROM paper_trades WHERE order_id=? AND closed_at IS NULL ORDER BY id ASC",
+            (order_id,),
+        ).fetchall()
+
+        keeper_id = int(trades[0]["id"])
+        for trade in trades[1:]:
+            dup_id = int(trade["id"])
+            conn.execute(
+                """
+                UPDATE paper_trades
+                SET closed_at=CURRENT_TIMESTAMP, close_reason='duplicate_cleanup',
+                    pnl=NULL, pnl_percent=NULL, pnl_r=NULL
+                WHERE id=?
+                """,
+                (dup_id,),
+            )
+            trades_closed += 1
+            # Close matching paper_position (position id matches trade id)
+            conn.execute(
+                "UPDATE paper_positions SET status='closed', closed_at=CURRENT_TIMESTAMP WHERE id=? AND status='open'",
+                (dup_id,),
+            )
+            positions_closed += conn.execute("SELECT changes() AS c").fetchone()["c"]
+
+    if trades_closed:
+        conn.commit()
+
+    return {"duplicate_trades_closed": trades_closed, "duplicate_positions_closed": positions_closed}
+
+
+def _cleanup_stale_empty_watches(conn: sqlite3.Connection) -> dict[str, int]:
+    """Clean up stale opportunity_watches with empty conditions and no TTL.
+
+    Old watches (pre-TTL era) have watch_condition_json='{}' and expires_at=NULL.
+    Without expires_at, evaluate_watch() can't expire them, so they stay active forever.
+
+    Real data: created_at is ISO format (e.g. '2026-06-18T00:15:18+00:00').
+    SQLite datetime('now') returns 'YYYY-MM-DD HH:MM:SS' (no T, no timezone).
+    We MUST use SQLite's built-in datetime() on created_at for consistent comparison,
+    and write expires_at in ISO UTC via strftime() so _is_expired() can parse it.
+    """
+    # Expire old watches (>24h since creation)
+    # datetime(created_at) normalizes ISO→SQLite format for consistent comparison
+    expired = conn.execute(
+        """
+        UPDATE opportunity_watches
+        SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'active'
+          AND (watch_condition_json IS NULL OR watch_condition_json = '{}')
+          AND (expires_at IS NULL OR expires_at = '')
+          AND datetime(created_at) < datetime('now', '-1 day')
+        """
+    )
+    expired_count = expired.rowcount if hasattr(expired, 'rowcount') else 0
+
+    # Set TTL for recent watches — write ISO UTC so _is_expired() can parse it
+    set_ttl = conn.execute(
+        """
+        UPDATE opportunity_watches
+        SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', datetime(created_at), '+1 day'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'active'
+          AND (watch_condition_json IS NULL OR watch_condition_json = '{}')
+          AND (expires_at IS NULL OR expires_at = '')
+          AND datetime(created_at) >= datetime('now', '-1 day')
+        """
+    )
+    ttl_count = set_ttl.rowcount if hasattr(set_ttl, 'rowcount') else 0
+
+    if expired_count or ttl_count:
+        conn.commit()
+
+    return {"stale_watches_expired": expired_count, "stale_watches_ttl_set": ttl_count}
+
+
+def _backfill_historical_shadow_pnl_r(conn: sqlite3.Connection) -> dict[str, int]:
+    """One-shot backfill: copy pnl_r from closed paper_trades to shadow evaluations.
+
+    For each closed trade with real pnl_r, finds the ga_decision's analysis_time (integer ms)
+    and strategy_name, then updates matching shadow strategy_evaluations (is_shadow=1).
+    Excludes duplicate_cleanup trades (pnl_r=NULL, no real outcome).
+    """
+    import json
+
+    trades = conn.execute(
+        """
+        SELECT pt.id, pt.order_id, pt.pnl_r
+        FROM paper_trades pt
+        WHERE pt.closed_at IS NOT NULL
+          AND pt.pnl_r IS NOT NULL
+          AND pt.close_reason != 'duplicate_cleanup'
+        """
+    ).fetchall()
+
+    trades_processed = 0
+    evals_updated = 0
+
+    for row in trades:
+        order_id = int(row["order_id"])
+        pnl_r = float(row["pnl_r"])
+
+        # Get order info
+        order = conn.execute(
+            "SELECT ga_decision_id, symbol FROM paper_orders WHERE id=?",
+            (order_id,),
+        ).fetchone()
+        if not order or not order["ga_decision_id"]:
+            continue
+
+        gd = conn.execute(
+            "SELECT analysis_time, raw_decision_json FROM ga_decisions WHERE id=?",
+            (int(order["ga_decision_id"]),),
+        ).fetchone()
+        if not gd or not gd["analysis_time"]:
+            continue
+
+        try:
+            analysis_time = int(gd["analysis_time"])
+        except (ValueError, TypeError):
+            continue
+
+        strategy_name = None
+        try:
+            raw = json.loads(gd["raw_decision_json"] or "{}")
+            # Real data: raw_decision_json.raw_legacy_decision.strategy_name
+            strategy_name = raw.get("strategy_name")
+            if not strategy_name:
+                legacy = raw.get("raw_legacy_decision")
+                if isinstance(legacy, dict):
+                    strategy_name = legacy.get("strategy_name")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if strategy_name:
+            conn.execute(
+                """
+                UPDATE strategy_evaluations
+                SET pnl_r=?
+                WHERE symbol=? AND strategy_name=? AND is_shadow=1 AND pnl_r IS NULL
+                  AND ABS(analysis_time - ?) < 3600000
+                """,
+                (pnl_r, order["symbol"], strategy_name, analysis_time),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE strategy_evaluations
+                SET pnl_r=?
+                WHERE symbol=? AND is_shadow=1 AND pnl_r IS NULL
+                  AND ABS(analysis_time - ?) < 3600000
+                """,
+                (pnl_r, order["symbol"], analysis_time),
+            )
+
+        updated = int(conn.execute("SELECT changes() AS c").fetchone()["c"])
+        if updated > 0:
+            trades_processed += 1
+            evals_updated += updated
+
+    if evals_updated:
+        conn.commit()
+
+    return {"trades_processed": trades_processed, "evaluations_updated": evals_updated}
+
+
+# Job types that use enqueue_job_once() with idempotent session_ids.
+# Cleanup only deduplicates these — event-queue callers (feishu_user_message,
+# feishu_button_callback, scheduled_market_analysis) are intentionally excluded
+# because they legitimately reuse session_ids across events.
+IDEMPOTENT_JOB_TYPES = frozenset({
+    "daily_review",
+    "intraday_loss_review",
+    "hourly_feishu_report",
+    "alert_outbox_retry",
+    "update_paper_positions",
+    "pending_order_management",
+    "pending_order_revalidation",
+    "update_opportunity_watches",
+})
+
+
+def _cleanup_agent_job_duplicates(conn: sqlite3.Connection) -> dict[str, int]:
+    """Soft-clean duplicate agent_jobs for idempotent job types only.
+
+    Only deduplicates job types in IDEMPOTENT_JOB_TYPES — these use
+    enqueue_job_once() and should have at most one active row per
+    (job_type, session_id).  Event-queue job types (feishu_user_message,
+    feishu_button_callback, etc.) are intentionally skipped because
+    they legitimately reuse session_ids.
+
+    Keeps the earliest success or the latest pending/running row,
+    marks the rest as 'duplicate'.
+
+    Returns cleanup stats for audit log.
+    """
+    result: dict[str, int] = {}
+    placeholders = ",".join("?" * len(IDEMPOTENT_JOB_TYPES))
+    params = tuple(IDEMPOTENT_JOB_TYPES)
+
+    # 1. agent_jobs: keep earliest success per (job_type, session_id)
+    dup_rows = conn.execute(
+        f"""
+        SELECT job_type, session_id, COUNT(*) as cnt
+        FROM agent_jobs
+        WHERE job_type IN ({placeholders})
+          AND status NOT IN ('duplicate', 'superseded')
+        GROUP BY job_type, session_id
+        HAVING cnt > 1
+        """,
+        params,
+    ).fetchall()
+    agent_jobs_cleaned = 0
+    for row in dup_rows:
+        keeper = conn.execute(
+            """
+            SELECT id FROM agent_jobs
+            WHERE job_type=? AND session_id=?
+            ORDER BY CASE WHEN status='success' THEN 0 ELSE 1 END, id ASC
+            LIMIT 1
+            """,
+            (row["job_type"], row["session_id"]),
+        ).fetchone()
+        if keeper:
+            cur = conn.execute(
+                """
+                UPDATE agent_jobs
+                SET status='duplicate',
+                    session_id=session_id || '--dup-' || id,
+                    error_message='deduped by agent_job_idempotency cleanup'
+                WHERE job_type=? AND session_id=? AND id!=?
+                """,
+                (row["job_type"], row["session_id"], int(keeper["id"])),
+            )
+            agent_jobs_cleaned += cur.rowcount
+    result["agent_jobs_duplicate"] = agent_jobs_cleaned
+
+    # 2. skill_feedback_memory: archive repeated low-info "无平仓样本"/"无显著亏损" entries
+    # Group by review_date (extracted from finding text pattern) + skill_name + finding
+    skill_cleaned = 0
+    low_info_patterns = (
+        "每日复盘：今日无平仓样本%",
+        "每日复盘：今日无显著亏损%",
+    )
+    for pattern in low_info_patterns:
+        dup_skills = conn.execute(
+            """
+            SELECT skill_name, finding, COUNT(*) as cnt, MIN(id) as keeper_id
+            FROM skill_feedback_memory
+            WHERE source_type='daily_review' AND finding LIKE ?
+            GROUP BY skill_name, finding
+            HAVING cnt > 1
+            """,
+            (pattern,),
+        ).fetchall()
+        for row in dup_skills:
+            cur = conn.execute(
+                """
+                UPDATE skill_feedback_memory
+                SET status='archived'
+                WHERE source_type='daily_review'
+                  AND skill_name=? AND finding=? AND id!=?
+                  AND status NOT IN ('archived', 'superseded')
+                """,
+                (row["skill_name"], row["finding"], int(row["keeper_id"])),
+            )
+            skill_cleaned += cur.rowcount
+    result["skill_feedback_archived"] = skill_cleaned
+
+    # 3. alert_outbox: mark duplicate daily_review alerts
+    alert_dup_rows = conn.execute(
+        """
+        SELECT dedupe_key, COUNT(*) as cnt
+        FROM alert_outbox
+        WHERE alert_type='daily_review'
+        GROUP BY dedupe_key
+        HAVING cnt > 1
+        """
+    ).fetchall()
+    alert_cleaned = 0
+    for row in alert_dup_rows:
+        keeper = conn.execute(
+            """
+            SELECT id FROM alert_outbox
+            WHERE alert_type='daily_review' AND dedupe_key=?
+            ORDER BY CASE WHEN status='sent' THEN 0 ELSE 1 END, id ASC
+            LIMIT 1
+            """,
+            (row["dedupe_key"],),
+        ).fetchone()
+        if keeper:
+            cur = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status='duplicate'
+                WHERE alert_type='daily_review' AND dedupe_key=? AND id!=?
+                """,
+                (row["dedupe_key"], int(keeper["id"])),
+            )
+            alert_cleaned += cur.rowcount
+    result["alert_outbox_duplicate"] = alert_cleaned
+
+    return result
 
 
 def check_schema_health(config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -508,9 +914,15 @@ def check_schema_health(config: CryptoGuardConfig | None = None, conn: sqlite3.C
     # Required columns for skill_feedback_memory
     required_columns = {
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
-        "ga_decisions": ["account_feedback_gate_json"],
+        "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json"],
         "opportunity_watches": ["dedupe_key"],
     }
+
+    # Required indexes
+    required_indexes = [
+        "idx_opportunity_watches_dedupe",
+        "idx_one_open_trade_per_order",
+    ]
 
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []
@@ -534,6 +946,15 @@ def check_schema_health(config: CryptoGuardConfig | None = None, conn: sqlite3.C
             for col in columns:
                 if col not in existing_cols:
                     missing.append({"table": table, "column": col})
+
+        # Check required indexes
+        for idx_name in required_indexes:
+            idx_exists = _conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+                (idx_name,),
+            ).fetchone()
+            if not idx_exists:
+                missing.append({"table": "(index)", "column": idx_name})
 
         return {
             "ok": len(missing) == 0,

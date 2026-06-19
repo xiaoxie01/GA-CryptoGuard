@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
-from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES
+from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES, score_market_regime
 from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
 
 
@@ -387,3 +387,110 @@ def risk_summary_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         decision = {}
     return decision.get("risk_check") or {"ok": False, "reasons": ["signal 缺少风控记录"]}
+
+
+def apply_regime_gate(
+    repo: Any,
+    *,
+    symbol: str,
+    side: str,
+    signal_grade: str,
+    confidence: float,
+    analysis_time_utc: int,
+    risk_percent: float = 0.5,
+    order_type: str = "",
+) -> dict[str, Any]:
+    """Counter-regime soft gate: downgrade/restrict trades against market regime.
+
+    Called before paper order creation. Does NOT hard-block — it downgrades
+    and annotates, letting the normal risk pipeline make the final decision.
+
+    Returns adjustments dict that callers merge into their decision.
+    """
+    cfg = load_config().trading_mode
+    regime_cfg = cfg.get("market_regime", {})
+    if not regime_cfg.get("enabled", True):
+        return {"ok": True, "regime_gate_applied": False, "mode": regime_cfg.get("mode", "shadow"), "adjustments": {}}
+
+    counter_cfg = regime_cfg.get("counter_regime", {})
+    independent_cfg = regime_cfg.get("independent_trend", {})
+
+    # Score regime
+    regime = score_market_regime(
+        repo,
+        symbol=symbol,
+        analysis_time_utc=analysis_time_utc,
+        decision_side=side,
+    )
+
+    alignment = regime.get("regime_alignment", "unclear")
+    if alignment != "counter_regime":
+        return {
+            "ok": True,
+            "regime_gate_applied": False,
+            "mode": regime_cfg.get("mode", "shadow"),
+            "market_regime": regime,
+            "adjustments": {
+                "confidence_adjustment": regime.get("confidence_adjustment", 0.0),
+                "risk_multiplier": regime.get("risk_multiplier", 1.0),
+            },
+        }
+
+    # Counter-regime: apply downgrades
+    grade_downgrade_steps = int(counter_cfg.get("grade_downgrade", 1))
+    grade_map = {"S": "A", "A": "B", "B": "C", "C": "D", "D": "D"}
+    effective_grade = signal_grade
+    for _ in range(grade_downgrade_steps):
+        effective_grade = grade_map.get(effective_grade, effective_grade)
+
+    confidence_penalty = float(counter_cfg.get("confidence_penalty", 0.10))
+    effective_confidence = max(0.0, confidence - confidence_penalty)
+
+    risk_mult = float(counter_cfg.get("risk_multiplier", 0.5))
+    min_rr = float(counter_cfg.get("min_rr", 2.0))
+    allowed_order_types = counter_cfg.get("allow_order_types", ["trigger", "retest"])
+
+    # Check consecutive same-side losses today
+    watch_only_after = int(counter_cfg.get("watch_only_after_same_side_losses", 2))
+    watch_only = False
+    if watch_only_after > 0:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        recent_trades = repo.conn.execute(
+            """
+            SELECT close_reason FROM paper_trades
+            WHERE side=? AND closed_at IS NOT NULL
+              AND DATE(COALESCE(closed_at, datetime('now')))=?
+            ORDER BY closed_at DESC
+            LIMIT ?
+            """,
+            (side, today, watch_only_after),
+        ).fetchall()
+        # Check if the most recent N are ALL stop_loss (consecutive)
+        watch_only = len(recent_trades) >= watch_only_after and all(
+            r["close_reason"] == "stop_loss" for r in recent_trades
+        )
+
+    adjustments = {
+        "effective_grade": effective_grade,
+        "original_grade": signal_grade,
+        "effective_confidence": effective_confidence,
+        "confidence_penalty": confidence_penalty,
+        "risk_multiplier": risk_mult,
+        "min_rr": min_rr,
+        "allowed_order_types": allowed_order_types,
+        "watch_only": watch_only,
+        "regime_alignment": alignment,
+        "market_phase": regime.get("market_phase"),
+        "btc_bias": regime.get("btc_bias"),
+        "eth_bias": regime.get("eth_bias"),
+        "reasons": regime.get("reasons", []),
+    }
+
+    return {
+        "ok": True,
+        "regime_gate_applied": True,
+        "mode": regime_cfg.get("mode", "shadow"),
+        "market_regime": regime,
+        "adjustments": adjustments,
+    }

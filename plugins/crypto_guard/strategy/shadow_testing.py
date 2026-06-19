@@ -831,6 +831,13 @@ def _maybe_generate_draft_patch(
             f"auto_draft_from_failure_{pattern_type}",
         ),
     )
+    repo.save_strategy_version(
+        strategy_name=strategy_name,
+        version=new_version,
+        status="shadow_testing",
+        config=draft_patch,
+        change_reason=f"auto_draft_from_failure_{pattern_type}",
+    )
     repo.conn.commit()
 
     LOGGER.info(

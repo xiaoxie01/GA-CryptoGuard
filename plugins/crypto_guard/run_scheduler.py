@@ -61,11 +61,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "update_opportunity_watches",
                         5,
                         "scheduler",
-                        "system:scheduled:opportunity_watches",
+                        f"system:scheduled:opportunity_watches:{scheduled_time}",
                         {"analysis_time_utc": scheduled_time},
                     ),
                 },
@@ -73,7 +73,10 @@ def run_job(job_name: str) -> dict:
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
         if job_name == "daily_review":
-            result = run_scheduled_job(repo, job_name=job_name, scheduled_time=latest_closed_close_time_ms("1d", now), task_fn=lambda: {"ok": True, "queued": repo.enqueue_job("daily_review", 7, "scheduler", "system:scheduled:daily", {})})
+            from datetime import datetime, timezone, timedelta
+            yesterday_utc = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+            scheduled_time = latest_closed_close_time_ms("1d", now)
+            result = run_scheduled_job(repo, job_name=job_name, scheduled_time=scheduled_time, task_fn=lambda: {"ok": True, "queued": repo.enqueue_job_once("daily_review", 7, "scheduler", f"system:scheduled:daily:{yesterday_utc}", {"day_utc": yesterday_utc})})
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
         if job_name == "hourly_feishu_report":
@@ -84,11 +87,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "hourly_feishu_report",
                         3,
                         "scheduler",
-                        "system:scheduled:hourly_report",
+                        f"system:scheduled:hourly_report:{scheduled_time}",
                         {"scheduled_time": scheduled_time},
                     ),
                 },
@@ -103,11 +106,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "alert_outbox_retry",
                         2,
                         "scheduler",
-                        "system:scheduled:alert_outbox_retry",
+                        f"system:scheduled:alert_outbox_retry:{scheduled_time}",
                         {"scheduled_time": scheduled_time, "limit": 10},
                     ),
                 },
@@ -122,11 +125,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "update_paper_positions",
                         5,
                         "scheduler",
-                        "system:scheduled:paper_positions",
+                        f"system:scheduled:paper_positions:{scheduled_time}",
                         {"scheduled_time": scheduled_time},
                     ),
                 },
@@ -141,11 +144,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "pending_order_management",
                         5,
                         "scheduler",
-                        "system:scheduled:pending_order_mgmt",
+                        f"system:scheduled:pending_order_mgmt:{scheduled_time}",
                         {"scheduled_time": scheduled_time},
                     ),
                 },
@@ -160,11 +163,11 @@ def run_job(job_name: str) -> dict:
                 scheduled_time=scheduled_time,
                 task_fn=lambda: {
                     "ok": True,
-                    "queued": repo.enqueue_job(
+                    "queued": repo.enqueue_job_once(
                         "pending_order_revalidation",
                         5,
                         "scheduler",
-                        "system:scheduled:pending_order_reval",
+                        f"system:scheduled:pending_order_reval:{scheduled_time}",
                         {"scheduled_time": scheduled_time},
                     ),
                 },
