@@ -640,3 +640,36 @@ Fixed 5 P1 issues: missing data safety (unknown/unclear), daily review pattern p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: P2: regime engine consistency - 8 fixes
+
+**Date**: 2026-06-20
+**Task**: P2: regime engine consistency - 8 fixes
+**Branch**: `main`
+
+### Summary
+
+8 P2 fixes: ETH confirmation, config weights scoring, independent_trend config, risk_multiplier unification, hourly report regime stats, self_evolution JSON parsing, check_schema_health keyword-only, fallback_now visibility. 232 tests passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5c5373a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
