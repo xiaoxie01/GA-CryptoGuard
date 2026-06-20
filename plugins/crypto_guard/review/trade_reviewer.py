@@ -27,6 +27,11 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
     metrics = _trade_metrics(trade)
     snapshot_context = _snapshot_context(repo, trade)
     evidence_checklist = _evidence_checklist(trade, snapshot_context)
+    # Use regime context from the new market_regime_gate_json if available,
+    # otherwise fall back to the legacy snapshot context.
+    # Use "is not None" check to preserve empty dict from gate (authoritative "no data").
+    regime_json = trade.get("market_regime_json")
+    regime_at_loss = regime_json if regime_json is not None else snapshot_context.get("market_regime", "normal")
     fallback_review = {
         "trade_id": int(trade_id),
         "result": result,
@@ -38,7 +43,7 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
         "evidence_checklist": evidence_checklist,
         "improvement_suggestion": _improvement_suggestion(primary),
         "strategy_patch_candidate": patch,
-        "market_regime_at_loss": snapshot_context.get("market_regime", "normal"),
+        "market_regime_at_loss": regime_at_loss,
         "evolution_trigger_allowed": bool(snapshot_context.get("evolution_trigger_allowed", True)),
     }
     review = run_agent_json_task(

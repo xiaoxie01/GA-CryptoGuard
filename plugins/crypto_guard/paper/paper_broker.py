@@ -101,14 +101,17 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
         }
 
     # Market regime gate — soft downgrade/restrict counter-regime entries
+    # Use the decision's original analysis_time to avoid lookahead bias
+    signal_analysis_time, time_source = _resolve_analysis_time(repo, signal, ga_decision_id)
     regime_gate = _apply_regime_gate_if_enabled(
         repo,
         symbol=signal["symbol"],
         side=str(trade_plan.get("side", "")).upper(),
         signal_grade=str(decision.get("signal_grade", "D")).upper(),
         confidence=float(decision.get("confidence") or 0),
-        analysis_time_utc=utc_ms(),
+        analysis_time_utc=signal_analysis_time,
         order_type=str(trade_plan.get("entry_type", "")),
+        time_source=time_source,
     )
     # Always save regime result for audit (even in shadow mode)
     if regime_gate:
@@ -149,6 +152,24 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
                     "regime_downgrade_reason": downgrade_reason,
                 }
             trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
+            # Check if effective grade/confidence still qualifies for paper order
+            effective_grade = adjustments.get("effective_grade", "")
+            effective_confidence = adjustments.get("effective_confidence", 0)
+            from plugins.crypto_guard.strategy.grade_config import is_paper_order_eligible
+            if not is_paper_order_eligible(effective_grade, effective_confidence):
+                _create_opportunity_watch_from_gate(repo, signal["symbol"],
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_downgrade: effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "signal_id": signal_id,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": f"effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
+                }
 
     order_id, created = repo.create_paper_order(
         signal_id,
@@ -242,14 +263,18 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
         }
 
     # Market regime gate — soft downgrade/restrict counter-regime entries
+    # Use the GA decision's original analysis_time to avoid lookahead bias
+    ga_analysis_time = ga_decision.get("analysis_time") or utc_ms()
+    ga_time_source = "original_analysis_time" if ga_decision.get("analysis_time") else "fallback_now"
     regime_gate = _apply_regime_gate_if_enabled(
         repo,
         symbol=ga_decision.get("symbol", ""),
         side=str(trade_plan.get("side", "")).upper(),
         signal_grade=str(ga_decision.get("signal_grade", "D")).upper(),
         confidence=float(ga_decision.get("confidence") or 0),
-        analysis_time_utc=utc_ms(),
+        analysis_time_utc=ga_analysis_time,
         order_type=str(trade_plan.get("entry_type", "")),
+        time_source=ga_time_source,
     )
     # Always save regime result for audit (even in shadow mode)
     if regime_gate:
@@ -288,6 +313,23 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
                     "regime_downgrade_reason": downgrade_reason,
                 }
             trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
+            # Check if effective grade/confidence still qualifies for paper order
+            effective_grade = adjustments.get("effective_grade", "")
+            effective_confidence = adjustments.get("effective_confidence", 0)
+            from plugins.crypto_guard.strategy.grade_config import is_paper_order_eligible
+            if not is_paper_order_eligible(effective_grade, effective_confidence):
+                _create_opportunity_watch_from_gate(repo, symbol,
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_downgrade: effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": f"effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
+                }
 
     signal = {
         "symbol": ga_decision["symbol"],
@@ -651,6 +693,7 @@ def _apply_regime_gate_if_enabled(
     confidence: float,
     analysis_time_utc: int,
     order_type: str = "",
+    time_source: str = "",
 ) -> dict[str, Any] | None:
     """Apply market regime gate if enabled in config."""
     from plugins.crypto_guard.config.loader import load_config
@@ -659,7 +702,7 @@ def _apply_regime_gate_if_enabled(
     if not regime_cfg.get("enabled", True):
         return None
     from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
-    return apply_regime_gate(
+    result = apply_regime_gate(
         repo,
         symbol=symbol,
         side=side,
@@ -668,6 +711,10 @@ def _apply_regime_gate_if_enabled(
         analysis_time_utc=analysis_time_utc,
         order_type=order_type,
     )
+    # Add time_source to the result for audit
+    if result is not None:
+        result["time_source"] = time_source or "fallback_now"
+    return result
 
 
 def _save_regime_gate_to_ga_decision(
@@ -754,3 +801,44 @@ def _should_downgrade_to_watch_by_regime(
             return f"RR={rr:.2f} below regime min_rr={min_rr:.1f}"
 
     return None
+
+
+def _resolve_analysis_time(
+    repo: CryptoGuardRepository,
+    signal: dict[str, Any],
+    ga_decision_id: int | None,
+) -> tuple[int, str]:
+    """Resolve the original analysis_time for a signal to avoid lookahead bias.
+
+    Tries: ga_decision.analysis_time -> signal.created_at -> utc_ms() fallback.
+    Returns (analysis_time_ms, time_source) tuple.
+    time_source is "original_analysis_time", "signal_created_at", or "fallback_now".
+    """
+    # Try GA decision first
+    if ga_decision_id:
+        try:
+            row = repo.conn.execute(
+                "SELECT analysis_time FROM ga_decisions WHERE id=?",
+                (int(ga_decision_id),),
+            ).fetchone()
+            if row and row["analysis_time"]:
+                return int(row["analysis_time"]), "original_analysis_time"
+        except Exception:
+            pass
+
+    # Try signal created_at as a better approximation than current time
+    if signal:
+        created_at = signal.get("created_at")
+        if created_at:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                text = str(created_at).replace("Z", "+00:00")
+                dt = _dt.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                return int(dt.timestamp() * 1000), "signal_created_at"
+            except Exception:
+                pass
+
+    # Fallback to current time
+    return utc_ms(), "fallback_now"

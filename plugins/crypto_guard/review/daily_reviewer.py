@@ -211,6 +211,16 @@ def _write_skill_memory_updates(
     # Build trade lookup by id
     trade_by_id = {t.get("id"): t for t in trades}
 
+    # Build regime context lookup by trade_id from reviews (not raw trades)
+    # market_regime_at_loss lives in trade_reviews, not paper_trades
+    regime_by_trade_id: dict[int, dict[str, Any]] = {}
+    for r in reviewed:
+        rev = r.get("review") or {}
+        tid = rev.get("trade_id")
+        ctx = rev.get("market_regime_at_loss")
+        if tid and ctx and isinstance(ctx, dict):
+            regime_by_trade_id[int(tid)] = ctx
+
     # Classify losses by failure pattern
     pattern_groups: dict[str, list[dict[str, Any]]] = {}
     for loss in losses:
@@ -218,7 +228,9 @@ def _write_skill_memory_updates(
         review = loss.get("review") or {}
         trade_id = loss.get("trade_id") or review.get("trade_id")
         trade = trade_by_id.get(trade_id) or loss
-        pattern = classify_trade(trade)
+        # Use the review's classification if available (enriched with regime context),
+        # otherwise fall back to classify_trade on the raw trade
+        pattern = review.get("primary_reason") or classify_trade(trade)
         pattern_groups.setdefault(pattern, []).append(trade)
 
     # Write one entry per pattern (not per skill)
@@ -227,16 +239,18 @@ def _write_skill_memory_updates(
         affected_sides = list({t.get("side") for t in pattern_trades if t.get("side")})
 
         # Map pattern to feedback_rules.yaml conditions
-        pattern_type = _map_pattern_to_rule(pattern, pattern_trades)
+        pattern_type = _map_pattern_to_rule(pattern, pattern_trades, regime_by_trade_id)
 
         finding = f"每日复盘：{len(pattern_trades)} 笔亏损符合 {pattern} 模式"
         if evolution.get("triggered"):
             finding += "，自进化触发器已启动"
 
         # Build structured suggested_adjustment with regime context
+        # Use regime_by_trade_id (from reviews), not the raw trade dict
         regime_info: dict[str, Any] = {}
         for t in pattern_trades:
-            ctx = t.get("market_regime_at_loss")
+            tid = t.get("id")
+            ctx = regime_by_trade_id.get(int(tid)) if tid else t.get("market_regime_at_loss")
             if ctx and isinstance(ctx, dict):
                 regime_info = {
                     "market_phase": ctx.get("market_phase"),
@@ -326,10 +340,20 @@ def _write_skill_memory_updates(
     return updates
 
 
-def _map_pattern_to_rule(pattern: str, trades: list[dict[str, Any]]) -> str:
+def _map_pattern_to_rule(
+    pattern: str,
+    trades: list[dict[str, Any]],
+    regime_by_trade_id: dict[int, dict[str, Any]] | None = None,
+) -> str:
     """Map loss_classifier pattern to feedback_rules.yaml condition."""
-    # Check market regime context if available
-    regimes = [t.get("market_regime_at_loss") for t in trades if t.get("market_regime_at_loss")]
+    # Check market regime context if available (from reviews, not raw trades)
+    regimes: list[Any] = []
+    for t in trades:
+        tid = t.get("id")
+        if tid and regime_by_trade_id and regime_by_trade_id.get(int(tid)):
+            regimes.append(regime_by_trade_id[int(tid)])
+        elif t.get("market_regime_at_loss"):
+            regimes.append(t["market_regime_at_loss"])
 
     # New regime-mismatch patterns
     if pattern == "macro_rebound_short_squeeze_loss":
@@ -364,6 +388,15 @@ def _map_pattern_to_rule(pattern: str, trades: list[dict[str, Any]]) -> str:
 
 def _primary_skill_for_pattern(pattern: str) -> str:
     """Determine primary skill responsible for a failure pattern."""
+    # Macro regime patterns: market-level context failure
+    if pattern in (
+        "macro_rebound_short_squeeze_loss",
+        "macro_selloff_long_trap_loss",
+        "counter_regime_entry_loss",
+        "market_regime_mismatch_short_loss",
+        "market_regime_mismatch_long_loss",
+    ):
+        return "trend_stage"
     if pattern in ("late_trend_chasing", "entry_chasing"):
         return "trend_stage"
     if pattern in ("entry_too_late", "entry_too_early"):

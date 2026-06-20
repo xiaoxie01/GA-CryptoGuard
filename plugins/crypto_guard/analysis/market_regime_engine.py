@@ -88,6 +88,10 @@ def score_market_regime(
     elif regime_alignment == "aligned":
         confidence_adjustment = 0.05
         reasons.append("regime_aligned: 方向与大盘阶段一致")
+    elif regime_alignment == "unclear":
+        confidence_adjustment = 0.0
+        require_stronger_confirmation = True
+        reasons.append("数据不足，不调整信心但提高确认要求")
 
     return {
         "module": "market_regime",
@@ -236,7 +240,7 @@ def _market_phase(
 ) -> str:
     """Classify market phase: risk_on, risk_off, rebound, selloff, chop."""
     if not btc_1h or not btc_4h:
-        return "chop"
+        return "unknown"
 
     btc_bias_4h = _bias_from_candles(btc_4h, "BTC")
     # Use all available 1h candles for EMA21; bias still reflects short-term due to EMA responsiveness
@@ -371,6 +375,9 @@ def _regime_alignment(
     """Determine if the decision side aligns with the market regime."""
     if not decision_side:
         return "unclear", "decision_side未提供，无法判断regime alignment"
+
+    if market_phase == "unknown":
+        return "unclear", "BTC/ETH数据不足，无法判断regime alignment"
 
     side = decision_side.upper()
 

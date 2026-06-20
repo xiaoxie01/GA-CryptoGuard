@@ -26,7 +26,12 @@
         "volatility_spike",
         "news_like_move",
         "good_execution",
-        "unknown"
+        "unknown",
+        "macro_rebound_short_squeeze_loss",
+        "macro_selloff_long_trap_loss",
+        "counter_regime_entry_loss",
+        "market_regime_mismatch_short_loss",
+        "market_regime_mismatch_long_loss"
       ]
     },
     "secondary_reasons": {"type": "array", "items": {"type": "string"}},

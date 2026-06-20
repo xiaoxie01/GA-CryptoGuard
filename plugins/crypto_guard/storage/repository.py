@@ -1484,6 +1484,12 @@ class CryptoGuardRepository:
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def save_trade_review(self, trade_id: int, review: dict[str, Any]) -> int:
+        # Ensure market_regime_at_loss is serialized as JSON string if it's a dict
+        regime_at_loss = review.get("market_regime_at_loss")
+        if isinstance(regime_at_loss, dict):
+            regime_at_loss = json.dumps(regime_at_loss, ensure_ascii=False)
+        elif regime_at_loss is None:
+            regime_at_loss = "unknown"
         self.conn.execute(
             """
             INSERT INTO trade_reviews(
@@ -1500,7 +1506,7 @@ class CryptoGuardRepository:
                 review.get("summary"),
                 json.dumps(review.get("improvement_suggestion", {}), ensure_ascii=False),
                 json.dumps(review, ensure_ascii=False),
-                review.get("market_regime_at_loss"),
+                regime_at_loss,
                 1 if review.get("evolution_trigger_allowed", True) else 0,
             ),
         )

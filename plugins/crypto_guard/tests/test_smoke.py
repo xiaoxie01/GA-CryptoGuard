@@ -7662,6 +7662,258 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     # ── End Regime Enforcement Tests ──
 
+    # ── P1 Round 2 Regime Fixes ──
+
+    def test_missing_btc_eth_data_no_aligned_bonus(self) -> None:
+        """Fix 1: Missing BTC/ETH data should NOT produce 'aligned' or +0.05 confidence."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        # No BTC/ETH candles seeded, so _market_phase returns "unknown"
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+        self.assertEqual(result["regime_alignment"], "unclear")
+        self.assertAlmostEqual(result["confidence_adjustment"], 0.0)
+        self.assertTrue(result["require_stronger_confirmation"])
+        self.assertEqual(result["market_phase"], "unknown")
+
+    def test_daily_review_preserves_regime_mismatch_pattern(self) -> None:
+        """Fix 2: Daily review uses the review's primary_reason, not re-classifying raw trade."""
+        from plugins.crypto_guard.review.daily_reviewer import _write_skill_memory_updates
+
+        # Create a trade with regime context
+        ga_id = self._create_minimal_ga_decision(symbol="AVAXUSDT", side="SHORT")
+        regime_gate = {
+            "ok": True,
+            "regime_gate_applied": True,
+            "mode": "shadow",
+            "market_regime": {
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+            },
+            "adjustments": {"watch_only": False},
+        }
+        self.conn.execute(
+            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            (json.dumps(regime_gate), ga_id),
+        )
+        self.conn.commit()
+
+        # Create order + trade linked to this GA decision
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            (ga_id,),
+        )
+        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+            "close_reason, pnl_r, closed_at) "
+            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, datetime('now'))",
+            (order_id,),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # The reviewed list simulates review_trade output with the correct pattern
+        reviewed = [{
+            "ok": True,
+            "trade_id": trade_id,
+            "review": {
+                "trade_id": trade_id,
+                "result": "loss",
+                "primary_reason": "macro_rebound_short_squeeze_loss",
+                "summary": "test",
+                "market_regime_at_loss": {
+                    "market_phase": "rebound",
+                    "regime_alignment": "counter_regime",
+                },
+            },
+        }]
+
+        # Get the raw trades for the window
+        trades = self.repo.list_closed_trades_for_review(only_unreviewed=False)
+
+        updates = _write_skill_memory_updates(self.repo, trades, reviewed, {"triggered": False})
+        # The pattern in skill_feedback_memory should be the regime-aware pattern
+        self.assertTrue(len(updates) > 0)
+        # Check that the pattern_type is the macro pattern, not wrong_direction
+        for update in updates:
+            if "pattern_type" in update:
+                self.assertEqual(update["pattern_type"], "macro_rebound_short_squeeze_loss")
+
+    def test_trade_review_saves_regime_context_from_gate(self) -> None:
+        """Fix 3: Trade review saves regime context from gate, not legacy snapshot."""
+        # Create a GA decision with market_regime_gate_json
+        ga_id = self._create_minimal_ga_decision(symbol="AVAXUSDT", side="SHORT")
+        regime_gate = {
+            "ok": True,
+            "regime_gate_applied": True,
+            "mode": "shadow",
+            "market_regime": {
+                "market_phase": "rebound",
+                "regime_alignment": "counter_regime",
+                "btc_bias": "bearish",
+                "eth_bias": "bearish",
+                "symbol_relative_strength": "neutral",
+            },
+            "adjustments": {"watch_only": False},
+        }
+        self.conn.execute(
+            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            (json.dumps(regime_gate), ga_id),
+        )
+        self.conn.commit()
+
+        # Create order + trade
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            (ga_id,),
+        )
+        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+            "close_reason, pnl_r) "
+            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
+            (order_id,),
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Run review_trade (which will enrich and save)
+        from plugins.crypto_guard.review.trade_reviewer import review_trade
+        result = review_trade(self.repo, trade_id)
+        self.assertTrue(result["ok"])
+
+        # Check that the saved trade_reviews row has regime data
+        row = self.conn.execute(
+            "SELECT market_regime_at_loss FROM trade_reviews WHERE trade_id=?",
+            (trade_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        regime_data = json.loads(row["market_regime_at_loss"])
+        self.assertEqual(regime_data["market_phase"], "rebound")
+        self.assertEqual(regime_data["regime_alignment"], "counter_regime")
+
+    def test_controlled_mode_downgrade_below_eligibility_creates_watch(self) -> None:
+        """Fix 4: Controlled mode with effective grade/confidence below eligibility creates watch."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        # Create a GA decision with SHORT side and LOW confidence in rebound market
+        # confidence=0.70, grade=B -> after downgrade: confidence=0.60, grade=C -> not eligible
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        trade_plan = {
+            "side": "SHORT", "entry_type": "trigger", "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}], "risk_percent": 0.5,
+            "invalid_condition": "above 105", "reason": "test setup",
+            "entry_price": 100.0, "trigger_price": 100.0,
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "AVAXUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "B", "confidence": 0.70,
+            "summary": "test", "market_bias": "bearish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_ms,
+            "feishu_actions": ["create_paper_order"],
+        })
+
+        # Build a controlled-mode config
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
+        original_cfg = loader.load_config()
+        controlled_trading_mode = dict(original_cfg.trading_mode)
+        mr = dict(controlled_trading_mode.get("market_regime", {}))
+        mr["mode"] = "controlled"
+        controlled_trading_mode["market_regime"] = mr
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=controlled_trading_mode,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                     return_value={"ok": True, "reasons": [], "metrics": {}}), \
+             _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_ga_decision(self.repo, ga_id)
+
+        # Should be blocked because effective grade/confidence below paper order eligibility
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "regime_gate_watch_only")
+        self.assertIn("regime_downgrade_reason", result)
+        self.assertIn("below paper order eligibility", result["regime_downgrade_reason"])
+
+    def test_regime_gate_uses_ga_decision_analysis_time(self) -> None:
+        """Fix 5: Regime gate uses GA decision's analysis_time, not current time."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        # Create a GA decision with analysis_time in the past
+        past_analysis_time = 1718800000000  # June 2024
+        trade_plan = {
+            "side": "SHORT", "entry_type": "trigger", "stop_loss": 105.0,
+            "take_profits": [{"price": 90.0}], "risk_percent": 0.5,
+            "invalid_condition": "above 105", "reason": "test setup",
+            "entry_price": 100.0, "trigger_price": 100.0,
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "AVAXUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "A", "confidence": 0.85,
+            "summary": "test", "market_bias": "bearish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": past_analysis_time, "analysis_time_utc": past_analysis_time,
+            "feishu_actions": ["create_paper_order"],
+        })
+
+        # Build a controlled-mode config
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
+        original_cfg = loader.load_config()
+        controlled_trading_mode = dict(original_cfg.trading_mode)
+        mr = dict(controlled_trading_mode.get("market_regime", {}))
+        mr["mode"] = "controlled"
+        controlled_trading_mode["market_regime"] = mr
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=controlled_trading_mode,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                     return_value={"ok": True, "reasons": [], "metrics": {}}), \
+             _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_ga_decision(self.repo, ga_id)
+
+        # Verify that the regime gate was saved with time_source=original_analysis_time
+        row = self.conn.execute(
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+        ).fetchone()
+        self.assertIsNotNone(row["market_regime_gate_json"])
+        gate_data = json.loads(row["market_regime_gate_json"])
+        self.assertEqual(gate_data.get("time_source"), "original_analysis_time")
+
+    # ── End P1 Round 2 Regime Fixes ──
+
     def _ensure_paper_trade(
         self, symbol: str, side: str, *, entry_price: float = 100.0,
     ) -> int:
