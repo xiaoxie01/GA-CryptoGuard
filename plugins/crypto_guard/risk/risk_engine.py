@@ -424,6 +424,32 @@ def apply_regime_gate(
     )
 
     alignment = regime.get("regime_alignment", "unclear")
+    if alignment == "unclear":
+        # Unclear data: require stronger confirmation, no penalty
+        return {
+            "ok": True,
+            "regime_gate_applied": True,
+            "mode": regime_cfg.get("mode", "shadow"),
+            "market_regime": regime,
+            "adjustments": {
+                "confidence_adjustment": 0.0,
+                "risk_multiplier": 1.0,
+                "effective_grade": signal_grade,
+                "original_grade": signal_grade,
+                "effective_confidence": confidence,
+                "confidence_penalty": 0.0,
+                "effective_risk_multiplier": 1.0,
+                "min_rr": 0.0,
+                "watch_only": False,
+                "require_stronger_confirmation": True,
+                "regime_alignment": "unclear",
+                "market_phase": regime.get("market_phase"),
+                "btc_bias": regime.get("btc_bias"),
+                "eth_bias": regime.get("eth_bias"),
+                "reasons": regime.get("reasons", []),
+            },
+        }
+
     if alignment != "counter_regime":
         return {
             "ok": True,

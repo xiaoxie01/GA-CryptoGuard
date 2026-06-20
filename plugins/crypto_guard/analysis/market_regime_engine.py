@@ -125,6 +125,7 @@ def score_market_regime(
 
     return {
         "module": "market_regime",
+        "symbol": symbol,
         "btc_bias": btc_bias,
         "eth_bias": eth_bias,
         "market_phase": market_phase,
@@ -310,9 +311,15 @@ def _market_phase(
     # ETH 1h confirmation: reduce conviction if BTC and ETH disagree
     eth_bias_1h = _bias_from_candles(eth_1h, "ETH_1h") if len(eth_1h) >= 21 else None
     if eth_bias_1h is not None and eth_bias_1h in {"bullish", "bearish"}:
-        if phase == "risk_on" and eth_bias_1h == "bearish":
+        # Abstract phase direction:
+        #   risk_on / rebound → bullish direction
+        #   risk_off / selloff → bearish direction
+        # If ETH 1h disagrees with the phase direction, downgrade to "transition"
+        bullish_phases = {"risk_on", "rebound"}
+        bearish_phases = {"risk_off", "selloff"}
+        if phase in bullish_phases and eth_bias_1h == "bearish":
             return "transition"
-        if phase == "risk_off" and eth_bias_1h == "bullish":
+        if phase in bearish_phases and eth_bias_1h == "bullish":
             return "transition"
 
     return phase

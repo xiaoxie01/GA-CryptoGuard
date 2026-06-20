@@ -170,6 +170,29 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
                     "ga_decision_id": int(ga_decision_id),
                     "regime_downgrade_reason": f"effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
                 }
+            # Enforce require_stronger_confirmation: check actual confidence/entry_quality
+            # against raised thresholds set by _apply_regime_adjustments.
+            # Confidence comes from the decision dict (same source as the gate call at line 111),
+            # entry_quality is extracted from trade_plan via _extract_entry_quality.
+            stronger_reason = _check_stronger_confirmation(
+                trade_plan, adjustments,
+                confidence=float(decision.get("confidence") or 0),
+                entry_quality=_extract_entry_quality(trade_plan),
+            )
+            if stronger_reason:
+                _create_opportunity_watch_from_gate(repo, signal["symbol"],
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_{stronger_reason}",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "signal_id": signal_id,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": stronger_reason,
+                }
 
     order_id, created = repo.create_paper_order(
         signal_id,
@@ -329,6 +352,25 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
                     "regime_gate": regime_gate,
                     "ga_decision_id": int(ga_decision_id),
                     "regime_downgrade_reason": f"effective_grade={effective_grade}, effective_confidence={effective_confidence:.2f} below paper order eligibility",
+                }
+            # Enforce require_stronger_confirmation (same as signal path)
+            stronger_reason = _check_stronger_confirmation(
+                trade_plan, adjustments,
+                confidence=float(ga_decision.get("confidence") or 0),
+                entry_quality=_extract_entry_quality(trade_plan),
+            )
+            if stronger_reason:
+                _create_opportunity_watch_from_gate(repo, symbol,
+                    trade_plan.get("side", ""), int(ga_decision_id),
+                    {"reason": f"regime_{stronger_reason}",
+                     "would_decide": "downgrade_to_watch",
+                     "regime_gate": regime_gate})
+                return {
+                    "ok": False,
+                    "error": "regime_gate_watch_only",
+                    "regime_gate": regime_gate,
+                    "ga_decision_id": int(ga_decision_id),
+                    "regime_downgrade_reason": stronger_reason,
                 }
 
     signal = {
@@ -745,6 +787,7 @@ def _apply_regime_adjustments(
     - risk_percent scaled by risk_multiplier
     - min_rr and allowed_order_types set as audit fields (enforced by caller)
     - confidence and grade updated for downstream audit
+    - require_stronger_confirmation raises effective thresholds for min_confidence and min_entry_quality
     """
     plan = dict(trade_plan)
 
@@ -773,6 +816,23 @@ def _apply_regime_adjustments(
     if allowed_types is not None:
         plan["regime_allowed_order_types"] = allowed_types
 
+    # Require stronger confirmation: raise effective thresholds
+    if adjustments.get("require_stronger_confirmation"):
+        from plugins.crypto_guard.config.loader import load_config
+        cfg = load_config().trading_mode
+        stronger_cfg = (cfg.get("account_feedback_rules", {}).get("actions", {}).get("require_stronger_confirmation", {}))
+        config_min_conf = float(stronger_cfg.get("min_confidence", 0.80))
+        config_min_quality = float(stronger_cfg.get("min_entry_quality", 0.70))
+
+        # Raise effective min confidence to at least config_min_conf
+        current_min_conf = float(trade_plan.get("min_confidence") or 0)
+        plan["regime_require_stronger_confirmation"] = True
+        plan["regime_effective_min_confidence"] = max(current_min_conf, config_min_conf)
+
+        # Raise effective min entry quality to at least config_min_quality
+        current_min_quality = float(trade_plan.get("min_entry_quality") or 0)
+        plan["regime_effective_min_entry_quality"] = max(current_min_quality, config_min_quality)
+
     return plan
 
 
@@ -800,6 +860,38 @@ def _should_downgrade_to_watch_by_regime(
         if rr is not None and rr < min_rr:
             return f"RR={rr:.2f} below regime min_rr={min_rr:.1f}"
 
+    return None
+
+
+def _check_stronger_confirmation(
+    trade_plan: dict[str, Any],
+    adjustments: dict[str, Any],
+    *,
+    confidence: float = 0.0,
+    entry_quality: float | None = None,
+) -> str | None:
+    """Check if require_stronger_confirmation thresholds are met.
+
+    Reads raised thresholds from trade_plan (set by _apply_regime_adjustments)
+    and compares against actual confidence/entry_quality values passed by caller.
+
+    Returns reason string if thresholds not met, None if OK or not applicable.
+    """
+    if not adjustments.get("require_stronger_confirmation"):
+        return None
+
+    min_conf = trade_plan.get("regime_effective_min_confidence")
+    min_quality = trade_plan.get("regime_effective_min_entry_quality")
+
+    failures = []
+    if min_conf is not None and confidence < min_conf:
+        failures.append(f"confidence={confidence:.2f} < required={min_conf:.2f}")
+    if min_quality is not None and (entry_quality is None or entry_quality < min_quality):
+        label = f"{entry_quality:.2f}" if entry_quality is not None else "missing"
+        failures.append(f"entry_quality={label} < required={min_quality:.2f}")
+
+    if failures:
+        return f"require_stronger_confirmation: {'; '.join(failures)}"
     return None
 
 
