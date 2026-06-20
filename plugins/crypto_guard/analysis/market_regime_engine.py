@@ -282,10 +282,11 @@ def _market_phase(
     btc_4h: list[dict[str, Any]],
     eth_1h: list[dict[str, Any]],
 ) -> str:
-    """Classify market phase: risk_on, risk_off, rebound, selloff, chop.
+    """Classify market phase: risk_on, risk_off, rebound, selloff, chop, unknown.
 
-    Uses ETH 1h bias as confirmation: if BTC and ETH disagree on direction,
-    the phase is downgraded to "transition" to reduce conviction.
+    Requires both BTC (1h+4h) and ETH (1h) data for joint confirmation.
+    Returns "unknown" if BTC data is missing or ETH 1h has insufficient candles
+    (< 21), triggering stronger_confirmation upstream.
     """
     if not btc_1h or not btc_4h:
         return "unknown"
@@ -308,9 +309,13 @@ def _market_phase(
     elif btc_bias_4h == "bearish" and btc_bias_1h in {"bearish", "transition"}:
         phase = "risk_off"
 
-    # ETH 1h confirmation: reduce conviction if BTC and ETH disagree
+    # ETH 1h confirmation: reduce conviction if BTC and ETH disagree.
+    # If ETH data is insufficient for a reliable bias, we cannot complete
+    # the joint confirmation — return "unknown" to trigger stronger_confirmation.
     eth_bias_1h = _bias_from_candles(eth_1h, "ETH_1h") if len(eth_1h) >= 21 else None
-    if eth_bias_1h is not None and eth_bias_1h in {"bullish", "bearish"}:
+    if eth_bias_1h is None:
+        return "unknown"
+    if eth_bias_1h in {"bullish", "bearish"}:
         # Abstract phase direction:
         #   risk_on / rebound → bullish direction
         #   risk_off / selloff → bearish direction
