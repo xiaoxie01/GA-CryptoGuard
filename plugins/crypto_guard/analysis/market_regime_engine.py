@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 EXTREME_REGIMES = {"extreme_volatility", "funding_shock", "news_like_event", "low_liquidity"}
@@ -63,9 +64,15 @@ def score_market_regime(
         if symbol_rs != "neutral":
             reasons.append(f"relative_strength={symbol_rs}")
 
+    # Load config for weights and independent_trend settings
+    cfg = load_config().trading_mode
+    regime_cfg = cfg.get("market_regime", {})
+
     # 7. Regime alignment vs decision side
+    independent_trend_cfg = regime_cfg.get("independent_trend")
     regime_alignment, alignment_reason = _regime_alignment(
-        market_phase, btc_bias, eth_bias, symbol_rs, decision_side, breadth_score
+        market_phase, btc_bias, eth_bias, symbol_rs, decision_side, breadth_score,
+        independent_trend_cfg=independent_trend_cfg,
     )
     reasons.append(alignment_reason)
 
@@ -93,6 +100,29 @@ def score_market_regime(
         require_stronger_confirmation = True
         reasons.append("数据不足，不调整信心但提高确认要求")
 
+    # 8. Weighted regime score from config weights
+    btc_weight = float(regime_cfg.get("btc_weight", 0.10))
+    eth_weight = float(regime_cfg.get("eth_weight", 0.05))
+    breadth_weight = float(regime_cfg.get("breadth_weight", 0.05))
+    volatility_weight = float(regime_cfg.get("volatility_weight", 0.05))
+
+    btc_score = 1 if btc_bias == "bullish" else (-1 if btc_bias == "bearish" else 0)
+    eth_score = 1 if eth_bias == "bullish" else (-1 if eth_bias == "bearish" else 0)
+    breadth_score_scaled = max(-1.0, min(1.0, breadth_score))
+    if volatility_state == "spike":
+        volatility_score = 1.0
+    elif volatility_state == "elevated":
+        volatility_score = 0.5
+    else:
+        volatility_score = 0.0
+
+    weighted_regime_score = (
+        btc_score * btc_weight
+        + eth_score * eth_weight
+        + breadth_score_scaled * breadth_weight
+        + volatility_score * volatility_weight
+    )
+
     return {
         "module": "market_regime",
         "btc_bias": btc_bias,
@@ -103,10 +133,23 @@ def score_market_regime(
         "symbol_relative_strength": symbol_rs,
         "regime_alignment": regime_alignment,
         "confidence_adjustment": confidence_adjustment,
-        "risk_multiplier": risk_multiplier,
+        "suggested_risk_multiplier": risk_multiplier,
         "require_stronger_confirmation": require_stronger_confirmation,
         "reasons": reasons,
         "analysis_time_utc": analysis_time_utc,
+        "regime_score": round(weighted_regime_score, 4),
+        "component_scores": {
+            "btc_score": btc_score,
+            "eth_score": eth_score,
+            "breadth_score": round(breadth_score_scaled, 4),
+            "volatility_score": volatility_score,
+        },
+        "component_weights": {
+            "btc_weight": btc_weight,
+            "eth_weight": eth_weight,
+            "breadth_weight": breadth_weight,
+            "volatility_weight": volatility_weight,
+        },
     }
 
 
@@ -238,7 +281,11 @@ def _market_phase(
     btc_4h: list[dict[str, Any]],
     eth_1h: list[dict[str, Any]],
 ) -> str:
-    """Classify market phase: risk_on, risk_off, rebound, selloff, chop."""
+    """Classify market phase: risk_on, risk_off, rebound, selloff, chop.
+
+    Uses ETH 1h bias as confirmation: if BTC and ETH disagree on direction,
+    the phase is downgraded to "transition" to reduce conviction.
+    """
     if not btc_1h or not btc_4h:
         return "unknown"
 
@@ -246,19 +293,29 @@ def _market_phase(
     # Use all available 1h candles for EMA21; bias still reflects short-term due to EMA responsiveness
     btc_bias_1h = _bias_from_candles(btc_1h, "BTC_1h") if len(btc_1h) >= 21 else btc_bias_4h
 
+    # Determine phase from BTC
+    phase = "chop"
     # Check for rebound: 1h turning bullish after 4h bearish/range
     if btc_bias_4h in {"bearish", "range", "transition"} and btc_bias_1h == "bullish":
-        return "rebound"
+        phase = "rebound"
     # Check for selloff: 1h turning bearish after 4h bullish/range
-    if btc_bias_4h in {"bullish", "range", "transition"} and btc_bias_1h == "bearish":
-        return "selloff"
+    elif btc_bias_4h in {"bullish", "range", "transition"} and btc_bias_1h == "bearish":
+        phase = "selloff"
     # Strong trend alignment
-    if btc_bias_4h == "bullish" and btc_bias_1h in {"bullish", "transition"}:
-        return "risk_on"
-    if btc_bias_4h == "bearish" and btc_bias_1h in {"bearish", "transition"}:
-        return "risk_off"
-    # Default
-    return "chop"
+    elif btc_bias_4h == "bullish" and btc_bias_1h in {"bullish", "transition"}:
+        phase = "risk_on"
+    elif btc_bias_4h == "bearish" and btc_bias_1h in {"bearish", "transition"}:
+        phase = "risk_off"
+
+    # ETH 1h confirmation: reduce conviction if BTC and ETH disagree
+    eth_bias_1h = _bias_from_candles(eth_1h, "ETH_1h") if len(eth_1h) >= 21 else None
+    if eth_bias_1h is not None and eth_bias_1h in {"bullish", "bearish"}:
+        if phase == "risk_on" and eth_bias_1h == "bearish":
+            return "transition"
+        if phase == "risk_off" and eth_bias_1h == "bullish":
+            return "transition"
+
+    return phase
 
 
 def _breadth_score(
@@ -371,13 +428,24 @@ def _regime_alignment(
     symbol_rs: str,
     decision_side: str,
     breadth_score: float,
+    independent_trend_cfg: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
-    """Determine if the decision side aligns with the market regime."""
+    """Determine if the decision side aligns with the market regime.
+
+    Args:
+        independent_trend_cfg: Config dict with keys min_relative_strength_pct,
+            min_confirmations, allow_bypass. If None, uses defaults.
+    """
     if not decision_side:
         return "unclear", "decision_side未提供，无法判断regime alignment"
 
     if market_phase == "unknown":
         return "unclear", "BTC/ETH数据不足，无法判断regime alignment"
+
+    # Read independent_trend config with defaults
+    it_cfg = independent_trend_cfg or {}
+    min_confirmations = int(it_cfg.get("min_confirmations", 2))
+    allow_bypass = bool(it_cfg.get("allow_bypass", True))
 
     side = decision_side.upper()
 
@@ -392,12 +460,20 @@ def _regime_alignment(
         return "aligned", f"{side}与当前market_phase={market_phase}一致"
 
     # Counter-regime — check for independent_trend exception
-    if symbol_rs == "strong" and side == "LONG" and abs(breadth_score) < 0.5:
+    # Count confirmations for independent_trend
+    confirmations = 0
+    # Symbol rs matching the side direction counts as a confirmation
+    if (symbol_rs == "strong" and side == "LONG") or (symbol_rs == "weak" and side == "SHORT"):
+        confirmations += 1
+    if abs(breadth_score) < 0.5:
+        confirmations += 1
+
+    if allow_bypass and symbol_rs == "strong" and side == "LONG" and confirmations >= min_confirmations:
         return "independent_trend", (
             f"个币相对强势（rs={symbol_rs}），且板块宽度不一致（breadth={breadth_score:+.2f}），"
             f"虽有market_phase={market_phase}但仍允许独立行情"
         )
-    if symbol_rs == "weak" and side == "SHORT" and abs(breadth_score) < 0.5:
+    if allow_bypass and symbol_rs == "weak" and side == "SHORT" and confirmations >= min_confirmations:
         return "independent_trend", (
             f"个币相对弱势（rs={symbol_rs}），且板块宽度不一致（breadth={breadth_score:+.2f}），"
             f"虽有market_phase={market_phase}但仍允许独立行情"

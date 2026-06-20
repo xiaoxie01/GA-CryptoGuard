@@ -432,7 +432,7 @@ def apply_regime_gate(
             "market_regime": regime,
             "adjustments": {
                 "confidence_adjustment": regime.get("confidence_adjustment", 0.0),
-                "risk_multiplier": regime.get("risk_multiplier", 1.0),
+                "risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
             },
         }
 
@@ -477,6 +477,7 @@ def apply_regime_gate(
         "effective_confidence": effective_confidence,
         "confidence_penalty": confidence_penalty,
         "risk_multiplier": risk_mult,
+        "effective_risk_multiplier": risk_mult,
         "min_rr": min_rr,
         "allowed_order_types": allowed_order_types,
         "watch_only": watch_only,

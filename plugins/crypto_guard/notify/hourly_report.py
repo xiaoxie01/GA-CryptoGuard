@@ -55,6 +55,7 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     feedback_patterns = _fetch_feedback_patterns(repo)
     long_short_performance = _fetch_long_short_performance(repo)
     account_feedback_gate = _fetch_account_feedback_gate_stats(repo)
+    market_regime_gate = _fetch_market_regime_gate_stats(repo)
     state_consistency = _fetch_state_consistency(repo)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
@@ -75,12 +76,13 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "feedback_patterns": feedback_patterns,
         "long_short_performance": long_short_performance,
         "account_feedback_gate": account_feedback_gate,
+        "market_regime_gate": market_regime_gate,
         "state_consistency": state_consistency,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, state_consistency=state_consistency)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, state_consistency=state_consistency)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency)
         ),
     }
 
@@ -100,6 +102,7 @@ def render_ga_hourly_summary(
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
     account_feedback_gate: dict[str, Any] | None = None,
+    market_regime_gate: dict[str, Any] | None = None,
     state_consistency: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
@@ -308,6 +311,31 @@ def render_ga_hourly_summary(
                     f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
                 )
                 lines.append(f"  - 受阻因素：{factor_text}")
+
+    # Market regime gate stats (Fix 5 + Fix 8)
+    if market_regime_gate and not market_regime_gate.get("error"):
+        mg = market_regime_gate
+        if mg.get("total_checks", 0) > 0:
+            lines.extend(["", "**市场情绪门禁（24h）**"])
+            lines.append(
+                f"- 检查 {mg['total_checks']} 次，"
+                f"counter_regime {mg.get('counter_regime', 0)} 次，"
+                f"independent_trend {mg.get('independent_trend', 0)} 次，"
+                f"watch_only {mg.get('watch_only', 0)} 次，"
+                f"数据不足 {mg.get('unknown', 0)} 次，"
+                f"aligned {mg.get('aligned', 0)} 次"
+            )
+            # Fix 8: time_source fallback_now warning
+            fallback_count = mg.get("fallback_now_count", 0)
+            if fallback_count > 0:
+                lines.append(
+                    f"- ⚠ {fallback_count} 次门禁使用当前时间（无原始分析时间），可能存在 lookahead 风险"
+                )
+            # Top 3 symbols with counter_regime
+            top_counter = mg.get("top_counter_regime_symbols", [])
+            if top_counter:
+                symbol_text = "，".join(f"{s['symbol']}({s['count']})" for s in top_counter[:3])
+                lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**九、风险事件**"])
     if failed_jobs:
@@ -597,6 +625,93 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
         return {"error": str(exc), "total_checks": 0}
 
 
+def _fetch_market_regime_gate_stats(repo: CryptoGuardRepository, hours: int = 24) -> dict[str, Any]:
+    """Fetch market regime gate statistics from recent GA decisions.
+
+    Counts alignment categories, watch_only occurrences, unknown data,
+    and fallback_now time_source usage (Fix 8).
+    """
+    try:
+        day_ago = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+        rows = repo.conn.execute(
+            """
+            SELECT market_regime_gate_json
+            FROM ga_decisions
+            WHERE datetime(created_at) >= datetime(?) AND market_regime_gate_json IS NOT NULL
+            """,
+            (day_ago,),
+        ).fetchall()
+
+        if not rows:
+            return {"ok": True, "total_checks": 0, "counter_regime": 0, "independent_trend": 0, "watch_only": 0, "unknown": 0, "aligned": 0, "fallback_now_count": 0}
+
+        total = len(rows)
+        counter_regime = 0
+        watch_only = 0
+        unknown = 0
+        aligned = 0
+        independent_trend = 0
+        fallback_now_count = 0
+        counter_regime_symbols: dict[str, int] = {}
+
+        for row in rows:
+            try:
+                gate = json.loads(row["market_regime_gate_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            # Count time_source=fallback_now (Fix 8)
+            if gate.get("time_source") == "fallback_now":
+                fallback_now_count += 1
+
+            # Extract alignment from adjustments or market_regime sub-dict
+            alignment = ""
+            adjustments = gate.get("adjustments", {})
+            market_regime = gate.get("market_regime", {})
+            if adjustments.get("regime_alignment"):
+                alignment = adjustments["regime_alignment"]
+            elif market_regime.get("regime_alignment"):
+                alignment = market_regime["regime_alignment"]
+
+            if alignment == "counter_regime":
+                counter_regime += 1
+                # Track symbol for top counter_regime
+                symbol = gate.get("market_regime", {}).get("symbol") or adjustments.get("symbol", "")
+                if symbol:
+                    counter_regime_symbols[symbol] = counter_regime_symbols.get(symbol, 0) + 1
+            elif alignment == "independent_trend":
+                independent_trend += 1
+            elif alignment == "aligned":
+                aligned += 1
+            elif alignment == "unclear":
+                unknown += 1
+
+            # Check watch_only in adjustments
+            if adjustments.get("watch_only"):
+                watch_only += 1
+
+        # Top 3 symbols with counter_regime
+        top_counter_regime_symbols = sorted(
+            [{"symbol": s, "count": c} for s, c in counter_regime_symbols.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        )[:3]
+
+        return {
+            "ok": True,
+            "total_checks": total,
+            "counter_regime": counter_regime,
+            "independent_trend": independent_trend,
+            "watch_only": watch_only,
+            "unknown": unknown,
+            "aligned": aligned,
+            "fallback_now_count": fallback_now_count,
+            "top_counter_regime_symbols": top_counter_regime_symbols,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "total_checks": 0}
+
+
 def render_hourly_report_text(
     generated_at_utc: str,
     active_symbols: list[str],
@@ -612,6 +727,7 @@ def render_hourly_report_text(
     feedback_patterns: dict[str, Any] | None = None,
     long_short_performance: dict[str, Any] | None = None,
     account_feedback_gate: dict[str, Any] | None = None,
+    market_regime_gate: dict[str, Any] | None = None,
     state_consistency: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
@@ -789,6 +905,31 @@ def render_hourly_report_text(
                     f"{k}={v}" for k, v in gate["controlled_gating_factors"].items()
                 )
                 lines.append(f"  - 受阻因素：{factor_text}")
+
+    # Market regime gate stats (Fix 5 + Fix 8)
+    if market_regime_gate and not market_regime_gate.get("error"):
+        mg = market_regime_gate
+        if mg.get("total_checks", 0) > 0:
+            lines.extend(["", "**市场情绪门禁（24h）**"])
+            lines.append(
+                f"- 检查 {mg['total_checks']} 次，"
+                f"counter_regime {mg.get('counter_regime', 0)} 次，"
+                f"independent_trend {mg.get('independent_trend', 0)} 次，"
+                f"watch_only {mg.get('watch_only', 0)} 次，"
+                f"数据不足 {mg.get('unknown', 0)} 次，"
+                f"aligned {mg.get('aligned', 0)} 次"
+            )
+            # Fix 8: time_source fallback_now warning
+            fallback_count = mg.get("fallback_now_count", 0)
+            if fallback_count > 0:
+                lines.append(
+                    f"- ⚠ {fallback_count} 次门禁使用当前时间（无原始分析时间），可能存在 lookahead 风险"
+                )
+            # Top 3 symbols with counter_regime
+            top_counter = mg.get("top_counter_regime_symbols", [])
+            if top_counter:
+                symbol_text = "，".join(f"{s['symbol']}({s['count']})" for s in top_counter[:3])
+                lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
     health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"

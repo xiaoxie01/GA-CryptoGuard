@@ -6999,7 +6999,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIn("symbol_relative_strength", result)
         self.assertIn("regime_alignment", result)
         self.assertIn("confidence_adjustment", result)
-        self.assertIn("risk_multiplier", result)
+        self.assertIn("suggested_risk_multiplier", result)
         self.assertIn("require_stronger_confirmation", result)
         self.assertIsInstance(result["reasons"], list)
         self.assertGreater(len(result["reasons"]), 0)
@@ -7972,6 +7972,217 @@ class PendingOrderManagerTest(unittest.TestCase):
         ga_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
         self.conn.commit()
         return ga_id
+
+    # ── P2 Regime Consistency Fixes ──
+
+    def test_eth_confirmation_reduces_btc_only_risk_on_to_transition(self) -> None:
+        """Fix 1: BTC risk_on + ETH 1h bearish -> transition."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        # Seed BTC: 4h bullish, 1h bullish (would be risk_on without ETH)
+        self._seed_btc_risk_on_candles()
+        # Seed ETH: 4h bullish, 1h bearish (conflicts with BTC risk_on)
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('ETHUSDT', 1)")
+        self._seed_candles_accel("ETHUSDT", "4h", count=30, start_price=3400, accel_factor=1.003, volatility_pct=0.4)
+        self._seed_candles_accel("ETHUSDT", "1h", count=30, start_price=3500, accel_factor=0.997, volatility_pct=0.3)
+        self.conn.commit()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+
+        # ETH 1h bearish overrides BTC risk_on -> transition
+        self.assertEqual(result["market_phase"], "transition")
+
+    def test_regime_score_uses_config_weights(self) -> None:
+        """Fix 2: regime_score reflects config weights and component scores."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+
+        self._seed_btc_risk_on_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = score_market_regime(
+            self.repo,
+            symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000,
+            decision_side="LONG",
+        )
+
+        # Should contain regime_score and component scores
+        self.assertIn("regime_score", result)
+        self.assertIn("component_scores", result)
+        self.assertIn("component_weights", result)
+        scores = result["component_scores"]
+        self.assertIn("btc_score", scores)
+        self.assertIn("eth_score", scores)
+        self.assertIn("breadth_score", scores)
+        self.assertIn("volatility_score", scores)
+        weights = result["component_weights"]
+        self.assertIn("btc_weight", weights)
+        self.assertIn("eth_weight", weights)
+        # Verify the weighted sum is correct
+        expected = (
+            scores["btc_score"] * weights["btc_weight"]
+            + scores["eth_score"] * weights["eth_weight"]
+            + scores["breadth_score"] * weights["breadth_weight"]
+            + scores["volatility_score"] * weights["volatility_weight"]
+        )
+        self.assertAlmostEqual(result["regime_score"], round(expected, 4), places=4)
+
+    def test_independent_trend_respects_config_allow_bypass_false(self) -> None:
+        """Fix 3: allow_bypass=False prevents independent_trend, returns counter_regime."""
+        from plugins.crypto_guard.analysis.market_regime_engine import _regime_alignment
+
+        # counter_regime scenario: SHORT in rebound (market_phase="rebound", side="SHORT")
+        # With allow_bypass=True (default): strong symbol should get independent_trend
+        alignment, _ = _regime_alignment(
+            "rebound", "bearish", "bearish", "weak", "SHORT", 0.1,
+            independent_trend_cfg={"allow_bypass": True, "min_confirmations": 2},
+        )
+        self.assertEqual(alignment, "independent_trend")
+
+        # With allow_bypass=False: same conditions should return counter_regime
+        alignment, _ = _regime_alignment(
+            "rebound", "bearish", "bearish", "weak", "SHORT", 0.1,
+            independent_trend_cfg={"allow_bypass": False, "min_confirmations": 2},
+        )
+        self.assertEqual(alignment, "counter_regime")
+
+    def test_independent_trend_respects_config_min_confirmations(self) -> None:
+        """Fix 3: min_confirmations=3 prevents independent_trend when only 2 confirmations exist."""
+        from plugins.crypto_guard.analysis.market_regime_engine import _regime_alignment
+
+        # counter_regime scenario: SHORT in rebound with weak symbol
+        # With min_confirmations=2: 2 confirmations (weak + breadth<0.5) => independent_trend
+        alignment, _ = _regime_alignment(
+            "rebound", "bearish", "bearish", "weak", "SHORT", 0.1,
+            independent_trend_cfg={"allow_bypass": True, "min_confirmations": 2},
+        )
+        self.assertEqual(alignment, "independent_trend")
+
+        # With min_confirmations=3: only 2 confirmations available => counter_regime
+        alignment, _ = _regime_alignment(
+            "rebound", "bearish", "bearish", "weak", "SHORT", 0.1,
+            independent_trend_cfg={"allow_bypass": True, "min_confirmations": 3},
+        )
+        self.assertEqual(alignment, "counter_regime")
+
+    def test_regime_gate_uses_config_risk_multiplier_not_engine_suggestion(self) -> None:
+        """Fix 4: apply_regime_gate uses config risk_multiplier (0.5), not engine's suggested 0.75."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_rebound_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="SHORT",
+            signal_grade="A",
+            confidence=0.80,
+            analysis_time_utc=1718800000000,
+        )
+
+        # Should be counter_regime
+        self.assertTrue(result["regime_gate_applied"])
+        adjustments = result["adjustments"]
+        # Config value is 0.5, engine's suggested_risk_multiplier would be 0.75
+        self.assertEqual(adjustments["risk_multiplier"], 0.5)
+        self.assertEqual(adjustments["effective_risk_multiplier"], 0.5)
+        # Engine's suggestion should be in the market_regime sub-dict
+        market_regime = result["market_regime"]
+        self.assertIn("suggested_risk_multiplier", market_regime)
+        self.assertNotIn("risk_multiplier", market_regime)
+
+    def test_hourly_report_includes_regime_gate_stats(self) -> None:
+        """Fix 5: hourly report includes market regime gate stats."""
+        from plugins.crypto_guard.notify.hourly_report import _fetch_market_regime_gate_stats
+
+        # Insert a GA decision with market_regime_gate_json
+        gate_data = json.dumps({
+            "regime_gate_applied": True,
+            "adjustments": {
+                "regime_alignment": "counter_regime",
+                "watch_only": False,
+                "risk_multiplier": 0.5,
+            },
+            "market_regime": {
+                "regime_alignment": "counter_regime",
+                "symbol": "AVAXUSDT",
+            },
+            "time_source": "original_analysis_time",
+        })
+        self.conn.execute(
+            "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, "
+            "final_summary, raw_decision_json, market_regime_gate_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "AVAXUSDT", 1700000000000, "2024-01-15T00:00:00Z", "scheduled",
+                "A", 0.80, "trade_plan_available",
+                json.dumps([]), json.dumps([]), json.dumps([]),
+                json.dumps({"ok": True, "reasons": []}),
+                json.dumps(["create_paper_order"]),
+                "test", json.dumps({}), gate_data,
+            ),
+        )
+        self.conn.commit()
+
+        stats = _fetch_market_regime_gate_stats(self.repo)
+        self.assertGreater(stats["total_checks"], 0)
+        self.assertGreater(stats["counter_regime"], 0)
+
+    def test_parse_regime_at_loss_handles_dict_json_string_and_plain_string(self) -> None:
+        """Fix 6: _parse_regime_at_loss handles dict, JSON string, and plain string."""
+        from plugins.crypto_guard.strategy.self_evolution import _parse_regime_at_loss, _is_extreme_regime
+
+        # None -> {}
+        self.assertEqual(_parse_regime_at_loss(None), {})
+
+        # dict -> returned as-is
+        d = {"regime": "extreme_volatility", "market_phase": "risk_off"}
+        self.assertEqual(_parse_regime_at_loss(d), d)
+
+        # JSON string that parses to dict
+        json_str = '{"regime": "extreme_volatility"}'
+        result = _parse_regime_at_loss(json_str)
+        self.assertEqual(result, {"regime": "extreme_volatility"})
+
+        # Plain string (legacy) -> {"regime": value}
+        self.assertEqual(_parse_regime_at_loss("extreme_volatility"), {"regime": "extreme_volatility"})
+
+        # JSON string that parses to a string
+        self.assertEqual(_parse_regime_at_loss('"extreme_volatility"'), {"regime": "extreme_volatility"})
+
+        # Unparseable string
+        self.assertEqual(_parse_regime_at_loss("not-json{"), {"regime": "not-json{"})
+
+        # _is_extreme_regime works with all formats
+        self.assertTrue(_is_extreme_regime("extreme_volatility"))
+        self.assertTrue(_is_extreme_regime({"regime": "extreme_volatility"}))
+        self.assertTrue(_is_extreme_regime('{"regime": "low_liquidity"}'))
+        self.assertFalse(_is_extreme_regime("normal"))
+        self.assertFalse(_is_extreme_regime(None))
+        self.assertFalse(_is_extreme_regime({"market_phase": "risk_on"}))
+
+    def test_check_schema_health_keyword_only(self) -> None:
+        """Fix 7: check_schema_health requires keyword arguments."""
+        from plugins.crypto_guard.storage.migrations import check_schema_health
+
+        # Positional args should raise TypeError
+        with self.assertRaises(TypeError):
+            check_schema_health(None, None)
+
+        # Keyword args should work
+        result = check_schema_health()
+        self.assertIn("ok", result)
 
 
 if __name__ == "__main__":

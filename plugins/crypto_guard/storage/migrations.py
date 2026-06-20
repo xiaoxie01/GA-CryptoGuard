@@ -889,7 +889,7 @@ def _cleanup_agent_job_duplicates(conn: sqlite3.Connection) -> dict[str, int]:
     return result
 
 
-def check_schema_health(config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
 
     Args:

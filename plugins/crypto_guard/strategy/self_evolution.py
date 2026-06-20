@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from typing import Any
 
@@ -11,6 +12,51 @@ from plugins.crypto_guard.strategy.version_manager import create_candidate_versi
 
 
 EXTREME_REVIEW_REGIMES = {"extreme_volatility", "funding_shock", "news_like_event", "low_liquidity"}
+
+
+def _parse_regime_at_loss(value: Any) -> dict[str, Any]:
+    """Parse market_regime_at_loss which can be None, dict, JSON string, or plain string.
+
+    Handles:
+    - None -> {}
+    - dict -> returned as-is
+    - JSON string that parses to dict -> returned as dict
+    - JSON string that parses to a plain string (legacy) -> {"regime": value}
+    - Unparseable string -> {"regime": str(value)}
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, str):
+                return {"regime": parsed}
+            # JSON parsed to number/bool/null — wrap the parsed value
+            return {"regime": str(parsed)}
+        except (json.JSONDecodeError, TypeError):
+            return {"regime": str(value)}
+    return {"regime": str(value)}
+
+
+def _is_extreme_regime(market_regime_at_loss: Any) -> bool:
+    """Check whether the regime at loss time indicates an extreme condition.
+
+    Handles legacy plain-string values and new JSON dict values by
+    parsing through _parse_regime_at_loss and checking relevant keys.
+    """
+    regime_info = _parse_regime_at_loss(market_regime_at_loss)
+    if not regime_info:
+        return False
+    # Check known keys for extreme regime indicators
+    for key in ("regime", "market_phase", "regime_alignment"):
+        val = regime_info.get(key, "")
+        if val and str(val) in EXTREME_REVIEW_REGIMES:
+            return True
+    return False
 
 
 def run_self_evolution_cycle(
@@ -26,7 +72,7 @@ def run_self_evolution_cycle(
     aggregation = aggregate_review_attribution(reviews)
     audit_steps: list[dict[str, Any]] = [{"step": "aggregate_reviews", "result": aggregation}]
 
-    extreme_reviews = [r for r in reviews if str(r.get("market_regime_at_loss") or "") in EXTREME_REVIEW_REGIMES or int(r.get("evolution_trigger_allowed") if r.get("evolution_trigger_allowed") is not None else 1) == 0]
+    extreme_reviews = [r for r in reviews if _is_extreme_regime(r.get("market_regime_at_loss")) or int(r.get("evolution_trigger_allowed") if r.get("evolution_trigger_allowed") is not None else 1) == 0]
     if extreme_reviews:
         result = _blocked(
             "evolution_paused_extreme_market",
