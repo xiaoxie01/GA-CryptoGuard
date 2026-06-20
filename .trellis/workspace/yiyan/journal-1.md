@@ -574,3 +574,36 @@ Implemented market regime engine (score_market_regime, apply_regime_gate, 5 loss
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: Fix 8 failing tests + real DB migration
+
+**Date**: 2026-06-20
+**Task**: Fix 8 failing tests + real DB migration
+**Branch**: `main`
+
+### Summary
+
+Fixed 8 failing tests: _insert_closed_trade hours_ago→minutes_ago for time-robustness, updated daily_loss_pause assertion, fixed structured feedback closed_at to use noon-ish times. Executed real DB migration to add market_regime_gate_json column.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `375c0ce` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
