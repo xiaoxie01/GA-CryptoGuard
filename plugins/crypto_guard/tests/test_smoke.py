@@ -7005,7 +7005,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIn("volatility_state", result)
         self.assertIn("symbol_relative_strength", result)
         self.assertIn("regime_alignment", result)
-        self.assertIn("confidence_adjustment", result)
+        self.assertIn("suggested_confidence_adjustment", result)
         self.assertIn("suggested_risk_multiplier", result)
         self.assertIn("require_stronger_confirmation", result)
         self.assertIsInstance(result["reasons"], list)
@@ -7029,7 +7029,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         self.assertEqual(result["market_phase"], "rebound")
         self.assertEqual(result["regime_alignment"], "counter_regime")
-        self.assertLess(result["confidence_adjustment"], 0)
+        self.assertLess(result["suggested_confidence_adjustment"], 0)
         self.assertTrue(result["require_stronger_confirmation"])
 
     def test_counter_regime_long_in_selloff_downgraded(self) -> None:
@@ -7049,7 +7049,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         self.assertEqual(result["market_phase"], "selloff")
         self.assertEqual(result["regime_alignment"], "counter_regime")
-        self.assertLess(result["confidence_adjustment"], 0)
+        self.assertLess(result["suggested_confidence_adjustment"], 0)
 
     def test_aligned_regime_no_penalty(self) -> None:
         """P0: LONG in risk_on gets aligned, no penalty."""
@@ -7068,7 +7068,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         self.assertEqual(result["market_phase"], "risk_on")
         self.assertEqual(result["regime_alignment"], "aligned")
-        self.assertGreaterEqual(result["confidence_adjustment"], 0)
+        self.assertGreaterEqual(result["suggested_confidence_adjustment"], 0)
         self.assertFalse(result["require_stronger_confirmation"])
 
     def test_independent_trend_bypasses_counter_regime(self) -> None:
@@ -7694,7 +7694,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             decision_side="LONG",
         )
         self.assertEqual(result["regime_alignment"], "unclear")
-        self.assertAlmostEqual(result["confidence_adjustment"], 0.0)
+        self.assertAlmostEqual(result["suggested_confidence_adjustment"], 0.0)
         self.assertTrue(result["require_stronger_confirmation"])
         self.assertEqual(result["market_phase"], "unknown")
 
@@ -8583,6 +8583,204 @@ class PendingOrderManagerTest(unittest.TestCase):
         # audit fields present
         self.assertIn("original_confidence", adjustments)
         self.assertIn("confidence_boost_reason", adjustments)
+        # Round 7: consistency — all confidence fields derive from single effective_delta
+        confidence_adjustment = adjustments["confidence_adjustment"]
+        self.assertAlmostEqual(wca, confidence_adjustment, delta=0.001,
+            msg="weighted_confidence_adjustment must equal confidence_adjustment")
+        effective = adjustments["effective_confidence"]
+        expected_effective = max(0.0, min(1.0, 0.80 + confidence_adjustment))
+        self.assertAlmostEqual(effective, expected_effective, delta=0.001,
+            msg="effective_confidence must be clamp(original + delta, 0.0, 1.0)")
+        self.assertAlmostEqual(adjustments["effective_confidence_after_regime"], effective, delta=0.001,
+            msg="effective_confidence_after_regime must equal effective_confidence")
+        # confidence_boost_reason mentions the boost
+        reason = adjustments["confidence_boost_reason"]
+        self.assertIn(f"boost={confidence_adjustment:+.4f}", reason)
+
+    def test_market_regime_weight_partial_score_consistency(self) -> None:
+        """Round 7: mocked non-max regime_score produces consistent confidence fields."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+        from unittest.mock import patch as _patch
+
+        # Mock score_market_regime to return a deterministic aligned regime
+        # with normalized_regime_score=0.10 (not max), weight=0.25, side=LONG
+        mock_regime = {
+            "module": "market_regime",
+            "symbol": "AVAXUSDT",
+            "btc_bias": "bullish",
+            "eth_bias": "bullish",
+            "market_phase": "risk_on",
+            "breadth_score": 0.5,
+            "volatility_state": "normal",
+            "symbol_relative_strength": "strong",
+            "regime_alignment": "aligned",
+            "suggested_confidence_adjustment": 0.005,
+            "suggested_risk_multiplier": 1.0,
+            "require_stronger_confirmation": False,
+            "reasons": ["mock aligned regime"],
+            "analysis_time_utc": 1718800000000,
+            "regime_score": 0.04,
+            "normalized_regime_score": 0.10,
+            "market_regime_weight": 0.25,
+            "component_scores": {"btc_score": 1, "eth_score": 1, "breadth_score": 0.5, "volatility_score": 0.0},
+        }
+
+        with _patch("plugins.crypto_guard.risk.risk_engine.score_market_regime", return_value=mock_regime):
+            result = apply_regime_gate(
+                self.repo,
+                symbol="AVAXUSDT",
+                side="LONG",
+                signal_grade="A",
+                confidence=0.80,
+                analysis_time_utc=1718800000000,
+            )
+
+        adjustments = result["adjustments"]
+        self.assertEqual(adjustments["regime_alignment"], "aligned")
+        # side=LONG → support_score = regime_score = 0.10
+        self.assertAlmostEqual(adjustments["support_score"], 0.10, delta=0.001)
+        self.assertEqual(adjustments["support_score_side"], "LONG")
+        # effective_delta = clamp(support_score * weight, 0.0, 0.05) = clamp(0.025, 0.0, 0.05) = 0.025
+        self.assertAlmostEqual(adjustments["weighted_confidence_adjustment"], 0.025, delta=0.001)
+        self.assertAlmostEqual(adjustments["confidence_adjustment"], 0.025, delta=0.001)
+        # effective_confidence_after_regime == original + 0.025
+        expected = 0.80 + 0.025
+        self.assertAlmostEqual(adjustments["effective_confidence_after_regime"], expected, delta=0.001)
+        self.assertAlmostEqual(adjustments["effective_confidence"], adjustments["effective_confidence_after_regime"], delta=0.001)
+        # confidence_boost_reason includes side-aware support_score and boost
+        self.assertIn("side=LONG", adjustments["confidence_boost_reason"])
+        self.assertIn("support_score=+0.100", adjustments["confidence_boost_reason"])
+        self.assertIn("boost=+0.0250", adjustments["confidence_boost_reason"])
+
+    def test_market_regime_audit_confidence_adjustment_not_conflicting(self) -> None:
+        """Round 7: market_regime sub-dict must not contain confidence_adjustment
+        (renamed to suggested_confidence_adjustment to avoid conflict with
+        adjustments.confidence_adjustment, which is the authoritative value)."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_risk_on_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="LONG",
+            signal_grade="A",
+            confidence=0.80,
+            analysis_time_utc=1718800000000,
+        )
+
+        market_regime = result.get("market_regime", {})
+        adjustments = result.get("adjustments", {})
+
+        # market_regime MUST NOT contain bare confidence_adjustment
+        self.assertNotIn("confidence_adjustment", market_regime,
+            msg="market_regime must use suggested_confidence_adjustment, not confidence_adjustment")
+
+        # market_regime MAY contain suggested_confidence_adjustment (informational only)
+        # adjustments.confidence_adjustment is the authoritative value
+        self.assertIn("confidence_adjustment", adjustments,
+            msg="adjustments must contain authoritative confidence_adjustment")
+
+    def test_market_regime_aligned_short_bearish_gets_positive_boost(self) -> None:
+        """Round 7: SHORT in bearish/risk_off aligned regime gets positive side-aware boost."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+        from unittest.mock import patch as _patch
+
+        # normalized_regime_score=-0.80 (bearish), side=SHORT → support_score = +0.80
+        mock_regime = {
+            "module": "market_regime",
+            "symbol": "AVAXUSDT",
+            "btc_bias": "bearish",
+            "eth_bias": "bearish",
+            "market_phase": "risk_off",
+            "breadth_score": -0.6,
+            "volatility_state": "normal",
+            "symbol_relative_strength": "weak",
+            "regime_alignment": "aligned",
+            "suggested_confidence_adjustment": 0.04,
+            "suggested_risk_multiplier": 1.0,
+            "require_stronger_confirmation": False,
+            "reasons": ["mock aligned bearish regime"],
+            "analysis_time_utc": 1718800000000,
+            "regime_score": -0.2,
+            "normalized_regime_score": -0.80,
+            "market_regime_weight": 0.25,
+            "component_scores": {"btc_score": -1, "eth_score": -1, "breadth_score": -0.6, "volatility_score": 0.0},
+        }
+
+        with _patch("plugins.crypto_guard.risk.risk_engine.score_market_regime", return_value=mock_regime):
+            result = apply_regime_gate(
+                self.repo,
+                symbol="AVAXUSDT",
+                side="SHORT",
+                signal_grade="A",
+                confidence=0.75,
+                analysis_time_utc=1718800000000,
+            )
+
+        adjustments = result["adjustments"]
+        self.assertEqual(adjustments["regime_alignment"], "aligned")
+        # side=SHORT → support_score = -(-0.80) = +0.80
+        self.assertAlmostEqual(adjustments["support_score"], 0.80, delta=0.001)
+        self.assertEqual(adjustments["support_score_side"], "SHORT")
+        # effective_delta = clamp(0.80 * 0.25, 0.0, 0.05) = 0.05 (capped)
+        self.assertAlmostEqual(adjustments["weighted_confidence_adjustment"], 0.05, delta=0.001)
+        self.assertAlmostEqual(adjustments["confidence_adjustment"], 0.05, delta=0.001)
+        # effective_confidence_after_regime == 0.75 + 0.05 = 0.80
+        self.assertAlmostEqual(adjustments["effective_confidence_after_regime"], 0.80, delta=0.001)
+        self.assertIn("side=SHORT", adjustments["confidence_boost_reason"])
+        self.assertIn("support_score=+0.800", adjustments["confidence_boost_reason"])
+
+    def test_market_regime_aligned_long_bearish_no_boost_or_counter(self) -> None:
+        """Round 7: LONG + bearish aligned should route to counter_regime.
+        If forced as aligned (mock), effective_delta must be 0.0 — aligned
+        branch never penalizes; only counter_regime applies negative adjustments."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+        from unittest.mock import patch as _patch
+
+        # LONG in bearish market: regime_score=-0.80 → support_score=-0.80 (negative!)
+        mock_regime = {
+            "module": "market_regime",
+            "symbol": "AVAXUSDT",
+            "btc_bias": "bearish",
+            "eth_bias": "bearish",
+            "market_phase": "selloff",
+            "breadth_score": -0.7,
+            "volatility_state": "elevated",
+            "symbol_relative_strength": "weak",
+            "regime_alignment": "aligned",  # forced — real engine would say counter_regime
+            "suggested_confidence_adjustment": 0.0,
+            "suggested_risk_multiplier": 1.0,
+            "require_stronger_confirmation": False,
+            "reasons": ["mock aligned bearish (forced)"],
+            "analysis_time_utc": 1718800000000,
+            "regime_score": -0.2,
+            "normalized_regime_score": -0.80,
+            "market_regime_weight": 0.25,
+            "component_scores": {"btc_score": -1, "eth_score": -1, "breadth_score": -0.7, "volatility_score": 0.5},
+        }
+
+        with _patch("plugins.crypto_guard.risk.risk_engine.score_market_regime", return_value=mock_regime):
+            result = apply_regime_gate(
+                self.repo,
+                symbol="AVAXUSDT",
+                side="LONG",
+                signal_grade="B",
+                confidence=0.70,
+                analysis_time_utc=1718800000000,
+            )
+
+        adjustments = result.get("adjustments", {})
+        # support_score is negative (regime opposes LONG)
+        self.assertLess(adjustments["support_score"], 0.0)
+        # But aligned branch must NOT penalize: delta must be 0.0
+        self.assertEqual(adjustments["weighted_confidence_adjustment"], 0.0)
+        self.assertEqual(adjustments["confidence_adjustment"], 0.0)
+        # Effective confidence unchanged
+        if "effective_confidence" in adjustments:
+            self.assertEqual(adjustments["effective_confidence"], 0.70)
 
     def test_market_regime_weight_does_not_boost_unclear(self) -> None:
         """P2: unclear regime (ETH missing) has zero confidence boost."""

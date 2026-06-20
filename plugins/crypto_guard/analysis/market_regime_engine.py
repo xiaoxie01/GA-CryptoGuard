@@ -111,12 +111,14 @@ def score_market_regime(
 
     # 9. Adjustments. The top-level market_regime.weight controls the maximum
     # confidence influence. With weight=0.25, max influence is +/-0.05.
-    confidence_adjustment = 0.0
+    # NOTE: This is a SUGGESTED value only. risk_engine.apply_regime_gate() is the
+    # authoritative source for the actual confidence_adjustment applied.
+    suggested_confidence_adjustment = 0.0
     risk_multiplier = 1.0
     require_stronger_confirmation = False
 
     if regime_alignment == "counter_regime":
-        confidence_adjustment = -max_confidence_adjustment
+        suggested_confidence_adjustment = -max_confidence_adjustment
         if market_phase in {"rebound", "risk_on"} and decision_side == "SHORT":
             risk_multiplier = 0.75
             require_stronger_confirmation = True
@@ -126,10 +128,10 @@ def score_market_regime(
             require_stronger_confirmation = True
             reasons.append("counter_regime: 抛售/risk_off阶段做多，降低信心并提高确认要求")
     elif regime_alignment == "aligned":
-        confidence_adjustment = max(0.0, normalized_regime_score * max_confidence_adjustment)
-        reasons.append(f"regime_aligned: 方向与大盘阶段一致，confidence_adjustment={confidence_adjustment:+.3f}")
+        suggested_confidence_adjustment = max(0.0, normalized_regime_score * max_confidence_adjustment)
+        reasons.append(f"regime_aligned: 方向与大盘阶段一致，suggested_confidence_adjustment={suggested_confidence_adjustment:+.3f}")
     elif regime_alignment == "unclear":
-        confidence_adjustment = 0.0
+        suggested_confidence_adjustment = 0.0
         require_stronger_confirmation = True
         reasons.append("数据不足，不调整信心但提高确认要求")
 
@@ -143,7 +145,7 @@ def score_market_regime(
         "volatility_state": volatility_state,
         "symbol_relative_strength": symbol_rs,
         "regime_alignment": regime_alignment,
-        "confidence_adjustment": confidence_adjustment,
+        "suggested_confidence_adjustment": suggested_confidence_adjustment,
         "suggested_risk_multiplier": risk_multiplier,
         "require_stronger_confirmation": require_stronger_confirmation,
         "reasons": reasons,

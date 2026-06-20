@@ -154,7 +154,7 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
             # Check if effective grade/confidence still qualifies for paper order
             effective_grade = adjustments.get("effective_grade", "")
-            effective_confidence = adjustments.get("effective_confidence", 0)
+            effective_confidence = _get_effective_regime_confidence(adjustments)
             from plugins.crypto_guard.strategy.grade_config import is_paper_order_eligible
             if not is_paper_order_eligible(effective_grade, effective_confidence):
                 _create_opportunity_watch_from_gate(repo, signal["symbol"],
@@ -338,7 +338,7 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
             trade_plan = _apply_regime_adjustments(trade_plan, adjustments)
             # Check if effective grade/confidence still qualifies for paper order
             effective_grade = adjustments.get("effective_grade", "")
-            effective_confidence = adjustments.get("effective_confidence", 0)
+            effective_confidence = _get_effective_regime_confidence(adjustments)
             from plugins.crypto_guard.strategy.grade_config import is_paper_order_eligible
             if not is_paper_order_eligible(effective_grade, effective_confidence):
                 _create_opportunity_watch_from_gate(repo, symbol,
@@ -844,6 +844,21 @@ def _signal_decision_confidence(decision: dict[str, Any], signal: dict[str, Any]
     value = decision.get("confidence")
     if value is None or value == "":
         value = signal.get("confidence")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _get_effective_regime_confidence(adjustments: dict[str, Any]) -> float:
+    """Read the authoritative effective confidence after regime adjustments.
+
+    Prefers effective_confidence_after_regime (risk_engine's canonical field),
+    falls back to effective_confidence, then 0.
+    """
+    value = adjustments.get("effective_confidence_after_regime")
+    if value is None:
+        value = adjustments.get("effective_confidence")
     try:
         return float(value or 0)
     except (TypeError, ValueError):

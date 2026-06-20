@@ -428,6 +428,13 @@ def apply_regime_gate(
         # Unclear data: require stronger confirmation, no penalty
         regime_weight = float(regime.get("market_regime_weight", 0.25))
         regime_score = float(regime.get("normalized_regime_score", 0.0))
+        side_upper = side.upper()
+        if side_upper == "LONG":
+            support_score = regime_score
+        elif side_upper == "SHORT":
+            support_score = -regime_score
+        else:
+            support_score = 0.0
         return {
             "ok": True,
             "regime_gate_applied": True,
@@ -454,27 +461,52 @@ def apply_regime_gate(
                 "regime_weight": regime_weight,
                 "weighted_confidence_adjustment": 0.0,
                 "effective_confidence_after_regime": confidence,
+                "support_score": round(support_score, 4),
+                "support_score_side": side_upper,
             },
         }
 
     if alignment != "counter_regime":
-        confidence_adjustment = float(regime.get("confidence_adjustment") or 0.0)
         regime_weight = float(regime.get("market_regime_weight", 0.25))
         regime_score = float(regime.get("normalized_regime_score", 0.0))
-        weighted_confidence_adjustment = max(-0.10, min(0.05, regime_score * regime_weight))
-        if confidence_adjustment != 0.0:
-            effective_confidence = max(0.0, min(1.0, confidence + confidence_adjustment))
+
+        # Side-aware support score: regime_score sign = market direction
+        # (+bullish/risk_on, -bearish/risk_off). Flip for SHORT so positive
+        # support_score always means "regime supports this trade direction."
+        side_upper = side.upper()
+        if side_upper == "LONG":
+            support_score = regime_score
+        elif side_upper == "SHORT":
+            support_score = -regime_score
+        else:
+            support_score = 0.0
+
+        if alignment == "aligned":
+            # Aligned boost only: positive side-aware support gets capped boost.
+            # Negative support (regime opposes the trade) is NOT a penalty here —
+            # that case should route through counter_regime. If we reach aligned
+            # with negative support, emit zero boost and let the audit record it.
+            effective_delta = max(0.0, min(0.05, support_score * regime_weight))
+        elif alignment == "independent_trend":
+            # Independent trend: coin-specific strength bypasses broad market.
+            # Do NOT apply regime_score boost — the coin is decoupled from market.
+            effective_delta = 0.0
+        else:
+            effective_delta = 0.0
+
+        if effective_delta != 0.0:
+            effective_confidence = max(0.0, min(1.0, confidence + effective_delta))
             return {
                 "ok": True,
                 "regime_gate_applied": True,
                 "mode": regime_cfg.get("mode", "shadow"),
                 "market_regime": regime,
                 "adjustments": {
-                    "confidence_adjustment": confidence_adjustment,
+                    "confidence_adjustment": round(effective_delta, 4),
                     "risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
                     "effective_grade": signal_grade,
                     "original_grade": signal_grade,
-                    "effective_confidence": effective_confidence,
+                    "effective_confidence": round(effective_confidence, 4),
                     "original_confidence": confidence,
                     "confidence_penalty": 0.0,
                     "effective_risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
@@ -488,9 +520,14 @@ def apply_regime_gate(
                     "reasons": regime.get("reasons", []),
                     "regime_score": regime_score,
                     "regime_weight": regime_weight,
-                    "weighted_confidence_adjustment": round(weighted_confidence_adjustment, 4),
+                    "weighted_confidence_adjustment": round(effective_delta, 4),
                     "effective_confidence_after_regime": round(effective_confidence, 4),
-                    "confidence_boost_reason": f"aligned regime: score={regime_score:+.3f} weight={regime_weight} capped_boost={weighted_confidence_adjustment:+.4f}",
+                    "support_score": round(support_score, 4),
+                    "support_score_side": side_upper,
+                    "confidence_boost_reason": (
+                        f"aligned regime: side={side_upper} support_score={support_score:+.3f} "
+                        f"weight={regime_weight} boost={effective_delta:+.4f}"
+                    ),
                 },
             }
         return {
@@ -499,11 +536,13 @@ def apply_regime_gate(
             "mode": regime_cfg.get("mode", "shadow"),
             "market_regime": regime,
             "adjustments": {
-                "confidence_adjustment": regime.get("confidence_adjustment", 0.0),
+                "confidence_adjustment": 0.0,
                 "risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
                 "regime_score": regime_score,
                 "regime_weight": regime_weight,
-                "weighted_confidence_adjustment": round(weighted_confidence_adjustment, 4),
+                "weighted_confidence_adjustment": 0.0,
+                "support_score": round(support_score, 4),
+                "support_score_side": side_upper,
             },
         }
 
