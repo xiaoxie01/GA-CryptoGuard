@@ -132,6 +132,9 @@ market_regime:
     min_rr: 2.0
     allow_order_types: ["trigger", "retest"]
     watch_only_after_same_side_losses: 2
+  require_stronger_confirmation:
+    min_confidence: 0.80
+    min_entry_quality: 0.70
   independent_trend:
     min_relative_strength_pct: 1.0
     min_confirmations: 2

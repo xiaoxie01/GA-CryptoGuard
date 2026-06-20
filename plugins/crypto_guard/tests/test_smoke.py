@@ -7209,7 +7209,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_regime_gate_disabled_by_config(self) -> None:
         """P0: Regime gate returns passthrough when disabled."""
+        from unittest.mock import patch as _patch
         from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
 
         # Seed candles so alignment is "aligned" (not "unclear"),
         # which returns regime_gate_applied=False when gate is not disabled.
@@ -7217,15 +7220,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_eth_candles()
         self._seed_symbol_candles("AVAXUSDT")
 
-        # Temporarily disable
-        import plugins.crypto_guard.config.loader as loader
-        original = loader.load_config()
-        try:
-            # Override config for test
-            cfg = loader.load_config()
-            cfg.trading_mode["market_regime"] = {"enabled": False}
-            loader._config_cache = cfg
+        original_cfg = loader.load_config()
+        disabled_trading_mode = dict(original_cfg.trading_mode)
+        disabled_trading_mode["market_regime"] = {"enabled": False}
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=disabled_trading_mode,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
 
+        with _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
             result = apply_regime_gate(
                 self.repo,
                 symbol="AVAXUSDT",
@@ -7235,8 +7242,6 @@ class PendingOrderManagerTest(unittest.TestCase):
                 analysis_time_utc=1718800000000,
             )
             self.assertFalse(result["regime_gate_applied"])
-        finally:
-            loader._config_cache = original
 
     # ── End Market Regime Engine Tests ──
 
@@ -8538,6 +8543,263 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertFalse(result["ok"], f"Expected watch, got: {result}")
         self.assertEqual(result["error"], "regime_gate_watch_only")
         self.assertIn("require_stronger_confirmation", result.get("regime_downgrade_reason", ""))
+
+    # ── P2: market_regime.weight integration tests ──
+
+    def test_market_regime_weight_affects_effective_confidence(self) -> None:
+        """P2: aligned regime with weight=0.25 produces capped confidence boost."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        self._seed_btc_risk_on_candles()
+        self._seed_eth_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="LONG",
+            signal_grade="A",
+            confidence=0.80,
+            analysis_time_utc=1718800000000,
+        )
+
+        adjustments = result["adjustments"]
+        # aligned regime should have confidence boost
+        self.assertIn("weighted_confidence_adjustment", adjustments)
+        self.assertIn("effective_confidence_after_regime", adjustments)
+        self.assertIn("regime_score", adjustments)
+        self.assertIn("regime_weight", adjustments)
+        # boost capped at +0.05
+        wca = adjustments["weighted_confidence_adjustment"]
+        self.assertGreaterEqual(wca, 0.0)
+        self.assertLessEqual(wca, 0.05)
+        # effective confidence should be original + confidence_adjustment
+        self.assertAlmostEqual(
+            adjustments["effective_confidence_after_regime"],
+            adjustments["effective_confidence"],
+            delta=0.001,
+        )
+        self.assertGreaterEqual(adjustments["effective_confidence_after_regime"], 0.80)
+        # audit fields present
+        self.assertIn("original_confidence", adjustments)
+        self.assertIn("confidence_boost_reason", adjustments)
+
+    def test_market_regime_weight_does_not_boost_unclear(self) -> None:
+        """P2: unclear regime (ETH missing) has zero confidence boost."""
+        from plugins.crypto_guard.risk.risk_engine import apply_regime_gate
+
+        # BTC risk_on but no ETH → unclear
+        self._seed_btc_risk_on_candles()
+        self._seed_symbol_candles("AVAXUSDT")
+
+        result = apply_regime_gate(
+            self.repo,
+            symbol="AVAXUSDT",
+            side="LONG",
+            signal_grade="A",
+            confidence=0.80,
+            analysis_time_utc=1718800000000,
+        )
+
+        adjustments = result["adjustments"]
+        self.assertEqual(adjustments["regime_alignment"], "unclear")
+        # unclear: no confidence boost
+        self.assertEqual(adjustments["weighted_confidence_adjustment"], 0.0)
+        self.assertEqual(adjustments["effective_confidence_after_regime"], 0.80)
+        # still require stronger confirmation
+        self.assertTrue(adjustments["require_stronger_confirmation"])
+
+    def test_relative_strength_uses_config_threshold(self) -> None:
+        """P2: min_relative_strength_pct from config controls strong/weak classification."""
+        from plugins.crypto_guard.analysis.market_regime_engine import score_market_regime
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
+
+        self._seed_btc_risk_on_candles()
+        self._seed_eth_candles()
+        # Seed symbol with mild outperformance (~2% above BTC)
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self._seed_candles_accel("AVAXUSDT", "4h", count=30, start_price=20, accel_factor=1.004, volatility_pct=0.3)
+        self._seed_candles_accel("AVAXUSDT", "1h", count=30, start_price=21, accel_factor=1.002, volatility_pct=0.2)
+        self.conn.commit()
+
+        # Default threshold 1.0% → mild outperformance may or may not be "strong"
+        result_default = score_market_regime(
+            self.repo, symbol="AVAXUSDT",
+            analysis_time_utc=1718800000000, decision_side="LONG",
+        )
+        default_rs = result_default["component_scores"]["relative_strength"]
+
+        # High threshold 5.0% → same outperformance should be "neutral"
+        original_cfg = loader.load_config()
+        high_threshold_tm = dict(original_cfg.trading_mode)
+        mr = dict(high_threshold_tm.get("market_regime", {}))
+        it = dict(mr.get("independent_trend", {}))
+        it["min_relative_strength_pct"] = 5.0
+        mr["independent_trend"] = it
+        high_threshold_tm["market_regime"] = mr
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=high_threshold_tm,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        with _patch("plugins.crypto_guard.analysis.market_regime_engine.load_config", return_value=mock_cfg):
+            result_high = score_market_regime(
+                self.repo, symbol="AVAXUSDT",
+                analysis_time_utc=1718800000000, decision_side="LONG",
+            )
+
+        high_rs = result_high["component_scores"]["relative_strength"]
+        # Threshold should be 0.05 (5.0 / 100)
+        self.assertAlmostEqual(high_rs["threshold"], 0.05, delta=0.001)
+        # Higher threshold should not produce a stronger label than default
+        if default_rs["label"] == "strong":
+            # With higher threshold, it should become neutral
+            self.assertEqual(high_rs["label"], "neutral")
+
+    def test_market_regime_stronger_confirmation_uses_own_config(self) -> None:
+        """P2: market_regime.require_stronger_confirmation overrides account_feedback_rules."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
+
+        # No BTC/ETH → unclear → require_stronger_confirmation
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self._seed_symbol_candles("AVAXUSDT")
+
+        now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
+        now_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "LONG", "entry_type": "trigger", "stop_loss": 95.0,
+            "take_profits": [{"price": 110.0}], "risk_percent": 0.5,
+            "invalid_condition": "below 95", "reason": "test",
+            "entry_price": 100.0,
+            "entry_confirmation_quality": 0.75,
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "AVAXUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "A", "confidence": 0.85,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        self.conn.execute(
+            "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("AVAXUSDT", 0.85, ga_id,
+             json.dumps(trade_plan, ensure_ascii=False),
+             json.dumps({"confidence": 0.85, "signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
+        )
+        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+
+        # Config: market_regime.require_stronger_confirmation.min_entry_quality=0.80
+        # account_feedback_rules still has 0.70
+        original_cfg = loader.load_config()
+        controlled_tm = dict(original_cfg.trading_mode)
+        mr = dict(controlled_tm.get("market_regime", {}))
+        mr["mode"] = "controlled"
+        mr["require_stronger_confirmation"] = {"min_confidence": 0.80, "min_entry_quality": 0.80}
+        controlled_tm["market_regime"] = mr
+        # Keep account_feedback_rules at 0.70 to prove we're NOT using it
+        controlled_tm["account_feedback_rules"] = {
+            "enabled": True, "mode": "shadow", "lookback_hours": 24,
+            "affected_scope": "trigger_related_symbols",
+            "actions": {
+                "require_stronger_confirmation": {
+                    "enabled": True, "min_confidence": 0.80, "min_entry_quality": 0.70, "on_fail": "annotate_only",
+                }
+            },
+        }
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=controlled_tm,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                     return_value={"ok": True, "reasons": [], "metrics": {}}), \
+             _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # entry_quality=0.75 < market_regime's 0.80 → should be blocked
+        # even though account_feedback_rules has 0.70 which would allow it
+        self.assertFalse(result["ok"], f"Expected watch, got: {result}")
+        self.assertEqual(result["error"], "regime_gate_watch_only")
+        self.assertIn("require_stronger_confirmation", result.get("regime_downgrade_reason", ""))
+
+    def test_signal_confidence_fallback_to_signal_row(self) -> None:
+        """P2: legacy signal with ga_decision_json missing confidence uses signal.confidence."""
+        from unittest.mock import patch as _patch
+        from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_signal
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+        import plugins.crypto_guard.config.loader as loader
+
+        # No BTC/ETH → unclear → require_stronger_confirmation
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self._seed_symbol_candles("AVAXUSDT")
+
+        now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
+        now_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trade_plan = {
+            "side": "LONG", "entry_type": "trigger", "stop_loss": 95.0,
+            "take_profits": [{"price": 110.0}], "risk_percent": 0.5,
+            "invalid_condition": "below 95", "reason": "test",
+            "entry_price": 100.0,
+            "entry_confirmation_quality": 0.75,
+        }
+        ga_id = self.repo.create_ga_decision({
+            "symbol": "AVAXUSDT", "decision": "trade_plan_available",
+            "decision_type": "test", "signal_grade": "A", "confidence": 0.85,
+            "summary": "test", "market_bias": "bullish", "trend_stage": "middle",
+            "has_trade_plan": True, "trade_plan": trade_plan,
+            "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
+            "analysis_time": now_ms, "analysis_time_utc": now_iso,
+        })
+        # Legacy signal: ga_decision_json has NO confidence field
+        self.conn.execute(
+            "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("AVAXUSDT", 0.85, ga_id,
+             json.dumps(trade_plan, ensure_ascii=False),
+             json.dumps({"signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
+        )
+        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+
+        original_cfg = loader.load_config()
+        controlled_tm = dict(original_cfg.trading_mode)
+        mr = dict(controlled_tm.get("market_regime", {}))
+        mr["mode"] = "controlled"
+        controlled_tm["market_regime"] = mr
+        mock_cfg = CryptoGuardConfig(
+            trading_mode=controlled_tm,
+            symbols=original_cfg.symbols,
+            scheduler=original_cfg.scheduler,
+            strategies=original_cfg.strategies,
+            database_path=original_cfg.database_path,
+        )
+
+        with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
+                     return_value={"ok": True, "reasons": [], "metrics": {}}), \
+             _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
+             _patch("plugins.crypto_guard.config.loader.load_config", return_value=mock_cfg):
+            result = create_paper_order_from_signal(self.repo, signal_id)
+
+        # confidence=0.85 from signal row, entry_quality=0.75 >= 0.70 → should create order
+        self.assertTrue(result["ok"], f"Expected order created, got: {result}")
+        self.assertGreater(result.get("order_id", 0), 0)
 
 
 if __name__ == "__main__":

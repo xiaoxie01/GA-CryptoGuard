@@ -108,7 +108,7 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
         symbol=signal["symbol"],
         side=str(trade_plan.get("side", "")).upper(),
         signal_grade=str(decision.get("signal_grade", "D")).upper(),
-        confidence=float(decision.get("confidence") or 0),
+        confidence=_signal_decision_confidence(decision, signal),
         analysis_time_utc=signal_analysis_time,
         order_type=str(trade_plan.get("entry_type", "")),
         time_source=time_source,
@@ -176,7 +176,7 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
             # entry_quality is extracted from trade_plan via _extract_entry_quality.
             stronger_reason = _check_stronger_confirmation(
                 trade_plan, adjustments,
-                confidence=float(decision.get("confidence") or 0),
+                confidence=_signal_decision_confidence(decision, signal),
                 entry_quality=_extract_entry_quality(trade_plan),
             )
             if stronger_reason:
@@ -820,7 +820,10 @@ def _apply_regime_adjustments(
     if adjustments.get("require_stronger_confirmation"):
         from plugins.crypto_guard.config.loader import load_config
         cfg = load_config().trading_mode
-        stronger_cfg = (cfg.get("account_feedback_rules", {}).get("actions", {}).get("require_stronger_confirmation", {}))
+        market_regime_cfg = cfg.get("market_regime", {})
+        stronger_cfg = market_regime_cfg.get("require_stronger_confirmation")
+        if not isinstance(stronger_cfg, dict):
+            stronger_cfg = (cfg.get("account_feedback_rules", {}).get("actions", {}).get("require_stronger_confirmation", {}))
         config_min_conf = float(stronger_cfg.get("min_confidence", 0.80))
         config_min_quality = float(stronger_cfg.get("min_entry_quality", 0.70))
 
@@ -834,6 +837,17 @@ def _apply_regime_adjustments(
         plan["regime_effective_min_entry_quality"] = max(current_min_quality, config_min_quality)
 
     return plan
+
+
+def _signal_decision_confidence(decision: dict[str, Any], signal: dict[str, Any]) -> float:
+    """Read confidence from GA decision JSON with legacy signal fallback."""
+    value = decision.get("confidence")
+    if value is None or value == "":
+        value = signal.get("confidence")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _should_downgrade_to_watch_by_regime(

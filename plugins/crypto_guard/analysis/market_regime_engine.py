@@ -57,10 +57,16 @@ def score_market_regime(
 
     # 6. Symbol relative strength vs BTC
     symbol_rs = "neutral"
+    rs_info: dict[str, Any] = {"label": "neutral", "relative_return": 0.0, "short_term_relative_return": 0.0, "threshold": 0.0}
     if symbol not in LEADER_SYMBOLS:
         sym_1h = _load_candles(repo, symbol, "1h", analysis_time_utc, limit=30)
         sym_4h = _load_candles(repo, symbol, "4h", analysis_time_utc, limit=30)
-        symbol_rs = _relative_strength(sym_4h, btc_4h, sym_1h, btc_1h)
+        cfg = load_config().trading_mode
+        regime_cfg = cfg.get("market_regime", {})
+        independent_trend_cfg = regime_cfg.get("independent_trend", {})
+        min_rs_pct = float(independent_trend_cfg.get("min_relative_strength_pct", 1.0))
+        rs_info = _relative_strength(sym_4h, btc_4h, sym_1h, btc_1h, threshold_pct=min_rs_pct)
+        symbol_rs = rs_info["label"]
         if symbol_rs != "neutral":
             reasons.append(f"relative_strength={symbol_rs}")
 
@@ -76,31 +82,8 @@ def score_market_regime(
     )
     reasons.append(alignment_reason)
 
-    # 8. Adjustments
-    confidence_adjustment = 0.0
-    risk_multiplier = 1.0
-    require_stronger_confirmation = False
-
-    if regime_alignment == "counter_regime":
-        if market_phase in {"rebound", "risk_on"} and decision_side == "SHORT":
-            confidence_adjustment = -0.10
-            risk_multiplier = 0.75
-            require_stronger_confirmation = True
-            reasons.append("counter_regime: 反弹/risk_on阶段做空，降低信心并提高确认要求")
-        elif market_phase in {"selloff", "risk_off"} and decision_side == "LONG":
-            confidence_adjustment = -0.10
-            risk_multiplier = 0.75
-            require_stronger_confirmation = True
-            reasons.append("counter_regime: 抛售/risk_off阶段做多，降低信心并提高确认要求")
-    elif regime_alignment == "aligned":
-        confidence_adjustment = 0.05
-        reasons.append("regime_aligned: 方向与大盘阶段一致")
-    elif regime_alignment == "unclear":
-        confidence_adjustment = 0.0
-        require_stronger_confirmation = True
-        reasons.append("数据不足，不调整信心但提高确认要求")
-
     # 8. Weighted regime score from config weights
+    regime_weight = float(regime_cfg.get("weight", 0.25))
     btc_weight = float(regime_cfg.get("btc_weight", 0.10))
     eth_weight = float(regime_cfg.get("eth_weight", 0.05))
     breadth_weight = float(regime_cfg.get("breadth_weight", 0.05))
@@ -122,6 +105,33 @@ def score_market_regime(
         + breadth_score_scaled * breadth_weight
         + volatility_score * volatility_weight
     )
+    total_component_weight = max(0.0001, abs(btc_weight) + abs(eth_weight) + abs(breadth_weight) + abs(volatility_weight))
+    normalized_regime_score = max(-1.0, min(1.0, weighted_regime_score / total_component_weight))
+    max_confidence_adjustment = min(0.10, max(0.0, regime_weight * 0.20))
+
+    # 9. Adjustments. The top-level market_regime.weight controls the maximum
+    # confidence influence. With weight=0.25, max influence is +/-0.05.
+    confidence_adjustment = 0.0
+    risk_multiplier = 1.0
+    require_stronger_confirmation = False
+
+    if regime_alignment == "counter_regime":
+        confidence_adjustment = -max_confidence_adjustment
+        if market_phase in {"rebound", "risk_on"} and decision_side == "SHORT":
+            risk_multiplier = 0.75
+            require_stronger_confirmation = True
+            reasons.append("counter_regime: 反弹/risk_on阶段做空，降低信心并提高确认要求")
+        elif market_phase in {"selloff", "risk_off"} and decision_side == "LONG":
+            risk_multiplier = 0.75
+            require_stronger_confirmation = True
+            reasons.append("counter_regime: 抛售/risk_off阶段做多，降低信心并提高确认要求")
+    elif regime_alignment == "aligned":
+        confidence_adjustment = max(0.0, normalized_regime_score * max_confidence_adjustment)
+        reasons.append(f"regime_aligned: 方向与大盘阶段一致，confidence_adjustment={confidence_adjustment:+.3f}")
+    elif regime_alignment == "unclear":
+        confidence_adjustment = 0.0
+        require_stronger_confirmation = True
+        reasons.append("数据不足，不调整信心但提高确认要求")
 
     return {
         "module": "market_regime",
@@ -139,11 +149,19 @@ def score_market_regime(
         "reasons": reasons,
         "analysis_time_utc": analysis_time_utc,
         "regime_score": round(weighted_regime_score, 4),
+        "normalized_regime_score": round(normalized_regime_score, 4),
+        "market_regime_weight": regime_weight,
         "component_scores": {
             "btc_score": btc_score,
             "eth_score": eth_score,
             "breadth_score": round(breadth_score_scaled, 4),
             "volatility_score": volatility_score,
+            "relative_strength": {
+                "label": symbol_rs,
+                "relative_return": rs_info.get("relative_return", 0.0),
+                "short_term_relative_return": rs_info.get("short_term_relative_return", 0.0),
+                "threshold": rs_info.get("threshold", 0.0),
+            },
         },
         "component_weights": {
             "btc_weight": btc_weight,
@@ -400,23 +418,29 @@ def _relative_strength(
     btc_4h: list[dict[str, Any]],
     sym_1h: list[dict[str, Any]],
     btc_1h: list[dict[str, Any]],
-) -> str:
-    """Compare symbol performance vs BTC to classify relative strength."""
+    *,
+    threshold_pct: float = 1.0,
+) -> dict[str, Any]:
+    """Compare symbol performance vs BTC to classify relative strength.
+
+    Returns dict with label, relative_return, short_term_relative_return, threshold.
+    """
     if not sym_4h or not btc_4h:
-        return "neutral"
+        return {"label": "neutral", "relative_return": 0.0, "short_term_relative_return": 0.0, "threshold": 0.0}
 
     sym_closes = [float(c["close"]) for c in sym_4h]
     btc_closes = [float(c["close"]) for c in btc_4h]
 
     if not sym_closes or not btc_closes or sym_closes[0] == 0 or btc_closes[0] == 0:
-        return "neutral"
+        return {"label": "neutral", "relative_return": 0.0, "short_term_relative_return": 0.0, "threshold": 0.0}
 
     sym_return = (sym_closes[-1] - sym_closes[0]) / sym_closes[0]
     btc_return = (btc_closes[-1] - btc_closes[0]) / btc_closes[0]
     relative = sym_return - btc_return
+    threshold = max(0.0, float(threshold_pct)) / 100.0
 
     # Also check 1h for short-term divergence
-    sym_1h_confirmation = 0
+    sym_1h_confirmation = 0.0
     if sym_1h and btc_1h:
         s1 = [float(c["close"]) for c in sym_1h[-6:]]
         b1 = [float(c["close"]) for c in btc_1h[-6:]]
@@ -425,12 +449,18 @@ def _relative_strength(
             btc_1h_ret = (b1[-1] - b1[0]) / b1[0]
             sym_1h_confirmation = sym_1h_ret - btc_1h_ret
 
-    if relative > 0.01 and sym_1h_confirmation > 0:
-        return "strong"
-    elif relative < -0.01 and sym_1h_confirmation < 0:
-        return "weak"
-    else:
-        return "neutral"
+    label = "neutral"
+    if relative > threshold and sym_1h_confirmation > 0:
+        label = "strong"
+    elif relative < -threshold and sym_1h_confirmation < 0:
+        label = "weak"
+
+    return {
+        "label": label,
+        "relative_return": round(relative, 6),
+        "short_term_relative_return": round(sym_1h_confirmation, 6),
+        "threshold": round(threshold, 6),
+    }
 
 
 def _regime_alignment(

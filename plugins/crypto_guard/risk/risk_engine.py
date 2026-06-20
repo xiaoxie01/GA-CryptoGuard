@@ -426,6 +426,8 @@ def apply_regime_gate(
     alignment = regime.get("regime_alignment", "unclear")
     if alignment == "unclear":
         # Unclear data: require stronger confirmation, no penalty
+        regime_weight = float(regime.get("market_regime_weight", 0.25))
+        regime_score = float(regime.get("normalized_regime_score", 0.0))
         return {
             "ok": True,
             "regime_gate_applied": True,
@@ -437,6 +439,7 @@ def apply_regime_gate(
                 "effective_grade": signal_grade,
                 "original_grade": signal_grade,
                 "effective_confidence": confidence,
+                "original_confidence": confidence,
                 "confidence_penalty": 0.0,
                 "effective_risk_multiplier": 1.0,
                 "min_rr": 0.0,
@@ -447,10 +450,49 @@ def apply_regime_gate(
                 "btc_bias": regime.get("btc_bias"),
                 "eth_bias": regime.get("eth_bias"),
                 "reasons": regime.get("reasons", []),
+                "regime_score": regime_score,
+                "regime_weight": regime_weight,
+                "weighted_confidence_adjustment": 0.0,
+                "effective_confidence_after_regime": confidence,
             },
         }
 
     if alignment != "counter_regime":
+        confidence_adjustment = float(regime.get("confidence_adjustment") or 0.0)
+        regime_weight = float(regime.get("market_regime_weight", 0.25))
+        regime_score = float(regime.get("normalized_regime_score", 0.0))
+        weighted_confidence_adjustment = max(-0.10, min(0.05, regime_score * regime_weight))
+        if confidence_adjustment != 0.0:
+            effective_confidence = max(0.0, min(1.0, confidence + confidence_adjustment))
+            return {
+                "ok": True,
+                "regime_gate_applied": True,
+                "mode": regime_cfg.get("mode", "shadow"),
+                "market_regime": regime,
+                "adjustments": {
+                    "confidence_adjustment": confidence_adjustment,
+                    "risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
+                    "effective_grade": signal_grade,
+                    "original_grade": signal_grade,
+                    "effective_confidence": effective_confidence,
+                    "original_confidence": confidence,
+                    "confidence_penalty": 0.0,
+                    "effective_risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
+                    "min_rr": 0.0,
+                    "watch_only": False,
+                    "require_stronger_confirmation": False,
+                    "regime_alignment": alignment,
+                    "market_phase": regime.get("market_phase"),
+                    "btc_bias": regime.get("btc_bias"),
+                    "eth_bias": regime.get("eth_bias"),
+                    "reasons": regime.get("reasons", []),
+                    "regime_score": regime_score,
+                    "regime_weight": regime_weight,
+                    "weighted_confidence_adjustment": round(weighted_confidence_adjustment, 4),
+                    "effective_confidence_after_regime": round(effective_confidence, 4),
+                    "confidence_boost_reason": f"aligned regime: score={regime_score:+.3f} weight={regime_weight} capped_boost={weighted_confidence_adjustment:+.4f}",
+                },
+            }
         return {
             "ok": True,
             "regime_gate_applied": False,
@@ -459,6 +501,9 @@ def apply_regime_gate(
             "adjustments": {
                 "confidence_adjustment": regime.get("confidence_adjustment", 0.0),
                 "risk_multiplier": regime.get("suggested_risk_multiplier", 1.0),
+                "regime_score": regime_score,
+                "regime_weight": regime_weight,
+                "weighted_confidence_adjustment": round(weighted_confidence_adjustment, 4),
             },
         }
 
@@ -501,6 +546,7 @@ def apply_regime_gate(
         "effective_grade": effective_grade,
         "original_grade": signal_grade,
         "effective_confidence": effective_confidence,
+        "original_confidence": confidence,
         "confidence_penalty": confidence_penalty,
         "risk_multiplier": risk_mult,
         "effective_risk_multiplier": risk_mult,
@@ -512,6 +558,10 @@ def apply_regime_gate(
         "btc_bias": regime.get("btc_bias"),
         "eth_bias": regime.get("eth_bias"),
         "reasons": regime.get("reasons", []),
+        "regime_score": float(regime.get("normalized_regime_score", 0.0)),
+        "regime_weight": float(regime.get("market_regime_weight", 0.25)),
+        "weighted_confidence_adjustment": round(-confidence_penalty, 4),
+        "effective_confidence_after_regime": round(effective_confidence, 4),
     }
 
     return {
