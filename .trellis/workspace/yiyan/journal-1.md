@@ -607,3 +607,36 @@ Fixed 8 failing tests: _insert_closed_trade hours_ago→minutes_ago for time-rob
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: P1 round 2: 5 regime gate business-logic fixes
+
+**Date**: 2026-06-20
+**Task**: P1 round 2: 5 regime gate business-logic fixes
+**Branch**: `main`
+
+### Summary
+
+Fixed 5 P1 issues: missing data safety (unknown/unclear), daily review pattern preservation, trade review regime context from gate, controlled mode eligibility downgrade, lookahead time fix. Plus 7 check-found fixes. 224 tests passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3014ed1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

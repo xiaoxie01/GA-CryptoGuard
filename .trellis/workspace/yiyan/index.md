@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
+- **Total Sessions**: 19
 - **Last Active**: 2026-06-20
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~609 | Active |
+| `journal-1.md` | ~642 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-06-20 | P1 round 2: 5 regime gate business-logic fixes | `3014ed1` | `main` |
 | 18 | 2026-06-20 | Fix 8 failing tests + real DB migration | `375c0ce` | `main` |
 | 17 | 2026-06-20 | P0 market regime engine + 6 integration hotfixes | `8b4f293` | `main` |
 | 16 | 2026-06-16 | P0 feedback gate hotfix — 6 rounds of review, 182 tests, 7 defects closed | `6ab9dd3`, `fd5daad`, `c2f00ec`, `d37051c`, `eb7d7cb`, `cee0a1b`, `ef1d67e` | `main` |
