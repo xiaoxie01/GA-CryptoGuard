@@ -502,3 +502,75 @@ Implemented account feedback gate module, integrated into paper_broker (both ord
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: P0 feedback gate hotfix — 6 rounds of review, 182 tests, 7 defects closed
+
+**Date**: 2026-06-16
+**Task**: P0 feedback gate hotfix — 6 rounds of review, 182 tests, 7 defects closed
+**Branch**: `main`
+
+### Summary
+
+P0 反馈门禁热修复：7 个初始缺陷 + 5 轮审查共修复 16 P1 + 11 P2。核心变更：config 层级修正、gate 重写（paired symbol-side、entry_quality fail-closed、would_decide/controlled_projection）、broker 双入口受控执行、schema.sql 同步、migration 顺序修复、opportunity watcher recheck 确定性检查、报表 shadow/controlled 分离、dedupe_key + 唯一索引幂等。测试 145→182。真实库 2 个 stale shadow 运维残留待单独处理。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6ab9dd3` | (see git log) |
+| `fd5daad` | (see git log) |
+| `c2f00ec` | (see git log) |
+| `d37051c` | (see git log) |
+| `eb7d7cb` | (see git log) |
+| `cee0a1b` | (see git log) |
+| `ef1d67e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 17: P0 market regime engine + 6 integration hotfixes
+
+**Date**: 2026-06-20
+**Task**: P0 market regime engine + 6 integration hotfixes
+**Branch**: `main`
+
+### Summary
+
+Implemented market regime engine (score_market_regime, apply_regime_gate, 5 loss patterns, daily_reviewer regime feedback) and 6 P0 hotfixes: schema column, shadow/controlled mode, GA decision path wiring, controlled mode adjustments, trade review regime context, consecutive loss check. 219 tests passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8b4f293` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

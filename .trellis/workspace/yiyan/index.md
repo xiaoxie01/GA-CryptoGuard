@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 15
-- **Last Active**: 2026-06-05
+- **Total Sessions**: 17
+- **Last Active**: 2026-06-20
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~504 | Active |
+| `journal-1.md` | ~576 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,8 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-06-20 | P0 market regime engine + 6 integration hotfixes | `8b4f293` | `main` |
+| 16 | 2026-06-16 | P0 feedback gate hotfix — 6 rounds of review, 182 tests, 7 defects closed | `6ab9dd3`, `fd5daad`, `c2f00ec`, `d37051c`, `eb7d7cb`, `cee0a1b`, `ef1d67e` | `main` |
 | 15 | 2026-06-05 | Account feedback gate: shadow/annotate controlled execution | `ef5f3c4` | `main` |
 | 14 | 2026-06-05 | Account feedback rules dry-run fixes | `02d8a29` | `main` |
 | 13 | 2026-06-05 | Account-level feedback rules dry-run | `8f5673e` | `main` |
