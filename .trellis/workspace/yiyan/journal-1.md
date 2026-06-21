@@ -673,3 +673,40 @@ Fixed 5 P1 issues: missing data safety (unknown/unclear), daily review pattern p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 21: Session 21 - P1/P2 review closure: deterministic PnL, backtest gate, shadow hard gate, evolution evidence
+
+**Date**: 2026-06-21
+**Task**: Session 21 - P1/P2 review closure: deterministic PnL, backtest gate, shadow hard gate, evolution evidence
+**Branch**: `main`
+
+### Summary
+
+3 rounds of P1/P2 fixes: (1) Daily review deterministic PnL + backtest gate no-silent-failure + shadow real PnL gate + failure reflection win_rate=None + evolution trigger original/latest evidence. (2) sqlite3.Row.get crash fix + active baseline data quality gate + backtest exception rejection + PnL override replaces wrong line + strategy_name top-level compat. (3) Shadow verdict post-LLM hard gate priority chain: merge LLM with fallback, A->B->C->D priority prevents LLM override of data quality gates. 14 new tests, 279 passed. Also archived 06-20-p1-unclear-enforcement (P2 regime consistency fixes done).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4b148af` | (see git log) |
+| `9999bbf` | (see git log) |
+| `b24b552` | (see git log) |
+| `fa3a29e` | (see git log) |
+| `4f22e86` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
