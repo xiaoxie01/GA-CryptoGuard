@@ -62,17 +62,30 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
         raise ValueError(f"TradeReview schema 校验失败: {err}")
     review_id = repo.save_trade_review(trade_id, review)
     review_patch = review.get("strategy_patch_candidate") if isinstance(review.get("strategy_patch_candidate"), dict) else patch
+    # Derive strategy_name: from patch first, then from ga_decisions, then fallback
+    strategy_name = (
+        (review_patch or {}).get("strategy_name")
+        or _derive_strategy_name_from_trade(repo, trade)
+        or "paper_trade_sop"
+    )
+    if review_patch and not review_patch.get("strategy_name"):
+        review_patch["strategy_name"] = strategy_name
     patch_id = repo.save_strategy_patch_candidate(review_patch, {"trade_id": trade_id, "review_id": review_id}) if review_patch and review.get("evolution_trigger_allowed", True) else None
     if patch_id and review_patch:
         repo.save_strategy_version(
-            strategy_name=review_patch["strategy_name"],
+            strategy_name=review_patch.get("strategy_name", strategy_name),
             version=review_patch["candidate_version"],
             status="shadow_testing",
             config=review_patch.get("patch", {}),
             change_reason=review_patch.get("change_reason", "trade_review"),
         )
+        # Run backtest gate if patch has score_adjustments
+        candidate_patch_data = review_patch.get("patch", {})
+        if candidate_patch_data.get("score_adjustments"):
+            _run_backtest_for_candidate(repo, review_patch.get("strategy_name", strategy_name),
+                                         review_patch["candidate_version"], patch_id)
     repo.update_strategy_memory_from_review(
-        strategy_name=(review_patch or {}).get("strategy_name", "paper_trade_sop"),
+        strategy_name=strategy_name,
         condition_hash=f"{trade.get('symbol')}:{primary}",
         result=result,
         pnl_r=pnl_r,
@@ -280,3 +293,94 @@ def _bounded_efficiency(entry: float, stop: float, exit_price: float, side: Any)
     direction = 1 if side == "LONG" else -1
     value = ((exit_price - entry) * direction) / risk
     return max(0.0, min(1.0, (value + 1.0) / 2.0))
+
+
+def _derive_strategy_name_from_trade(repo: CryptoGuardRepository, trade: dict[str, Any]) -> str | None:
+    """Derive strategy_name from trade via paper_orders -> ga_decisions.raw_decision_json.
+
+    Returns None if the chain is broken — caller should fall back to a default.
+    """
+    order_id = trade.get("order_id")
+    if not order_id:
+        return None
+    try:
+        order = repo.conn.execute(
+            "SELECT ga_decision_id FROM paper_orders WHERE id=?",
+            (int(order_id),),
+        ).fetchone()
+    except Exception:
+        return None
+    if not order or not order["ga_decision_id"]:
+        return None
+    try:
+        gd = repo.conn.execute(
+            "SELECT raw_decision_json FROM ga_decisions WHERE id=?",
+            (int(order["ga_decision_id"]),),
+        ).fetchone()
+    except Exception:
+        return None
+    if not gd or not gd["raw_decision_json"]:
+        return None
+    try:
+        raw = json.loads(gd["raw_decision_json"])
+        # Try top-level first, then raw_legacy_decision
+        strategy_name = raw.get("strategy_name")
+        if not strategy_name:
+            legacy = raw.get("raw_legacy_decision") or {}
+            strategy_name = legacy.get("strategy_name")
+        return strategy_name
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _run_backtest_for_candidate(
+    repo: CryptoGuardRepository,
+    strategy_name: str,
+    candidate_version: str,
+    patch_id: int,
+) -> None:
+    """Run backtest gate for a trade-review candidate that has score_adjustments.
+
+    Saves backtest_result_json to strategy_patches. If backtest fails,
+    rejects the patch and strategy_version immediately.
+    """
+    import json
+    from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
+
+    try:
+        backtest_result = run_backtest_gate(
+            repo,
+            strategy_name=strategy_name,
+            candidate_version=candidate_version,
+        )
+    except Exception as exc:
+        backtest_result = {
+            "ok": False,
+            "passed": False,
+            "reason": "backtest_exception",
+            "error": str(exc),
+        }
+
+    repo.conn.execute(
+        "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
+        (json.dumps(backtest_result, ensure_ascii=False), patch_id),
+    )
+
+    # Reject on: (ok=false AND passed=false AND NOT skipped) OR (ok=true AND passed=false AND NOT skipped AND NOT gate_disabled)
+    skipped = backtest_result.get("skipped", False)
+    gate_disabled = backtest_result.get("gate_disabled", False)
+    backtest_failed = (
+        not backtest_result.get("passed")
+        and not skipped
+        and not gate_disabled
+    )
+    if backtest_failed:
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
+            (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, candidate_version),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_patches SET status='rejected' WHERE id=?",
+            (patch_id,),
+        )
+    repo.conn.commit()

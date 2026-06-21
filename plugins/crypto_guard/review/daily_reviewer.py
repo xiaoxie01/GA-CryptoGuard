@@ -52,6 +52,7 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
     all_window_trades = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=False)
     memory = repo.strategy_memory_top(limit=8)
     evolution = evaluate_evolution_triggers(repo)
+    paper_summary = _paper_summary(all_window_trades)
     fallback_summary = _summary(start, end, all_window_trades, reviewed, errors, memory)
     agent = run_agent_json_task(
         task_name="daily_paper_review_summary",
@@ -62,6 +63,7 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
             "errors": errors,
             "strategy_memory": memory,
             "evolution": evolution,
+            "paper_summary": paper_summary,
         },
         fallback={
             "summary_text": fallback_summary,
@@ -73,12 +75,17 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
             "总结昨日 UTC 模拟盘表现、亏损原因、策略表现和下一步 candidate/shadow 事项。",
             "输出 summary_text 字段，适合直接推送飞书。",
             "不要建议实盘交易。",
+            f"交易概览必须使用以下确定性数据：净 PnL={paper_summary['daily_pnl']:+.2f} USDT，"
+            f"胜={paper_summary['wins']}，负={paper_summary['losses']}，"
+            f"平仓={paper_summary['trades']}，avg_r={paper_summary['avg_r']:.2f}。",
         ],
     )
-    summary = str(agent.get("summary_text") or fallback_summary)
+    raw_summary_text = str(agent.get("summary_text") or fallback_summary)
+    # P1: Override LLM summary with deterministic paper_summary values.
+    # If LLM reports wrong PnL, we rewrite the trade overview section.
+    summary = _override_pnl_in_summary(raw_summary_text, paper_summary)
     skill_updates = _write_skill_memory_updates(repo, all_window_trades, reviewed, evolution)
     report_date = start[:10]
-    paper_summary = _paper_summary(all_window_trades)
     report_id = repo.save_daily_review_report(
         review_date=report_date,
         summary={
@@ -131,6 +138,8 @@ def _summary(
     memory: list[dict[str, Any]],
 ) -> str:
     pnl_rs = [float(t.get("pnl_r") or 0) for t in trades]
+    pnls = [float(t.get("pnl") or 0) for t in trades]
+    daily_pnl = sum(pnls)
     wins = len([x for x in pnl_rs if x > 0.05])
     losses = len([x for x in pnl_rs if x < -0.05])
     breakeven = len(pnl_rs) - wins - losses
@@ -143,6 +152,7 @@ def _summary(
         f"- 平仓交易：{len(trades)}",
         f"- 新增复盘：{len(reviewed)}",
         f"- 胜 / 负 / 平：{wins} / {losses} / {breakeven}",
+        f"- 净 PnL：{daily_pnl:+.2f} USDT",
         f"- 平均 R：{avg_r:.2f}",
     ]
 
@@ -195,6 +205,59 @@ def _paper_summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_r": sum(pnl_r) / len(pnl_r) if pnl_r else 0.0,
         "max_drawdown": min([float(t.get("max_adverse_excursion") or 0) for t in trades], default=0.0),
     }
+
+
+def _override_pnl_in_summary(summary_text: str, paper_summary: dict[str, Any]) -> str:
+    """Ensure the summary text uses deterministic paper_summary values for PnL.
+
+    If the LLM summary contains a trade overview section with potentially wrong
+    PnL numbers, replace the wrong line with the correct deterministic value.
+    If no PnL line is found at all, append a correction section.
+    """
+    import re
+
+    daily_pnl = paper_summary["daily_pnl"]
+    wins = paper_summary["wins"]
+    losses = paper_summary["losses"]
+    trades = paper_summary["trades"]
+    avg_r = paper_summary["avg_r"]
+
+    # Match the entire "净 PnL" line through the number.
+    # Captures: optional sign, optional $, digits.decimals, optional USDT.
+    # Formats: 净 PnL: -$26.92, 净 PnL：-26.92 USDT, 净 PnL: +26.92, etc.
+    pnl_line_pattern = re.compile(
+        r"(净\s*PnL[：:]\s*[+-]?\s*\$?\s*\d+\.?\d*\s*(?:USDT)?)"
+    )
+    # Also capture just the numeric value for comparison
+    pnl_value_pattern = re.compile(
+        r"净\s*PnL[：:]\s*([+-]?)\s*\$?\s*(\d+\.?\d*)"
+    )
+    match = pnl_value_pattern.search(summary_text)
+    if match:
+        try:
+            sign = match.group(1) or ""
+            digits = match.group(2)
+            reported_pnl = float(digits)
+            if "-" in sign:
+                reported_pnl = -reported_pnl
+            if abs(reported_pnl - daily_pnl) < 0.01:
+                return summary_text  # Already correct
+            # Wrong value — replace the entire line
+            correct_line = f"净 PnL：{daily_pnl:+.2f} USDT"
+            summary_text = pnl_line_pattern.sub(correct_line, summary_text)
+            return summary_text
+        except ValueError:
+            pass
+
+    # No PnL line found — append deterministic correction
+    correction = (
+        f"\n\n**确定性交易概览（paper_summary）：**\n"
+        f"- 平仓交易：{trades}\n"
+        f"- 胜 / 负：{wins} / {losses}\n"
+        f"- 净 PnL：{daily_pnl:+.2f} USDT\n"
+        f"- 平均 R：{avg_r:.2f}"
+    )
+    return summary_text + correction
 
 
 def _write_skill_memory_updates(
@@ -314,7 +377,11 @@ def _write_skill_memory_updates(
         })
 
     # If no losses, write a general observation
-    if not losses and trades:
+    # BUT: if there are unreviewed loss trades (review failures), do NOT write
+    # "no significant losses" — the losses just weren't reviewed yet.
+    trade_losses = [t for t in trades if float(t.get("pnl_r") or 0) < -0.05]
+    unreviewed_losses = len(trade_losses) - len(losses)
+    if not losses and not trade_losses:
         finding = "每日复盘：今日无显著亏损，保持当前 Skill 权重并继续观察。"
         for skill in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
             memory_id = repo.save_skill_feedback_memory(
@@ -323,6 +390,17 @@ def _write_skill_memory_updates(
                 source_type="daily_review",
                 finding=finding,
                 suggested_adjustment={"loss_count": 0, "evolution_triggered": False},
+            )
+            updates.append({"skill": skill, "memory_id": memory_id, "finding": finding})
+    elif not losses and unreviewed_losses > 0:
+        finding = f"每日复盘：{unreviewed_losses} 笔亏损交易因 review 错误未生成归因，仅记录观察。"
+        for skill in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
+            memory_id = repo.save_skill_feedback_memory(
+                skill_name=skill,
+                feedback_type="daily_review",
+                source_type="daily_review",
+                finding=finding,
+                suggested_adjustment={"loss_count": unreviewed_losses, "unreviewed": True, "evolution_triggered": False},
             )
             updates.append({"skill": skill, "memory_id": memory_id, "finding": finding})
     elif not trades:

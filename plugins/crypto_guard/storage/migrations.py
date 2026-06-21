@@ -323,6 +323,10 @@ def _apply_v2_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_evolution_triggers_status ON evolution_triggers(status, trigger_type, created_at)")
+    _add_column(conn, "evolution_triggers", "latest_trigger_value", "REAL")
+    _add_column(conn, "evolution_triggers", "latest_triggered_at", "TEXT")
+    _add_column(conn, "evolution_triggers", "original_related_trade_ids", "TEXT")
+    _add_column(conn, "evolution_triggers", "latest_related_trade_ids", "TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_review_reports (

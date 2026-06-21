@@ -1572,9 +1572,10 @@ class CryptoGuardRepository:
             """
             INSERT INTO evolution_triggers(
                 trigger_type, strategy_name, symbol, trigger_value, threshold_value, related_trade_ids,
+                original_related_trade_ids, latest_related_trade_ids,
                 market_regime, evolution_allowed, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trigger_type,
@@ -1582,6 +1583,8 @@ class CryptoGuardRepository:
                 symbol,
                 float(trigger_value),
                 float(threshold_value),
+                json.dumps(related_trade_ids or [], ensure_ascii=False),
+                json.dumps(related_trade_ids or [], ensure_ascii=False),
                 json.dumps(related_trade_ids or [], ensure_ascii=False),
                 market_regime,
                 1 if evolution_allowed else 0,

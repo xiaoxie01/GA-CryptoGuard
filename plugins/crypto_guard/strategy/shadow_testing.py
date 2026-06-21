@@ -111,6 +111,26 @@ def run_shadow_test(
                 "shadow_quality_alert: %s/%s has %d samples but all pseudo_r_from_score — real pnl_r required for promotion",
                 strategy_name, candidate_version, sample_count,
             )
+    elif candidate_stats.get("real_pnl_samples", 0) < effective_min_samples:
+        # P1: Verdict requires enough real PnL samples, not just total shadow evals
+        recommendation = "data_quality_insufficient"
+        status = "running"
+        shadow_quality_alert = sample_count >= effective_min_samples
+        if shadow_quality_alert:
+            LOGGER.warning(
+                "shadow_quality_alert: %s/%s has %d total samples but only %d real_pnl_samples < %d — real PnL required for verdict",
+                strategy_name, candidate_version, sample_count,
+                candidate_stats.get("real_pnl_samples", 0), effective_min_samples,
+            )
+    elif active_stats.get("data_source") != "real_pnl" or active_stats.get("win_rate") is None:
+        # P1: Cannot compare against pseudo-only or None-win_rate active baseline
+        recommendation = "data_quality_insufficient"
+        status = "running"
+        LOGGER.warning(
+            "shadow_verdict_blocked: %s/%s active baseline data_quality insufficient (source=%s, win_rate=%s)",
+            strategy_name, candidate_version,
+            active_stats.get("data_source"), active_stats.get("win_rate"),
+        )
     elif candidate_stats["avg_r"] > active_stats["avg_r"] and candidate_stats["win_rate"] >= active_stats["win_rate"] and candidate_stats["drawdown"] >= active_stats["drawdown"]:
         recommendation = "candidate_can_be_promoted_with_manual_confirmation"
         status = "passed"
@@ -124,6 +144,9 @@ def run_shadow_test(
         "candidate_version": candidate_version,
         "active_version": active_version,
         "sample_count": sample_count,
+        "total_shadow_samples": candidate_stats.get("total_shadow_samples", sample_count),
+        "real_pnl_samples": candidate_stats.get("real_pnl_samples", 0),
+        "pseudo_r_samples": candidate_stats.get("pseudo_r_samples", 0),
         "min_samples": effective_min_samples,
         "backtest_passed": backtest_status.get("passed", False),
         "active_stats": active_stats,
@@ -135,7 +158,7 @@ def run_shadow_test(
         "auto_promoted": False,
         "promotion_allowed": bool(allow_auto_promote),
     }
-    result = run_agent_json_task(
+    llm_result = run_agent_json_task(
         task_name="shadow_test_strategy_verdict",
         payload={
             "strategy_name": strategy_name,
@@ -154,12 +177,26 @@ def run_shadow_test(
             "必须保守处理过拟合风险；不能绕过人工确认或配置门禁。",
         ],
     )
+    result = {**fallback_result, **(llm_result or {})}
 
-    # P0: Hard gate — enforce pseudo-only block AFTER LLM verdict.
-    # LLM may return "candidate_can_be_promoted..." but we must not allow
-    # promotion based on pseudo-R data. Only apply when samples are sufficient
-    # (insufficient_samples takes priority — we haven't accumulated enough data yet).
-    if pseudo_only and sample_count >= effective_min_samples:
+    # P0: Hard gate — enforce sample count gate AFTER LLM verdict.
+    # LLM verdict cannot override these — they are non-negotiable.
+    real_pnl_samples = candidate_stats.get("real_pnl_samples", 0)
+    active_baseline_bad = (
+        active_stats.get("data_source") != "real_pnl"
+        or active_stats.get("win_rate") is None
+    )
+
+    if sample_count < effective_min_samples:
+        result["recommendation"] = "insufficient_samples"
+        result["status"] = "running"
+        result["hard_gate_applied"] = "insufficient_samples"
+        LOGGER.info(
+            "hard_gate: forced insufficient_samples for %s/%s (sample_count=%d < %d, LLM returned %s)",
+            strategy_name, candidate_version, sample_count, effective_min_samples,
+            result.get("recommendation"),
+        )
+    elif pseudo_only:
         result["recommendation"] = "data_quality_insufficient"
         result["status"] = "running"
         result["data_quality"] = candidate_data_source
@@ -168,6 +205,27 @@ def run_shadow_test(
         LOGGER.info(
             "hard_gate: forced data_quality_insufficient for %s/%s (pseudo_only, LLM returned %s)",
             strategy_name, candidate_version, result.get("recommendation"),
+        )
+    elif real_pnl_samples < effective_min_samples:
+        result["recommendation"] = "data_quality_insufficient"
+        result["status"] = "running"
+        result["data_quality"] = candidate_data_source
+        result["shadow_quality_alert"] = shadow_quality_alert
+        result["hard_gate_applied"] = "insufficient_real_pnl"
+        LOGGER.info(
+            "hard_gate: forced data_quality_insufficient for %s/%s (real_pnl=%d < %d, LLM returned %s)",
+            strategy_name, candidate_version, real_pnl_samples, effective_min_samples,
+            result.get("recommendation"),
+        )
+    elif active_baseline_bad:
+        result["recommendation"] = "data_quality_insufficient"
+        result["status"] = "running"
+        result["hard_gate_applied"] = "active_baseline_data_quality_insufficient"
+        LOGGER.info(
+            "hard_gate: forced data_quality_insufficient for %s/%s (active baseline bad: source=%s, win_rate=%s, LLM returned %s)",
+            strategy_name, candidate_version,
+            active_stats.get("data_source"), active_stats.get("win_rate"),
+            result.get("recommendation"),
         )
 
     result_id = repo.save_shadow_test_result(result)
@@ -669,12 +727,14 @@ def _write_failure_reflection(
 
     candidate_stats = shadow_result.get("candidate_stats") or {}
     avg_r = candidate_stats.get("avg_r", 0)
-    win_rate = candidate_stats.get("win_rate", 0)
+    win_rate = candidate_stats.get("win_rate")  # May be None for pseudo-only
     drawdown = candidate_stats.get("drawdown", 0)
     sample_count = shadow_result.get("sample_count", 0)
 
-    # Determine failure pattern
-    if avg_r < 0 and win_rate < 0.45:
+    # Determine failure pattern — handle win_rate=None gracefully
+    if win_rate is None:
+        pattern_type = "data_quality_insufficient"
+    elif avg_r < 0 and win_rate < 0.45:
         pattern_type = "low_win_rate_negative_r"
     elif avg_r < 0:
         pattern_type = "negative_avg_r"
@@ -690,24 +750,34 @@ def _write_failure_reflection(
         "SELECT DISTINCT symbol FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
         (strategy_name, candidate_version),
     ).fetchall()
-    affected_symbols = [r["symbol"] for r in rows if r.get("symbol")]
+    affected_symbols = [r["symbol"] for r in rows if r["symbol"]]
 
-    # Get affected sides from trade plans
-    sides = repo.conn.execute(
+    # Get affected sides from strategy evaluations evidence/counter_evidence/decision.
+    # strategy_evaluations does NOT have ga_decision_id — use decision column instead.
+    sides_rows = repo.conn.execute(
         """
-        SELECT DISTINCT json_extract(ga.decision_json, '$.trade_plan.side') as side
-        FROM strategy_evaluations se
-        JOIN ga_decisions ga ON se.ga_decision_id = ga.id
-        WHERE se.strategy_name=? AND se.strategy_version=? AND se.is_shadow=1
+        SELECT DISTINCT decision FROM strategy_evaluations
+        WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND decision IS NOT NULL
         """,
         (strategy_name, candidate_version),
     ).fetchall()
-    affected_sides = [r["side"] for r in sides if r.get("side")]
+    affected_sides: list[str] = []
+    for r in sides_rows:
+        decision = (r["decision"] or "").upper()
+        if "LONG" in decision:
+            affected_sides.append("LONG")
+        if "SHORT" in decision:
+            affected_sides.append("SHORT")
+    affected_sides = list(set(affected_sides))
 
-    # Build failure report
+    # Build failure report — handle win_rate=None in formatting
+    if win_rate is not None:
+        win_rate_str = f"{win_rate:.1%}"
+    else:
+        win_rate_str = "N/A (pseudo_only)"
     finding = (
         f"影子测试失败：{strategy_name}/{candidate_version} "
-        f"avg_r={avg_r:.3f}, win_rate={win_rate:.1%}, drawdown={drawdown:.1%}, "
+        f"avg_r={avg_r:.3f}, win_rate={win_rate_str}, drawdown={drawdown:.1%}, "
         f"samples={sample_count}"
     )
 
@@ -747,10 +817,17 @@ def _write_failure_reflection(
             suggested_adjustment=suggested_adjustment,
         )
 
-    LOGGER.info(
-        "shadow_failure_reflection: %s/%s pattern=%s avg_r=%.3f win_rate=%.1f%%",
-        strategy_name, candidate_version, pattern_type, avg_r, win_rate * 100,
-    )
+    # Log safely — don't multiply None by 100
+    if win_rate is not None:
+        LOGGER.info(
+            "shadow_failure_reflection: %s/%s pattern=%s avg_r=%.3f win_rate=%.1f%%",
+            strategy_name, candidate_version, pattern_type, avg_r, win_rate * 100,
+        )
+    else:
+        LOGGER.info(
+            "shadow_failure_reflection: %s/%s pattern=%s avg_r=%.3f win_rate=None (pseudo_only)",
+            strategy_name, candidate_version, pattern_type, avg_r,
+        )
 
     # Check rate-limiting for draft patch generation
     _maybe_generate_draft_patch(repo, strategy_name, candidate_version, pattern_type, shadow_result)
@@ -770,15 +847,15 @@ def _maybe_generate_draft_patch(
     from datetime import datetime, timezone, timedelta
 
     # Find original trigger
-    patch = repo.conn.execute(
+    patch_row = repo.conn.execute(
         "SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND strategy_name=?",
         (candidate_version, strategy_name),
     ).fetchone()
 
-    if not patch or not patch.get("trigger_id"):
+    if not patch_row or not patch_row["trigger_id"]:
         return
 
-    trigger_id = patch["trigger_id"]
+    trigger_id = patch_row["trigger_id"]
 
     # Count existing drafts for this trigger
     draft_count = repo.conn.execute(
@@ -796,7 +873,7 @@ def _maybe_generate_draft_patch(
         (trigger_id,),
     ).fetchone()
 
-    if last_draft and last_draft.get("created_at"):
+    if last_draft and last_draft["created_at"]:
         try:
             last_time = datetime.fromisoformat(last_draft["created_at"])
             if last_time.tzinfo is None:
@@ -820,11 +897,12 @@ def _maybe_generate_draft_patch(
     new_version = f"{candidate_version}.draft.{int(datetime.now(timezone.utc).timestamp())}"
     repo.conn.execute(
         """
-        INSERT INTO strategy_patches(strategy_name, candidate_version, patch_json, status, trigger_id, change_reason)
-        VALUES (?, ?, ?, 'draft', ?, ?)
+        INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id, reason)
+        VALUES (?, ?, ?, ?, 'draft', ?, ?)
         """,
         (
             strategy_name,
+            candidate_version,
             new_version,
             json.dumps(draft_patch, ensure_ascii=False),
             trigger_id,
@@ -880,13 +958,23 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     If real paper trade outcomes are available (via pnl_r column), use actual PnL.
     Otherwise fall back to score-based pseudo-R.
+
+    Returns real_pnl_samples, pseudo_r_samples, and total_shadow_samples
+    so displays can distinguish data quality.
     """
+    # Count by data source
+    real_pnl_samples = 0
+    pseudo_r_samples = 0
+
     # Try to get real trade outcomes from pnl_r column
     real_pnls = []
     for r in rows:
         pnl_r = r.get("pnl_r")
         if pnl_r is not None:
             real_pnls.append(float(pnl_r))
+            real_pnl_samples += 1
+        else:
+            pseudo_r_samples += 1
 
     if real_pnls:
         # Use real trade outcomes
@@ -902,6 +990,9 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             drawdown = min(drawdown, equity - peak)
         return {
             "sample_count": len(real_pnls),
+            "total_shadow_samples": len(rows),
+            "real_pnl_samples": real_pnl_samples,
+            "pseudo_r_samples": pseudo_r_samples,
             "avg_r": avg_r,
             "win_rate": win_rate,
             "drawdown": drawdown,
@@ -912,8 +1003,6 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scores = [float(r.get("score") or 0) for r in rows]
     pseudo_rs = [(score - 0.5) * 2 for score in scores]
     avg_r = sum(pseudo_rs) / len(pseudo_rs) if pseudo_rs else 0.0
-    wins = len([x for x in pseudo_rs if x > 0.1])
-    win_rate = wins / len(pseudo_rs) if pseudo_rs else 0.0
     equity = 0.0
     peak = 0.0
     drawdown = 0.0
@@ -923,8 +1012,12 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         drawdown = min(drawdown, equity - peak)
     return {
         "sample_count": len(rows),
+        "total_shadow_samples": len(rows),
+        "real_pnl_samples": 0,
+        "pseudo_r_samples": len(rows),
         "avg_r": avg_r,
-        "win_rate": win_rate,
+        "win_rate": None,   # NOT displayed for pseudo-only — misleading
         "drawdown": drawdown,
         "data_source": "pseudo_r_from_score",
+        "data_quality": "data_quality_insufficient",
     }

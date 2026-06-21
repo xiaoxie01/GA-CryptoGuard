@@ -168,6 +168,35 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
 
     if existing:
         existing_id = int(existing["id"])
+        # Update latest_related_trade_ids to reflect the LATEST triggering trades,
+        # and record latest_triggered_at. Preserve original_related_trade_ids.
+        new_related_trade_ids = json.dumps(trigger.get("related_trade_ids") or [])
+        from datetime import datetime, timezone as tz
+
+        # Check if original_related_trade_ids exists; if not, backfill from current related_trade_ids
+        existing_row = repo.conn.execute(
+            "SELECT original_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=?",
+            (existing_id,),
+        ).fetchone()
+        if existing_row and not existing_row["original_related_trade_ids"]:
+            # First reuse: freeze original from the existing related_trade_ids
+            original = existing_row["related_trade_ids"]
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET original_related_trade_ids=?, latest_related_trade_ids=?, related_trade_ids=?, latest_triggered_at=? WHERE id=?",
+                (original, new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
+            )
+        else:
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET latest_related_trade_ids=?, related_trade_ids=?, latest_triggered_at=? WHERE id=?",
+                (new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
+            )
+        # Also sync latest_trigger_value if the new trigger has it
+        if trigger.get("trigger_value") is not None:
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET latest_trigger_value=? WHERE id=?",
+                (float(trigger["trigger_value"]), existing_id),
+            )
+        repo.conn.commit()
         # Find the associated patch for this trigger
         existing_patch = repo.conn.execute(
             "SELECT id, candidate_version FROM strategy_patches WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
@@ -218,17 +247,25 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
 
     # Run backtest gate immediately after candidate creation
     from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
-    backtest_result = run_backtest_gate(
-        repo,
-        strategy_name=strategy_name,
-        candidate_version=candidate_version,
-    )
+    try:
+        backtest_result = run_backtest_gate(
+            repo,
+            strategy_name=strategy_name,
+            candidate_version=candidate_version,
+        )
+    except Exception as exc:
+        backtest_result = {
+            "ok": False,
+            "passed": False,
+            "reason": "backtest_exception",
+            "error": str(exc),
+        }
 
-    # If backtest truly fails (not skipped), reject the candidate immediately
+    # If backtest truly fails (not skipped, not gate_disabled), reject the candidate immediately
     backtest_failed = (
-        backtest_result.get("ok")
-        and not backtest_result.get("passed")
+        not backtest_result.get("passed")
         and not backtest_result.get("skipped")
+        and not backtest_result.get("gate_disabled")
     )
     if backtest_failed:
         repo.conn.execute(
@@ -250,6 +287,7 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
             "patch_id": patch_id,
             "status": "rejected",
             "reason": "backtest_gate_failed",
+            "candidate_version": candidate_version,
             "backtest_result": backtest_result,
             "trigger": trigger,
         }
