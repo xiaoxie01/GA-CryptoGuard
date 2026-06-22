@@ -165,6 +165,9 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
     # Pending order revalidation: multi-dimensional review (every 60 minutes, offset by 15)
     if minute == 15:
         jobs.append("pending_order_revalidation")
+    # Position conflict revalidation: every 10 minutes at minute % 10 == 5
+    if minute % 10 == 5:
+        jobs.append("position_conflict_revalidation")
     # Daily review: run between 00:05-00:30 UTC (wider window for crash recovery)
     # _tick_key ensures it only runs once per day
     if hour == 0 and 5 <= minute <= 30:
@@ -191,4 +194,6 @@ def _tick_key(job_name: str, now: datetime) -> int:
         return int(now.timestamp()) // (4 * 3600)
     if job_name == "update_paper_positions_3m":
         return int(now.timestamp()) // (3 * 60)
+    if job_name == "position_conflict_revalidation":
+        return int(now.timestamp()) // (10 * 60)
     return int(now.timestamp()) // 86400

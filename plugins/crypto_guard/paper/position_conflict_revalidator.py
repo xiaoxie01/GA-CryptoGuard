@@ -66,16 +66,26 @@ def run_position_conflict_revalidation(
         trade_symbol = str(trade["symbol"])
         pos_side = str(trade["side"] or "").upper()
 
-        # Get latest GA decision for this symbol
-        latest_decision = repo.conn.execute(
-            "SELECT * FROM ga_decisions WHERE symbol=? ORDER BY analysis_time_utc DESC LIMIT 1",
-            (trade_symbol,),
-        ).fetchone()
-        if not latest_decision:
+        # Get GA decision for this symbol — prefer the passed ga_decision_id
+        if ga_decision_id is not None:
+            latest_decision_row = repo.conn.execute(
+                "SELECT * FROM ga_decisions WHERE id=? AND symbol=?",
+                (ga_decision_id, trade_symbol),
+            ).fetchone()
+        else:
+            latest_decision_row = None
+
+        if latest_decision_row is None:
+            latest_decision_row = repo.conn.execute(
+                "SELECT * FROM ga_decisions WHERE symbol=? ORDER BY analysis_time_utc DESC LIMIT 1",
+                (trade_symbol,),
+            ).fetchone()
+
+        if not latest_decision_row:
             continue
 
         checked_count += 1
-        latest_decision = dict(latest_decision)
+        latest_decision = dict(latest_decision_row)
         bias = str(latest_decision.get("market_bias") or "neutral").lower()
         grade = str(latest_decision.get("signal_grade") or "D").upper()
         confidence = float(latest_decision.get("confidence") or 0)
@@ -126,10 +136,24 @@ def run_position_conflict_revalidation(
             strong_confirmations=strong_confirmations,
         ):
             action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price)
-            closed_count += 1
+            if action.get("status") == "executed":
+                closed_count += 1
+            elif action.get("status") in ("already_closed", "duplicate"):
+                pass  # Don't double count
+            elif action.get("status") == "no_change":
+                skipped_count += 1
+            elif action.get("status") == "marked":
+                # Early exit bounced to recheck (e.g. missing current_price)
+                recheck_count += 1
         elif _should_tighten_stop(trade, current_price, breakeven_mfe_r=breakeven_mfe_r):
             action = _execute_stop_tighten(repo, trade, latest_decision, ga_dec_id, current_price)
-            stop_adjusted_count += 1
+            if action.get("status") == "executed":
+                stop_adjusted_count += 1
+            elif action.get("status") == "duplicate":
+                pass  # Don't double count
+            else:
+                # no_change — route to skipped or its own category
+                skipped_count += 1
         else:
             action = _execute_recheck_mark(repo, trade, latest_decision, ga_dec_id, current_price)
             recheck_count += 1
@@ -207,7 +231,7 @@ def _count_consecutive_reverse_confirmations(
 
     rows = repo.conn.execute(
         """SELECT market_bias, signal_grade FROM ga_decisions
-           WHERE symbol=? AND analysis_time_utc >= ?
+           WHERE symbol=? AND datetime(analysis_time_utc) >= datetime(?)
            ORDER BY analysis_time_utc DESC""",
         (trade_symbol, created_at),
     ).fetchall()
@@ -273,7 +297,8 @@ def _get_current_price_for_trade(
 ) -> float | None:
     """Get the most recent current price for a trade's symbol.
 
-    Priority: paper_positions.current_price > klines_1h.close
+    Priority: paper_positions.current_price > recent klines_1h.close
+    Requires the price source to be fresh (within 15 min).
     """
     pos_row = repo.conn.execute(
         "SELECT current_price FROM paper_positions WHERE id=?",
@@ -282,12 +307,18 @@ def _get_current_price_for_trade(
     if pos_row and pos_row["current_price"] is not None:
         return float(pos_row["current_price"])
 
-    kline_row = repo.conn.execute(
-        "SELECT close FROM klines_1h WHERE symbol=? ORDER BY close_time DESC LIMIT 1",
-        (symbol,),
-    ).fetchone()
-    if kline_row and kline_row["close"] is not None:
-        return float(kline_row["close"])
+    # Priority 2: recent klines_1h close (must be within 15 min)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    freshness_cutoff_ms = now_ms - 15 * 60 * 1000  # 15 minutes ago
+    try:
+        kline_row = repo.conn.execute(
+            "SELECT close FROM klines_1h WHERE symbol=? AND close_time >= ? ORDER BY close_time DESC LIMIT 1",
+            (symbol, freshness_cutoff_ms),
+        ).fetchone()
+        if kline_row and kline_row["close"] is not None:
+            return float(kline_row["close"])
+    except Exception:
+        pass
 
     return None
 
@@ -408,7 +439,10 @@ def _execute_early_exit(
     quantity = float(trade.get("quantity") or 1)
 
     if current_price is None or current_price <= 0:
-        current_price = entry_price
+        return _execute_recheck_mark(
+            repo, trade, latest_decision, ga_decision_id, current_price,
+            reason="missing_current_price",
+        )
 
     # Compute PnL
     if pos_side == "LONG":
@@ -452,26 +486,32 @@ def _execute_early_exit(
         stop_take_path=stop_take_path,
     )
 
-    # Update paper_orders
+    # Backfill real PnL to shadow evaluations (side effect paper_broker does)
+    repo.backfill_shadow_evaluation_pnl_r(trade, pnl_r)
+
+    # Update paper_orders using proper repository method
     if order_id:
+        repo.update_paper_order_status(int(order_id), "closed", closed_at=now)
         repo.conn.execute(
-            """UPDATE paper_orders SET status='closed', closed_at=?,
-               cancel_reason=?, invalidated_by_ga_decision_id=?
-               WHERE id=?""",
-            (now, f"conflict_exit: GA#{ga_decision_id} direction conflict",
-             ga_decision_id, int(order_id)),
+            "UPDATE paper_orders SET cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
+            (f"conflict_exit: GA#{ga_decision_id} direction conflict", ga_decision_id, int(order_id)),
         )
 
-    # Update paper_positions
-    repo.conn.execute(
-        "UPDATE paper_positions SET status='closed', closed_at=? WHERE id=?",
-        (now, trade_id),
+    # Update paper_positions to closed using proper repository method
+    account = repo.ensure_paper_account()
+    repo.upsert_paper_position_from_trade(
+        account_id=int(account["id"]),
+        trade=trade,
+        status="closed",
+        current_price=current_price,
+        unrealized_pnl=0.0,
+        unrealized_pnl_pct=0.0,
     )
 
     # Record action
     _record_action(repo, dedupe_key, trade_id, trade_symbol)
 
-    # Log event
+    # Log conflict_exit event
     repo.log_paper_trade_event(
         event_type="conflict_exit",
         symbol=trade_symbol,
@@ -490,6 +530,47 @@ def _execute_early_exit(
             "pnl_r": round(pnl_r, 4),
             "close_reason": "conflict_exit",
             "dedupe_key": dedupe_key,
+        },
+    )
+
+    # Log standard close_position event (side effect paper_broker does)
+    repo.log_paper_trade_event(
+        position_id=trade_id,
+        event_type="close_position",
+        symbol=trade_symbol,
+        side=pos_side,
+        price=current_price,
+        quantity=quantity,
+        pnl=pnl,
+        pnl_pct=pnl_percent,
+        reason="conflict_exit",
+        event={"order_id": order_id, "trade_id": trade_id, "pnl_r": pnl_r},
+    )
+
+    # Enqueue trade_review job (side effect paper_broker does)
+    repo.enqueue_job("trade_review", 4, "position_conflict", f"system:review:{trade_id}", {"trade_id": trade_id})
+
+    # Enqueue paper_event_alert job (side effect paper_broker does)
+    repo.enqueue_job(
+        "paper_event_alert",
+        3,
+        "position_conflict",
+        f"system:paper:closed:{trade_id}",
+        {
+            "event_type": "close_position",
+            "symbol": trade_symbol,
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "exit_price": current_price,
+            "close_reason": "conflict_exit",
+            "pnl_r": pnl_r,
+            "side": pos_side,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profits": json.loads(trade.get("take_profit_json") or "[]") if trade.get("take_profit_json") else [],
+            "filled_at": trade.get("created_at"),
+            "quantity": quantity,
+            "order_type": trade.get("fill_method") or "market",
         },
     )
 
@@ -615,9 +696,7 @@ def _execute_stop_tighten(
             "status": "executed",
         }
 
-    # Stop already at or past breakeven
-    _record_action(repo, dedupe_key, trade_id, trade_symbol)
-
+    # Stop already at or past breakeven — no action taken, don't write ledger
     return {
         "action": "stop_adjusted",
         "trade_id": trade_id,
@@ -640,12 +719,14 @@ def _execute_recheck_mark(
     latest_decision: dict[str, Any],
     ga_decision_id: int,
     current_price: float | None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Mark trade as needing recheck — conflict exists but doesn't meet exit/tighten criteria."""
     trade_id = int(trade["id"])
     trade_symbol = str(trade["symbol"])
 
-    dedupe_key = f"position_conflict:{trade_id}:{ga_decision_id}:needs_position_recheck"
+    reason_suffix = f":{reason}" if reason else ""
+    dedupe_key = f"position_conflict:{trade_id}:{ga_decision_id}:needs_position_recheck{reason_suffix}"
     if _was_action_executed(repo, dedupe_key):
         return {
             "action": "needs_position_recheck", "trade_id": trade_id,
@@ -656,10 +737,30 @@ def _execute_recheck_mark(
     current_r = _compute_current_r_for_trade(trade, current_price)
     _record_action(repo, dedupe_key, trade_id, trade_symbol)
 
+    repo.log_paper_trade_event(
+        event_type="needs_position_recheck",
+        symbol=trade_symbol,
+        side=trade.get("side"),
+        price=current_price,
+        quantity=trade.get("quantity"),
+        reason=f"Position conflict recheck: GA#{ga_decision_id} {latest_decision.get('signal_grade')} {latest_decision.get('market_bias')} vs {trade.get('side')}",
+        position_id=trade_id,
+        event={
+            "trade_id": trade_id,
+            "ga_decision_id": ga_decision_id,
+            "current_r": round(current_r, 4) if current_r is not None else None,
+            "dedupe_key": dedupe_key,
+            "trigger": "position_conflict",
+            "reason": reason or "方向冲突但未满足提前退出或收紧止损条件，进入复核",
+        },
+    )
+    repo.conn.commit()
+
     LOGGER.info(
-        "needs_position_recheck: trade_id=%s symbol=%s side=%s grade=%s r=%.2f ga=%s",
+        "needs_position_recheck: trade_id=%s symbol=%s side=%s grade=%s r=%.2f ga=%s reason=%s",
         trade_id, trade_symbol, trade.get("side"),
         latest_decision.get("signal_grade"), current_r or 0, ga_decision_id,
+        reason or "方向冲突",
     )
 
     return {
@@ -671,7 +772,7 @@ def _execute_recheck_mark(
         "signal_grade": latest_decision.get("signal_grade"),
         "market_bias": latest_decision.get("market_bias"),
         "ga_decision_id": ga_decision_id,
-        "reason": "方向冲突但未满足提前退出或收紧止损条件，进入复核",
+        "reason": reason or "方向冲突但未满足提前退出或收紧止损条件，进入复核",
         "status": "marked",
     }
 
@@ -683,12 +784,6 @@ def _execute_recheck_mark(
 
 def _was_action_executed(repo: CryptoGuardRepository, dedupe_key: str) -> bool:
     """Check if an action was already executed by its dedupe key."""
-    row = repo.conn.execute(
-        "SELECT id FROM alert_outbox WHERE dedupe_key=? AND status='sent' LIMIT 1",
-        (dedupe_key,),
-    ).fetchone()
-    if row:
-        return True
     row = repo.conn.execute(
         "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
         (dedupe_key,),
@@ -704,15 +799,16 @@ def _record_action(
 ) -> None:
     """Record that an action was executed to prevent duplicates."""
     now = datetime.now(timezone.utc).isoformat()
-    repo.conn.execute(
-        """INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json,
-           status, dedupe_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "position_conflict_action", symbol, 4,
-            json.dumps({"trade_id": trade_id, "dedupe_key": dedupe_key, "recorded_at": now}),
-            "sent", dedupe_key, now, now,
-        ),
+    repo.log_paper_trade_event(
+        event_type="position_conflict_action",
+        symbol=symbol,
+        position_id=trade_id,
+        event={
+            "dedupe_key": dedupe_key,
+            "trade_id": trade_id,
+            "trigger": "position_conflict",
+            "recorded_at": now,
+        },
     )
 
 
@@ -778,8 +874,16 @@ def _notify_action(
     from plugins.crypto_guard.notify.hourly_report import resolve_report_target
 
     action_type = action.get("action", "")
-    if action_type == "skipped":
-        return {"ok": True, "sent": False, "queued": False, "reason": "skipped"}
+    status = action.get("status", "")
+
+    # Only notify on actual executed/marked actions
+    allowed = {
+        ("conflict_exit", "executed"),
+        ("stop_adjusted", "executed"),
+        ("needs_position_recheck", "marked"),
+    }
+    if (action_type, status) not in allowed:
+        return {"ok": True, "sent": False, "queued": False, "reason": f"not_notifiable:{action_type}:{status}"}
 
     symbol = action.get("symbol", "-")
     side = str(action.get("side") or "").upper()

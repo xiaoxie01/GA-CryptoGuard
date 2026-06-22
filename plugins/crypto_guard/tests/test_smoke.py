@@ -10314,6 +10314,363 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["conflict_count"], 0)
         self.assertEqual(result["skipped_count"], 1)
 
+    def test_position_conflict_stop_already_at_breakeven_no_change_not_counted(self):
+        """When stop is already at entry (breakeven), _execute_stop_tighten returns no_change
+        and stop_adjusted_count must NOT be incremented."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        # SHORT trade where stop_loss == entry_price (already at breakeven)
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 14.50, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 0.1, 0, 0, ?)",
+            (now_iso,),
+        )
+        # Current price below entry (floating profit) — triggers _should_tighten_stop
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 14.30, 1, 14.50, 'open')"
+        )
+        # S-grade bullish with high confidence — conflict with SHORT
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9081, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9081)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 1)
+        # Stop already at breakeven (14.50 == entry 14.50), so no_change — must NOT count
+        self.assertEqual(result["stop_adjusted_count"], 0)
+        # Should have been routed to skipped_count since action status is no_change
+        self.assertEqual(result["skipped_count"], 1)
+
+    def test_position_conflict_exit_writes_order_audit_fields(self):
+        """conflict_exit writes cancel_reason and invalidated_by_ga_decision_id to paper_orders."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+        )
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9081, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9081)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["closed_count"], 1)
+
+        # Verify trade closed
+        trade = self.repo.get_trade(9081)
+        self.assertEqual(trade["close_reason"], "conflict_exit")
+
+        # Verify order audit fields
+        order = self.conn.execute("SELECT * FROM paper_orders WHERE id=9081").fetchone()
+        self.assertEqual(order["status"], "closed")
+        self.assertEqual(order["invalidated_by_ga_decision_id"], 9081)
+        self.assertIn("conflict_exit", order["cancel_reason"] or "")
+
+    def test_position_conflict_missing_price_does_not_close(self):
+        """When current_price is unavailable, conflict_exit must NOT close the trade."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9091, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9091, 9091, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        # NO paper_positions row — so current_price will be None
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9091, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9091)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["closed_count"], 0)
+        self.assertGreaterEqual(result["recheck_count"], 1)
+
+        # Verify trade is NOT closed
+        trade = self.repo.get_trade(9091)
+        self.assertIsNone(trade["closed_at"])
+
+        # Verify order is still open
+        order = self.conn.execute("SELECT * FROM paper_orders WHERE id=9091").fetchone()
+        self.assertEqual(order["status"], "open")
+
+        # Verify paper_trade_logs has needs_position_recheck with missing_current_price
+        log = self.conn.execute(
+            "SELECT * FROM paper_trade_logs WHERE event_type='needs_position_recheck' AND position_id=9091 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log)
+        event_json = json.loads(log["event_json"])
+        self.assertIn("missing_current_price", event_json.get("reason", ""))
+
+    def test_position_conflict_uses_passed_ga_decision_id_not_latest(self):
+        """When ga_decision_id is passed, use it instead of the latest GA decision."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9101, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9101, 9101, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9101, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+        )
+        # Older GA decision: bullish S (conflicts with SHORT)
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9101, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S older', '{}')",
+            (now_iso,),
+        )
+        # Newer GA decision: bearish S (does NOT conflict with SHORT)
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9102, 'LINKUSDT', 2000000, ?, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
+            "'[]', '[]', '[]', '[]', '[]', 'bearish S newer', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        # Pass the OLDER conflicting GA decision id
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9101)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 1)
+        self.assertEqual(result["closed_count"], 1)
+
+        trade = self.repo.get_trade(9101)
+        self.assertEqual(trade["close_reason"], "conflict_exit")
+
+    def test_position_conflict_pre_open_ga_not_counted_as_consecutive_confirmation(self):
+        """GA decisions before trade open time should NOT count toward consecutive reverse confirmations."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Trade created at a specific time
+        trade_created = "2026-06-22T10:00:00+00:00"
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9111, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (trade_created,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9111, 9111, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.1, 0, 0, ?)",
+            (trade_created,),
+        )
+        # Current price at entry (no loss, no decay trigger)
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9111, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+        )
+        # GA decision BEFORE trade open: bullish S at 09:55
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9111, 'LINKUSDT', 1000000, '2026-06-22T09:55:00+00:00', 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S pre-open', '{}')",
+        )
+        # GA decision AFTER trade open: bullish S at 10:05
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9112, 'LINKUSDT', 2000000, '2026-06-22T10:05:00+00:00', 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S post-open', '{}')",
+        )
+        self.conn.commit()
+
+        # Run with strong_conflict_confirmations=2 — but only 1 post-open confirmation should count
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT")
+        self.assertTrue(result["ok"])
+        # Should NOT early exit (only 1 post-open confirmation, not 2)
+        self.assertEqual(result["closed_count"], 0)
+        # Should be stop_adjusted or recheck, not closed
+        self.assertGreaterEqual(result["stop_adjusted_count"] + result["recheck_count"], 1)
+
+    def test_service_manager_due_jobs_includes_position_conflict_revalidation(self):
+        """Verify scheduler includes position_conflict_revalidation and tick key works."""
+        from plugins.crypto_guard.service_manager import _due_scheduler_jobs, _tick_key
+        from datetime import datetime, timezone
+
+        # At minute 5, should include position_conflict_revalidation
+        t1 = datetime(2026, 6, 22, 10, 5, 0, tzinfo=timezone.utc)
+        jobs = _due_scheduler_jobs(t1)
+        self.assertIn("position_conflict_revalidation", jobs)
+
+        # At minute 15, should also include (15 % 10 == 5)
+        t2 = datetime(2026, 6, 22, 10, 15, 0, tzinfo=timezone.utc)
+        jobs2 = _due_scheduler_jobs(t2)
+        self.assertIn("position_conflict_revalidation", jobs2)
+
+        # At minute 0, should NOT include (0 % 10 != 5)
+        t3 = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
+        jobs3 = _due_scheduler_jobs(t3)
+        self.assertNotIn("position_conflict_revalidation", jobs3)
+
+        # Tick key: same 10-minute window should be same
+        tk1 = _tick_key("position_conflict_revalidation", t1)
+        tk2 = _tick_key("position_conflict_revalidation", datetime(2026, 6, 22, 10, 9, 59, tzinfo=timezone.utc))
+        self.assertEqual(tk1, tk2)
+
+        # Different 10-minute window should be different
+        tk3 = _tick_key("position_conflict_revalidation", datetime(2026, 6, 22, 10, 10, 0, tzinfo=timezone.utc))
+        self.assertNotEqual(tk1, tk3)
+
+    def test_position_conflict_exit_side_effects(self):
+        """conflict_exit must produce all expected side effects: logs, jobs, shadow PnL."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, ga_decision_id, created_at) "
+            "VALUES (9121, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, 9121, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9121, 9121, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9121, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+        )
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9121, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        # Update raw_decision_json to include strategy_name for shadow PnL backfill
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=? WHERE id=9121",
+            ('{"raw_legacy_decision": {"strategy_name": "test_strategy"}}',),
+        )
+        # Insert a shadow strategy_evaluation to verify PnL backfill
+        self.conn.execute(
+            "INSERT INTO strategy_evaluations(symbol, strategy_name, strategy_version, is_shadow, analysis_time, pnl_r) "
+            "VALUES ('LINKUSDT', 'test_strategy', 'v1', 1, 1000000, NULL)"
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9121)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["closed_count"], 1)
+
+        # Verify paper_trade_logs has close_position event
+        close_log = self.conn.execute(
+            "SELECT * FROM paper_trade_logs WHERE event_type='close_position' AND position_id=9121 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(close_log)
+
+        # Verify paper_trade_logs has conflict_exit event
+        conflict_log = self.conn.execute(
+            "SELECT * FROM paper_trade_logs WHERE event_type='conflict_exit' AND symbol='LINKUSDT' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(conflict_log)
+
+        # Verify paper_trade_logs has position_conflict_action event (dedup ledger)
+        action_log = self.conn.execute(
+            "SELECT * FROM paper_trade_logs WHERE event_type='position_conflict_action' AND position_id=9121 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(action_log)
+
+        # Verify agent_jobs has trade_review
+        review_job = self.conn.execute(
+            "SELECT * FROM agent_jobs WHERE job_type='trade_review' "
+            "AND session_id='system:review:9121' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(review_job)
+
+        # Verify agent_jobs has paper_event_alert with close_reason='conflict_exit'
+        alert_job = self.conn.execute(
+            "SELECT * FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "AND session_id='system:paper:closed:9121' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(alert_job)
+
+        # Verify shadow PnL was backfilled
+        eval_row = self.conn.execute(
+            "SELECT pnl_r FROM strategy_evaluations WHERE symbol='LINKUSDT' AND strategy_name='test_strategy' AND is_shadow=1"
+        ).fetchone()
+        self.assertIsNotNone(eval_row)
+        self.assertIsNotNone(eval_row["pnl_r"])
+
 
 if __name__ == "__main__":
     unittest.main()
