@@ -710,3 +710,36 @@ Fixed 5 P1 issues: missing data safety (unknown/unclear), daily review pattern p
 ### Next Steps
 
 - None - task complete
+
+
+## Session 22: Session 22 - Position conflict revalidator for open paper trades
+
+**Date**: 2026-06-22
+**Task**: Session 22 - Position conflict revalidator for open paper trades
+**Branch**: `main`
+
+### Summary
+
+New module paper/position_conflict_revalidator.py that turns passive position conflict alerts into auditable actions. Three-tier action model: (1) S-grade >= 0.85 with strong evidence → conflict_exit close, (2) A/B grade or S without exit criteria → tighten stop to breakeven if profitable, else needs_position_recheck, (3) neutral/mixed → skip. Deduplication by dedupe_key per trade+GA decision+action. Integrated in run_ga_workers.py (post-GA-analysis) and run_scheduler.py (periodic ~10min). Config section: position_conflict in trading_mode.yaml. 8 new tests, 281 total passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `84cb212` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
