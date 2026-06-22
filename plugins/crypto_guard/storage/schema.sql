@@ -319,7 +319,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     max_adverse_excursion REAL DEFAULT 0,
     status TEXT DEFAULT 'open',
     opened_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    closed_at TEXT
+    closed_at TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_paper_positions_account_status ON paper_positions(account_id, status, symbol);
 

@@ -297,19 +297,25 @@ def _get_current_price_for_trade(
 ) -> float | None:
     """Get the most recent current price for a trade's symbol.
 
-    Priority: paper_positions.current_price > recent klines_1h.close
+    Priority: paper_positions.current_price (if fresh) > recent klines_1h.close
     Requires the price source to be fresh (within 15 min).
     """
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    freshness_cutoff_ms = now_ms - 15 * 60 * 1000  # 15 minutes ago
+
+    # Priority 1: paper_positions.current_price (must be fresh within 15 min)
+    # Use SQLite strftime to handle format differences between CURRENT_TIMESTAMP
+    # ('YYYY-MM-DD HH:MM:SS') and ISO 8601 strings alike.
     pos_row = repo.conn.execute(
-        "SELECT current_price FROM paper_positions WHERE id=?",
-        (trade_id,),
+        """SELECT current_price, updated_at FROM paper_positions WHERE id=?
+           AND updated_at IS NOT NULL
+           AND CAST(strftime('%s', updated_at) AS INTEGER) >= ?""",
+        (trade_id, freshness_cutoff_ms // 1000),
     ).fetchone()
     if pos_row and pos_row["current_price"] is not None:
         return float(pos_row["current_price"])
 
     # Priority 2: recent klines_1h close (must be within 15 min)
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    freshness_cutoff_ms = now_ms - 15 * 60 * 1000  # 15 minutes ago
     try:
         kline_row = repo.conn.execute(
             "SELECT close FROM klines_1h WHERE symbol=? AND close_time >= ? ORDER BY close_time DESC LIMIT 1",

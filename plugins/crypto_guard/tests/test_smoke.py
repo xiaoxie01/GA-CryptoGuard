@@ -10009,7 +10009,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Paper position with current price showing loss
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9001, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9001, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # S-grade, bullish, high confidence GA decision
         self.conn.execute(
@@ -10055,7 +10056,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Current price ниже entry (浮盈), но нет signal_decay и нет большого убытка
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9011, 1, 'LINKUSDT', 'SHORT', 14.50, 14.40, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9011, 1, 'LINKUSDT', 'SHORT', 14.50, 14.40, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # S-grade bullish with high confidence
         self.conn.execute(
@@ -10097,7 +10099,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Current price below entry (floating profit)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9021, 1, 'ETHUSDT', 'SHORT', 3200.0, 3100.0, 1, 3300.0, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9021, 1, 'ETHUSDT', 'SHORT', 3200.0, 3100.0, 1, 3300.0, 'open', ?)",
+            (now_iso,),
         )
         # A-grade bearish with 0.80 confidence — conflicts with SHORT (bullish needed for SHORT conflict)
         # Wait — for SHORT, conflict = bullish. Let's use bullish A 0.80.
@@ -10144,7 +10147,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Current price at 91000 → R = (91000-100000)/5000 = -1.8
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9031, 1, 'BTCUSDT', 'LONG', 100000.0, 91000.0, 0.01, 95000.0, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9031, 1, 'BTCUSDT', 'LONG', 100000.0, 91000.0, 0.01, 95000.0, 'open', ?)",
+            (now_iso,),
         )
         # S-grade bearish with high confidence — conflict with LONG
         self.conn.execute(
@@ -10185,7 +10189,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9041, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9041, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # Neutral GA decision
         self.conn.execute(
@@ -10256,7 +10261,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9061, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9061, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
@@ -10295,7 +10301,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9071, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9071, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # S-grade but confidence only 0.82 (below 0.85 threshold)
         self.conn.execute(
@@ -10336,7 +10343,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Current price below entry (floating profit) — triggers _should_tighten_stop
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 14.30, 1, 14.50, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 14.30, 1, 14.50, 'open', ?)",
+            (now_iso,),
         )
         # S-grade bullish with high confidence — conflict with SHORT
         self.conn.execute(
@@ -10377,7 +10385,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
@@ -10472,7 +10481,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9101, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9101, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # Older GA decision: bullish S (conflicts with SHORT)
         self.conn.execute(
@@ -10525,7 +10535,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Current price at entry (no loss, no decay trigger)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9111, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9111, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         # GA decision BEFORE trade open: bullish S at 09:55
         self.conn.execute(
@@ -10582,6 +10593,62 @@ class PendingOrderManagerTest(unittest.TestCase):
         tk3 = _tick_key("position_conflict_revalidation", datetime(2026, 6, 22, 10, 10, 0, tzinfo=timezone.utc))
         self.assertNotEqual(tk1, tk3)
 
+    def test_position_conflict_stale_current_price_does_not_close(self):
+        """When paper_positions.current_price is stale (>15min), conflict_exit must NOT close."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        stale_iso = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9131, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9131, 9131, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        # Paper position with stale current_price (updated_at is 30 min ago)
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status, updated_at) "
+            "VALUES (9131, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (stale_iso,),
+        )
+        # S-grade bullish with high confidence + decay
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9131, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9131)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["closed_count"], 0)
+        self.assertGreaterEqual(result["recheck_count"], 1)
+
+        # Verify trade is NOT closed
+        trade = self.repo.get_trade(9131)
+        self.assertIsNone(trade["closed_at"])
+
+        # Verify order is still open
+        order = self.conn.execute("SELECT * FROM paper_orders WHERE id=9131").fetchone()
+        self.assertEqual(order["status"], "open")
+
+        # Verify paper_trade_logs has needs_position_recheck
+        log = self.conn.execute(
+            "SELECT * FROM paper_trade_logs WHERE event_type='needs_position_recheck' AND position_id=9131 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log)
+
     def test_position_conflict_exit_side_effects(self):
         """conflict_exit must produce all expected side effects: logs, jobs, shadow PnL."""
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
@@ -10601,7 +10668,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status) VALUES (9121, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+            "quantity, stop_loss, status, updated_at) VALUES (9121, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "

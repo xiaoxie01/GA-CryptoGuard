@@ -501,6 +501,7 @@ def _apply_daily_review_idempotency_migration(conn: sqlite3.Connection) -> None:
     The cleanup here soft-deduplicates historical duplicates so the data is
     tidy, but does not create a hard constraint.
     """
+    _add_column(conn, "paper_positions", "updated_at", "TEXT")
     _cleanup_agent_job_duplicates(conn)
     _cleanup_orphan_patches(conn)
     _cleanup_noisy_auto_analysis(conn)

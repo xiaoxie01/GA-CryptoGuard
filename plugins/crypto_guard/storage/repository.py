@@ -1362,7 +1362,8 @@ class CryptoGuardRepository:
                 UPDATE paper_positions
                 SET current_price=?, stop_loss=?, take_profit_json=?, unrealized_pnl=?, unrealized_pnl_pct=?,
                     max_favorable_excursion=?, max_adverse_excursion=?, status=?,
-                    closed_at=CASE WHEN ?!='open' THEN CURRENT_TIMESTAMP ELSE closed_at END
+                    closed_at=CASE WHEN ?!='open' THEN CURRENT_TIMESTAMP ELSE closed_at END,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (
@@ -1383,9 +1384,9 @@ class CryptoGuardRepository:
             """
             INSERT INTO paper_positions(
                 id, account_id, symbol, side, entry_price, current_price, quantity, stop_loss, take_profit_json,
-                unrealized_pnl, unrealized_pnl_pct, max_favorable_excursion, max_adverse_excursion, status
+                unrealized_pnl, unrealized_pnl_pct, max_favorable_excursion, max_adverse_excursion, status, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 position_id or None,
