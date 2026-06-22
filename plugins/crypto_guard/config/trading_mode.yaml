@@ -169,3 +169,16 @@ performance_gate:
       B: "C"
       C: "D"
       D: "D"
+
+position_conflict:
+  enabled: true
+  mode: controlled
+  min_confidence:
+    S: 0.85
+    A: 0.78
+    B: 0.72
+  strong_conflict_confirmations: 2
+  early_exit_min_adverse_r: -0.30
+  signal_decay_exit_threshold: 0.70
+  breakeven_on_conflict_if_mfe_r: 0.10
+  notify_actions: true

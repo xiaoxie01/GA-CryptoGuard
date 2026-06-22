@@ -3428,6 +3428,14 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.commit()
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+    def _seed_paper_data(self) -> None:
+        """Seed paper_accounts and other required data for position conflict tests."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+        )
+        self.conn.commit()
+
     def test_expire_pending_orders_ttl_expired(self) -> None:
         """P0: Orders older than TTL should be expired."""
         from plugins.crypto_guard.paper.pending_order_manager import expire_pending_orders
@@ -9978,6 +9986,333 @@ class PendingOrderManagerTest(unittest.TestCase):
         # confidence=0.85 from signal row, entry_quality=0.75 >= 0.70 → should create order
         self.assertTrue(result["ok"], f"Expected order created, got: {result}")
         self.assertGreater(result.get("order_id", 0), 0)
+
+    def test_position_conflict_short_s_high_confidence_with_decay_exits(self):
+        """SHORT open trade + bullish S 0.89 + signal_decay >= 0.70 → conflict_exit."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+        import json
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Create an open SHORT trade
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9001, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9001, 9001, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        # Paper position with current price showing loss
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9001, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+        )
+        # S-grade, bullish, high confidence GA decision
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9001, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9001)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["checked_count"], 1)
+        self.assertEqual(result["conflict_count"], 1)
+        self.assertEqual(result["closed_count"], 1)
+
+        # Verify trade was actually closed
+        trade = self.repo.get_trade(9001)
+        self.assertIsNotNone(trade["closed_at"])
+        self.assertEqual(trade["close_reason"], "conflict_exit")
+
+    def test_position_conflict_short_s_first_conflict_no_decay_no_loss_tightens_stop(self):
+        """SHORT open trade + bullish S 0.89 + first conflict, no decay, floating profit → stop tightened."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        # Open SHORT trade with NO signal decay and floating profit (current < entry)
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9011, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9011, 9011, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.1, 0, 0, ?)",
+            (now_iso,),
+        )
+        # Current price ниже entry (浮盈), но нет signal_decay и нет большого убытка
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9011, 1, 'LINKUSDT', 'SHORT', 14.50, 14.40, 1, 15.00, 'open')"
+        )
+        # S-grade bullish with high confidence
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9011, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9011)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 1)
+        # Floating profit triggers stop tighten, not recheck
+        self.assertEqual(result["stop_adjusted_count"], 1)
+        self.assertEqual(result["closed_count"], 0)
+
+    def test_position_conflict_short_a_grade_with_mfe_tightens_stop(self):
+        """SHORT open trade + bullish A 0.80 + has MFE → stop moved to breakeven (entry)."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        # Open SHORT trade in profit (current < entry), stop_loss still far
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9021, 'ETHUSDT', 'SHORT', 'market', 'open', 3200.0, 3300.0, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9021, 9021, 'ETHUSDT', 'SHORT', 3200.0, 3300.0, 1, 0.2, 100, 0, ?)",
+            (now_iso,),
+        )
+        # Current price below entry (floating profit)
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9021, 1, 'ETHUSDT', 'SHORT', 3200.0, 3100.0, 1, 3300.0, 'open')"
+        )
+        # A-grade bearish with 0.80 confidence — conflicts with SHORT (bullish needed for SHORT conflict)
+        # Wait — for SHORT, conflict = bullish. Let's use bullish A 0.80.
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9021, 'ETHUSDT', 1000000, ?, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish A', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="ETHUSDT", ga_decision_id=9021)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 1)
+        self.assertEqual(result["stop_adjusted_count"], 1)
+
+        # Verify stop was tightened
+        trade = self.repo.get_trade(9021)
+        # For SHORT in profit, stop should be min(old_stop=3300, entry=3200) = 3200
+        self.assertLessEqual(trade["stop_loss"], 3300.0)
+
+    def test_position_conflict_long_s_with_loss_exits(self):
+        """LONG open trade + bearish S 0.89 + running loss <= -0.30R → conflict_exit."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        # Open LONG trade in significant loss (current << entry)
+        # entry=100, stop=95, risk=5, current=91.5 → R = (91.5-100)/5 = -1.7
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9031, 'BTCUSDT', 'LONG', 'market', 'open', 100000.0, 95000.0, 0.01, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9031, 9031, 'BTCUSDT', 'LONG', 100000.0, 95000.0, 0.01, 0.3, 0, 5000, ?)",
+            (now_iso,),
+        )
+        # Current price at 91000 → R = (91000-100000)/5000 = -1.8
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9031, 1, 'BTCUSDT', 'LONG', 100000.0, 91000.0, 0.01, 95000.0, 'open')"
+        )
+        # S-grade bearish with high confidence — conflict with LONG
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9031, 'BTCUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
+            "'[]', '[]', '[]', '[]', '[]', 'bearish S', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="BTCUSDT", ga_decision_id=9031)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 1)
+        self.assertEqual(result["closed_count"], 1)
+
+        trade = self.repo.get_trade(9031)
+        self.assertIsNotNone(trade["closed_at"])
+        self.assertEqual(trade["close_reason"], "conflict_exit")
+
+    def test_position_conflict_neutral_no_action(self):
+        """Neutral bias does not trigger any conflict action."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9041, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9041, 9041, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9041, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+        )
+        # Neutral GA decision
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9041, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'B', 0.80, 'neutral', 'no_trade', "
+            "'[]', '[]', '[]', '[]', '[]', 'neutral', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 0)
+        self.assertEqual(result["skipped_count"], 1)
+
+    def test_position_conflict_pending_order_unaffected(self):
+        """Pending order conflict cancellation behavior is not affected by position conflict revalidator."""
+        from plugins.crypto_guard.paper.pending_order_manager import cancel_conflict_pending_orders
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        # Pending SHORT order
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9051, 'LINKUSDT', 'SHORT', 'limit', 'pending', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        # Bullish S GA decision
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9051, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        # Run both — pending cancel should still work
+        cancel_result = cancel_conflict_pending_orders(self.repo)
+        self.assertEqual(cancel_result["cancelled_count"], 1)
+
+        # Position revalidation should have no open trades to check
+        pos_result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT")
+        self.assertTrue(pos_result["ok"])
+        self.assertEqual(pos_result["checked_count"], 0)
+
+    def test_position_conflict_same_ga_decision_no_duplicate_action(self):
+        """Same trade + same GA decision re-run does not duplicate close/adjust/notify."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9061, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (9061, 9061, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.75, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9061, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open')"
+        )
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9061, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        # First run — should close
+        result1 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
+        self.assertEqual(result1["closed_count"], 1)
+
+        # Second run — trade is already closed, so checked_count=0 (not in open trades)
+        result2 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
+        self.assertEqual(result2["checked_count"], 0)
+        self.assertEqual(result2["conflict_count"], 0)
+
+    def test_position_conflict_confidence_below_threshold_skipped(self):
+        """Conflict exists but confidence below threshold → skipped."""
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_data()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9071, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (9071, 9071, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status) VALUES (9071, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open')"
+        )
+        # S-grade but confidence only 0.82 (below 0.85 threshold)
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
+            "VALUES (9071, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.82, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S low conf', '{}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9071)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conflict_count"], 0)
+        self.assertEqual(result["skipped_count"], 1)
 
 
 if __name__ == "__main__":

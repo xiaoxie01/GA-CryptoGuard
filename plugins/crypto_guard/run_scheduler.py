@@ -174,6 +174,25 @@ def run_job(job_name: str) -> dict:
             )
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
+        if job_name == "position_conflict_revalidation":
+            scheduled_time = (now // (10 * 60 * 1000)) * (10 * 60 * 1000)
+            result = run_scheduled_job(
+                repo,
+                job_name=job_name,
+                scheduled_time=scheduled_time,
+                task_fn=lambda: {
+                    "ok": True,
+                    "queued": repo.enqueue_job_once(
+                        "position_conflict_revalidation",
+                        4,
+                        "scheduler",
+                        f"system:scheduled:position_conflict:{scheduled_time}",
+                        {"scheduled_time": scheduled_time},
+                    ),
+                },
+            )
+            LOGGER.info("run_job done job=%s result=%s", job_name, result)
+            return result
         raise ValueError(f"未知 scheduler job: {job_name}")
     finally:
         conn.close()

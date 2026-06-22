@@ -111,49 +111,24 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                 LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
                 auto_order = {"ok": False, "error": str(exc)}
 
-        # Position-aware analysis: check if new analysis conflicts with open position
-        open_trades = repo.list_open_paper_trades()
-        symbol_trades = [t for t in open_trades if t.get("symbol") == decision.get("symbol")]
-        if symbol_trades and send_message:
-            _pos_target = resolve_report_target(repo, payload)
-            if _pos_target:
-                for trade in symbol_trades:
-                    pos_side = str(trade.get("side") or "").upper()
-                    new_bias = str(decision.get("market_bias") or "neutral").lower()
-                    pos_cn = {"LONG": "做多", "SHORT": "做空"}.get(pos_side, pos_side)
-                    bias_cn = {
-                        "bullish": "偏多（bullish）",
-                        "bearish": "偏空（bearish）",
-                        "neutral": "中性（neutral）",
-                        "mixed": "多空混合（mixed）",
-                    }.get(new_bias, new_bias)
-                    # Direction conflict: open LONG but analysis says bearish, or vice versa
-                    if (pos_side == "LONG" and new_bias == "bearish") or (pos_side == "SHORT" and new_bias == "bullish"):
-                        summary = decision.get("summary") or ""
-                        from datetime import datetime, timezone, timedelta
-                        now_utc8 = datetime.now(timezone(timedelta(hours=8)))
-                        conflict_text = "\n".join([
-                            f"**CryptoGuard 持仓方向冲突提醒**",
-                            "",
-                            f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)",
-                            f"- 产品：{decision.get('symbol')}",
-                            f"- 当前持仓：{pos_cn}（入场价 {trade.get('entry_price')}）",
-                            f"- 最新研判：{bias_cn}",
-                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
-                            f"- 研判摘要：{summary}" if summary else "",
-                            f"- 建议：关注是否需要提前平仓或调整止损",
-                            "",
-                            "不构成实盘建议，仅用于模拟盘与策略研究。",
-                        ])
-                        send_markdown_alert(
-                            repo, send_message,
-                            receive_id=_pos_target["receive_id"],
-                            receive_id_type=_pos_target.get("receive_id_type", "chat_id"),
-                            text=conflict_text,
-                            alert_type="risk_alert",
-                            symbol=decision.get("symbol"),
-                            priority=3,
-                        )
+        # Position-aware analysis: revalidate open positions when GA decision conflicts
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+        _pos_result = run_position_conflict_revalidation(
+            repo,
+            symbol=decision.get("symbol"),
+            ga_decision_id=ga_decision_id,
+            send_message=send_message,
+        )
+        if _pos_result.get("conflict_count"):
+            LOGGER.info(
+                "position_conflict_revalidation: symbol=%s checked=%s conflicts=%s closed=%s stop_adjusted=%s recheck=%s",
+                decision.get("symbol"),
+                _pos_result.get("checked_count"),
+                _pos_result.get("conflict_count"),
+                _pos_result.get("closed_count"),
+                _pos_result.get("stop_adjusted_count"),
+                _pos_result.get("recheck_count"),
+            )
 
         # v2: scheduled analysis is recorded into analysis_states/signals and summarized hourly.
         # Real-time Feishu alerts are reserved for paper/risk/opportunity events.
@@ -278,6 +253,15 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         from plugins.crypto_guard.paper.pending_revalidator import revalidate_pending_orders
         result = revalidate_pending_orders(repo, send_message=send_message)
         LOGGER.info("process_job done id=%s type=%s ok=%s reviewed=%s actions=%s", job.get("id"), job_type, result.get("ok"), result.get("reviewed_count"), result.get("actions_count"))
+        return result
+    if job_type == "position_conflict_revalidation":
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+        result = run_position_conflict_revalidation(repo, send_message=send_message)
+        LOGGER.info("process_job done id=%s type=%s ok=%s checked=%s conflicts=%s closed=%s stop_adjusted=%s recheck=%s",
+                    job.get("id"), job_type, result.get("ok"),
+                    result.get("checked_count"), result.get("conflict_count"),
+                    result.get("closed_count"), result.get("stop_adjusted_count"),
+                    result.get("recheck_count"))
         return result
     return {"ok": False, "error": f"未知 job_type: {job_type}"}
 
@@ -501,6 +485,7 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         "stop_loss": "止损",
         "timeout": "超时平仓",
         "manual": "手动平仓",
+        "conflict_exit": "方向冲突提前退出",
     }.get(payload.get("close_reason"), payload.get("close_reason") or "")
 
     # Calculate USDT P&L from R-multiple
