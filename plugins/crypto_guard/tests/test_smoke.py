@@ -5194,6 +5194,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["missing_columns"]), 0)
         self.assertIn("skill_feedback_memory", result["tables_checked"])
+        self.assertIn("paper_positions", result["tables_checked"])
 
     # =========================================================================
     # P2-Bugfix: State Diagnostics - Active Patch + Deprecated Version

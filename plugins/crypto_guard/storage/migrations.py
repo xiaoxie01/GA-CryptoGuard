@@ -921,6 +921,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
         "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json"],
         "opportunity_watches": ["dedupe_key"],
+        "paper_positions": ["updated_at"],
     }
 
     # Required indexes
