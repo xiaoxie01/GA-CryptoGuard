@@ -6,7 +6,7 @@ from typing import Any
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 
-def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[str, Any] | None = None, report_only: bool = False) -> dict[str, Any]:
     snapshot = snapshot or {}
     actions: list[dict[str, Any]] = []
 
@@ -15,6 +15,21 @@ def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[s
 
     # P1: 软清理历史重复补丁
     duplicates_cleaned = repo.mark_duplicate_patches_rejected()
+
+    # In report_only mode, only return current state — don't create new triggers/patches/backtests
+    if report_only:
+        existing_triggers = repo.conn.execute(
+            "SELECT * FROM evolution_triggers WHERE status IN ('pending','shadow_testing','review_required') ORDER BY latest_triggered_at DESC LIMIT 20"
+        ).fetchall()
+        return {
+            "ok": True,
+            "triggered": False,
+            "actions": [],
+            "cleaned_stale": cleaned,
+            "cleaned_duplicates": duplicates_cleaned,
+            "report_only": True,
+            "existing_triggers": [dict(r) for r in existing_triggers],
+        }
 
     stop_loss_trigger = _consecutive_stop_losses(repo)
     if stop_loss_trigger:
