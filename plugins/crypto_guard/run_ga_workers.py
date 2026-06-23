@@ -470,7 +470,7 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         "take_profit_hit": "止盈触发",
         "stop_loss_hit": "止损触发",
         "stop_loss_adjustment": "止损调整",
-        "close_position": "手动平仓",
+        "close_position": "平仓",
         "risk_alert": "风险提醒",
         "opportunity_triggered": "机会触发",
     }.get(event_type, event_type)
@@ -487,6 +487,10 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         "manual": "手动平仓",
         "conflict_exit": "方向冲突提前退出",
     }.get(payload.get("close_reason"), payload.get("close_reason") or "")
+    if event_type == "close_position" and payload.get("close_reason") == "conflict_exit":
+        event_cn = "提前退出"
+    elif event_type == "close_position" and payload.get("close_reason") == "manual":
+        event_cn = "手动平仓"
 
     # Calculate USDT P&L from R-multiple
     pnl_r = payload.get("pnl_r")
@@ -509,10 +513,26 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
 
     # Build event-specific details
     detail_lines = []
-    # Add UTC+8 timestamp
     from datetime import datetime, timezone, timedelta
-    now_utc8 = datetime.now(timezone(timedelta(hours=8)))
-    detail_lines.append(f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)")
+    utc8 = timezone(timedelta(hours=8))
+
+    def _fmt_utc8(value: Any) -> str | None:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(utc8).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return None
+
+    event_time = payload.get("event_time") or payload.get("closed_at")
+    if event_type == "paper_order_filled":
+        event_time = event_time or payload.get("filled_at")
+    now_utc8 = datetime.now(utc8)
+    event_time_text = _fmt_utc8(event_time) or now_utc8.strftime("%Y-%m-%d %H:%M")
+    detail_lines.append(f"- 时间：{event_time_text} (UTC+8)")
     if event_type == "stop_loss_adjustment":
         new_stop = payload.get("new_stop_loss")
         adj_reason = payload.get("reason", "")
@@ -529,13 +549,10 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
             detail_lines.append(f"- 入场价：{float(entry_price):.4f}")
         filled_at = payload.get("filled_at")
         if filled_at:
-            try:
-                # filled_at is UTC ISO string, convert to UTC+8 for display
-                from datetime import datetime as _dt
-                filled_dt = _dt.fromisoformat(str(filled_at).replace("Z", "+00:00"))
-                filled_cn = filled_dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+            filled_cn = _fmt_utc8(filled_at)
+            if filled_cn:
                 detail_lines.append(f"- 入场时间：{filled_cn} (UTC+8)")
-            except Exception:
+            else:
                 detail_lines.append(f"- 入场时间：{filled_at}")
         # TP/SL prices
         stop_loss = payload.get("stop_loss")

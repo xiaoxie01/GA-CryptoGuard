@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
 from plugins.crypto_guard.review.trade_reviewer import review_trade
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+LOGGER = get_logger("crypto_guard.daily_reviewer")
 
 
 def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None, force: bool = False) -> dict[str, Any]:
@@ -40,27 +44,43 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
             (f"每日复盘：%{report_date}%",),
         )
 
-    trades = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=True)
-    reviewed: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    for trade in trades:
-        try:
-            reviewed.append(review_trade(repo, int(trade["id"])))
-        except Exception as exc:
-            errors.append({"trade_id": trade.get("id"), "error": str(exc)})
+    # Fix 1: Get ALL closed trades in window (not just unreviewed)
+    all_closed = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=False)
+    all_review_items: list[dict[str, Any]] = []
+    new_reviews = 0
+    failed_review_trade_ids: list[int] = []
+    for trade in all_closed:
+        existing_review = repo.get_trade_review_by_trade(trade["id"])
+        if existing_review:
+            all_review_items.append({"trade": trade, "review": dict(existing_review), "is_new": False})
+        else:
+            try:
+                review_result = review_trade(repo, int(trade["id"]))
+                if review_result.get("ok"):
+                    new_review = repo.get_trade_review_by_trade(trade["id"])
+                    if new_review:
+                        all_review_items.append({"trade": trade, "review": dict(new_review), "is_new": True})
+                        new_reviews += 1
+                    else:
+                        failed_review_trade_ids.append(trade["id"])
+                else:
+                    failed_review_trade_ids.append(trade["id"])
+            except Exception:
+                LOGGER.exception("review_trade failed for trade_id=%s", trade["id"])
+                failed_review_trade_ids.append(trade["id"])
 
-    all_window_trades = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=False)
+    all_window_trades = [item["trade"] for item in all_review_items]
     memory = repo.strategy_memory_top(limit=8)
     evolution = evaluate_evolution_triggers(repo)
     paper_summary = _paper_summary(all_window_trades)
-    fallback_summary = _summary(start, end, all_window_trades, reviewed, errors, memory)
+    fallback_summary = _summary(start, end, all_window_trades, all_review_items, failed_review_trade_ids, memory)
     agent = run_agent_json_task(
         task_name="daily_paper_review_summary",
         payload={
             "window": {"start_utc": start, "end_utc": end},
             "trades": all_window_trades[:50],
-            "new_reviews": reviewed[:50],
-            "errors": errors,
+            "new_reviews": [item for item in all_review_items if item["is_new"]][:50],
+            "errors": [{"trade_id": tid, "error": "review failed"} for tid in failed_review_trade_ids],
             "strategy_memory": memory,
             "evolution": evolution,
             "paper_summary": paper_summary,
@@ -81,34 +101,43 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
         ],
     )
     raw_summary_text = str(agent.get("summary_text") or fallback_summary)
-    # P1: Override LLM summary with deterministic paper_summary values.
-    # If LLM reports wrong PnL, we rewrite the trade overview section.
-    summary = _override_pnl_in_summary(raw_summary_text, paper_summary)
-    skill_updates = _write_skill_memory_updates(repo, all_window_trades, reviewed, evolution)
+    # Fix 3: Enforce deterministic overview stats in report text
+    summary = _enforce_deterministic_overview(raw_summary_text, all_review_items)
+    # Fix 2 & 4: Write skill memory updates with proper tracking
+    skill_updates = _write_skill_memory_updates(repo, all_window_trades, all_review_items, failed_review_trade_ids, evolution)
+    # Fix 5: Build deterministic evolution status
+    evo_status = _evolution_status_for_report(repo, all_window_trades)
+    # Fix 6: Strategy performance by real names
+    strategy_perf = _strategy_performance_summary(repo, all_review_items)
+    # Fix 7: UTC+8 window display
+    window_display = _window_display_text(start, end)
     report_date = start[:10]
     report_id = repo.save_daily_review_report(
         review_date=report_date,
         summary={
             "date_utc": report_date,
             "paper_summary": paper_summary,
-            "win_analysis": [r for r in reviewed if (r.get("review") or {}).get("result") == "win"],
-            "loss_analysis": [r for r in reviewed if (r.get("review") or {}).get("result") == "loss"],
+            "win_analysis": [item for item in all_review_items if (item["review"].get("pnl_r") or 0) > 0],
+            "loss_analysis": _build_loss_analysis(all_review_items),
             "analysis_failures": agent.get("analysis_failures", []),
             "next_focus_points": agent.get("risk_focus", []),
             "skill_memory_updates": skill_updates,
             "evolution": evolution,
+            "evo_status": evo_status,
+            "strategy_performance": strategy_perf,
+            "window_display": window_display,
         },
         ga_report=summary,
         skill_updates=skill_updates,
         evolution_actions=evolution,
     )
     return {
-        "ok": not errors,
+        "ok": not failed_review_trade_ids,
         "day_start_utc": start,
         "day_end_utc": end,
         "closed_trades": len(all_window_trades),
-        "new_reviews": len(reviewed),
-        "errors": errors,
+        "new_reviews": new_reviews,
+        "errors": [{"trade_id": tid, "error": "review failed"} for tid in failed_review_trade_ids],
         "strategy_memory": memory,
         "daily_review_report_id": report_id,
         "skill_memory_updates": skill_updates,
@@ -133,8 +162,8 @@ def _summary(
     start: str,
     end: str,
     trades: list[dict[str, Any]],
-    reviewed: list[dict[str, Any]],
-    errors: list[dict[str, Any]],
+    review_items: list[dict[str, Any]],
+    failed_ids: list[int],
     memory: list[dict[str, Any]],
 ) -> str:
     pnl_rs = [float(t.get("pnl_r") or 0) for t in trades]
@@ -150,7 +179,7 @@ def _summary(
         "",
         "**交易概览：**",
         f"- 平仓交易：{len(trades)}",
-        f"- 新增复盘：{len(reviewed)}",
+        f"- 新增复盘：{sum(1 for item in review_items if item['is_new'])}",
         f"- 胜 / 负 / 平：{wins} / {losses} / {breakeven}",
         f"- 净 PnL：{daily_pnl:+.2f} USDT",
         f"- 平均 R：{avg_r:.2f}",
@@ -165,10 +194,10 @@ def _summary(
                 f"R={float(trade.get('pnl_r') or 0):.2f} reason={trade.get('close_reason') or '-'}"
             )
 
-    if reviewed:
+    if review_items:
         lines.append("")
-        lines.append("**新增归因：**")
-        for item in reviewed[:20]:
+        lines.append("**归因：**")
+        for item in review_items[:20]:
             review = item.get("review", {})
             lines.append(f"- trade #{review.get('trade_id')}：{review.get('primary_reason')}，{review.get('summary')}")
 
@@ -181,11 +210,11 @@ def _summary(
                 f"样本 {row.get('sample_count')}，胜 {row.get('win_count')}，负 {row.get('loss_count')}，avgR={float(row.get('avg_rr') or 0):.2f}"
             )
 
-    if errors:
+    if failed_ids:
         lines.append("")
         lines.append("**异常：**")
-        for err in errors:
-            lines.append(f"- trade #{err.get('trade_id')}：{err.get('error')}")
+        for tid in failed_ids:
+            lines.append(f"- trade #{tid}：review failed")
 
     lines.append("")
     lines.append("所有策略补丁仍只进入 candidate，不会直接 active。不构成实盘建议。")
@@ -207,94 +236,90 @@ def _paper_summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _override_pnl_in_summary(summary_text: str, paper_summary: dict[str, Any]) -> str:
-    """Ensure the summary text uses deterministic paper_summary values for PnL.
+def _enforce_deterministic_overview(report_text: str, all_review_items: list[dict[str, Any]]) -> str:
+    """Replace LLM-generated overview stats with deterministic computed values from all_review_items.
 
-    If the LLM summary contains a trade overview section with potentially wrong
-    PnL numbers, replace the wrong line with the correct deterministic value.
-    If no PnL line is found at all, append a correction section.
+    Forces these 4 lines in the report:
+      - 平仓交易: X 笔 (胜 Y / 负 Z / 平 W)
+      - 净 PnL: +XXX.XX USDT
+      - 平均 R: +X.XXR
+
+    Computes everything from all_review_items (not from LLM text), so even when review_trade
+    was skipped (existing reviews loaded), the numbers are correct.
     """
     import re
 
-    daily_pnl = paper_summary["daily_pnl"]
-    wins = paper_summary["wins"]
-    losses = paper_summary["losses"]
-    trades = paper_summary["trades"]
-    avg_r = paper_summary["avg_r"]
+    wins = sum(1 for item in all_review_items if (item["review"].get("pnl_r") or item["trade"].get("pnl_r") or 0) > 0)
+    losses = sum(1 for item in all_review_items if (item["review"].get("pnl_r") or item["trade"].get("pnl_r") or 0) < 0)
+    breakevens = sum(1 for item in all_review_items if (item["review"].get("pnl_r") or item["trade"].get("pnl_r") or 0) == 0)
+    total = len(all_review_items)
+    net_pnl = sum(item["trade"].get("pnl") or 0 for item in all_review_items)
+    avg_r = sum(item["review"].get("pnl_r") or item["trade"].get("pnl_r") or 0 for item in all_review_items) / max(total, 1)
 
-    # Match the entire "净 PnL" line through the number.
-    # Captures: optional sign, optional $, digits.decimals, optional USDT.
-    # Formats: 净 PnL: -$26.92, 净 PnL：-26.92 USDT, 净 PnL: +26.92, etc.
-    pnl_line_pattern = re.compile(
-        r"(净\s*PnL[：:]\s*[+-]?\s*\$?\s*\d+\.?\d*\s*(?:USDT)?)"
+    # Replace lines matching the patterns
+    report_text = re.sub(
+        r'平仓交易[：:]\s*\d+\s*笔\s*\([^)]*\)',
+        f'平仓交易: {total} 笔 (胜 {wins} / 负 {losses} / 平 {breakevens})',
+        report_text,
+        count=1,
     )
-    # Also capture just the numeric value for comparison
-    pnl_value_pattern = re.compile(
-        r"净\s*PnL[：:]\s*([+-]?)\s*\$?\s*(\d+\.?\d*)"
+    report_text = re.sub(
+        r'平仓交易[：:]\s*\d+',
+        f'平仓交易: {total} 笔 (胜 {wins} / 负 {losses} / 平 {breakevens})',
+        report_text,
+        count=1 if '平仓交易:' not in report_text else 0,
     )
-    match = pnl_value_pattern.search(summary_text)
-    if match:
-        try:
-            sign = match.group(1) or ""
-            digits = match.group(2)
-            reported_pnl = float(digits)
-            if "-" in sign:
-                reported_pnl = -reported_pnl
-            if abs(reported_pnl - daily_pnl) < 0.01:
-                return summary_text  # Already correct
-            # Wrong value — replace the entire line
-            correct_line = f"净 PnL：{daily_pnl:+.2f} USDT"
-            summary_text = pnl_line_pattern.sub(correct_line, summary_text)
-            return summary_text
-        except ValueError:
-            pass
+    # Re-replace with full format
+    if f"平仓交易: {total} 笔" not in report_text:
+        # Append at the beginning of the overview section
+        report_text = report_text.replace(
+            "**交易概览：**",
+            f"**交易概览：**\n- 平仓交易: {total} 笔 (胜 {wins} / 负 {losses} / 平 {breakevens})",
+            1,
+        )
 
-    # No PnL line found — append deterministic correction
-    correction = (
-        f"\n\n**确定性交易概览（paper_summary）：**\n"
-        f"- 平仓交易：{trades}\n"
-        f"- 胜 / 负：{wins} / {losses}\n"
-        f"- 净 PnL：{daily_pnl:+.2f} USDT\n"
-        f"- 平均 R：{avg_r:.2f}"
-    )
-    return summary_text + correction
+    report_text = re.sub(r'净\s*PnL[：:]\s*[^\n]*', f'净 PnL: {net_pnl:+.2f} USDT', report_text, count=1)
+    report_text = re.sub(r'平均\s*R[：:]\s*[^\n]*', f'平均 R: {avg_r:+.2f}R', report_text, count=1)
+
+    return report_text
 
 
 def _write_skill_memory_updates(
     repo: CryptoGuardRepository,
     trades: list[dict[str, Any]],
-    reviewed: list[dict[str, Any]],
+    review_items: list[dict[str, Any]],
+    failed_ids: list[int],
     evolution: dict[str, Any],
 ) -> list[dict[str, Any]]:
     from plugins.crypto_guard.review.loss_classifier import classify_trade
 
     updates: list[dict[str, Any]] = []
-    losses = [r for r in reviewed if (r.get("review") or {}).get("result") == "loss"]
 
-    # Build trade lookup by id
-    trade_by_id = {t.get("id"): t for t in trades}
+    # Fix 2: Clean up existing "review 错误" or "未生成归因" entries for this date range
+    _cleanup_false_review_error_memories(repo)
 
-    # Build regime context lookup by trade_id from reviews (not raw trades)
-    # market_regime_at_loss lives in trade_reviews, not paper_trades
+    # Classify losses by failure pattern using review_items primary_reason
+    pattern_groups: dict[str, list[dict[str, Any]]] = {}
+    for item in review_items:
+        review = item["review"]
+        trade = item["trade"]
+        pnl_r = float(review.get("pnl_r") or trade.get("pnl_r") or 0)
+        if pnl_r >= -0.05:
+            continue  # Not a loss
+        pattern = review.get("primary_reason") or classify_trade(trade)
+        # Enrich trade with review data for downstream use
+        enriched = dict(trade)
+        enriched["_review"] = review
+        pattern_groups.setdefault(pattern, []).append(enriched)
+
+    # Build regime context lookup by trade_id from reviews
     regime_by_trade_id: dict[int, dict[str, Any]] = {}
-    for r in reviewed:
-        rev = r.get("review") or {}
+    for item in review_items:
+        rev = item["review"]
         tid = rev.get("trade_id")
         ctx = rev.get("market_regime_at_loss")
         if tid and ctx and isinstance(ctx, dict):
             regime_by_trade_id[int(tid)] = ctx
-
-    # Classify losses by failure pattern
-    pattern_groups: dict[str, list[dict[str, Any]]] = {}
-    for loss in losses:
-        # trade_id is inside the review dict, not at top level
-        review = loss.get("review") or {}
-        trade_id = loss.get("trade_id") or review.get("trade_id")
-        trade = trade_by_id.get(trade_id) or loss
-        # Use the review's classification if available (enriched with regime context),
-        # otherwise fall back to classify_trade on the raw trade
-        pattern = review.get("primary_reason") or classify_trade(trade)
-        pattern_groups.setdefault(pattern, []).append(trade)
 
     # Write one entry per pattern (not per skill)
     for pattern, pattern_trades in pattern_groups.items():
@@ -309,7 +334,6 @@ def _write_skill_memory_updates(
             finding += "，自进化触发器已启动"
 
         # Build structured suggested_adjustment with regime context
-        # Use regime_by_trade_id (from reviews), not the raw trade dict
         regime_info: dict[str, Any] = {}
         for t in pattern_trades:
             tid = t.get("id")
@@ -335,6 +359,13 @@ def _write_skill_memory_updates(
             "btc_bias": regime_info.get("btc_bias"),
             "eth_bias": regime_info.get("eth_bias"),
             "symbol_relative_strength": regime_info.get("symbol_relative_strength"),
+            # Fix 4: Include improvement suggestions and avg R
+            "avg_r": sum(float(t["_review"].get("pnl_r") or 0) for t in pattern_trades) / len(pattern_trades),
+            "suggestions": [
+                t["_review"].get("improvement_suggestion")
+                for t in pattern_trades
+                if t["_review"].get("improvement_suggestion")
+            ],
         }
 
         # Add action-oriented suggested_adjustment_json for regime-mismatch patterns
@@ -376,12 +407,9 @@ def _write_skill_memory_updates(
             "affected_sides": affected_sides,
         })
 
-    # If no losses, write a general observation
-    # BUT: if there are unreviewed loss trades (review failures), do NOT write
-    # "no significant losses" — the losses just weren't reviewed yet.
+    # If no losses at all, write a general observation
     trade_losses = [t for t in trades if float(t.get("pnl_r") or 0) < -0.05]
-    unreviewed_losses = len(trade_losses) - len(losses)
-    if not losses and not trade_losses:
+    if not pattern_groups and not trade_losses:
         finding = "每日复盘：今日无显著亏损，保持当前 Skill 权重并继续观察。"
         for skill in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
             memory_id = repo.save_skill_feedback_memory(
@@ -392,15 +420,16 @@ def _write_skill_memory_updates(
                 suggested_adjustment={"loss_count": 0, "evolution_triggered": False},
             )
             updates.append({"skill": skill, "memory_id": memory_id, "finding": finding})
-    elif not losses and unreviewed_losses > 0:
-        finding = f"每日复盘：{unreviewed_losses} 笔亏损交易因 review 错误未生成归因，仅记录观察。"
+    elif not pattern_groups and failed_ids:
+        # Fix 2: Only write "review error" when actual review failures occurred, and only for the specific failed trades
+        finding = f"每日复盘：{len(failed_ids)} 笔亏损交易因 review 异常未生成归因，仅记录观察。"
         for skill in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
             memory_id = repo.save_skill_feedback_memory(
                 skill_name=skill,
                 feedback_type="daily_review",
                 source_type="daily_review",
                 finding=finding,
-                suggested_adjustment={"loss_count": unreviewed_losses, "unreviewed": True, "evolution_triggered": False},
+                suggested_adjustment={"loss_count": len(failed_ids), "failed_trade_ids": failed_ids, "evolution_triggered": False},
             )
             updates.append({"skill": skill, "memory_id": memory_id, "finding": finding})
     elif not trades:
@@ -416,6 +445,182 @@ def _write_skill_memory_updates(
             updates.append({"skill": skill, "memory_id": memory_id, "finding": finding})
 
     return updates
+
+
+def _cleanup_false_review_error_memories(repo: CryptoGuardRepository) -> None:
+    """Archive existing skill_feedback_memory entries that falsely claim 'review 错误' or '未生成归因'.
+
+    These polluted entries may have been written by previous run_daily_review versions
+    when the `reviewed` list was empty but trades actually had valid reviews.
+    """
+    repo.conn.execute(
+        """
+        UPDATE skill_feedback_memory
+        SET status='archived'
+        WHERE source_type='daily_review'
+          AND (finding LIKE '%review 错误%' OR finding LIKE '%未生成归因%')
+          AND status='candidate'
+        """
+    )
+    repo.conn.commit()
+
+
+def _build_loss_analysis(all_review_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build structured loss_analysis from all_review_items for summary_json.
+
+    Each entry includes trade details and review attribution.
+    """
+    loss_analysis = []
+    for item in all_review_items:
+        review = item["review"]
+        trade = item["trade"]
+        pnl_r = float(review.get("pnl_r") or trade.get("pnl_r") or 0)
+        if pnl_r >= -0.05:
+            continue
+        loss_analysis.append({
+            "trade_id": trade["id"],
+            "symbol": trade.get("symbol"),
+            "side": trade.get("side"),
+            "pnl_r": pnl_r,
+            "close_reason": trade.get("close_reason"),
+            "primary_reason": review.get("primary_reason"),
+            "market_regime_at_loss": review.get("market_regime_at_loss"),
+            "improvement_suggestion": review.get("improvement_suggestion"),
+        })
+    return loss_analysis
+
+
+def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build deterministic evolution/shadow status for daily report.
+
+    Queries evolution_triggers and strategy_patches to build structured status
+    that the report can render instead of relying on LLM interpretation.
+    """
+    triggers = repo.conn.execute(
+        "SELECT * FROM evolution_triggers ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+
+    patches = repo.conn.execute(
+        "SELECT * FROM strategy_patches ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+
+    # Compute shadow stats from strategy_evaluations (not from strategy_patches which lacks these columns)
+    eval_stats: dict[tuple[str, str], dict[str, Any]] = {}
+    evals = repo.conn.execute(
+        """
+        SELECT strategy_name, strategy_version, COUNT(*) AS sample_count,
+               SUM(CASE WHEN pnl_r IS NOT NULL THEN 1 ELSE 0 END) AS real_pnl_count,
+               AVG(pnl_r) AS avg_r
+        FROM strategy_evaluations
+        WHERE is_shadow = 1
+        GROUP BY strategy_name, strategy_version
+        """
+    ).fetchall()
+    for e in evals:
+        key = (e["strategy_name"], e["strategy_version"])
+        eval_stats[key] = {
+            "shadow_sample_count": e["sample_count"],
+            "real_pnl_count": e["real_pnl_count"],
+            "avg_r": e["avg_r"],
+        }
+
+    trigger_items = []
+    for t in triggers:
+        trigger_items.append({
+            "id": t["id"],
+            "type": t["trigger_type"],
+            "status": t["status"],
+            "original_trade_ids": t["original_related_trade_ids"],
+            "latest_trade_ids": t["latest_related_trade_ids"],
+            "triggered_at": _safe_col(t, "latest_triggered_at") or _safe_col(t, "created_at"),
+        })
+
+    patch_items = []
+    for p in patches:
+        key = (p["strategy_name"], p["candidate_version"])
+        stats = eval_stats.get(key, {})
+        patch_items.append({
+            "id": p["id"],
+            "candidate_version": p["candidate_version"],
+            "status": p["status"],
+            "backtest_result": _safe_col(p, "backtest_result_json"),
+            "shadow_sample_count": stats.get("shadow_sample_count", 0),
+            "real_pnl_count": stats.get("real_pnl_count", 0),
+            "avg_r": stats.get("avg_r"),
+        })
+
+    # Only status=review_required means "进入 review"
+    review_required = [p for p in patch_items if p["status"] == "review_required"]
+    shadow_testing = [p for p in patch_items if p["status"] == "shadow_testing"]
+
+    return {
+        "triggers": trigger_items,
+        "patches": patch_items,
+        "review_required": review_required,
+        "shadow_testing": shadow_testing,
+    }
+
+
+def _safe_col(row: Any, col: str) -> Any:
+    """Safely get a column from a sqlite3.Row, returning None if missing."""
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return None
+
+
+def _get_strategy_name_for_trade(repo: CryptoGuardRepository, trade: dict[str, Any]) -> str:
+    """Get the real strategy name for a trade via paper_orders -> ga_decisions chain.
+
+    Falls back to trade-level strategy_name or 'unknown'.
+    """
+    from plugins.crypto_guard.review.trade_reviewer import _derive_strategy_name_from_trade
+
+    name = _derive_strategy_name_from_trade(repo, trade)
+    if name:
+        return name
+    return trade.get("strategy_name") or "unknown"
+
+
+def _strategy_performance_summary(
+    repo: CryptoGuardRepository, all_review_items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Compute per-strategy performance stats from all_review_items."""
+    from collections import defaultdict
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in all_review_items:
+        name = _get_strategy_name_for_trade(repo, item["trade"])
+        groups[name].append(item)
+
+    result = {}
+    for name, items in groups.items():
+        pnl_rs = [float(it["review"].get("pnl_r") or it["trade"].get("pnl_r") or 0) for it in items]
+        pnls = [float(it["trade"].get("pnl") or 0) for it in items]
+        wins = len([x for x in pnl_rs if x > 0.05])
+        losses = len([x for x in pnl_rs if x < -0.05])
+        result[name] = {
+            "trades": len(items),
+            "wins": wins,
+            "losses": losses,
+            "net_pnl": sum(pnls),
+            "avg_r": sum(pnl_rs) / len(pnl_rs) if pnl_rs else 0.0,
+        }
+    return result
+
+
+def _window_display_text(start_utc: str, end_utc: str) -> str:
+    """Build UTC+8 window display text for the daily report."""
+    utc_start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+    utc_end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+    beijing_tz = timezone(timedelta(hours=8))
+    bj_start = utc_start_dt.astimezone(beijing_tz)
+    bj_end = utc_end_dt.astimezone(beijing_tz)
+
+    return (
+        f"UTC窗口: {utc_start_dt.strftime('%Y-%m-%d %H:%M')} ~ {utc_end_dt.strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"北京时间窗口: {bj_start.strftime('%Y-%m-%d %H:%M')} ~ {bj_end.strftime('%Y-%m-%d %H:%M')} UTC+8"
+    )
 
 
 def _map_pattern_to_rule(

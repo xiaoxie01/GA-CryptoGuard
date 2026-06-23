@@ -104,16 +104,22 @@ class AccountRiskGuard:
         if not hard_risk_off and not daily_pause_active:
             if risk_off:
                 # In risk_off but not hard — check if recovery conditions met
-                if recovery_eligible or recovery.get("sample_count", 0) == 0:
+                if recovery_eligible:
                     return _ok_result(drawdown_pct=drawdown_pct)
                 else:
+                    recovery_reason = recovery.get("reason")
+                    if not recovery_reason:
+                        recovery_reason = (
+                            f"avg_r={recovery.get('avg_r', 0):.3f}, "
+                            f"亏损{recovery.get('loss_count', 0)}笔"
+                        )
                     return {
                         "ok": True,
                         "risk_off": True,
                         "hard_risk_off": False,
                         "daily_loss_pause": False,
                         "pause_active": False,
-                        "pause_reason": f"账户回撤 {drawdown_pct:.2f}% 虽已恢复，但近期表现不达标（avg_r={recovery.get('avg_r', 0):.3f}, 亏损{recovery.get('loss_count', 0)}笔）",
+                        "pause_reason": f"账户回撤 {drawdown_pct:.2f}% 处于 risk_off，恢复条件未满足（{recovery_reason}）",
                         "drawdown_pct": drawdown_pct,
                         "effective_risk_percent": self.risk_off_risk_percent,
                         "blocked": False,
@@ -192,8 +198,10 @@ class AccountRiskGuard:
         - 2 consecutive stop losses today (pnl_r <= -1.0)
         - Today's avg_r <= -0.5
         """
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # "Today" in user-facing risk alerts follows UTC+8, matching Feishu reports.
+        utc8 = timezone(timedelta(hours=8))
+        now_local = datetime.now(timezone.utc).astimezone(utc8)
+        today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         today_start_iso = today_start.isoformat()
 
         rows = self.repo.conn.execute(

@@ -471,6 +471,50 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(int(row["priority"]), 2)
         self.assertIn('"limit": 10', row["payload_json"])
 
+    def test_paper_event_alert_uses_event_time_and_converts_naive_utc_entry_time(self) -> None:
+        from plugins.crypto_guard.run_ga_workers import handle_paper_event_alert
+
+        old_receive_id = os.environ.get("CRYPTO_GUARD_FEISHU_RECEIVE_ID")
+        os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = "test_chat_id"
+        captured: dict[str, str] = {}
+
+        def fake_send(receive_id: str, content: str, **kwargs: object) -> bool:
+            captured["content"] = content
+            return True
+
+        try:
+            result = handle_paper_event_alert(
+                self.repo,
+                {
+                    "event_type": "close_position",
+                    "symbol": "AVAXUSDT",
+                    "order_id": 52,
+                    "side": "LONG",
+                    "exit_price": 6.191,
+                    "close_reason": "conflict_exit",
+                    "pnl_r": -0.78,
+                    "entry_price": 6.23,
+                    "filled_at": "2026-06-22 21:39:10",
+                    "event_time": "2026-06-22T22:31:54Z",
+                    "stop_loss": 6.18,
+                    "take_profits": [{"price": 6.3}, {"price": 6.35}],
+                },
+                send_message=fake_send,
+            )
+        finally:
+            if old_receive_id is None:
+                os.environ.pop("CRYPTO_GUARD_FEISHU_RECEIVE_ID", None)
+            else:
+                os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = old_receive_id
+
+        self.assertTrue(result["ok"])
+        card = json.loads(captured["content"])
+        text = card["body"]["elements"][0]["content"]
+        self.assertIn("CryptoGuard 模拟盘 · 提前退出", text)
+        self.assertIn("时间：2026-06-23 06:31 (UTC+8)", text)
+        self.assertIn("入场时间：2026-06-23 05:39 (UTC+8)", text)
+        self.assertNotIn("手动平仓", text)
+
     def test_hourly_report_priority_and_market_analysis_backlog_guard(self) -> None:
         from plugins.crypto_guard.run_scheduler import run_job
         from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
@@ -2621,7 +2665,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             {"id": 4, "pnl": -50.0, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT", "close_reason": "stop_loss"},
             {"id": 5, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG", "close_reason": "stop_loss"},
         ]
-        text = _summary("2026-06-20T00:00:00Z", "2026-06-21T00:00:00Z", trades, [], [], [])
+        review_items = [{"trade": t, "review": {}, "is_new": False} for t in trades]
+        text = _summary("2026-06-20T00:00:00Z", "2026-06-21T00:00:00Z", trades, review_items, [], [])
         self.assertIn("净 PnL：-126.92 USDT", text)
         self.assertIn("胜 / 负 / 平：1 / 4 / 0", text)
 
@@ -2630,13 +2675,6 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         from plugins.crypto_guard.review.daily_reviewer import _write_skill_memory_updates
 
         # 4 losses, all reviewed with loss result
-        reviewed = [
-            {"review": {"trade_id": 1, "result": "win", "primary_reason": "good_execution"}},
-            {"review": {"trade_id": 2, "result": "loss", "primary_reason": "wrong_direction"}},
-            {"review": {"trade_id": 3, "result": "loss", "primary_reason": "wrong_direction"}},
-            {"review": {"trade_id": 4, "result": "loss", "primary_reason": "entry_too_late"}},
-            {"review": {"trade_id": 5, "result": "loss", "primary_reason": "entry_too_late"}},
-        ]
         trades = [
             {"id": 1, "pnl_r": 1.46, "symbol": "BTCUSDT", "side": "LONG"},
             {"id": 2, "pnl_r": -1.0, "symbol": "BTCUSDT", "side": "LONG"},
@@ -2644,8 +2682,15 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             {"id": 4, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT"},
             {"id": 5, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG"},
         ]
+        review_items = [
+            {"trade": trades[0], "review": {"trade_id": 1, "pnl_r": 1.46, "primary_reason": "good_execution"}, "is_new": False},
+            {"trade": trades[1], "review": {"trade_id": 2, "pnl_r": -1.0, "primary_reason": "wrong_direction"}, "is_new": False},
+            {"trade": trades[2], "review": {"trade_id": 3, "pnl_r": -1.0, "primary_reason": "wrong_direction"}, "is_new": False},
+            {"trade": trades[3], "review": {"trade_id": 4, "pnl_r": -1.0, "primary_reason": "entry_too_late"}, "is_new": False},
+            {"trade": trades[4], "review": {"trade_id": 5, "pnl_r": -1.0, "primary_reason": "entry_too_late"}, "is_new": False},
+        ]
         evolution = {"triggered": False, "actions": []}
-        updates = _write_skill_memory_updates(self.repo, trades, reviewed, evolution)
+        updates = _write_skill_memory_updates(self.repo, trades, review_items, [], evolution)
         findings = [u.get("finding", "") for u in updates]
         # Must NOT contain the "no significant losses" message
         self.assertFalse(
@@ -2824,77 +2869,86 @@ class CryptoGuardSmokeTest(unittest.TestCase):
     # ── P1 Fix 1: Daily review PnL deterministic ──
 
     def test_daily_review_override_pnl_when_llm_wrong(self) -> None:
-        """P1 Fix 1: _override_pnl_in_summary corrects LLM PnL to paper_summary."""
-        from plugins.crypto_guard.review.daily_reviewer import _override_pnl_in_summary
+        """P1 Fix 1: _enforce_deterministic_overview corrects LLM PnL to deterministic values."""
+        from plugins.crypto_guard.review.daily_reviewer import _enforce_deterministic_overview
 
-        paper_summary = {
-            "trades": 5,
-            "wins": 1,
-            "losses": 4,
-            "daily_pnl": -126.92,
-            "avg_r": -0.51,
-        }
-        # LLM returns wrong PnL
+        trades = [
+            {"id": 1, "pnl": 73.08, "pnl_r": 1.46, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 2, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 3, "pnl": -50.0, "pnl_r": -1.0, "symbol": "ETHUSDT", "side": "LONG"},
+            {"id": 4, "pnl": -50.0, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT"},
+            {"id": 5, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG"},
+        ]
+        all_review_items = [
+            {"trade": t, "review": {"pnl_r": t["pnl_r"]}, "is_new": False} for t in trades
+        ]
+        # LLM returns wrong PnL (-26.92 instead of -126.92)
         llm_text = (
             "**CryptoGuard 每日模拟盘复盘**\n"
             "窗口：2026-06-20T00:00:00Z ~ 2026-06-21T00:00:00Z\n\n"
             "**交易概览：**\n"
-            "- 平仓交易：5\n"
+            "- 平仓交易: 5 笔 (胜 1 / 负 4 / 平 0)\n"
             "- 胜 / 负 / 平：1 / 4 / 0\n"
             "- 净 PnL：-26.92 USDT\n"
             "- 平均 R：-0.51\n"
         )
-        corrected = _override_pnl_in_summary(llm_text, paper_summary)
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
         # Must contain the correct PnL
         self.assertIn("-126.92", corrected)
         # Must NOT contain the wrong value -26.92
         self.assertNotIn("-26.92", corrected)
-        # Must NOT contain the old deterministic correction appendix (replacement should handle it)
-        # The corrected line should have replaced the wrong one:
-        self.assertIn("净 PnL：-126.92 USDT", corrected)
+        self.assertIn("净 PnL: -126.92 USDT", corrected)
 
     def test_daily_review_override_pnl_no_change_when_correct(self) -> None:
-        """P1 Fix 1: _override_pnl_in_summary returns unchanged when PnL matches."""
-        from plugins.crypto_guard.review.daily_reviewer import _override_pnl_in_summary
+        """P1 Fix 1: _enforce_deterministic_overview updates format when PnL matches."""
+        from plugins.crypto_guard.review.daily_reviewer import _enforce_deterministic_overview
 
-        paper_summary = {
-            "trades": 5,
-            "wins": 1,
-            "losses": 4,
-            "daily_pnl": -126.92,
-            "avg_r": -0.51,
-        }
+        trades = [
+            {"id": 1, "pnl": 73.08, "pnl_r": 1.46, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 2, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 3, "pnl": -50.0, "pnl_r": -1.0, "symbol": "ETHUSDT", "side": "LONG"},
+            {"id": 4, "pnl": -50.0, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT"},
+            {"id": 5, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG"},
+        ]
+        all_review_items = [
+            {"trade": t, "review": {"pnl_r": t["pnl_r"]}, "is_new": False} for t in trades
+        ]
         llm_text = (
             "**交易概览：**\n"
+            "- 平仓交易: 5 笔 (胜 1 / 负 4 / 平 0)\n"
             "- 净 PnL：-126.92 USDT\n"
+            "- 平均 R：-0.51R\n"
         )
-        corrected = _override_pnl_in_summary(llm_text, paper_summary)
-        # Should be unchanged — no correction appended
-        self.assertEqual(corrected, llm_text)
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
+        # Should still contain the correct values (overview line replaced deterministically)
+        self.assertIn("-126.92", corrected)
 
     def test_daily_review_override_pnl_removes_wrong_dollar_value(self) -> None:
-        """P2 Fix: _override_pnl_in_summary replaces wrong dollar-format PnL line."""
-        from plugins.crypto_guard.review.daily_reviewer import _override_pnl_in_summary
+        """P2 Fix: _enforce_deterministic_overview replaces wrong dollar-format PnL line."""
+        from plugins.crypto_guard.review.daily_reviewer import _enforce_deterministic_overview
 
-        paper_summary = {
-            "trades": 5,
-            "wins": 1,
-            "losses": 4,
-            "daily_pnl": -126.92,
-            "avg_r": -0.51,
-        }
+        trades = [
+            {"id": 1, "pnl": 73.08, "pnl_r": 1.46, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 2, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 3, "pnl": -50.0, "pnl_r": -1.0, "symbol": "ETHUSDT", "side": "LONG"},
+            {"id": 4, "pnl": -50.0, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT"},
+            {"id": 5, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG"},
+        ]
+        all_review_items = [
+            {"trade": t, "review": {"pnl_r": t["pnl_r"]}, "is_new": False} for t in trades
+        ]
         # LLM returns wrong PnL with dollar sign format
         llm_text = (
             "**交易概览：**\n"
+            "- 平仓交易: 5 笔 (胜 1 / 负 4 / 平 0)\n"
             "- 净 PnL: -$26.92\n"
+            "- 平均 R：-0.51R\n"
         )
-        corrected = _override_pnl_in_summary(llm_text, paper_summary)
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
         # Must NOT contain the wrong dollar value
         self.assertNotIn("-$26.92", corrected)
         # Must contain the correct value with USDT
         self.assertIn("-126.92 USDT", corrected)
-        # Must have replaced the line (not appended a correction section)
-        self.assertNotIn("确定性交易概览", corrected)
 
     # ── P1 Fix 2: Backtest gate no silent failure ──
 
@@ -8630,8 +8684,24 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Get the raw trades for the window
         trades = self.repo.list_closed_trades_for_review(only_unreviewed=False)
+        # Build review_items in new format
+        trade = trades[0] if trades else {"id": trade_id, "pnl_r": -1.0, "symbol": "AVAXUSDT", "side": "SHORT"}
+        review_items = [{
+            "trade": trade,
+            "review": {
+                "trade_id": trade_id,
+                "pnl_r": -1.0,
+                "primary_reason": "macro_rebound_short_squeeze_loss",
+                "summary": "test",
+                "market_regime_at_loss": {
+                    "market_phase": "rebound",
+                    "regime_alignment": "counter_regime",
+                },
+            },
+            "is_new": False,
+        }]
 
-        updates = _write_skill_memory_updates(self.repo, trades, reviewed, {"triggered": False})
+        updates = _write_skill_memory_updates(self.repo, trades, review_items, [], {"triggered": False})
         # The pattern in skill_feedback_memory should be the regime-aware pattern
         self.assertTrue(len(updates) > 0)
         # Check that the pattern_type is the macro pattern, not wrong_direction
@@ -10655,11 +10725,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        filled_iso = "2026-06-22T21:39:10Z"
         self._seed_paper_data()
         self.conn.execute(
-            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, ga_decision_id, created_at) "
-            "VALUES (9121, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, 9121, ?)",
-            (now_iso,),
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, ga_decision_id, filled_at, created_at) "
+            "VALUES (9121, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, 9121, ?, ?)",
+            (filled_iso, now_iso),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
@@ -10732,6 +10803,11 @@ class PendingOrderManagerTest(unittest.TestCase):
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(alert_job)
+        alert_payload = json.loads(alert_job["payload_json"])
+        self.assertEqual(alert_payload["filled_at"], filled_iso)
+        self.assertIn("event_time", alert_payload)
+        self.assertIn("closed_at", alert_payload)
+        self.assertEqual(alert_payload["close_reason"], "conflict_exit")
 
         # Verify shadow PnL was backfilled
         eval_row = self.conn.execute(
@@ -10739,6 +10815,188 @@ class PendingOrderManagerTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(eval_row)
         self.assertIsNotNone(eval_row["pnl_r"])
+
+    # ── P1 Fix: Daily review consistency (7 fixes) ──
+
+    def test_daily_review_uses_existing_trade_reviews(self) -> None:
+        """Fix 1: Window has closed losing trades with pre-existing trade_reviews.
+        Verify loss_analysis is populated, skill_feedback_memory has pattern_type."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a closed trade with pre-existing review
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        # Pre-create a trade_review
+        self.conn.execute(
+            """
+            INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
+                improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
+            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            """,
+            (trade_id,),
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        self.assertTrue(result["ok"])
+        # loss_analysis should be populated (from existing review) - read from DB
+        report = self.conn.execute(
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            (day,),
+        ).fetchone()
+        self.assertIsNotNone(report, "daily_review_report should exist")
+        summary = json.loads(report["summary_json"])
+        loss_analysis = summary.get("loss_analysis", [])
+        self.assertTrue(len(loss_analysis) > 0, f"loss_analysis should be populated, got: {loss_analysis}")
+        self.assertEqual(loss_analysis[0]["trade_id"], trade_id)
+        # skill_feedback_memory should have pattern_type
+        mem = self.conn.execute(
+            "SELECT * FROM skill_feedback_memory WHERE source_type='daily_review'"
+        ).fetchall()
+        self.assertTrue(len(mem) > 0, "Should have skill_feedback_memory entries")
+        self.assertIsNotNone(mem[0]["pattern_type"])
+
+    def test_daily_review_no_false_review_error_memory(self) -> None:
+        """Fix 2: All trades have reviews. Verify no 'review 错误' skill memory is written."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a closed losing trade with pre-existing review
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            """
+            INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
+                improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
+            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            """,
+            (trade_id,),
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        self.assertTrue(result["ok"])
+        # Check no "review 错误" or "未生成归因" in skill_feedback_memory
+        mem = self.conn.execute(
+            "SELECT finding FROM skill_feedback_memory WHERE source_type='daily_review'"
+        ).fetchall()
+        for row in mem:
+            self.assertNotIn("review 错误", row["finding"] or "")
+            self.assertNotIn("未生成归因", row["finding"] or "")
+
+    def test_daily_review_deterministic_overview_overrides_llm(self) -> None:
+        """Fix 3: LLM output has wrong win/loss/PnL/avgR. Verify ga_report has corrected values."""
+        from plugins.crypto_guard.review.daily_reviewer import _enforce_deterministic_overview
+
+        trades = [
+            {"id": 1, "pnl": 73.08, "pnl_r": 1.46, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 2, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 3, "pnl": -50.0, "pnl_r": -1.0, "symbol": "ETHUSDT", "side": "LONG"},
+            {"id": 4, "pnl": -50.0, "pnl_r": -1.0, "symbol": "LTCUSDT", "side": "SHORT"},
+            {"id": 5, "pnl": -50.0, "pnl_r": -1.0, "symbol": "BNBUSDT", "side": "LONG"},
+        ]
+        all_review_items = [
+            {"trade": t, "review": {"pnl_r": t["pnl_r"]}, "is_new": False} for t in trades
+        ]
+        # LLM claims 3 wins, 2 losses, PnL +50
+        llm_text = (
+            "**交易概览：**\n"
+            "- 平仓交易: 5 笔 (胜 3 / 负 2 / 平 0)\n"
+            "- 净 PnL：+50.00 USDT\n"
+            "- 平均 R：+0.50R\n"
+        )
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
+        # Correct values: 1 win, 4 losses, -126.92 PnL, -0.51 avg R
+        self.assertIn("胜 1 / 负 4 / 平 0", corrected)
+        self.assertIn("-126.92", corrected)
+        self.assertIn("-0.51", corrected)
+
+    def test_daily_review_evolution_status_not_exaggerated(self) -> None:
+        """Fix 5: Patch status=shadow_testing. Verify report does NOT say '进入 review'.
+        Patch status=review_required. Verify report DOES say '进入 review'."""
+        from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report
+
+        # Create patches with different statuses
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing')"
+        )
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
+            "VALUES ('test_strategy2', '1.0', 'v2-review', '{}', 'review_required')"
+        )
+        self.conn.commit()
+
+        evo_status = _evolution_status_for_report(self.repo, [])
+        # shadow_testing patches should be in shadow_testing list, NOT review_required
+        self.assertTrue(len(evo_status["shadow_testing"]) >= 1)
+        self.assertTrue(len(evo_status["review_required"]) >= 1)
+        # Verify the shadow_testing entry does NOT have status review_required
+        for p in evo_status["shadow_testing"]:
+            self.assertEqual(p["status"], "shadow_testing")
+        for p in evo_status["review_required"]:
+            self.assertEqual(p["status"], "review_required")
+
+    def test_daily_review_strategy_name_from_ga_decision(self) -> None:
+        """Fix 6: Trade has ga_decision with strategy_name='pa_breakout_retest_long'.
+        Verify _get_strategy_name_for_trade returns the real strategy name."""
+        from plugins.crypto_guard.review.daily_reviewer import _get_strategy_name_for_trade
+
+        # Create a ga_decision with raw_decision_json containing strategy_name
+        raw_decision = {
+            "raw_legacy_decision": {
+                "strategy_name": "pa_breakout_retest_long",
+            },
+        }
+        self.conn.execute(
+            "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, trade_plan_json, feishu_actions_json, "
+            "final_summary, raw_decision_json) "
+            "VALUES ('BTCUSDT', 1700000000000, '2024-01-15T00:00:00Z', 'scheduled', "
+            "'A', 0.80, 'trade_plan_available', '[]', '[]', '[]', '{\"ok\":true}', '{}', '[]', "
+            "'test', ?)",
+            (json.dumps(raw_decision),),
+        )
+        ga_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 'filled', ?)",
+            (ga_id,),
+        )
+        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+
+        trade = {"id": 1, "order_id": order_id, "symbol": "BTCUSDT", "side": "LONG"}
+        name = _get_strategy_name_for_trade(self.repo, trade)
+        self.assertEqual(name, "pa_breakout_retest_long")
+
+    def test_daily_review_shows_utc8_window(self) -> None:
+        """Fix 7: Verify _window_display_text contains both UTC and UTC+8 window text."""
+        from plugins.crypto_guard.review.daily_reviewer import _window_display_text
+
+        text = _window_display_text("2026-06-20T00:00:00Z", "2026-06-21T00:00:00Z")
+        self.assertIn("UTC窗口:", text)
+        self.assertIn("UTC", text.split("\n")[0])
+        self.assertIn("北京时间窗口:", text)
+        self.assertIn("UTC+8", text)
 
 
 if __name__ == "__main__":

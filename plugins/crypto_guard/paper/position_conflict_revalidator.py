@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
@@ -443,6 +443,12 @@ def _execute_early_exit(
     stop_loss = float(trade.get("stop_loss") or entry_price or 0)
     risk = abs(entry_price - stop_loss) or 1.0
     quantity = float(trade.get("quantity") or 1)
+    order_row = None
+    if order_id:
+        order_row = repo.conn.execute(
+            "SELECT filled_at, order_type, fill_method FROM paper_orders WHERE id=?",
+            (int(order_id),),
+        ).fetchone()
 
     if current_price is None or current_price <= 0:
         return _execute_recheck_mark(
@@ -574,9 +580,12 @@ def _execute_early_exit(
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profits": json.loads(trade.get("take_profit_json") or "[]") if trade.get("take_profit_json") else [],
-            "filled_at": trade.get("created_at"),
+            "filled_at": (order_row["filled_at"] if order_row and order_row["filled_at"] else trade.get("created_at")),
+            "closed_at": now,
+            "event_time": now,
             "quantity": quantity,
-            "order_type": trade.get("fill_method") or "market",
+            "order_type": (order_row["order_type"] if order_row and order_row["order_type"] else trade.get("fill_method") or "market"),
+            "fill_method": (order_row["fill_method"] if order_row and order_row["fill_method"] else trade.get("fill_method")),
         },
     )
 
@@ -599,6 +608,8 @@ def _execute_early_exit(
         "signal_grade": latest_decision.get("signal_grade"),
         "market_bias": latest_decision.get("market_bias"),
         "ga_decision_id": ga_decision_id,
+        "event_time": now,
+        "exit_time": now,
         "reason": f"强反向{latest_decision.get('signal_grade')}级信号触发提前退出",
         "status": "executed",
     }
@@ -865,6 +876,20 @@ def _build_stop_take_path(
     return path
 
 
+def _format_utc8_timestamp(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).astimezone(
+            timezone(timedelta(hours=8))
+        ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
@@ -900,11 +925,13 @@ def _notify_action(
         pnl_r = action.get("pnl_r", 0)
         ga_id = action.get("ga_decision_id", "?")
         grade = action.get("signal_grade", "?")
+        event_time = _format_utc8_timestamp(action.get("event_time") or action.get("exit_time"))
         lines = [
             "**模拟盘持仓冲突 - 已提前退出**",
             "",
             f"- 产品：{symbol}",
             f"- 方向：{side_cn}",
+            f"- 时间：{event_time} (UTC+8)" if event_time else "",
             f"- 退出价格：{exit_price}",
             f"- 盈亏 R：{pnl_r}",
             f"- 触发信号：GA#{ga_id} {grade}级",

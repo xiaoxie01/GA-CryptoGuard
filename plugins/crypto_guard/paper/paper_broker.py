@@ -551,7 +551,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         signal_decay_score=quality["signal_decay_score"],
         stop_take_path=stop_take_path,
     )
-    repo.update_paper_order_status(order["id"], "closed", closed_at=utc_iso())
+    closed_at = utc_iso()
+    repo.update_paper_order_status(order["id"], "closed", closed_at=closed_at)
     # Backfill real pnl_r to shadow strategy_evaluations for this trade
     repo.backfill_shadow_evaluation_pnl_r(trade, quality["pnl_r"])
     repo.upsert_paper_position_from_trade(
@@ -594,6 +595,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
             "stop_loss": order.get("stop_loss"),
             "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
             "filled_at": order.get("filled_at"),
+            "closed_at": closed_at,
+            "event_time": closed_at,
             "quantity": trade.get("quantity"),
             "order_type": order.get("order_type"),
         },
