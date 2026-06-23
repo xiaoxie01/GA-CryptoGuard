@@ -651,14 +651,11 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
             else:
                 p["data_quality"] = "no_real_pnl"
 
-    review_required = [p for p in related_patches if p.get("status") == "review_required"]
-    shadow_testing = [p for p in related_patches if p.get("status") == "shadow_testing"]
-    rejected = [p for p in related_patches if p.get("status") == "rejected"]
-
-    # Build patch items for report — use parsed backtest summary, never raw JSON
-    patch_items = []
+    # Build standard patch_summary list — single source of truth for all return lists.
+    # Never leak raw strategy_patches rows (which contain backtest_result_json, etc.).
+    patch_summaries: list[dict[str, Any]] = []
     for p in related_patches:
-        patch_items.append({
+        patch_summaries.append({
             "id": p["id"],
             "candidate_version": p.get("candidate_version"),
             "status": p.get("status"),
@@ -668,6 +665,10 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
             "avg_r": p.get("avg_r"),
             "data_quality": p.get("data_quality", "unknown"),
         })
+
+    review_required = [ps for ps in patch_summaries if ps.get("status") == "review_required"]
+    shadow_testing = [ps for ps in patch_summaries if ps.get("status") == "shadow_testing"]
+    rejected = [ps for ps in patch_summaries if ps.get("status") == "rejected"]
 
     trigger_items = []
     for t in related_triggers:
@@ -682,7 +683,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
 
     return {
         "triggers": trigger_items,
-        "patches": patch_items,
+        "patches": patch_summaries,
         "review_required": review_required,
         "shadow_testing": shadow_testing,
         "rejected": rejected,

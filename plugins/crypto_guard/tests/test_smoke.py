@@ -11393,6 +11393,185 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(patch_count_before, patch_count_after,
                          "force rebuild should not create duplicate patches")
 
+    def test_evolution_status_strips_raw_backtest_fields(self) -> None:
+        """P1: strategy_patches.backtest_result_json contains symbol_results/active_r_values.
+        Assert json.dumps(evo_status) does NOT leak these raw fields."""
+        from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report
+
+        # Create a window trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create a trigger related to the window trade
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            (json.dumps([trade_id]),),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create a patch with backtest_result_json containing raw fields
+        raw_backtest = json.dumps({
+            "passed": True,
+            "reason": "ok",
+            "delta_avg_r": 0.15,
+            "delta_win_rate": 0.05,
+            "symbol_results": {"BTCUSDT": {"active_r": [1.0, -0.5], "candidate_r": [1.2, -0.3]}},
+            "active_r_values": [1.0, -0.5, 0.8],
+            "candidate_r_values": [1.2, -0.3, 0.9],
+            "gate_checks": {"min_trades": True, "avg_r_improvement": True},
+        })
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id, backtest_result_json) "
+            "VALUES ('test_strategy', '1.0', 'v2-test', '{}', 'shadow_testing', ?, ?)",
+            (trigger_id, raw_backtest),
+        )
+        self.conn.commit()
+
+        window_trades = [{"id": trade_id, "symbol": "BTCUSDT"}]
+        evo_status = _evolution_status_for_report(self.repo, window_trades)
+
+        # Serialize and check no raw fields leak
+        serialized = json.dumps(evo_status, default=str)
+        self.assertNotIn("symbol_results", serialized)
+        self.assertNotIn("active_r_values", serialized)
+        self.assertNotIn("candidate_r_values", serialized)
+        self.assertNotIn("gate_checks", serialized)
+        self.assertNotIn("backtest_result_json", serialized)
+
+        # Verify parsed backtest_result is present and clean
+        patches = evo_status.get("patches", [])
+        self.assertTrue(len(patches) > 0)
+        bt = patches[0].get("backtest_result", {})
+        self.assertEqual(bt.get("passed"), True)
+        self.assertEqual(bt.get("delta_avg_r"), 0.15)
+        self.assertEqual(bt.get("delta_win_rate"), 0.05)
+        # shadow_testing list must also use clean patch_summary
+        for p in evo_status.get("shadow_testing", []):
+            self.assertNotIn("backtest_result_json", p)
+            self.assertIn("shadow_sample_count", p)
+
+    def test_evolution_status_shadow_sample_count_in_report(self) -> None:
+        """P1: 17 shadow evaluations with real_pnl_count=0.
+        Assert shadow_testing[0].shadow_sample_count == 17 and report shows 样本=17."""
+        from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report, _build_deterministic_report
+
+        # Create a window trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create trigger + patch
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            (json.dumps([trade_id]),),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', ?)",
+            (trigger_id,),
+        )
+        self.conn.commit()
+
+        # Insert 17 shadow evaluations with pnl_r=NULL (no real PnL)
+        for i in range(17):
+            self.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, is_shadow, pnl_r, score, decision, evidence_json) "
+                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-shadow', 1, NULL, 0.5, 'hold', '{}')"
+            )
+        self.conn.commit()
+
+        window_trades = [{"id": trade_id, "symbol": "BTCUSDT"}]
+        evo_status = _evolution_status_for_report(self.repo, window_trades)
+
+        # Verify shadow_testing has correct sample_count
+        st = evo_status.get("shadow_testing", [])
+        self.assertTrue(len(st) > 0, "Should have shadow_testing entry")
+        self.assertEqual(st[0]["shadow_sample_count"], 17, "shadow_sample_count should be 17")
+        self.assertEqual(st[0]["real_pnl_count"], 0, "real_pnl_count should be 0")
+
+        # Verify report text shows 样本=17 — use proper trade dicts for all_closed
+        all_closed = [{
+            "id": trade_id, "symbol": "BTCUSDT", "side": "LONG",
+            "pnl": -5.0, "pnl_r": -1.0, "close_reason": "stop_loss",
+        }]
+        report = _build_deterministic_report(
+            all_closed=all_closed,
+            all_review_items=[],
+            paper_summary={"total": 1, "wins": 0, "losses": 1, "breakevens": 0, "net_pnl": -5.0, "avg_r": -1.0},
+            window_display="test",
+            evo_status=evo_status,
+            strategy_perf={},
+            loss_analysis=[],
+            win_analysis=[],
+        )
+        self.assertIn("样本=17", report, "Report should show 样本=17")
+
+    def test_evolution_status_no_real_pnl_avg_r_none(self) -> None:
+        """P1: real_pnl_count=0. Assert avg_r is None and data_quality == 'no_real_pnl'."""
+        from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report
+
+        # Create a window trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create trigger + patch
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            (json.dumps([trade_id]),),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('test_strategy', '1.0', 'v2-no-pnl', '{}', 'shadow_testing', ?)",
+            (trigger_id,),
+        )
+        self.conn.commit()
+
+        # Insert 5 shadow evaluations, all with pnl_r=NULL
+        for i in range(5):
+            self.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, is_shadow, pnl_r, score, decision, evidence_json) "
+                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-no-pnl', 1, NULL, 0.3, 'hold', '{}')"
+            )
+        self.conn.commit()
+
+        window_trades = [{"id": trade_id, "symbol": "BTCUSDT"}]
+        evo_status = _evolution_status_for_report(self.repo, window_trades)
+
+        st = evo_status.get("shadow_testing", [])
+        self.assertTrue(len(st) > 0)
+        self.assertIsNone(st[0]["avg_r"], "avg_r should be None when real_pnl_count=0")
+        self.assertEqual(st[0]["data_quality"], "no_real_pnl")
+        self.assertEqual(st[0]["real_pnl_count"], 0)
+        self.assertEqual(st[0]["shadow_sample_count"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()
