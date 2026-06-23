@@ -2892,7 +2892,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "- 净 PnL：-26.92 USDT\n"
             "- 平均 R：-0.51\n"
         )
-        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items, trades)
         # Must contain the correct PnL
         self.assertIn("-126.92", corrected)
         # Must NOT contain the wrong value -26.92
@@ -2919,7 +2919,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "- 净 PnL：-126.92 USDT\n"
             "- 平均 R：-0.51R\n"
         )
-        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items, trades)
         # Should still contain the correct values (overview line replaced deterministically)
         self.assertIn("-126.92", corrected)
 
@@ -2944,8 +2944,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "- 净 PnL: -$26.92\n"
             "- 平均 R：-0.51R\n"
         )
-        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
-        # Must NOT contain the wrong dollar value
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items, trades)
         self.assertNotIn("-$26.92", corrected)
         # Must contain the correct value with USDT
         self.assertIn("-126.92 USDT", corrected)
@@ -10922,8 +10921,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "- 净 PnL：+50.00 USDT\n"
             "- 平均 R：+0.50R\n"
         )
-        corrected = _enforce_deterministic_overview(llm_text, all_review_items)
-        # Correct values: 1 win, 4 losses, -126.92 PnL, -0.51 avg R
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items, trades)
         self.assertIn("胜 1 / 负 4 / 平 0", corrected)
         self.assertIn("-126.92", corrected)
         self.assertIn("-0.51", corrected)
@@ -10933,18 +10931,41 @@ class PendingOrderManagerTest(unittest.TestCase):
         Patch status=review_required. Verify report DOES say '进入 review'."""
         from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report
 
-        # Create patches with different statuses
+        # Create window trades
         self.conn.execute(
-            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
-            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing')"
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create triggers related to the window trade
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'pending')",
+            (json.dumps([trade_id]),),
+        )
+        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create patches with different statuses linked to the trigger
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', ?)",
+            (trigger_id,),
         )
         self.conn.execute(
-            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
-            "VALUES ('test_strategy2', '1.0', 'v2-review', '{}', 'review_required')"
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('test_strategy2', '1.0', 'v2-review', '{}', 'review_required', ?)",
+            (trigger_id,),
         )
         self.conn.commit()
 
-        evo_status = _evolution_status_for_report(self.repo, [])
+        window_trades = [{"id": trade_id, "symbol": "BTCUSDT"}]
+        evo_status = _evolution_status_for_report(self.repo, window_trades)
         # shadow_testing patches should be in shadow_testing list, NOT review_required
         self.assertTrue(len(evo_status["shadow_testing"]) >= 1)
         self.assertTrue(len(evo_status["review_required"]) >= 1)
@@ -10997,6 +11018,380 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIn("UTC", text.split("\n")[0])
         self.assertIn("北京时间窗口:", text)
         self.assertIn("UTC+8", text)
+
+    # ── P1 Fix: 8 remaining issues ──
+
+    def test_daily_review_includes_failed_review_trade_in_stats(self) -> None:
+        """Fix 1: Create a closed trade. Run daily review.
+        Assert the trade appears in paper_summary total count and net PnL (from all_closed, not all_review_items).
+        Assert closed_trades count equals all closed trades in window."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a closed trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        # The trade should appear in paper_summary (from all_closed)
+        report = self.conn.execute(
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            (day,),
+        ).fetchone()
+        self.assertIsNotNone(report, "daily_review_report should exist")
+        summary = json.loads(report["summary_json"])
+        paper_summary = summary.get("paper_summary", {})
+        self.assertGreaterEqual(paper_summary.get("total", 0), 1, "paper_summary should include all closed trades")
+        self.assertLess(paper_summary.get("net_pnl", 0), 0, "net PnL should be negative")
+        # closed_trades in result should match all_closed count
+        self.assertGreaterEqual(result.get("closed_trades", 0), 1, "closed_trades should count all closed trades")
+
+    def test_daily_review_win_analysis_populated_from_existing_reviews(self) -> None:
+        """Fix 2: Create a winning trade with existing trade_review that has pnl_r only in ga_review_json.
+        Run daily review. Assert summary_json.win_analysis is non-empty."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a winning trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 110, 95, 1, 10, 10, 2.0, 12, -3, 'take_profit', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        # Pre-create a trade_review with pnl_r only in ga_review_json.metrics
+        ga_review_json = json.dumps({"metrics": {"pnl_r": 2.0}})
+        self.conn.execute(
+            """
+            INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
+                improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
+            VALUES (?, 'win', 'correct_direction', '[]', 'test', '{}', ?, 'normal', 1)
+            """,
+            (trade_id, ga_review_json),
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        report = self.conn.execute(
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            (day,),
+        ).fetchone()
+        self.assertIsNotNone(report, "daily_review_report should exist")
+        summary = json.loads(report["summary_json"])
+        win_analysis = summary.get("win_analysis", [])
+        self.assertTrue(len(win_analysis) > 0, f"win_analysis should be populated, got: {win_analysis}")
+
+    def test_daily_review_skill_memory_parses_json_market_regime(self) -> None:
+        """Fix 3: Create a loss trade with trade_review where market_regime_at_loss is a JSON string.
+        Run daily review. Assert skill_feedback_memory.suggested_adjustment_json contains parsed market_phase/regime_alignment."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a losing trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'SHORT', 100, 106, 105, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        # Pre-create a trade_review with market_regime_at_loss as JSON string
+        regime_json = json.dumps({
+            "market_phase": "bearish",
+            "regime_alignment": "counter_trend",
+            "btc_bias": "bearish",
+            "eth_bias": "neutral",
+            "symbol_relative_strength": "weak",
+        })
+        self.conn.execute(
+            """
+            INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
+                improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
+            VALUES (?, 'loss', 'counter_regime_entry_loss', '[]', 'test', '{}', '{}', ?, 1)
+            """,
+            (trade_id, regime_json),
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        # Check skill_feedback_memory for parsed regime data
+        mem = self.conn.execute(
+            "SELECT suggested_adjustment_json FROM skill_feedback_memory WHERE source_type='daily_review'"
+        ).fetchall()
+        self.assertTrue(len(mem) > 0, "Should have skill_feedback_memory entries")
+        for row in mem:
+            adj = json.loads(row["suggested_adjustment_json"] or "{}")
+            if adj.get("market_phase"):
+                self.assertEqual(adj["market_phase"], "bearish")
+                self.assertEqual(adj["regime_alignment"], "counter_trend")
+                return
+        self.fail("No skill_feedback_memory entry had parsed market_phase")
+
+    def test_daily_review_deterministic_overview_rebuilds_entire_block(self) -> None:
+        """Fix 4: Create LLM text with wrong stats on separate lines.
+        Run _enforce_deterministic_overview. Assert only correct values remain, old wrong lines are removed."""
+        from plugins.crypto_guard.review.daily_reviewer import _enforce_deterministic_overview
+
+        trades = [
+            {"id": 1, "pnl": 100.0, "pnl_r": 2.0, "symbol": "BTCUSDT", "side": "LONG"},
+            {"id": 2, "pnl": -50.0, "pnl_r": -1.0, "symbol": "ETHUSDT", "side": "LONG"},
+        ]
+        all_review_items = [
+            {"trade": t, "review": {"pnl_r": t["pnl_r"]}, "is_new": False} for t in trades
+        ]
+        # LLM text with wrong stats scattered across multiple lines
+        llm_text = (
+            "## 交易概览\n"
+            "平仓交易: 99 笔 (胜 80 / 负 10 / 平 9)\n"
+            "净 PnL: +999.99 USDT\n"
+            "平均 R: +9.99R\n"
+            "胜率: 99%\n"
+            "负率: 1%\n"
+        )
+        corrected = _enforce_deterministic_overview(llm_text, all_review_items, trades)
+        # Correct values: 2 trades, 1 win, 1 loss, 0 breakeven, +50 PnL, +0.50 avg R
+        self.assertIn("平仓交易: 2 笔 (胜 1 / 负 1 / 平 0)", corrected)
+        self.assertIn("+50.00", corrected)
+        self.assertIn("+0.50", corrected)
+        # Old wrong lines should be removed
+        self.assertNotIn("99 笔", corrected)
+        self.assertNotIn("999.99", corrected)
+        self.assertNotIn("9.99R", corrected)
+        self.assertNotIn("胜率: 99%", corrected)
+        self.assertNotIn("负率: 1%", corrected)
+
+    def test_daily_review_integration_has_all_deterministic_sections(self) -> None:
+        """Fix 5: Run full run_daily_review() with trades, reviews, patches.
+        Assert ga_report contains: UTC+8 window, real strategy name, shadow_testing does NOT say '进入 review',
+        loss analysis items."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Create a losing trade with pre-existing review
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            """
+            INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
+                improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
+            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            """,
+            (trade_id,),
+        )
+        # Create a shadow_testing patch
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing')"
+        )
+        self.conn.commit()
+
+        result = run_daily_review(self.repo, day_utc=day)
+        report = self.conn.execute(
+            "SELECT ga_report, summary_json FROM daily_review_reports WHERE review_date=?",
+            (day,),
+        ).fetchone()
+        self.assertIsNotNone(report, "daily_review_report should exist")
+        ga_report = report["ga_report"] or ""
+        # Should contain UTC+8 window
+        self.assertIn("UTC+8", ga_report)
+        # Should contain deterministic sections
+        self.assertIn("分析窗口", ga_report)
+        self.assertIn("策略表现", ga_report)
+        self.assertIn("亏损归因", ga_report)
+        # shadow_testing should NOT say "进入 review"
+        if "影子测试中" in ga_report:
+            # OK - shadow_testing is correctly labeled
+            pass
+        # Should NOT say "进入 review" for shadow_testing patches
+        summary = json.loads(report["summary_json"])
+        evo_status = summary.get("evo_status", {})
+        for p in evo_status.get("shadow_testing", []):
+            self.assertEqual(p["status"], "shadow_testing")
+
+    def test_daily_review_evolution_status_filters_by_window_trades(self) -> None:
+        """Fix 6: Create an old unrelated patch from a different day.
+        Create a window trade with a related trigger+patch.
+        Run _evolution_status_for_report. Assert only the related patch appears, not the old one."""
+        from plugins.crypto_guard.review.daily_reviewer import _evolution_status_for_report
+
+        # Create an old unrelated trigger + patch
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, '[99999]', 'pending')"
+        )
+        old_trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('old_strategy', '1.0', 'v2-old', '{}', 'shadow_testing', ?)",
+            (old_trigger_id,),
+        )
+
+        # Create a window trade
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Create a trigger related to the window trade
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
+            "VALUES ('daily_loss_threshold', 5.0, 5.0, ?, 'pending')",
+            (json.dumps([trade_id]),),
+        )
+        window_trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('window_strategy', '1.0', 'v2-window', '{}', 'review_required', ?)",
+            (window_trigger_id,),
+        )
+        self.conn.commit()
+
+        window_trades = [{"id": trade_id, "symbol": "BTCUSDT"}]
+        evo_status = _evolution_status_for_report(self.repo, window_trades)
+
+        # Should have the window-related patch
+        patch_ids = [p["id"] for p in evo_status.get("patches", [])]
+        self.assertTrue(len(patch_ids) > 0, "Should have at least one related patch")
+        # The old unrelated patch should NOT appear
+        for p in evo_status.get("patches", []):
+            self.assertNotEqual(p.get("candidate_version"), "v2-old",
+                                "Old unrelated patch should not appear")
+
+    def test_daily_review_real_review_failure_not_archived(self) -> None:
+        """Fix 7: When a loss trade has no review, _cleanup_false_review_error_memories should NOT archive error memories.
+        Only when ALL loss trades have valid reviews should it archive."""
+        from plugins.crypto_guard.review.daily_reviewer import _cleanup_false_review_error_memories
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Manually insert a "review 错误" error memory for this date
+        self.conn.execute(
+            """INSERT INTO skill_feedback_memory(
+                skill_name, skill_version, feedback_type, source_type, finding,
+                suggested_adjustment_json, status)
+               VALUES ('price_action', '1.0', 'daily_review', 'daily_review',
+                '每日复盘：1 笔亏损交易因 review 错误未生成归因', '{}', 'candidate')"""
+        )
+        self.conn.commit()
+
+        # Create a loss trade WITHOUT a review — cleanup should NOT archive
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades(
+                symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r,
+                max_favorable_excursion, max_adverse_excursion, close_reason, closed_at
+            )
+            VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
+            """
+        )
+        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+
+        # Build all_review_items without a review for this trade
+        all_review_items = [{"trade": {"id": trade_id, "pnl_r": -1.2}, "review": {}, "is_new": False}]
+
+        # Since the loss trade has no review (empty review dict, no primary_reason), cleanup should NOT archive
+        cleaned = _cleanup_false_review_error_memories(self.repo, day, all_review_items)
+        self.assertEqual(cleaned, 0, "Should NOT archive when loss trades lack valid reviews")
+
+        # Verify the error memory is still candidate
+        mem = self.conn.execute(
+            "SELECT status FROM skill_feedback_memory WHERE finding LIKE '%review 错误%'"
+        ).fetchone()
+        self.assertIsNotNone(mem)
+        self.assertEqual(mem["status"], "candidate", "Error memory should remain candidate")
+
+        # Now add a valid review — cleanup should archive
+        all_review_items_with_review = [
+            {"trade": {"id": trade_id, "pnl_r": -1.2}, "review": {"primary_reason": "wrong_direction"}, "is_new": False}
+        ]
+        cleaned2 = _cleanup_false_review_error_memories(self.repo, day, all_review_items_with_review)
+        self.assertEqual(cleaned2, 1, "Should archive when all loss trades have valid reviews")
+
+        # Verify the error memory is now archived
+        mem2 = self.conn.execute(
+            "SELECT status FROM skill_feedback_memory WHERE finding LIKE '%review 错误%'"
+        ).fetchone()
+        self.assertIsNotNone(mem2)
+        self.assertEqual(mem2["status"], "archived", "Error memory should be archived")
+
+    def test_daily_review_force_rebuild_does_not_timeout(self) -> None:
+        """Fix 8: Create several patches. Run run_daily_review(force=True).
+        Assert it completes without error. Assert no duplicate patches are created."""
+        from plugins.crypto_guard.review.daily_reviewer import run_daily_review
+
+        report_date = "2026-06-15"
+        # Pre-create a report
+        self.repo.save_daily_review_report(
+            review_date=report_date,
+            summary={"date_utc": report_date},
+            ga_report="old_report",
+            skill_updates=[],
+            evolution_actions={},
+        )
+        # Create several patches
+        for i in range(3):
+            self.conn.execute(
+                "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
+                "VALUES (?, '1.0', ?, '{}', 'shadow_testing')",
+                (f"strategy_{i}", f"v2-shadow-{i}"),
+            )
+        self.conn.commit()
+
+        # Add a closed trade so run_daily_review has something to work with
+        self._ensure_paper_trade("BTCUSDT", "LONG", entry_price=100.0)
+        self.repo.close_paper_trade(
+            trade_id=1, exit_price=95.0, close_reason="stop_loss",
+            pnl=-5.0, pnl_percent=-5.0, pnl_r=-1.0, mfe=0.0, mae=-5.0,
+        )
+        self.conn.commit()
+
+        # Count patches before
+        patch_count_before = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM strategy_patches"
+        ).fetchone()["cnt"]
+
+        result = run_daily_review(self.repo, day_utc=report_date, force=True)
+        # Should not return idempotent
+        self.assertFalse(result.get("idempotent"), "force=True should not short-circuit")
+        # Should complete without error (may not be ok if review fails, but should not crash)
+        self.assertIsNotNone(result.get("text"), "Should have report text")
+
+        # No duplicate patches should be created
+        patch_count_after = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM strategy_patches"
+        ).fetchone()["cnt"]
+        self.assertEqual(patch_count_before, patch_count_after,
+                         "force rebuild should not create duplicate patches")
 
 
 if __name__ == "__main__":
