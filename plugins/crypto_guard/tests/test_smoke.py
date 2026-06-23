@@ -11572,6 +11572,119 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(st[0]["real_pnl_count"], 0)
         self.assertEqual(st[0]["shadow_sample_count"], 5)
 
+    def test_report_only_skips_all_writes(self) -> None:
+        """report_only=True must not modify strategy_versions, strategy_patches, or evolution_triggers."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Create a stale shadow_testing version (created 8 days ago)
+        from datetime import datetime, timezone, timedelta
+        stale_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        self.conn.execute(
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
+            "VALUES ('smc_pullback_long', 'v2-report-only-test', 'shadow_testing', '{}', 'test', ?)",
+            (stale_time,),
+        )
+        self.conn.execute(
+            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
+            "VALUES ('smc_pullback_long', '1.0', 'v2-report-only-test', '{}', 'shadow_testing', NULL)"
+        )
+        self.conn.commit()
+
+        # Snapshot before report_only call
+        version_before = self.conn.execute(
+            "SELECT status FROM strategy_versions WHERE version='v2-report-only-test'"
+        ).fetchone()
+        patch_before = self.conn.execute(
+            "SELECT status FROM strategy_patches WHERE candidate_version='v2-report-only-test'"
+        ).fetchone()
+
+        # Call with report_only=True
+        result = evaluate_evolution_triggers(self.repo, report_only=True)
+
+        # Verify return shape
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["triggered"])
+        self.assertTrue(result["report_only"])
+        self.assertEqual(result["cleaned_stale"], {"skipped": True, "reason": "report_only"})
+        self.assertEqual(result["cleaned_duplicates"], {"skipped": True, "reason": "report_only"})
+
+        # Verify NO writes happened
+        version_after = self.conn.execute(
+            "SELECT status FROM strategy_versions WHERE version='v2-report-only-test'"
+        ).fetchone()
+        patch_after = self.conn.execute(
+            "SELECT status FROM strategy_patches WHERE candidate_version='v2-report-only-test'"
+        ).fetchone()
+        self.assertEqual(version_before["status"], version_after["status"],
+                         "report_only=True must not change strategy_versions.status")
+        self.assertEqual(patch_before["status"], patch_after["status"],
+                         "report_only=True must not change strategy_patches.status")
+
+    def test_report_only_false_still_runs_cleanup(self) -> None:
+        """report_only=False (default) must still execute cleanup and duplicate rejection."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Create 3 stop loss trades to trigger evolution
+        for i in range(3):
+            self.conn.execute(
+                "INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at) "
+                "VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)"
+            )
+        self.conn.commit()
+
+        result = evaluate_evolution_triggers(self.repo, report_only=False)
+        # With report_only=False, cleaned_stale and cleaned_duplicates should be real dicts, not skip placeholders
+        self.assertNotEqual(result.get("cleaned_stale"), {"skipped": True, "reason": "report_only"})
+        self.assertNotEqual(result.get("cleaned_duplicates"), {"skipped": True, "reason": "report_only"})
+        # Should have triggered (3 consecutive stop losses)
+        self.assertTrue(result["triggered"])
+
+    def test_report_only_no_trigger_created(self) -> None:
+        """report_only=True with 3 stop losses must NOT create triggers or patches."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Create 3 stop loss trades (would normally trigger evolution)
+        for i in range(3):
+            self.conn.execute(
+                "INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at) "
+                "VALUES ('BTCUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)"
+            )
+        self.conn.commit()
+
+        trigger_count_before = self.conn.execute("SELECT COUNT(*) as cnt FROM evolution_triggers").fetchone()["cnt"]
+        patch_count_before = self.conn.execute("SELECT COUNT(*) as cnt FROM strategy_patches").fetchone()["cnt"]
+
+        result = evaluate_evolution_triggers(self.repo, report_only=True)
+
+        trigger_count_after = self.conn.execute("SELECT COUNT(*) as cnt FROM evolution_triggers").fetchone()["cnt"]
+        patch_count_after = self.conn.execute("SELECT COUNT(*) as cnt FROM strategy_patches").fetchone()["cnt"]
+
+        self.assertTrue(result["report_only"])
+        self.assertFalse(result["triggered"])
+        self.assertEqual(trigger_count_before, trigger_count_after,
+                         "report_only=True must not create evolution_triggers")
+        self.assertEqual(patch_count_before, patch_count_after,
+                         "report_only=True must not create strategy_patches")
+
+    def test_report_only_existing_triggers_included(self) -> None:
+        """report_only=True should return existing pending/shadow_testing/review_required triggers."""
+        from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+
+        # Insert a pending trigger
+        self.conn.execute(
+            "INSERT INTO evolution_triggers(trigger_type, strategy_name, trigger_value, threshold_value, status, latest_triggered_at) "
+            "VALUES ('consecutive_stop_losses', 'smc_pullback_long', 3, 3, 'pending', CURRENT_TIMESTAMP)"
+        )
+        self.conn.commit()
+
+        result = evaluate_evolution_triggers(self.repo, report_only=True)
+        self.assertIn("existing_triggers", result)
+        triggers = result["existing_triggers"]
+        self.assertIsInstance(triggers, list)
+        # Should include our pending trigger
+        trigger_types = [t["trigger_type"] for t in triggers]
+        self.assertIn("consecutive_stop_losses", trigger_types)
+
 
 if __name__ == "__main__":
     unittest.main()

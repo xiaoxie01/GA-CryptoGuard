@@ -8,15 +8,8 @@ from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[str, Any] | None = None, report_only: bool = False) -> dict[str, Any]:
     snapshot = snapshot or {}
-    actions: list[dict[str, Any]] = []
 
-    # Cleanup stale candidates before creating new ones
-    cleaned = _cleanup_stale_candidates(repo)
-
-    # P1: 软清理历史重复补丁
-    duplicates_cleaned = repo.mark_duplicate_patches_rejected()
-
-    # In report_only mode, only return current state — don't create new triggers/patches/backtests
+    # report_only must be checked FIRST — before any write operations
     if report_only:
         existing_triggers = repo.conn.execute(
             "SELECT * FROM evolution_triggers WHERE status IN ('pending','shadow_testing','review_required') ORDER BY latest_triggered_at DESC LIMIT 20"
@@ -25,11 +18,19 @@ def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[s
             "ok": True,
             "triggered": False,
             "actions": [],
-            "cleaned_stale": cleaned,
-            "cleaned_duplicates": duplicates_cleaned,
+            "cleaned_stale": {"skipped": True, "reason": "report_only"},
+            "cleaned_duplicates": {"skipped": True, "reason": "report_only"},
             "report_only": True,
             "existing_triggers": [dict(r) for r in existing_triggers],
         }
+
+    actions: list[dict[str, Any]] = []
+
+    # Cleanup stale candidates before creating new ones
+    cleaned = _cleanup_stale_candidates(repo)
+
+    # P1: 软清理历史重复补丁
+    duplicates_cleaned = repo.mark_duplicate_patches_rejected()
 
     stop_loss_trigger = _consecutive_stop_losses(repo)
     if stop_loss_trigger:
