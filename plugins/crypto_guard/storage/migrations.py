@@ -32,6 +32,9 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_p1_structured_feedback_migrations(conn)
         _apply_account_feedback_gate_migration(conn)
         _apply_daily_review_idempotency_migration(conn)
+        _apply_legacy_fuzzy_migration(conn)
+        _apply_phase_shadow_vt_v2_migration(conn)
+        _apply_candidate_cap_cleanup(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -391,6 +394,9 @@ def _apply_ga_master_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "opportunity_watches", "created_by_user_action", "INTEGER DEFAULT 0")
     _add_column(conn, "opportunity_watches", "source_button_action", "TEXT")
     _add_column(conn, "strategy_evaluations", "pnl_r", "REAL")
+    _add_column(conn, "strategy_evaluations", "ga_decision_id", "INTEGER")
+    _add_column(conn, "strategy_evaluations", "paper_trade_id", "INTEGER")
+    _add_column(conn, "strategy_evaluations", "outcome_source", "TEXT")
     _add_column(conn, "strategy_patches", "trigger_id", "INTEGER")
     _add_column(conn, "strategy_patches", "backtest_result_json", "TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_ga_decision_unique ON paper_orders(ga_decision_id) WHERE ga_decision_id IS NOT NULL")
@@ -508,6 +514,9 @@ def _apply_daily_review_idempotency_migration(conn: sqlite3.Connection) -> None:
     _cleanup_duplicate_open_trades(conn)
     _backfill_historical_shadow_pnl_r(conn)
     _cleanup_stale_empty_watches(conn)
+    _add_column(conn, "paper_orders", "initial_stop_loss", "REAL")
+    _add_column(conn, "paper_trades", "initial_stop_loss", "REAL")
+    _add_column(conn, "paper_trades", "initial_risk_usdt", "REAL")
     # Partial unique index: one order can only have one open trade.
     # Unlike the global UNIQUE on agent_jobs(job_type, session_id) which was
     # rejected because event-queue callers legitimately reuse session_ids,
@@ -666,11 +675,12 @@ def _cleanup_stale_empty_watches(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def _backfill_historical_shadow_pnl_r(conn: sqlite3.Connection) -> dict[str, int]:
-    """One-shot backfill: copy pnl_r from closed paper_trades to shadow evaluations.
+    """One-shot backfill: copy pnl_r from closed paper_trades to active evaluations.
 
-    For each closed trade with real pnl_r, finds the ga_decision's analysis_time (integer ms)
-    and strategy_name, then updates matching shadow strategy_evaluations (is_shadow=1).
-    Excludes duplicate_cleanup trades (pnl_r=NULL, no real outcome).
+    Uses exact ga_decision_id matching (no ±1h fuzzy match).
+    Each trade backfills at most one active evaluation (is_shadow=0).
+    Shadow evaluations are NOT backfilled — they get PnL exclusively from
+    their independent shadow_virtual_trades lifecycle.
     """
     import json
 
@@ -699,50 +709,17 @@ def _backfill_historical_shadow_pnl_r(conn: sqlite3.Connection) -> dict[str, int
         if not order or not order["ga_decision_id"]:
             continue
 
-        gd = conn.execute(
-            "SELECT analysis_time, raw_decision_json FROM ga_decisions WHERE id=?",
-            (int(order["ga_decision_id"]),),
-        ).fetchone()
-        if not gd or not gd["analysis_time"]:
-            continue
+        gd_id = int(order["ga_decision_id"])
 
-        try:
-            analysis_time = int(gd["analysis_time"])
-        except (ValueError, TypeError):
-            continue
-
-        strategy_name = None
-        try:
-            raw = json.loads(gd["raw_decision_json"] or "{}")
-            # Real data: raw_decision_json.raw_legacy_decision.strategy_name
-            strategy_name = raw.get("strategy_name")
-            if not strategy_name:
-                legacy = raw.get("raw_legacy_decision")
-                if isinstance(legacy, dict):
-                    strategy_name = legacy.get("strategy_name")
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        if strategy_name:
-            conn.execute(
-                """
-                UPDATE strategy_evaluations
-                SET pnl_r=?
-                WHERE symbol=? AND strategy_name=? AND is_shadow=1 AND pnl_r IS NULL
-                  AND ABS(analysis_time - ?) < 3600000
-                """,
-                (pnl_r, order["symbol"], strategy_name, analysis_time),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE strategy_evaluations
-                SET pnl_r=?
-                WHERE symbol=? AND is_shadow=1 AND pnl_r IS NULL
-                  AND ABS(analysis_time - ?) < 3600000
-                """,
-                (pnl_r, order["symbol"], analysis_time),
-            )
+        # Update active evaluation with exact ga_decision_id match
+        conn.execute(
+            """
+            UPDATE strategy_evaluations
+            SET pnl_r=?, ga_decision_id=?, paper_trade_id=?, outcome_source='real_pnl'
+            WHERE ga_decision_id=? AND is_shadow=0 AND pnl_r IS NULL
+            """,
+            (pnl_r, gd_id, int(row["id"]), gd_id),
+        )
 
         updated = int(conn.execute("SELECT changes() AS c").fetchone()["c"])
         if updated > 0:
@@ -894,6 +871,151 @@ def _cleanup_agent_job_duplicates(conn: sqlite3.Connection) -> dict[str, int]:
     return result
 
 
+def _apply_legacy_fuzzy_migration(conn: sqlite3.Connection) -> None:
+    """Mark legacy strategy_evaluations as outcome_source='legacy_fuzzy'.
+
+    - All rows WHERE ga_decision_id IS NULL → legacy_fuzzy
+    - All rows WHERE paper_trade_id IS NULL AND outcome_source IS NULL → legacy_fuzzy
+    - Clean stalled momentum_continuation_long candidate (Item 12)
+    """
+    # Mark ga_decision_id IS NULL rows
+    conn.execute(
+        """
+        UPDATE strategy_evaluations
+        SET outcome_source='legacy_fuzzy'
+        WHERE ga_decision_id IS NULL AND outcome_source IS NULL
+        """,
+    )
+    # Mark paper_trade_id IS NULL AND outcome_source IS NULL rows
+    conn.execute(
+        """
+        UPDATE strategy_evaluations
+        SET outcome_source='legacy_fuzzy'
+        WHERE paper_trade_id IS NULL AND outcome_source IS NULL AND ga_decision_id IS NOT NULL
+        """,
+    )
+
+    # Item 12: Clean stalled momentum_continuation_long candidate
+    stalled = conn.execute(
+        """
+        SELECT sv.id AS version_id, sv.version, sv.created_at
+        FROM strategy_versions sv
+        WHERE sv.strategy_name = 'momentum_continuation_long'
+          AND sv.status = 'candidate'
+          AND datetime(sv.created_at) < datetime('now', '-48 hours')
+        """
+    ).fetchall()
+
+    for row in stalled:
+        conn.execute(
+            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
+            ("stalled_candidate_cleanup:超过48小时未进入shadow_testing", int(row["version_id"])),
+        )
+        conn.execute(
+            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
+            (row["version"],),
+        )
+
+    updated = int(conn.execute(
+        "SELECT COUNT(*) as cnt FROM strategy_evaluations WHERE outcome_source='legacy_fuzzy'"
+    ).fetchone()["cnt"])
+
+    if updated:
+        conn.commit()
+
+    LOGGER = __import__("logging", fromlist=["getLogger"]).getLogger("crypto_guard.migrations")
+    LOGGER.info(
+        "legacy_fuzzy_migration: marked %d evaluations as legacy_fuzzy, cleaned %d stalled candidates",
+        updated, len(stalled),
+    )
+
+
+def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
+    """Phase shadow_vt_v2: entry_type, opened_at, expires_at + strategy_name + shadow_virtual_trade_id."""
+    # 1.0: shadow_virtual_trades add entry_type, opened_at, expires_at
+    _add_column(conn, "shadow_virtual_trades", "entry_type", "TEXT NOT NULL DEFAULT 'market'")
+    _add_column(conn, "shadow_virtual_trades", "opened_at", "TEXT")
+    _add_column(conn, "shadow_virtual_trades", "expires_at", "TEXT")
+
+    # 1.1: shadow_virtual_trades add strategy_name + rebuild unique index
+    _add_column(conn, "shadow_virtual_trades", "strategy_name", "TEXT NOT NULL DEFAULT 'smc_pullback_long'")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)")
+
+    # 1.2: strategy_evaluations add shadow_virtual_trade_id
+    _add_column(conn, "strategy_evaluations", "shadow_virtual_trade_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evals_shadow_vt ON strategy_evaluations(shadow_virtual_trade_id)")
+
+    # 1.3: Backfill opened_at for existing open trades that have no opened_at
+    conn.execute(
+        "UPDATE shadow_virtual_trades SET opened_at=created_at WHERE opened_at IS NULL AND status='open'"
+    )
+    # Backfill entry_type to 'market' for existing trades without it (already covered by DEFAULT)
+
+    # 1.4: shadow_virtual_trades add last_processed_candle_time for per-candle replay cursor
+    _add_column(conn, "shadow_virtual_trades", "last_processed_candle_time", "INTEGER")
+
+
+def _apply_candidate_cap_cleanup(conn: sqlite3.Connection) -> None:
+    """Reject excess candidates beyond 5 per strategy_name.
+
+    For each strategy_name with more than 5 candidate+shadow_testing versions,
+    reject the excess candidates, sorted by real_pnl_count DESC, created_at ASC
+    (meaning the weakest candidates are rejected first).
+
+    Idempotent: no-op if cap is already satisfied.
+    Atomic: all rejections happen in a single transaction.
+    """
+    # Find all strategy_names that have candidates
+    strategy_names = conn.execute(
+        """
+        SELECT DISTINCT sv.strategy_name
+        FROM strategy_versions sv
+        WHERE sv.status IN ('candidate', 'shadow_testing')
+        """
+    ).fetchall()
+
+    for row in strategy_names:
+        strategy_name = str(row["strategy_name"])
+
+        # Get all candidate+shadow_testing versions sorted by real_pnl_count DESC, created_at ASC
+        candidates = conn.execute(
+            """
+            SELECT sv.id, sv.version, sv.created_at, sv.status,
+                   (SELECT COUNT(*) FROM strategy_evaluations se
+                    WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
+                      AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count
+            FROM strategy_versions sv
+            WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
+            ORDER BY real_pnl_count DESC, sv.created_at ASC
+            """,
+            (strategy_name,),
+        ).fetchall()
+
+        if len(candidates) <= 5:
+            continue
+
+        # Reject the excess: weakest candidates (fewest real_pnl samples, newest first)
+        excess = list(candidates[5:])
+        for cand in excess:
+            # Reject strategy_versions
+            conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
+                ("候选上限 5 已满，自动拒绝旧候选", int(cand["id"])),
+            )
+            # Sync strategy_patches
+            conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
+                (cand["version"],),
+            )
+            # Sync evolution_triggers via strategy_patches
+            conn.execute(
+                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+                (cand["version"],),
+            )
+
+    conn.commit()
+
+
 def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
 
@@ -922,12 +1044,17 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json"],
         "opportunity_watches": ["dedupe_key"],
         "paper_positions": ["updated_at"],
+        "strategy_evaluations": ["ga_decision_id", "paper_trade_id", "outcome_source", "shadow_virtual_trade_id"],
+        "paper_orders": ["initial_stop_loss"],
+        "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
+        "shadow_virtual_trades": ["strategy_name", "status", "entry_type", "opened_at", "expires_at", "last_processed_candle_time"],
     }
 
     # Required indexes
     required_indexes = [
         "idx_opportunity_watches_dedupe",
         "idx_one_open_trade_per_order",
+        "idx_shadow_vt_unique",
     ]
 
     missing: list[dict[str, str]] = []

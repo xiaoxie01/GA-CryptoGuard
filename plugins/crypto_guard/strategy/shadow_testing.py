@@ -26,6 +26,10 @@ def record_shadow_evaluation(
     counter_evidence: dict[str, Any] | None = None,
     pnl_r: float | None = None,
     snapshot_id: int | None = None,
+    ga_decision_id: int | None = None,
+    outcome_source: str | None = None,
+    paper_trade_id: int | None = None,
+    shadow_virtual_trade_id: int | None = None,
 ) -> dict[str, Any]:
     """候选策略只做影子记录，不推送飞书、不创建模拟盘。"""
 
@@ -33,9 +37,10 @@ def record_shadow_evaluation(
         """
         INSERT INTO strategy_evaluations(
             symbol, timeframe, analysis_time, strategy_name, strategy_version, score,
-            decision, evidence_json, counter_evidence_json, is_shadow, snapshot_id, pnl_r
+            decision, evidence_json, counter_evidence_json, is_shadow, snapshot_id, pnl_r,
+            ga_decision_id, outcome_source, paper_trade_id, shadow_virtual_trade_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
         """,
         (
             symbol,
@@ -49,6 +54,10 @@ def record_shadow_evaluation(
             "{}" if counter_evidence is None else __import__("json").dumps(counter_evidence, ensure_ascii=False),
             snapshot_id,
             pnl_r,
+            ga_decision_id,
+            outcome_source,
+            paper_trade_id,
+            shadow_virtual_trade_id,
         ),
     )
     evaluation_id = int(repo.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -138,6 +147,11 @@ def run_shadow_test(
         recommendation = "reject_candidate"
         status = "rejected"
 
+    # P1: Compute paired comparison BEFORE LLM verdict and hard gates.
+    # Paired comparison result acts as a gate condition.
+    paired = _run_paired_comparison(repo, strategy_name, active_version, candidate_version)
+    paired_real = _paired_real_pnl_samples(repo, strategy_name, active_version, candidate_version)
+
     fallback_result = {
         "ok": True,
         "strategy_name": strategy_name,
@@ -157,7 +171,11 @@ def run_shadow_test(
         "shadow_quality_alert": shadow_quality_alert,
         "auto_promoted": False,
         "promotion_allowed": bool(allow_auto_promote),
+        "paired_comparison": paired,
+        "paired_real_pnl_samples": paired_real,
     }
+    # Paired comparison computed above — used as gate condition below.
+
     llm_result = run_agent_json_task(
         task_name="shadow_test_strategy_verdict",
         payload={
@@ -177,7 +195,12 @@ def run_shadow_test(
             "必须保守处理过拟合风险；不能绕过人工确认或配置门禁。",
         ],
     )
-    result = {**fallback_result, **(llm_result or {})}
+    # LLM result ONLY used for explanation and notes — verdict comes from deterministic gates
+    result = {
+        **fallback_result,
+        "llm_explanation": (llm_result or {}).get("explanation", ""),
+        "llm_notes": (llm_result or {}).get("notes", ""),
+    }
 
     # P0: Hard gate — enforce sample count gate AFTER LLM verdict.
     # LLM verdict cannot override these — they are non-negotiable.
@@ -197,15 +220,42 @@ def run_shadow_test(
             result.get("recommendation"),
         )
     elif pseudo_only:
-        result["recommendation"] = "data_quality_insufficient"
-        result["status"] = "running"
-        result["data_quality"] = candidate_data_source
-        result["shadow_quality_alert"] = shadow_quality_alert
-        result["hard_gate_applied"] = "pseudo_only_block"
-        LOGGER.info(
-            "hard_gate: forced data_quality_insufficient for %s/%s (pseudo_only, LLM returned %s)",
-            strategy_name, candidate_version, result.get("recommendation"),
-        )
+        # Check if candidate has been shadow_testing for 7+ days with zero real_pnl
+        # If so, reject instead of keeping in 'running' — unlikely to ever accumulate real samples
+        candidate_version_row = repo.conn.execute(
+            "SELECT created_at FROM strategy_versions WHERE strategy_name=? AND version=?",
+            (strategy_name, candidate_version),
+        ).fetchone()
+        is_stale = False
+        if candidate_version_row and candidate_version_row["created_at"]:
+            try:
+                created = datetime.fromisoformat(candidate_version_row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - created > timedelta(days=7):
+                    is_stale = True
+            except Exception:
+                pass
+
+        if is_stale:
+            result["recommendation"] = "reject_candidate"
+            result["status"] = "rejected"
+            result["data_quality"] = candidate_data_source
+            result["hard_gate_applied"] = "stale_zero_real_pnl_7d"
+            LOGGER.info(
+                "hard_gate: forced reject_candidate for %s/%s (pseudo_only + 7+ days with zero real_pnl, LLM returned %s)",
+                strategy_name, candidate_version, result.get("recommendation"),
+            )
+        else:
+            result["recommendation"] = "data_quality_insufficient"
+            result["status"] = "running"
+            result["data_quality"] = candidate_data_source
+            result["shadow_quality_alert"] = shadow_quality_alert
+            result["hard_gate_applied"] = "pseudo_only_block"
+            LOGGER.info(
+                "hard_gate: forced data_quality_insufficient for %s/%s (pseudo_only, LLM returned %s)",
+                strategy_name, candidate_version, result.get("recommendation"),
+            )
     elif real_pnl_samples < effective_min_samples:
         result["recommendation"] = "data_quality_insufficient"
         result["status"] = "running"
@@ -227,10 +277,304 @@ def run_shadow_test(
             active_stats.get("data_source"), active_stats.get("win_rate"),
             result.get("recommendation"),
         )
+    elif active_stats.get("real_pnl_samples", 0) < effective_min_samples:
+        result["recommendation"] = "active_baseline_insufficient"
+        result["status"] = "running"
+        result["hard_gate_applied"] = "active_baseline_insufficient_real_pnl"
+        result["active_real_pnl_samples"] = active_stats.get("real_pnl_samples", 0)
+        LOGGER.info(
+            "hard_gate: forced active_baseline_insufficient for %s/%s (active real_pnl=%d < %d, LLM returned %s)",
+            strategy_name, candidate_version,
+            active_stats.get("real_pnl_samples", 0), effective_min_samples,
+            result.get("recommendation"),
+        )
+    elif paired_real < 3 and active_version is not None:
+        # P1: Paired comparison gate — need at least 3 paired real_pnl samples
+        # to have a meaningful comparison before promotion
+        result["recommendation"] = "paired_samples_insufficient"
+        result["status"] = "running"
+        result["hard_gate_applied"] = "paired_samples_insufficient"
+        LOGGER.info(
+            "hard_gate: forced paired_samples_insufficient for %s/%s (paired_real=%d < 3, LLM returned %s)",
+            strategy_name, candidate_version, paired_real,
+            result.get("recommendation"),
+        )
+    elif active_version is not None and paired.get("paired") and paired.get("pairs", 0) >= 3:
+        # P1: Paired metrics gate — candidate must outperform active on paired samples
+        paired_avg_r_diff = paired.get("avg_r_diff", 0)
+        paired_candidate_win_rate = paired.get("candidate_win_rate", 0)
+        if paired_avg_r_diff <= 0 or paired_candidate_win_rate < 0.5:
+            result["recommendation"] = "paired_underperformance"
+            result["status"] = "rejected"
+            result["hard_gate_applied"] = "paired_underperformance"
+            LOGGER.info(
+                "hard_gate: forced paired_underperformance for %s/%s (avg_r_diff=%.4f, candidate_win_rate=%.2f%%, LLM returned %s)",
+                strategy_name, candidate_version, paired_avg_r_diff,
+                paired_candidate_win_rate * 100,
+                result.get("recommendation"),
+            )
 
     result_id = repo.save_shadow_test_result(result)
     result["shadow_test_result_id"] = result_id
     return result
+
+
+def _paired_real_pnl_samples(
+    repo: CryptoGuardRepository,
+    strategy_name: str,
+    active_version: str | None,
+    candidate_version: str,
+) -> int:
+    """Count ga_decision_ids where BOTH active AND candidate have real_pnl evaluations.
+
+    JOINs active and shadow evaluations on ga_decision_id, requiring both to have
+    outcome_source='real_pnl' and pnl_r IS NOT NULL.
+    """
+    if not active_version:
+        return 0
+
+    row = repo.conn.execute(
+        """
+        SELECT COUNT(DISTINCT a.ga_decision_id) as paired_count
+        FROM strategy_evaluations a
+        INNER JOIN strategy_evaluations c
+            ON a.ga_decision_id = c.ga_decision_id
+        WHERE a.strategy_name = ?
+          AND a.strategy_version = ?
+          AND a.is_shadow = 0
+          AND a.outcome_source = 'real_pnl'
+          AND a.pnl_r IS NOT NULL
+          AND c.strategy_name = ?
+          AND c.strategy_version = ?
+          AND c.is_shadow = 1
+          AND c.outcome_source = 'real_pnl'
+          AND c.pnl_r IS NOT NULL
+        """,
+        (strategy_name, active_version, strategy_name, candidate_version),
+    ).fetchone()
+
+    return int(row["paired_count"]) if row else 0
+
+
+def _run_paired_comparison(
+    repo: CryptoGuardRepository,
+    strategy_name: str,
+    active_version: str | None,
+    candidate_version: str,
+) -> dict[str, Any]:
+    """Paired comparison of active vs candidate at the same analysis_time.
+
+    Matches strategy_evaluations where both active and candidate have a row
+    for the same (symbol, analysis_time), then compares pnl_r side-by-side.
+    Returns paired stats: win/loss/tie counts, avg_r_diff, etc.
+    """
+    if not active_version:
+        return {"paired": False, "reason": "no_active_version", "pairs": 0}
+
+    rows = repo.conn.execute(
+        """
+        SELECT a.pnl_r AS active_r, c.pnl_r AS candidate_r,
+               a.symbol, a.analysis_time
+        FROM strategy_evaluations a
+        INNER JOIN strategy_evaluations c
+            ON a.ga_decision_id = c.ga_decision_id
+        WHERE a.strategy_name = ?
+          AND a.strategy_version = ?
+          AND a.is_shadow = 0
+          AND a.outcome_source = 'real_pnl'
+          AND c.strategy_name = ?
+          AND c.strategy_version = ?
+          AND c.is_shadow = 1
+          AND c.outcome_source = 'real_pnl'
+        ORDER BY a.analysis_time ASC
+        """,
+        (strategy_name, active_version, strategy_name, candidate_version),
+    ).fetchall()
+
+    if not rows:
+        return {"paired": True, "pairs": 0, "reason": "no_overlapping_analysis_times"}
+
+    pairs = []
+    candidate_wins = 0
+    active_wins = 0
+    ties = 0
+    r_diffs = []
+
+    for r in rows:
+        if r["active_r"] is None or r["candidate_r"] is None:
+            continue  # Skip pairs where either side has NULL pnl_r
+        a_r = float(r["active_r"])
+        c_r = float(r["candidate_r"])
+        diff = c_r - a_r
+        r_diffs.append(diff)
+        if diff > 0:
+            candidate_wins += 1
+        elif diff < 0:
+            active_wins += 1
+        else:
+            ties += 1
+        pairs.append({
+            "symbol": r["symbol"],
+            "analysis_time": r["analysis_time"],
+            "active_r": a_r,
+            "candidate_r": c_r,
+            "diff": diff,
+        })
+
+    n = len(pairs)
+    avg_diff = sum(r_diffs) / n if n > 0 else 0.0
+
+    return {
+        "paired": True,
+        "pairs": n,
+        "candidate_wins": candidate_wins,
+        "active_wins": active_wins,
+        "ties": ties,
+        "avg_r_diff": round(avg_diff, 4),
+        "candidate_win_rate": round(candidate_wins / n, 4) if n > 0 else 0.0,
+        "pairs_detail": pairs[:20],  # limit detail to 20 pairs
+    }
+
+
+def _designate_primary_candidate(repo: CryptoGuardRepository, strategy_name: str) -> dict[str, Any]:
+    """Designate primary candidate per strategy_name for verdict priority.
+
+    Primary = most real_pnl_samples DESC, then created_at ASC (oldest first).
+    Returns {primary_version, candidate_count, candidates: [{version, real_pnl_count, last_sample_at}]}.
+    """
+    rows = repo.conn.execute(
+        """
+        SELECT sv.version, sv.created_at,
+               (SELECT COUNT(*) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
+                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count,
+               (SELECT MAX(se.created_at) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
+                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as last_sample_at
+        FROM strategy_versions sv
+        WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
+        ORDER BY real_pnl_count DESC, sv.created_at ASC
+        """,
+        (strategy_name,),
+    ).fetchall()
+
+    candidates = []
+    for r in rows:
+        candidates.append({
+            "version": r["version"],
+            "real_pnl_count": int(r["real_pnl_count"]) if r["real_pnl_count"] else 0,
+            "last_sample_at": r["last_sample_at"],
+        })
+
+    primary_version = candidates[0]["version"] if candidates else None
+    return {
+        "strategy_name": strategy_name,
+        "primary_version": primary_version,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def _enforce_candidate_cap(repo: CryptoGuardRepository, strategy_name: str, max_candidates: int = 5) -> int:
+    """Reject excess candidates beyond max_candidates per strategy_name.
+
+    Sorts by real_pnl_count DESC, created_at ASC to protect candidates with real samples.
+    Rejects the weakest candidates (fewest real samples, newest).
+
+    Preservation logic: candidates with most real_pnl_samples are kept.
+    Both 'candidate' and 'shadow_testing' statuses count toward the cap.
+
+    Atomic: all rejections happen in a single transaction. Caller is responsible
+    for committing the transaction.
+
+    Returns number of candidates rejected.
+    """
+    rows = repo.conn.execute(
+        """
+        SELECT sv.id, sv.version, sv.created_at, sv.status,
+               (SELECT COUNT(*) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
+                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count
+        FROM strategy_versions sv
+        WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
+        ORDER BY real_pnl_count DESC, sv.created_at ASC
+        """,
+        (strategy_name,),
+    ).fetchall()
+
+    if len(rows) <= max_candidates:
+        return 0
+
+    # Reject the excess: fewest real PnL samples, newest first
+    excess = list(rows[max_candidates:])
+    rejected = 0
+    for row in excess:
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
+            (f"候选上限 {max_candidates} 已满，自动拒绝旧候选", int(row["id"])),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
+            (row["version"],),
+        )
+        repo.conn.execute(
+            "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+            (row["version"],),
+        )
+        rejected += 1
+
+    if rejected:
+        pass  # Caller is responsible for committing the transaction.
+    return rejected
+
+
+def _soft_reject_unknown_candidates(repo: CryptoGuardRepository) -> int:
+    """Soft-reject candidates with loss_pattern='unknown' in their patch.
+
+    These candidates were created from unclassified trades and have no
+    meaningful conditional adjustments. They are marked as rejected with
+    reason='needs_manual_classification' but not physically deleted.
+
+    Returns number of candidates soft-rejected.
+    """
+    import json
+
+    unknown = repo.conn.execute(
+        """
+        SELECT sv.id, sv.strategy_name, sv.version
+        FROM strategy_versions sv
+        JOIN strategy_patches sp ON sp.strategy_name=sv.strategy_name AND sp.candidate_version=sv.version
+        WHERE sv.status IN ('candidate', 'shadow_testing') AND sp.status NOT IN ('rejected', 'duplicate')
+        """
+    ).fetchall()
+
+    rejected = 0
+    for row in unknown:
+        patch_row = repo.conn.execute(
+            "SELECT patch_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+            (row["strategy_name"], row["version"]),
+        ).fetchone()
+        if not patch_row:
+            continue
+        try:
+            patch = json.loads(patch_row["patch_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        loss_pattern = patch.get("patch", patch).get("loss_pattern", "")
+        if loss_pattern == "unknown":
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason='needs_manual_classification' WHERE id=?",
+                (int(row["id"]),),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=? AND candidate_version=?",
+                (row["strategy_name"], row["version"]),
+            )
+            rejected += 1
+
+    if rejected:
+        repo.conn.commit()  # commit immediately after soft reject
+    return rejected
 
 
 def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
@@ -260,8 +604,105 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
         """
     ).fetchall()
 
+    # Enforce candidate cap per strategy_name (max 5)
+    strategy_names = set(row["strategy_name"] for row in candidates)
+    cap_diagnostics = {}
+    for sn in strategy_names:
+        rejected = _enforce_candidate_cap(repo, sn, max_candidates=5)
+        if rejected:
+            cap_diagnostics[sn] = rejected
+
+    # Re-query after cap enforcement — rejected candidates must not enter verdict loop
+    candidates = repo.conn.execute(
+        """
+        SELECT DISTINCT sv.strategy_name, sv.version
+        FROM strategy_versions sv
+        WHERE sv.status = 'shadow_testing'
+        """
+    ).fetchall()
+    strategy_names = set(row["strategy_name"] for row in candidates)
+
+    # Soft-reject historical unknown candidates (patch with loss_pattern='unknown')
+    _soft_reject_unknown_candidates(repo)
+    repo.conn.commit()  # commit immediately after soft reject
+
+    # Re-query after soft reject — rejected candidates must not appear in re-queried list
+    candidates = repo.conn.execute(
+        """
+        SELECT DISTINCT sv.strategy_name, sv.version
+        FROM strategy_versions sv
+        WHERE sv.status = 'shadow_testing'
+        """
+    ).fetchall()
+    strategy_names = set(row["strategy_name"] for row in candidates)
+
+    # P1: Soft-reject zero-real-PnL candidates after 7+ days
+    # Candidates with no real_pnl evaluations after 7 days are unlikely to ever accumulate enough
+    cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    stale_zero_real = repo.conn.execute(
+        """
+        SELECT sv.id, sv.strategy_name, sv.version, sv.created_at
+        FROM strategy_versions sv
+        WHERE sv.status = 'shadow_testing'
+          AND sv.created_at < ?
+          AND (SELECT COUNT(*) FROM strategy_evaluations se
+               WHERE se.strategy_name = sv.strategy_name
+                 AND se.strategy_version = sv.version
+                 AND se.is_shadow = 1
+                 AND se.outcome_source = 'real_pnl'
+                 AND se.pnl_r IS NOT NULL) = 0
+        """,
+        (cutoff_7d,),
+    ).fetchall()
+
+    for row in stale_zero_real:
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
+            ("no_real_samples_7d", int(row["id"])),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
+            (row["version"],),
+        )
+        repo.conn.execute(
+            "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
+            (row["version"],),
+        )
+        LOGGER.info(
+            "soft_reject_zero_real_pnl: %s/%s has 0 real_pnl samples after 7+ days — rejected",
+            row["strategy_name"], row["version"],
+        )
+    if stale_zero_real:
+        repo.conn.commit()
+
+    # Re-query after zero-real-PnL soft reject
+    candidates = repo.conn.execute(
+        """
+        SELECT DISTINCT sv.strategy_name, sv.version
+        FROM strategy_versions sv
+        WHERE sv.status = 'shadow_testing'
+        """
+    ).fetchall()
+    strategy_names = set(row["strategy_name"] for row in candidates)
+
+    # Designate primary candidate per strategy_name for diagnostics
+    primary_map = {}
+    for sn in strategy_names:
+        primary_map[sn] = _designate_primary_candidate(repo, sn)
+
     results = []
     for row in candidates:
+        strategy_name = row["strategy_name"]
+        candidate_version = row["version"]
+
+        # Guard: skip if status was changed to 'rejected' (e.g. by soft reject)
+        current_status = repo.conn.execute(
+            "SELECT status FROM strategy_versions WHERE strategy_name=? AND version=?",
+            (strategy_name, candidate_version),
+        ).fetchone()
+        if not current_status or current_status["status"] == "rejected":
+            results.append({"strategy_name": strategy_name, "version": candidate_version, "verdict": "skipped_rejected_status"})
+            continue
         strategy_name = row["strategy_name"]
         candidate_version = row["version"]
 
@@ -354,7 +795,13 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
         except Exception:
             pass
     repo.conn.commit()
-    return {"ok": True, "processed": len(results), "results": results}
+    return {
+        "ok": True,
+        "processed": len(results),
+        "results": results,
+        "primary_designations": {sn: {"primary": p["primary_version"], "count": p["candidate_count"]} for sn, p in primary_map.items()},
+        "cap_enforcement": cap_diagnostics,
+    }
 
 
 def run_backtest_gate(
@@ -445,14 +892,24 @@ def run_backtest_gate(
 
     for symbol in symbols:
         for interval in ("1h", "15m"):
-            result = run_paired_backtest(
-                repo,
-                symbol=symbol,
-                interval=interval,
-                start_time=start_time,
-                end_time=end_time,
-                candidate_score_adjustment=candidate_score_adjustment,
-            )
+            try:
+                result = run_paired_backtest(
+                    repo,
+                    symbol=symbol,
+                    interval=interval,
+                    start_time=start_time,
+                    end_time=end_time,
+                    candidate_patch=candidate_patch,
+                )
+            except Exception as exc:
+                return {
+                    "ok": False, "passed": False,
+                    "reason": "backtest_exception",
+                    "error": str(exc),
+                    "skipped": False,
+                    "strategy_name": strategy_name,
+                    "candidate_version": candidate_version,
+                }
             if not result.get("ok"):
                 no_lookahead_ok = False
                 continue
@@ -484,7 +941,7 @@ def run_backtest_gate(
 
     # Aggregate stats using real R sequences
     if not symbol_results:
-        return {"ok": False, "passed": False, "reason": "no_valid_backtest_results", "error": "all_backtests_failed"}
+        return {"ok": True, "passed": False, "reason": "skipped:data_unavailable", "skipped": True, "error": "all_backtests_failed"}
 
     active_stats_agg = _aggregate_stats(all_active_r_values, all_active_outcomes, active_decision_samples, active_simulated_trades)
     candidate_stats_agg = _aggregate_stats(all_candidate_r_values, all_candidate_outcomes, candidate_decision_samples, candidate_simulated_trades)
@@ -624,9 +1081,16 @@ def _get_candidate_patch(repo: CryptoGuardRepository, strategy_name: str, candid
 def _extract_score_adjustment(patch: dict[str, Any]) -> float:
     """Extract score adjustment from candidate patch if present.
 
-    Supports both:
+    Supports:
     - score_adjustment: float (single value)
-    - score_adjustments: dict (multiple adjustments, summed)
+    - score_adjustments: dict with legacy flat values (summed unconditionally)
+    - score_adjustments: dict with conditional {value, when} entries
+
+    For backtest use, this returns the maximum possible adjustment (sum of all
+    unconditional values). Conditional adjustments with 'when' clauses are NOT
+    summed here — they must be evaluated per historical snapshot by the caller.
+    Callers that have snapshot context should use _apply_conditional_adjustments()
+    instead.
     """
     patch_data = patch.get("patch", patch)
 
@@ -634,10 +1098,22 @@ def _extract_score_adjustment(patch: dict[str, Any]) -> float:
     if "score_adjustment" in patch_data:
         return float(patch_data["score_adjustment"])
 
-    # Multiple adjustments (sum values)
+    # Multiple adjustments — only sum unconditional ones
     adjustments = patch_data.get("score_adjustments")
     if isinstance(adjustments, dict) and adjustments:
-        return sum(float(v) for v in adjustments.values())
+        total = 0.0
+        for adj_val in adjustments.values():
+            if isinstance(adj_val, (int, float)):
+                total += float(adj_val)
+            elif isinstance(adj_val, dict) and "value" in adj_val:
+                when = adj_val.get("when", {})
+                # Only apply if no context conditions (unconditional)
+                has_conditions = any(
+                    when.get(k) for k in ("side", "market_phase", "trend_stage", "entry_type")
+                )
+                if not has_conditions:
+                    total += float(adj_val["value"])
+        return total
 
     return 0.0
 
@@ -667,6 +1143,40 @@ def check_candidate_backtest_status(repo: CryptoGuardRepository, strategy_name: 
         return {"has_backtest": True, "passed": backtest.get("passed", False), "backtest": backtest}
     except (json.JSONDecodeError, TypeError):
         return {"has_backtest": False}
+
+
+def _promote_draft_to_candidate(
+    repo: CryptoGuardRepository,
+    *,
+    strategy_name: str,
+    candidate_version: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Promote a draft patch to candidate status (requires explicit human approval).
+
+    Only transitions patches with status='draft' to 'candidate'.
+    Returns the updated status info.
+    """
+    if not confirm:
+        return {"ok": False, "error": "draft promotion requires explicit confirmation (confirm=True)"}
+
+    row = repo.conn.execute(
+        "SELECT id, status FROM strategy_patches WHERE strategy_name=? AND candidate_version=? AND status='draft'",
+        (strategy_name, candidate_version),
+    ).fetchone()
+    if not row:
+        return {"ok": False, "error": "draft patch not found or not in draft status"}
+
+    repo.conn.execute(
+        "UPDATE strategy_patches SET status='candidate' WHERE id=?",
+        (int(row["id"]),),
+    )
+    repo.conn.execute(
+        "UPDATE strategy_versions SET status='candidate', change_reason='manual_approval_from_draft' WHERE strategy_name=? AND version=? AND status='draft'",
+        (strategy_name, candidate_version),
+    )
+    repo.conn.commit()
+    return {"ok": True, "strategy_name": strategy_name, "candidate_version": candidate_version, "status": "candidate"}
 
 
 def promote_shadow_candidate(
@@ -912,7 +1422,7 @@ def _maybe_generate_draft_patch(
     repo.save_strategy_version(
         strategy_name=strategy_name,
         version=new_version,
-        status="shadow_testing",
+        status="draft",
         config=draft_patch,
         change_reason=f"auto_draft_from_failure_{pattern_type}",
     )
@@ -956,8 +1466,9 @@ def _suggest_changes_for_pattern(pattern_type: str, stats: dict[str, Any]) -> di
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute stats from strategy evaluations.
 
-    If real paper trade outcomes are available (via pnl_r column), use actual PnL.
-    Otherwise fall back to score-based pseudo-R.
+    Only counts rows with outcome_source='real_pnl' AND complete IDs as real PnL.
+    Everything else (NULL outcome_source, legacy_fuzzy, avoided_trade, etc.)
+    falls through to pseudo-R.
 
     Returns real_pnl_samples, pseudo_r_samples, and total_shadow_samples
     so displays can distinguish data quality.
@@ -965,12 +1476,36 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # Count by data source
     real_pnl_samples = 0
     pseudo_r_samples = 0
+    legacy_fuzzy_samples = 0
 
-    # Try to get real trade outcomes from pnl_r column
+    # Only count as real_pnl when ALL conditions are met:
+    # pnl_r IS NOT NULL AND outcome_source='real_pnl' AND ga_decision_id IS NOT NULL
+    # AND (for active evals: paper_trade_id IS NOT NULL; for shadow evals: shadow_virtual_trade_id IS NOT NULL)
     real_pnls = []
     for r in rows:
         pnl_r = r.get("pnl_r")
-        if pnl_r is not None:
+        outcome_source = r.get("outcome_source", "")
+        ga_decision_id = r.get("ga_decision_id")
+        paper_trade_id = r.get("paper_trade_id")
+        shadow_virtual_trade_id = r.get("shadow_virtual_trade_id")
+        is_shadow = r.get("is_shadow", 0)
+
+        # Strict mode: require complete real_pnl signature
+        # All rows now have audit fields (migration populated legacy_fuzzy),
+        # so the backward-compat path is removed.
+        if outcome_source in ("legacy_fuzzy", "avoided_trade", "pending_outcome", "ambiguous_path") or outcome_source is None:
+            if outcome_source == "legacy_fuzzy" or outcome_source is None:
+                legacy_fuzzy_samples += 1
+            pseudo_r_samples += 1
+        elif (
+            pnl_r is not None
+            and outcome_source == "real_pnl"
+            and ga_decision_id is not None
+            and (
+                (is_shadow == 1 and shadow_virtual_trade_id is not None)
+                or (is_shadow == 0 and paper_trade_id is not None)
+            )
+        ):
             real_pnls.append(float(pnl_r))
             real_pnl_samples += 1
         else:
@@ -993,6 +1528,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "total_shadow_samples": len(rows),
             "real_pnl_samples": real_pnl_samples,
             "pseudo_r_samples": pseudo_r_samples,
+            "legacy_fuzzy_samples": legacy_fuzzy_samples,
             "avg_r": avg_r,
             "win_rate": win_rate,
             "drawdown": drawdown,
@@ -1015,6 +1551,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_shadow_samples": len(rows),
         "real_pnl_samples": 0,
         "pseudo_r_samples": len(rows),
+        "legacy_fuzzy_samples": legacy_fuzzy_samples,
         "avg_r": avg_r,
         "win_rate": None,   # NOT displayed for pseudo-only — misleading
         "drawdown": drawdown,

@@ -229,37 +229,47 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
     # Detect actual strategy used in related trades
     strategy_name, from_version = _detect_strategy_from_trades(repo, trigger.get("related_trade_ids") or [])
 
-    trigger_id = repo.create_evolution_trigger(
-        trigger_type=trigger["trigger_type"],
-        trigger_value=float(trigger["trigger_value"]),
-        threshold_value=float(trigger["threshold_value"]),
-        related_trade_ids=trigger.get("related_trade_ids") or [],
-        strategy_name=strategy_name,
-        symbol=trigger.get("symbol"),
-        evolution_allowed=True,
-        status="shadow_testing",
-    )
-    candidate_version = f"v2-trigger-{trigger_id}"
-    patch = {
-        "strategy_name": strategy_name,
-        "from_version": from_version,
-        "candidate_version": candidate_version,
-        "change_reason": trigger.get("reason", "自进化触发器创建 candidate patch"),
-        "patch": {
-            "status": "candidate",
-            "paper_order_permission": "shadow_testing_only",
-            "risk_controls": ["require_structure_momentum_alignment", "pause_after_trigger"],
-            "trigger": trigger,
-        },
-    }
-    patch_id = repo.save_strategy_patch_candidate(patch, evidence={"trigger": trigger, "trigger_id": trigger_id}, trigger_id=trigger_id)
-    repo.save_strategy_version(
-        strategy_name=patch["strategy_name"],
-        version=patch["candidate_version"],
-        status="shadow_testing",
-        config=patch["patch"],
-        change_reason=patch["change_reason"],
-    )
+    # Wrap trigger creation + patch creation + version creation + cap enforcement in explicit BEGIN/COMMIT
+    from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
+    repo.conn.execute("BEGIN")
+    try:
+        trigger_id = repo.create_evolution_trigger(
+            trigger_type=trigger["trigger_type"],
+            trigger_value=float(trigger["trigger_value"]),
+            threshold_value=float(trigger["threshold_value"]),
+            related_trade_ids=trigger.get("related_trade_ids") or [],
+            strategy_name=strategy_name,
+            symbol=trigger.get("symbol"),
+            evolution_allowed=True,
+            status="shadow_testing",
+        )
+        candidate_version = f"v2-trigger-{trigger_id}"
+        patch = {
+            "strategy_name": strategy_name,
+            "from_version": from_version,
+            "candidate_version": candidate_version,
+            "change_reason": trigger.get("reason", "自进化触发器创建 candidate patch"),
+            "patch": {
+                "status": "candidate",
+                "paper_order_permission": "shadow_testing_only",
+                "risk_controls": ["require_structure_momentum_alignment", "pause_after_trigger"],
+                "trigger": trigger,
+            },
+        }
+        patch_id = repo.save_strategy_patch_candidate(patch, evidence={"trigger": trigger, "trigger_id": trigger_id}, trigger_id=trigger_id, status="candidate")
+        repo.save_strategy_version(
+            strategy_name=patch["strategy_name"],
+            version=patch["candidate_version"],
+            status="candidate",
+            config=patch["patch"],
+            change_reason=patch["change_reason"],
+        )
+        # Enforce candidate cap AFTER creation, inside same transaction
+        _enforce_candidate_cap(repo, strategy_name, max_candidates=5)
+        repo.conn.commit()
+    except Exception:
+        repo.conn.execute("ROLLBACK")
+        raise
 
     # Run backtest gate immediately after candidate creation
     from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
@@ -308,9 +318,13 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
             "trigger": trigger,
         }
 
-    # Backtest passed or skipped - save result and continue to online shadow
+    # Backtest passed or skipped - transition to shadow_testing and continue
     repo.conn.execute(
-        "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
+        "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
+        (strategy_name, candidate_version),
+    )
+    repo.conn.execute(
+        "UPDATE strategy_patches SET backtest_result_json=?, status='shadow_testing' WHERE id=?",
         (json.dumps(backtest_result, ensure_ascii=False), patch_id),
     )
     repo.conn.commit()

@@ -10,6 +10,7 @@ from typing import Any, Callable
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger, log_path
 from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
+from plugins.crypto_guard.paper.shadow_virtual_trade_updater import update_shadow_virtual_trades
 from plugins.crypto_guard.run_ga_workers import run_once
 from plugins.crypto_guard.run_scheduler import run_job
 from plugins.crypto_guard.storage.migrations import initialize_database
@@ -125,9 +126,13 @@ def _paper_loop(_: Any = None) -> None:
             initialize_database(cfg)
             conn = connect_db(cfg.database_path)
             try:
-                result = update_paper_positions(CryptoGuardRepository(conn))
+                repo = CryptoGuardRepository(conn)
+                result = update_paper_positions(repo)
                 if result.get("results"):
                     LOGGER.info("paper_worker update results=%s", result.get("results"))
+                shadow_result = update_shadow_virtual_trades(repo)
+                if shadow_result.get("updated_count") or shadow_result.get("closed_count"):
+                    LOGGER.info("paper_worker shadow_virtual_trade_update result=%s", shadow_result)
             finally:
                 conn.close()
         except Exception:
@@ -168,6 +173,8 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
     # Position conflict revalidation: every 10 minutes at minute % 10 == 5
     if minute % 10 == 5:
         jobs.append("position_conflict_revalidation")
+    # Shadow virtual trade update: every minute
+    jobs.append("shadow_virtual_trade_update")
     # Daily review: run between 00:05-00:30 UTC (wider window for crash recovery)
     # _tick_key ensures it only runs once per day
     if hour == 0 and 5 <= minute <= 30:
@@ -196,4 +203,6 @@ def _tick_key(job_name: str, now: datetime) -> int:
         return int(now.timestamp()) // (3 * 60)
     if job_name == "position_conflict_revalidation":
         return int(now.timestamp()) // (10 * 60)
+    if job_name == "shadow_virtual_trade_update":
+        return int(now.timestamp()) // 60
     return int(now.timestamp()) // 86400

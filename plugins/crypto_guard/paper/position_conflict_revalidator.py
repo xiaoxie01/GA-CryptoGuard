@@ -46,6 +46,10 @@ def run_position_conflict_revalidation(
     early_exit_min_adverse_r = float(pos_conflict_cfg.get("early_exit_min_adverse_r", -0.30))
     signal_decay_exit_threshold = float(pos_conflict_cfg.get("signal_decay_exit_threshold", 0.70))
     breakeven_mfe_r = float(pos_conflict_cfg.get("breakeven_on_conflict_if_mfe_r", 0.10))
+    min_hold_minutes = int(pos_conflict_cfg.get("min_hold_minutes", 15))
+    min_current_r_for_breakeven = float(pos_conflict_cfg.get("min_current_r_for_breakeven", 0.50))
+    min_mfe_r_for_breakeven = float(pos_conflict_cfg.get("min_mfe_r_for_breakeven", 0.75))
+    reverse_confirmations_for_tighten = int(pos_conflict_cfg.get("reverse_confirmations_for_tighten", 2))
     notify_actions = bool(pos_conflict_cfg.get("notify_actions", True))
 
     open_trades = repo.list_open_paper_trades()
@@ -128,6 +132,24 @@ def run_position_conflict_revalidation(
         # Get current price once for all downstream checks
         current_price = _get_current_price_for_trade(repo, trade_id, trade_symbol)
 
+        # ── Pre-gate: passive decisions must not adjust position ──
+        is_passive = _is_passive_decision(latest_decision)
+        if is_passive:
+            # S-grade strong conflict at deep adverse R still gets emergency exit
+            grade = str(latest_decision.get("signal_grade") or "").upper()
+            current_r = _compute_current_r_for_trade(trade, current_price)
+            if grade == "S" and current_r is not None and current_r <= early_exit_min_adverse_r:
+                action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price)
+                if action.get("status") == "executed":
+                    closed_count += 1
+            else:
+                action = _execute_recheck_mark(repo, trade, latest_decision, ga_dec_id, current_price)
+                recheck_count += 1
+            actions.append(action)
+            if notify_actions:
+                _notify_action(repo, action, send_message)
+            continue
+
         # --- P0: Strong conflict early exit ---
         if _should_early_exit(
             repo, trade, latest_decision, current_price,
@@ -145,7 +167,13 @@ def run_position_conflict_revalidation(
             elif action.get("status") == "marked":
                 # Early exit bounced to recheck (e.g. missing current_price)
                 recheck_count += 1
-        elif _should_tighten_stop(trade, current_price, breakeven_mfe_r=breakeven_mfe_r):
+        elif _should_tighten_stop(
+            repo, trade, latest_decision, current_price,
+            min_hold_minutes=min_hold_minutes,
+            min_current_r_for_breakeven=min_current_r_for_breakeven,
+            min_mfe_r_for_breakeven=min_mfe_r_for_breakeven,
+            reverse_confirmations_for_tighten=reverse_confirmations_for_tighten,
+        ):
             action = _execute_stop_tighten(repo, trade, latest_decision, ga_dec_id, current_price)
             if action.get("status") == "executed":
                 stop_adjusted_count += 1
@@ -177,6 +205,41 @@ def run_position_conflict_revalidation(
 # ---------------------------------------------------------------------------
 # Decision helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_passive_decision(ga_decision: dict[str, Any]) -> bool:
+    """Check if a GA decision is passive (should NOT trigger position adjustments).
+
+    Passive decisions: opportunity_watch, monitor_only, risk_check.ok=false,
+    or decisions without a trade_plan.
+    """
+    decision = str(ga_decision.get("decision") or "").lower()
+    if decision in ("opportunity_watch", "monitor_only"):
+        return True
+
+    # Check risk_check
+    risk = ga_decision.get("risk_check_json")
+    if risk:
+        if isinstance(risk, str):
+            try:
+                risk = json.loads(risk)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if isinstance(risk, dict) and risk.get("ok") is False:
+            return True
+
+    # No trade_plan
+    trade_plan = ga_decision.get("trade_plan_json")
+    if trade_plan:
+        if isinstance(trade_plan, str):
+            try:
+                trade_plan = json.loads(trade_plan)
+            except (json.JSONDecodeError, TypeError):
+                trade_plan = None
+    if not trade_plan:
+        return True
+
+    return False
 
 
 def _should_early_exit(
@@ -222,41 +285,92 @@ def _should_early_exit(
 def _count_consecutive_reverse_confirmations(
     repo: CryptoGuardRepository, trade: dict[str, Any]
 ) -> int:
-    """Count consecutive GA decisions that reverse the trade direction since open."""
+    """Count consecutive GA decisions that reverse the trade direction since open.
+
+    Only counts actionable decisions: risk_check.ok=true AND has trade_plan.
+    Passive decisions (opportunity_watch, monitor_only, no trade_plan, risk_check failed)
+    are SKIPPED (not counted) but do NOT break the consecutive chain — only truly
+    non-reverse decisions break it.
+    """
+    import json as _json
     trade_symbol = str(trade["symbol"])
     pos_side = str(trade["side"] or "").upper()
     created_at = trade.get("created_at")
     if not created_at:
         return 0
 
+    # Parse created_at to ISO string for proper comparison with analysis_time_utc (TEXT)
+    from datetime import datetime, timezone
+    try:
+        if isinstance(created_at, str):
+            dt = datetime.fromisoformat(created_at)
+        else:
+            dt = created_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        created_at_iso = dt.isoformat()
+    except (ValueError, TypeError):
+        return 0
+
     rows = repo.conn.execute(
-        """SELECT market_bias, signal_grade FROM ga_decisions
+        """SELECT market_bias, signal_grade, risk_check_json, trade_plan_json FROM ga_decisions
            WHERE symbol=? AND datetime(analysis_time_utc) >= datetime(?)
            ORDER BY analysis_time_utc DESC""",
-        (trade_symbol, created_at),
+        (trade_symbol, created_at_iso),
     ).fetchall()
 
     count = 0
     for row in rows:
         bias = str(row["market_bias"] or "neutral").lower()
         grade = str(row["signal_grade"] or "").upper()
-        if (pos_side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"}) or \
-           (pos_side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"}):
+
+        # Skip non-reverse decisions — but also check actionability
+        is_reverse = (pos_side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"}) or \
+                     (pos_side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"})
+        if not is_reverse:
+            break  # consecutive chain broken
+
+        # Check actionability: must have risk_check.ok=true and trade_plan
+        is_actionable = True
+        try:
+            risk = _json.loads(row["risk_check_json"] or "{}") if isinstance(row["risk_check_json"], str) else (row["risk_check_json"] or {})
+            if isinstance(risk, dict) and risk.get("ok") is False:
+                is_actionable = False
+            trade_plan = _json.loads(row["trade_plan_json"] or "null") if isinstance(row["trade_plan_json"], str) else row["trade_plan_json"]
+            if not trade_plan or not isinstance(trade_plan, dict):
+                is_actionable = False
+        except (_json.JSONDecodeError, TypeError):
+            is_actionable = False
+
+        if is_actionable:
             count += 1
         else:
-            break
+            # Passive decisions (no trade_plan, risk_check failed) are skipped
+            # but do NOT break the consecutive chain — only non-reverse decisions break it
+            continue
+
     return count
 
 
 def _should_tighten_stop(
+    repo: CryptoGuardRepository,
     trade: dict[str, Any],
+    latest_decision: dict[str, Any],
     current_price: float | None,
     *,
-    breakeven_mfe_r: float,
+    min_hold_minutes: int,
+    min_current_r_for_breakeven: float,
+    min_mfe_r_for_breakeven: float,
+    reverse_confirmations_for_tighten: int,
 ) -> bool:
-    """Check if we should tighten stop loss instead of exiting.
+    """Check if stop should be tightened to breakeven on direction conflict.
 
-    Tighten if trade has floating profit or MFE >= breakeven_mfe_r.
+    All 5 gates must pass:
+    1. Holding time >= min_hold_minutes (15 min)
+    2. 2+ consecutive reverse GA confirmations
+    3. current_r >= min_current_r_for_breakeven (0.50)
+    4. MFE/R >= min_mfe_r_for_breakeven (0.75)
+    5. Not a passive decision (checked upstream by caller)
     """
     if current_price is None or current_price <= 0:
         return False
@@ -266,23 +380,41 @@ def _should_tighten_stop(
     if entry_price <= 0:
         return False
 
-    stop_loss = trade.get("stop_loss")
-    if stop_loss is None:
+    # Gate 1: holding time >= min_hold_minutes — fail-closed on missing created_at
+    created_at = trade.get("created_at")
+    if not created_at:
+        return False
+    try:
+        from datetime import datetime, timezone
+        if isinstance(created_at, str):
+            open_time = datetime.fromisoformat(created_at)
+        else:
+            open_time = created_at
+        if open_time.tzinfo is None:
+            open_time = open_time.replace(tzinfo=timezone.utc)
+        holding_minutes = (datetime.now(timezone.utc) - open_time).total_seconds() / 60
+        if holding_minutes < min_hold_minutes:
+            return False
+    except (ValueError, TypeError):
         return False
 
-    if pos_side == "LONG":
-        if current_price > entry_price:
-            return True
-    elif pos_side == "SHORT":
-        if current_price < entry_price:
-            return True
+    # Gate 2: 2+ consecutive reverse GA confirmations
+    confirmations = _count_consecutive_reverse_confirmations(repo, trade)
+    if confirmations < reverse_confirmations_for_tighten:
+        return False
 
-    # MFE-based
+    # Gate 3: current_r >= min_current_r_for_breakeven
+    current_r = _compute_current_r_for_trade(trade, current_price)
+    if current_r is None or current_r < min_current_r_for_breakeven:
+        return False
+
+    # Gate 4: MFE/R >= min_mfe_r_for_breakeven
     mfe_r = _compute_mfe_r_for_trade(trade, current_price)
-    if mfe_r is not None and mfe_r >= breakeven_mfe_r:
-        return True
+    if mfe_r is None or mfe_r < min_mfe_r_for_breakeven:
+        return False
 
-    return False
+    # Gate 5: Not passive (checked by caller — _is_passive_decision)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -333,39 +465,67 @@ def _compute_current_r_for_trade(
     trade: dict[str, Any],
     current_price: float | None,
 ) -> float | None:
-    """Compute current unrealized R."""
+    """Compute current unrealized R using initial_risk_usdt if available.
+
+    Fail-closed: returns None if initial_risk_usdt is unavailable and
+    cannot be computed from entry_price/initial_stop_loss/quantity.
+    """
     if current_price is None or current_price <= 0:
         return None
 
     pos_side = str(trade["side"] or "").upper()
     entry_price = float(trade.get("entry_price") or 0)
-    stop_loss = float(trade.get("stop_loss") or entry_price or 0)
-    risk = abs(entry_price - stop_loss)
-    if risk <= 0:
+    if entry_price <= 0:
         return None
 
+    # Use initial_risk_usdt if available
+    initial_risk = float(trade.get("initial_risk_usdt") or 0)
+    if initial_risk <= 0:
+        # Fallback: compute from entry_price and initial_stop_loss (NOT stop_loss)
+        stop_loss = float(trade.get("initial_stop_loss") or 0)
+        quantity = float(trade.get("quantity") or 0)
+        if stop_loss <= 0 or quantity <= 0:
+            return None  # fail-closed
+        initial_risk = abs(entry_price - stop_loss) * quantity
+    if initial_risk <= 0:
+        return None
+
+    quantity = float(trade.get("quantity") or 0)
     if pos_side == "LONG":
-        return (current_price - entry_price) / risk
+        return (current_price - entry_price) * quantity / initial_risk
     else:
-        return (entry_price - current_price) / risk
+        return (entry_price - current_price) * quantity / initial_risk
 
 
 def _compute_mfe_r_for_trade(
     trade: dict[str, Any],
     current_price: float,
 ) -> float | None:
-    """Compute MFE in R-terms based on current price."""
-    pos_side = str(trade["side"] or "").upper()
+    """Compute MFE in R-terms from historical max_favorable_excursion.
+
+    Uses the stored max_favorable_excursion (absolute USD distance from entry
+    to best price) divided by initial_risk_usdt. This is the proper MFE/R —
+    NOT current unrealized R (which would retrace from the best price).
+
+    Fail-closed: returns None if initial_risk_usdt is 0/unavailable.
+    """
     entry_price = float(trade.get("entry_price") or 0)
-    stop_loss = float(trade.get("stop_loss") or entry_price or 0)
-    risk = abs(entry_price - stop_loss)
-    if risk <= 0:
+    if entry_price <= 0:
         return None
 
-    if pos_side == "LONG":
-        return (current_price - entry_price) / risk
-    else:
-        return (entry_price - current_price) / risk
+    initial_risk_usdt = float(trade.get("initial_risk_usdt") or 0)
+    if initial_risk_usdt <= 0:
+        # Fallback: compute from entry_price and initial_stop_loss (NOT stop_loss)
+        stop_loss = float(trade.get("initial_stop_loss") or 0)
+        quantity = float(trade.get("quantity") or 0)
+        if stop_loss <= 0 or quantity <= 0:
+            return None  # fail-closed
+        initial_risk_usdt = abs(entry_price - stop_loss) * quantity
+    if initial_risk_usdt <= 0:
+        return None
+
+    mfe_usdt = float(trade.get("max_favorable_excursion") or 0)
+    return mfe_usdt / initial_risk_usdt
 
 
 def _compute_signal_decay_for_trade(
@@ -498,8 +658,9 @@ def _execute_early_exit(
         stop_take_path=stop_take_path,
     )
 
-    # Backfill real PnL to shadow evaluations (side effect paper_broker does)
-    repo.backfill_shadow_evaluation_pnl_r(trade, pnl_r)
+    # Backfill real PnL to active evaluations.
+    # Shadow evaluations get PnL exclusively from their independent virtual_trade lifecycle.
+    repo.backfill_active_evaluation_pnl_r(trade, pnl_r)
 
     # Update paper_orders using proper repository method
     if order_id:
@@ -673,6 +834,24 @@ def _execute_stop_tighten(
                 (new_stop, int(order_id)),
             )
 
+        # Compute audit info
+        from datetime import datetime, timezone as tz_utc
+        open_time = trade.get("created_at")
+        holding_minutes = None
+        if open_time:
+            try:
+                if isinstance(open_time, str):
+                    ot = datetime.fromisoformat(open_time)
+                else:
+                    ot = open_time
+                if ot.tzinfo is None:
+                    ot = ot.replace(tzinfo=tz_utc)
+                holding_minutes = round((datetime.now(tz_utc) - ot).total_seconds() / 60, 1)
+            except (ValueError, TypeError):
+                pass
+
+        mfe_r = _compute_mfe_r_for_trade(trade, current_price)
+
         repo.log_paper_trade_event(
             event_type="stop_loss_adjustment",
             symbol=trade_symbol,
@@ -687,6 +866,15 @@ def _execute_stop_tighten(
                 "new_stop_loss": new_stop,
                 "trigger": "position_conflict",
                 "dedupe_key": dedupe_key,
+                "audit": {
+                    "open_time": open_time,
+                    "action_time": datetime.now(tz_utc).isoformat(),
+                    "holding_minutes": holding_minutes,
+                    "current_r": round(current_r, 4) if current_r is not None else None,
+                    "mfe_r": round(mfe_r, 4) if mfe_r is not None else None,
+                    "decision_executable": True,
+                    "gate_result": "all_passed",
+                },
             },
         )
         repo.conn.commit()

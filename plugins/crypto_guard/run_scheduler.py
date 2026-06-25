@@ -193,6 +193,17 @@ def run_job(job_name: str) -> dict:
             )
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
+        if job_name == "shadow_virtual_trade_update":
+            from plugins.crypto_guard.paper.shadow_virtual_trade_updater import update_shadow_virtual_trades
+            scheduled_time = (now // (60 * 1000)) * (60 * 1000)
+            result = run_scheduled_job(
+                repo,
+                job_name=job_name,
+                scheduled_time=scheduled_time,
+                task_fn=lambda: update_shadow_virtual_trades(repo),
+            )
+            LOGGER.info("run_job done job=%s result=%s", job_name, result)
+            return result
         raise ValueError(f"未知 scheduler job: {job_name}")
     finally:
         conn.close()

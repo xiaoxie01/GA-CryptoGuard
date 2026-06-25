@@ -25,7 +25,6 @@ risk:
   min_confidence: 0.72
   require_structure_momentum_alignment: true
   allow_manual_bypass: false
-  breakeven_after_rr: 2.0  # MFE >= 2R 才移止损到保本
   min_sl_distance_pct: 0.8  # 止损距离至少占入场价的0.8%
   min_tp_distance_pct: 1.0  # 第一止盈距离至少占入场价的1.0%
 
@@ -85,6 +84,7 @@ evolution:
   preferred_promotion_sample_size: 30
   affected_strategy_observation_hours: 24
   auto_promote: false
+  allow_auto_promote_to_candidate: false
   pause_evolution_on_extreme_market: true
   online_shadow:
     min_samples_after_backtest: 5
@@ -182,3 +182,8 @@ position_conflict:
   signal_decay_exit_threshold: 0.70
   breakeven_on_conflict_if_mfe_r: 0.10
   notify_actions: true
+  # P0-4: Unified breakeven gates (used by both conflict and routine paths)
+  min_hold_minutes: 15
+  min_current_r_for_breakeven: 0.50
+  min_mfe_r_for_breakeven: 0.75
+  reverse_confirmations_for_tighten: 2

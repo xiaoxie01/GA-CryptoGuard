@@ -103,6 +103,12 @@ jobs:
       summarize_trades: true
       update_strategy_memory: true
       notify_feishu: true
+  shadow_virtual_trade_update:
+    cron: "*/1 * * * *"
+    task: "shadow_virtual_trade_update"
+    params:
+      interval_seconds: 60
+      enabled: true
 
 queues:
   priorities:

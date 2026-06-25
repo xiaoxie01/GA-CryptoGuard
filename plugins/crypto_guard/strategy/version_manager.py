@@ -25,12 +25,12 @@ def list_strategy_versions(repo: CryptoGuardRepository, strategy_name: str | Non
     return {"ok": True, "versions": versions, "agent_summary": agent, "text": render_strategy_versions(versions, agent_summary=agent)}
 
 
-def create_candidate_version_from_patch(repo: CryptoGuardRepository, patch_id: int) -> dict[str, Any]:
+def create_candidate_version_from_patch(repo: CryptoGuardRepository, patch_id: int, *, initial_status: str = "draft") -> dict[str, Any]:
     row = repo.conn.execute("SELECT * FROM strategy_patches WHERE id=?", (int(patch_id),)).fetchone()
     if not row:
         return {"ok": False, "error": "strategy_patch 不存在", "patch_id": patch_id}
     patch = dict(row)
-    config = _candidate_config(repo, patch)
+    config = _candidate_config(repo, patch, initial_status=initial_status)
     agent = run_agent_json_task(
         task_name="candidate_strategy_config_review",
         payload={"patch": patch, "candidate_config": config},
@@ -48,12 +48,12 @@ def create_candidate_version_from_patch(repo: CryptoGuardRepository, patch_id: i
     version_id = repo.save_strategy_version(
         strategy_name=patch["strategy_name"],
         version=patch["candidate_version"],
-        status="shadow_testing",
+        status=initial_status,
         config=config,
         change_reason=patch.get("reason") or "candidate_from_patch",
         created_from_review_id=_review_id_from_evidence(patch.get("evidence_json")),
     )
-    return {"ok": True, "version_id": version_id, "status": "shadow_testing", "strategy_name": patch["strategy_name"], "version": patch["candidate_version"], "paper_order_permission": "observation_only"}
+    return {"ok": True, "version_id": version_id, "status": initial_status, "strategy_name": patch["strategy_name"], "version": patch["candidate_version"], "paper_order_permission": "observation_only"}
 
 
 def rollback_active_strategy(repo: CryptoGuardRepository, strategy_name: str, target_version: str, *, change_reason: str) -> dict[str, Any]:
@@ -77,7 +77,7 @@ def render_strategy_versions(versions: list[dict[str, Any]], agent_summary: dict
     return "\n".join(lines)
 
 
-def _candidate_config(repo: CryptoGuardRepository, patch: dict[str, Any]) -> dict[str, Any]:
+def _candidate_config(repo: CryptoGuardRepository, patch: dict[str, Any], initial_status: str = "candidate") -> dict[str, Any]:
     active = repo.active_strategy_version(patch["strategy_name"])
     base: dict[str, Any] = {}
     if active:
@@ -93,7 +93,7 @@ def _candidate_config(repo: CryptoGuardRepository, patch: dict[str, Any]) -> dic
         **base,
         "strategy_name": patch["strategy_name"],
         "version": patch["candidate_version"],
-        "status": "shadow_testing",
+        "status": initial_status,
         "candidate_patch": patch_json,
         "safety": {"candidate_only": True, "requires_shadow_testing": True, "paper_order_permission": "observation_only_until_min_3_signals"},
     }

@@ -259,6 +259,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     entry_price REAL,
     trigger_price REAL,
     stop_loss REAL,
+    initial_stop_loss REAL,
     take_profit_json TEXT,
     quantity REAL,
     risk_percent REAL,
@@ -285,6 +286,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     entry_price REAL,
     exit_price REAL,
     stop_loss REAL,
+    initial_stop_loss REAL,
+    initial_risk_usdt REAL,
     take_profit_json TEXT,
     quantity REAL,
     pnl REAL,
@@ -394,6 +397,10 @@ CREATE TABLE IF NOT EXISTS strategy_evaluations (
     is_shadow INTEGER DEFAULT 0,
     snapshot_id INTEGER,
     pnl_r REAL,
+    ga_decision_id INTEGER,
+    paper_trade_id INTEGER,
+    shadow_virtual_trade_id INTEGER,
+    outcome_source TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -406,7 +413,7 @@ CREATE TABLE IF NOT EXISTS strategy_patches (
     reason TEXT,
     evidence_json TEXT,
     trigger_id INTEGER,
-    status TEXT DEFAULT 'candidate',
+    status TEXT DEFAULT 'draft',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -613,4 +620,33 @@ CREATE TABLE IF NOT EXISTS sop_definitions (
     status TEXT DEFAULT 'active',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(sop_name, version)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_virtual_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_name TEXT NOT NULL DEFAULT 'smc_pullback_long',
+    candidate_version TEXT NOT NULL,
+    ga_decision_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT 'LONG',
+    entry_type TEXT NOT NULL DEFAULT 'market',
+    entry_price REAL NOT NULL,
+    stop_loss REAL NOT NULL,
+    initial_stop_loss REAL NOT NULL,
+    take_profit_json TEXT DEFAULT '[]',
+    quantity REAL NOT NULL DEFAULT 0,
+    initial_risk_usdt REAL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending_entry',
+    opened_at TEXT,
+    expires_at TEXT,
+    last_processed_candle_time INTEGER,
+    max_favorable_excursion REAL DEFAULT 0,
+    max_adverse_excursion REAL DEFAULT 0,
+    current_price REAL,
+    unrealized_pnl_r REAL,
+    closed_at TEXT,
+    pnl_r REAL,
+    close_reason TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );

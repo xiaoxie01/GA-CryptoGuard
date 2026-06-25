@@ -159,7 +159,9 @@ def run_self_evolution_cycle(
             return result
 
     primary_reason = aggregation["top_reasons"][0]["reason"] if aggregation["top_reasons"] else "unknown"
-    fallback_patch = build_candidate_patch({"symbol": "MULTI", "pnl_r": aggregation["avg_r"]}, primary_reason)
+    # Use real trade data from aggregation for context-aware patch, not synthetic MULTI stub
+    representative_trade = aggregation.get("representative_trade") or {}
+    fallback_patch = build_candidate_patch(representative_trade, primary_reason, strategy_name=strategy_name)
     agent_patch = run_agent_json_task(
         task_name="self_evolution_candidate_patch",
         payload={
@@ -181,13 +183,53 @@ def run_self_evolution_cycle(
         result["agent_patch"] = agent_patch
         result["run_id"] = repo.save_self_evolution_run(result)
         return result
+
+    # Schema validation: reject illegal patches before persisting
+    if not _validate_patch_schema(patch):
+        result = _blocked("invalid_patch_schema", "LLM 生成的 patch schema 校验失败，拒绝落库。", aggregation, audit_steps)
+        result["agent_patch"] = agent_patch
+        result["run_id"] = repo.save_self_evolution_run(result)
+        return result
+
     patch["strategy_name"] = strategy_name
     patch["candidate_version"] = _next_candidate_version(repo, strategy_name)
     patch["change_reason"] = f"自进化聚合触发：{primary_reason}"
-    patch_id = repo.save_strategy_patch_candidate(patch, {"aggregation": aggregation})
-    candidate = create_candidate_version_from_patch(repo, patch_id)
+
+    # Enforce candidate cap after creating new candidate — atomic with save + create + cap
+    from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
+    repo.conn.execute("BEGIN")
+    try:
+        # Check config gate: draft patches stay draft unless auto-promote is allowed
+        from plugins.crypto_guard.config.loader import load_config as _load_cfg
+        _evo_cfg = _load_cfg().trading_mode.get("evolution", {})
+        allow_auto_promote_to_candidate = _evo_cfg.get("allow_auto_promote_to_candidate", False)
+
+        initial_status = "candidate" if (allow_auto_promote or allow_auto_promote_to_candidate) else "draft"
+        patch_id = repo.save_strategy_patch_candidate(patch, {"aggregation": aggregation}, status=initial_status)
+        candidate = create_candidate_version_from_patch(repo, patch_id, initial_status=initial_status)
+        _enforce_candidate_cap(repo, strategy_name, max_candidates=5)
+        repo.conn.commit()
+    except Exception:
+        repo.conn.execute("ROLLBACK")
+        raise
     audit_steps.append({"step": "create_candidate_patch", "patch_id": patch_id, "candidate": candidate})
     audit_steps.append({"step": "ga_llm_candidate_patch", "result": agent_patch})
+
+    # If draft status, skip backtest gate and shadow testing — draft stays draft
+    if initial_status == "draft":
+        result = {
+            "ok": True,
+            "status": "draft_pending_approval",
+            "strategy_name": strategy_name,
+            "aggregation": aggregation,
+            "patch_id": patch_id,
+            "candidate_version": patch["candidate_version"],
+            "audit_steps": audit_steps,
+            "agent_patch": agent_patch,
+            "explanation": f"候选补丁已创建为 draft 状态（allow_auto_promote_to_candidate=false），等待人工审批。",
+        }
+        result["run_id"] = repo.save_self_evolution_run(result)
+        return result
 
     # Run backtest gate immediately after candidate creation
     from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
@@ -205,11 +247,21 @@ def run_self_evolution_cycle(
         (json.dumps(backtest_result, ensure_ascii=False), patch_id),
     )
 
-    # If backtest truly fails (not skipped), reject the candidate immediately
+    # If backtest truly fails (not skipped, not gate_disabled, not data_missing),
+    # reject the candidate immediately.
+    # Covers both ok=true/passed=false AND ok=false (exception) cases.
+    skipped = backtest_result.get("skipped", False)
+    gate_disabled = backtest_result.get("gate_disabled", False)
+    no_data = backtest_result.get("reason") in ("no_valid_backtest_results", "skipped:data_unavailable")
+    backtest_exception = backtest_result.get("reason") == "backtest_exception" or not backtest_result.get("ok")
+    no_lookahead_failed = "no_lookahead" in str(backtest_result.get("reason", "")).lower() and not backtest_result.get("passed")
     backtest_failed = (
-        backtest_result.get("ok")
-        and not backtest_result.get("passed")
-        and not backtest_result.get("skipped")
+        backtest_exception
+        or no_lookahead_failed
+        or (not backtest_result.get("passed")
+            and not skipped
+            and not gate_disabled
+            and not no_data)
     )
     if backtest_failed:
         # Update strategy version status to rejected
@@ -233,6 +285,13 @@ def run_self_evolution_cycle(
         result["backtest_result"] = backtest_result
         result["run_id"] = repo.save_self_evolution_run(result)
         return result
+
+    # Backtest passed or skipped — transition candidate to shadow_testing
+    repo.conn.execute(
+        "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
+        (strategy_name, patch["candidate_version"]),
+    )
+    repo.conn.commit()
 
     shadow = run_shadow_test(
         repo,
@@ -280,13 +339,93 @@ def aggregate_review_attribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
     reasons = Counter(str(r.get("primary_reason") or "unknown") for r in rows)
     symbols = {str(r.get("symbol")) for r in rows if r.get("symbol")}
     pnl_rs = [float(r.get("pnl_r") or 0) for r in rows]
+    # Pick a representative trade with the most negative pnl_r for context-aware patch building
+    representative = None
+    worst_r = 0.0
+    for r in rows:
+        r_val = float(r.get("pnl_r") or 0)
+        if r_val < worst_r:
+            worst_r = r_val
+            representative = r
     return {
         "review_count": len(rows),
         "symbol_count": len(symbols),
         "symbols": sorted(symbols),
         "avg_r": sum(pnl_rs) / len(pnl_rs) if pnl_rs else 0.0,
         "top_reasons": [{"reason": reason, "count": count} for reason, count in reasons.most_common(5)],
+        "representative_trade": representative or {},
     }
+
+
+def _validate_patch_schema(patch: dict[str, Any]) -> bool:
+    """Validate LLM-generated patch schema before persisting.
+
+    Checks:
+    - strategy_name is present and non-empty
+    - score_adjustments values are {value, when} dicts or floats
+    - Nested conditional adjustments validated recursively
+    - risk_controls is a list if present
+    """
+    if not patch.get("strategy_name"):
+        return False
+
+    score_adj = patch.get("score_adjustments") or patch.get("score_adjustment")
+    if score_adj is not None:
+        if not _validate_score_adjustments(score_adj):
+            return False
+
+    risk_controls = patch.get("risk_controls")
+    if risk_controls is not None and not isinstance(risk_controls, list):
+        return False
+
+    return True
+
+
+def _validate_score_adjustments(score_adj: Any) -> bool:
+    """Recursively validate score_adjustments structure.
+
+    Allowed shapes:
+    - float/int (flat adjustment)
+    - {"value": float, "when": {str: str}} (single conditional)
+    - {"adj_name": float} (legacy named flat)
+    - {"adj_name": {"value": float, "when": {str: str}}} (named conditional)
+    - Recursive nesting via nested_score_adjustments key
+    """
+    if isinstance(score_adj, (int, float)):
+        return True  # flat format
+    if isinstance(score_adj, list):
+        # List of adjustments with nested structure
+        for item in score_adj:
+            if not _validate_score_adjustments(item):
+                return False
+        return True
+    if not isinstance(score_adj, dict):
+        return False
+
+    for key, val in score_adj.items():
+        if key == "nested_score_adjustments":
+            # Recurse into nested adjustments
+            if not _validate_score_adjustments(val):
+                return False
+        elif isinstance(val, (int, float)):
+            continue  # legacy flat format
+        elif isinstance(val, dict):
+            if "value" not in val:
+                return False
+            when = val.get("when", {})
+            if not isinstance(when, dict):
+                return False
+            # Validate when values are strings or simple types (no deeper nesting)
+            for _wk, wv in when.items():
+                if isinstance(wv, dict):
+                    return False  # when clauses cannot contain nested dicts
+            # Recurse into nested if present
+            if "nested_score_adjustments" in val:
+                if not _validate_score_adjustments(val["nested_score_adjustments"]):
+                    return False
+        else:
+            return False
+    return True
 
 
 def _next_candidate_version(repo: CryptoGuardRepository, strategy_name: str) -> str:
@@ -296,10 +435,15 @@ def _next_candidate_version(repo: CryptoGuardRepository, strategy_name: str) -> 
 
 
 def _latest_candidate_version(repo: CryptoGuardRepository, strategy_name: str) -> str | None:
-    for version in repo.list_strategy_versions(strategy_name):
-        if version.get("status") in {"candidate", "shadow_testing"}:
-            return str(version["version"])
-    return None
+    """Return the PRIMARY candidate version (most real PnL samples, then oldest).
+
+    With multi-candidate support, multiple shadow_testing candidates can coexist.
+    This returns the primary for informational purposes — it does NOT block new
+    candidate creation.
+    """
+    from plugins.crypto_guard.strategy.shadow_testing import _designate_primary_candidate
+    diag = _designate_primary_candidate(repo, strategy_name)
+    return diag.get("primary_version")
 
 
 def _blocked(reason: str, explanation: str, aggregation: dict[str, Any], audit_steps: list[dict[str, Any]]) -> dict[str, Any]:

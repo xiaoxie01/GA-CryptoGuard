@@ -27,6 +27,21 @@ def _extract_strategy_name(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _compute_initial_risk_usdt(order: dict[str, Any], entry_price: float) -> float | None:
+    """Compute initial_risk_usdt = |entry_price - stop_loss| * quantity.
+
+    Returns None if any required field is missing or invalid.
+    """
+    try:
+        stop = float(order.get("initial_stop_loss") or order.get("stop_loss") or 0)
+        quantity = float(order.get("quantity") or 0)
+        if stop <= 0 or entry_price <= 0 or quantity <= 0:
+            return None
+        return abs(entry_price - stop) * quantity
+    except (TypeError, ValueError):
+        return None
+
+
 class CryptoGuardRepository:
     """Repository 层隔离所有 SQL，业务模块不直接拼 SQL。"""
 
@@ -537,13 +552,21 @@ class CryptoGuardRepository:
         return signal_id
 
     def save_strategy_evaluation(self, decision: dict[str, Any], snapshot_id: int | None = None, *, is_shadow: bool = False) -> int:
+        # Active evaluations start as pending_outcome — only backfilled to real_pnl
+        # when the corresponding paper_trade closes.
+        outcome_source = None
+        if is_shadow:
+            outcome_source = decision.get("outcome_source")
+        elif decision.get("ga_decision_id") is not None:
+            outcome_source = "pending_outcome"
         self.conn.execute(
             """
             INSERT INTO strategy_evaluations(
                 snapshot_id, symbol, timeframe, analysis_time, strategy_name, strategy_version,
-                score, decision, evidence_json, counter_evidence_json, is_shadow
+                score, decision, evidence_json, counter_evidence_json, is_shadow, ga_decision_id,
+                outcome_source, paper_trade_id, shadow_virtual_trade_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot_id,
@@ -557,6 +580,10 @@ class CryptoGuardRepository:
                 json.dumps(decision.get("evidence", []), ensure_ascii=False),
                 json.dumps(decision.get("counter_evidence", []), ensure_ascii=False),
                 1 if is_shadow else 0,
+                decision.get("ga_decision_id"),
+                outcome_source,
+                decision.get("paper_trade_id"),
+                decision.get("shadow_virtual_trade_id"),
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -1007,10 +1034,10 @@ class CryptoGuardRepository:
                 """
                 INSERT INTO paper_orders(
                     signal_id, ga_decision_id, symbol, side, order_type, entry_price, trigger_price,
-                    stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed,
+                    stop_loss, initial_stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed,
                     expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(signal_id) if signal_id is not None else None,
@@ -1021,6 +1048,7 @@ class CryptoGuardRepository:
                     trade_plan.get("entry_price"),
                     trade_plan.get("trigger_price"),
                     trade_plan["stop_loss"],
+                    trade_plan["stop_loss"],  # initial_stop_loss = stop_loss at creation
                     json.dumps(trade_plan.get("take_profits", []), ensure_ascii=False),
                     trade_plan.get("quantity"),
                     trade_plan.get("risk_percent"),
@@ -1093,10 +1121,11 @@ class CryptoGuardRepository:
             """
             INSERT INTO paper_trades(
                 order_id, signal_id, market_snapshot_id, symbol, side, entry_price, stop_loss,
+                initial_stop_loss, initial_risk_usdt,
                 take_profit_json, quantity, max_favorable_excursion, max_adverse_excursion,
                 entry_efficiency, exit_efficiency, signal_decay_score, stop_take_path_json, fill_method
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, ?, ?)
             """,
             (
                 order["id"],
@@ -1106,6 +1135,8 @@ class CryptoGuardRepository:
                 order["side"],
                 entry_price,
                 order.get("stop_loss"),
+                order.get("initial_stop_loss") or order.get("stop_loss"),
+                _compute_initial_risk_usdt(order, entry_price),
                 order.get("take_profit_json"),
                 order.get("quantity"),
                 json.dumps([{"event": "filled", "entry_price": entry_price, "ts": utc_iso()}], ensure_ascii=False),
@@ -1190,12 +1221,10 @@ class CryptoGuardRepository:
             ),
         )
 
-    def backfill_shadow_evaluation_pnl_r(self, trade: dict[str, Any], pnl_r: float) -> int:
-        """Backfill real pnl_r to shadow strategy_evaluations linked to this trade.
-
-        When a paper trade closes, find all shadow candidate evaluations (is_shadow=1)
-        for the same strategy_name, symbol, and nearby analysis_time, and backfill
-        the real pnl_r.
+    def backfill_active_evaluation_pnl_r(self, trade: dict[str, Any], pnl_r: float) -> int:
+        """Backfill real pnl_r to active strategy_evaluations (is_shadow=0) using exact ga_decision_id.
+        One trade updates at most one active evaluation (LIMIT 1 via exact ID match).
+        Only updates rows where outcome_source IS NULL.
 
         Returns number of evaluation rows updated.
         """
@@ -1207,65 +1236,31 @@ class CryptoGuardRepository:
             "SELECT ga_decision_id, symbol FROM paper_orders WHERE id=?",
             (int(order_id),),
         ).fetchone()
-        if not order:
+        if not order or not order["ga_decision_id"]:
             return 0
 
-        # Get analysis_time and strategy_name from ga_decision
-        analysis_time = None
-        strategy_name = None
-        if order["ga_decision_id"]:
-            gd = self.conn.execute(
-                "SELECT analysis_time, raw_decision_json FROM ga_decisions WHERE id=?",
-                (int(order["ga_decision_id"]),),
-            ).fetchone()
-            if gd:
-                try:
-                    analysis_time = int(gd["analysis_time"])
-                except (ValueError, TypeError):
-                    pass
-                # Extract strategy_name from raw_decision_json
-                # real data: raw_decision_json.raw_legacy_decision.strategy_name
-                try:
-                    raw = json.loads(gd["raw_decision_json"] or "{}")
-                    strategy_name = _extract_strategy_name(raw)
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        gd_id = int(order["ga_decision_id"])
 
-        if analysis_time is None:
-            return 0
-
-        # Backfill pnl_r to candidate shadow evaluations for the same strategy + symbol + time window
-        if strategy_name:
-            self.conn.execute(
-                """
-                UPDATE strategy_evaluations
-                SET pnl_r=?
-                WHERE symbol=? AND strategy_name=? AND is_shadow=1 AND pnl_r IS NULL
-                  AND ABS(analysis_time - ?) < 3600000
-                """,
-                (float(pnl_r), order["symbol"], strategy_name, analysis_time),
-            )
-        else:
-            # Fallback: match by symbol + time only (no strategy_name in ga_decision)
-            self.conn.execute(
-                """
-                UPDATE strategy_evaluations
-                SET pnl_r=?
-                WHERE symbol=? AND is_shadow=1 AND pnl_r IS NULL
-                  AND ABS(analysis_time - ?) < 3600000
-                """,
-                (float(pnl_r), order["symbol"], analysis_time),
-            )
+        # Exact ga_decision_id match — no ±1h fuzzy matching, LIMIT 1
+        # Guard: only rows where outcome_source='pending_outcome' (not already classified)
+        self.conn.execute(
+            """
+            UPDATE strategy_evaluations
+            SET pnl_r=?, ga_decision_id=?, paper_trade_id=?, outcome_source='real_pnl'
+            WHERE id IN (SELECT id FROM strategy_evaluations WHERE ga_decision_id=? AND is_shadow=0 AND pnl_r IS NULL AND outcome_source='pending_outcome' LIMIT 1)
+            """,
+            (float(pnl_r), gd_id, int(trade.get("id") or 0), gd_id),
+        )
         updated = int(self.conn.execute("SELECT changes() AS c").fetchone()["c"])
         if updated:
             self.conn.commit()
         return updated
 
-    def backfill_historical_shadow_pnl_r(self) -> dict[str, int]:
-        """One-shot: backfill pnl_r from all closed paper_trades to shadow evaluations.
+    def backfill_historical_active_pnl_r(self) -> dict[str, int]:
+        """One-shot: backfill pnl_r from all closed paper_trades to active evaluations.
 
         Iterates closed trades with real pnl_r, traces to ga_decision for
-        strategy_name + analysis_time, and backfills matching shadow evals.
+        strategy_name + analysis_time, and backfills matching active evals (is_shadow=0).
 
         Returns {trades_processed, evaluations_updated}.
         """
@@ -1283,7 +1278,7 @@ class CryptoGuardRepository:
         total_updated = 0
 
         for trade_row in closed_trades:
-            updated = self.backfill_shadow_evaluation_pnl_r(
+            updated = self.backfill_active_evaluation_pnl_r(
                 {"order_id": trade_row["order_id"]},
                 float(trade_row["pnl_r"]),
             )
@@ -1292,6 +1287,201 @@ class CryptoGuardRepository:
                 total_updated += updated
 
         return {"trades_processed": trades_processed, "evaluations_updated": total_updated}
+
+    # ── shadow_virtual_trades ──────────────────────────────────────────
+
+    def create_shadow_virtual_trade(self, candidate_version: str, ga_decision_id: int,
+                                    symbol: str, side: str, entry_price: float,
+                                    stop_loss: float, initial_stop_loss: float,
+                                    take_profit_json: str, quantity: float,
+                                    initial_risk_usdt: float, *,
+                                    strategy_name: str = "smc_pullback_long",
+                                    entry_type: str = "market",
+                                    max_pending_minutes: int = 120) -> int:
+        """Create a shadow virtual trade for a candidate version.
+
+        Idempotent: checks for existing row by (strategy_name, candidate_version, ga_decision_id)
+        first. If it exists, returns the existing ID without overwriting.
+        Otherwise inserts a new row.
+
+        Status logic:
+          - entry_type='market' → status='open', opened_at=NOW
+          - entry_type='limit'/'trigger'/'stop' → status='pending_entry', opened_at=NULL
+
+        max_pending_minutes controls expires_at for pending_entry trades (default 120 min).
+        """
+        from datetime import datetime, timezone
+
+        # Check for existing row first (idempotent, avoids INSERT OR REPLACE which resets timestamps)
+        existing = self.conn.execute(
+            "SELECT id FROM shadow_virtual_trades"
+            " WHERE strategy_name=? AND candidate_version=? AND ga_decision_id=?",
+            (strategy_name, candidate_version, ga_decision_id),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+
+        entry_type_lower = str(entry_type).lower()
+        is_market = entry_type_lower == "market"
+        status = "open" if is_market else "pending_entry"
+        now = datetime.now(timezone.utc)
+        opened_at = now.isoformat() if is_market else None
+        # expires_at = opened_at + 72h for market, created_at + max_pending_minutes for pending_entry
+        if is_market:
+            expires_at = (now + timedelta(minutes=4320)).isoformat()
+        else:
+            expires_at = (now + timedelta(minutes=max_pending_minutes)).isoformat()
+
+        self.conn.execute(
+            """
+            INSERT INTO shadow_virtual_trades(
+                strategy_name, candidate_version, ga_decision_id, symbol, side,
+                entry_type, entry_price, stop_loss, initial_stop_loss, take_profit_json,
+                quantity, initial_risk_usdt, status, opened_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (strategy_name, candidate_version, ga_decision_id, symbol, side,
+             entry_type_lower, entry_price, stop_loss, initial_stop_loss, take_profit_json,
+             quantity, initial_risk_usdt, status, opened_at, expires_at),
+        )
+        self.conn.commit()
+        return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def update_shadow_virtual_trade_prices(self, virtual_trade_id: int,
+                                           current_price: float) -> None:
+        """Update unrealized PnL for an open shadow virtual trade.
+
+        current_r = (current_price - entry_price) * quantity / initial_risk_usdt
+        Tracks max_favorable_excursion and max_adverse_excursion.
+        """
+        trade = self.conn.execute(
+            "SELECT entry_price, quantity, initial_risk_usdt, side,"
+            " max_favorable_excursion, max_adverse_excursion"
+            " FROM shadow_virtual_trades WHERE id=? AND status='open'",
+            (virtual_trade_id,),
+        ).fetchone()
+        if not trade:
+            return
+        entry = float(trade["entry_price"])
+        qty = float(trade["quantity"])
+        risk = float(trade["initial_risk_usdt"])
+        side = str(trade["side"])
+        if risk <= 0:
+            return
+        multiplier = 1.0 if side == "LONG" else -1.0
+        current_r = (current_price - entry) * multiplier * qty / risk
+        mfe = max(float(trade["max_favorable_excursion"] or 0), max(current_r, 0.0))
+        mae = min(float(trade["max_adverse_excursion"] or 0), min(current_r, 0.0))
+        self.conn.execute(
+            "UPDATE shadow_virtual_trades SET current_price=?, unrealized_pnl_r=?,"
+            " max_favorable_excursion=?, max_adverse_excursion=?, updated_at=CURRENT_TIMESTAMP"
+            " WHERE id=?",
+            (current_price, current_r, mfe, mae, virtual_trade_id),
+        )
+        self.conn.commit()
+
+    def close_shadow_virtual_trade(self, virtual_trade_id: int,
+                                   close_price: float, close_reason: str) -> dict | None:
+        """Close a shadow virtual trade and return the closed trade dict with pnl_r.
+
+        After closing, backfills the corresponding strategy_evaluations row with
+        pnl_r, outcome_source='real_pnl', and shadow_virtual_trade_id.
+        """
+        trade = self.conn.execute(
+            "SELECT * FROM shadow_virtual_trades WHERE id=? AND status='open'",
+            (virtual_trade_id,),
+        ).fetchone()
+        if not trade:
+            return None
+        entry = float(trade["entry_price"])
+        qty = float(trade["quantity"])
+        risk = float(trade["initial_risk_usdt"])
+        side = str(trade["side"])
+        if risk <= 0:
+            self.conn.execute(
+                "UPDATE shadow_virtual_trades SET status='closed', close_reason=?,"
+                " closed_at=CURRENT_TIMESTAMP, pnl_r=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (close_reason, virtual_trade_id),
+            )
+            self.conn.commit()
+            return dict(trade)
+        multiplier = 1.0 if side == "LONG" else -1.0
+        pnl_r = (close_price - entry) * multiplier * qty / risk
+        self.conn.execute(
+            "UPDATE shadow_virtual_trades SET status='closed', close_reason=?,"
+            " closed_at=CURRENT_TIMESTAMP, pnl_r=?, updated_at=CURRENT_TIMESTAMP"
+            " WHERE id=?",
+            (close_reason, pnl_r, virtual_trade_id),
+        )
+
+        # Backfill candidate evaluation with real PnL (or ambiguous path)
+        strategy_name = str(trade["strategy_name"])
+        candidate_version = str(trade["candidate_version"])
+        ga_decision_id = int(trade["ga_decision_id"])
+        # activation_ambiguous_path and ambiguous_path must NOT be counted as real_pnl
+        if close_reason in ("activation_ambiguous_path", "ambiguous_path"):
+            eval_outcome = "ambiguous_path"
+        else:
+            eval_outcome = "real_pnl"
+        self.conn.execute(
+            """
+            UPDATE strategy_evaluations
+            SET pnl_r=?, outcome_source=?, shadow_virtual_trade_id=?
+            WHERE strategy_name=? AND strategy_version=? AND is_shadow=1
+              AND ga_decision_id=? AND pnl_r IS NULL
+            """,
+            (pnl_r, eval_outcome, virtual_trade_id, strategy_name, candidate_version, ga_decision_id),
+        )
+
+        self.conn.commit()
+        trade_dict = dict(trade)
+        trade_dict["pnl_r"] = pnl_r
+        trade_dict["status"] = "closed"
+        trade_dict["close_reason"] = close_reason
+        return trade_dict
+
+    def list_open_shadow_virtual_trades(self) -> list[dict]:
+        """Return all currently open or pending-entry shadow virtual trades."""
+        rows = self.conn.execute(
+            "SELECT * FROM shadow_virtual_trades WHERE status IN ('open', 'pending_entry') ORDER BY created_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_shadow_virtual_trade_status(self, virtual_trade_id: int, status: str,
+                                           *, event_time: str | None = None) -> None:
+        """Transition a shadow virtual trade to a new status (e.g. pending_entry -> open).
+
+        When transitioning to 'open', sets opened_at and expires_at.
+        Uses event_time (ISO string) if provided, otherwise falls back to wall clock.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        if status == "open":
+            if event_time is not None:
+                now = datetime.fromisoformat(event_time)
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+            else:
+                now = datetime.now(timezone.utc)
+            expires_at = (now + timedelta(minutes=4320)).isoformat()
+            self.conn.execute(
+                "UPDATE shadow_virtual_trades SET status=?, opened_at=?, expires_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, now.isoformat(), expires_at, virtual_trade_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE shadow_virtual_trades SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, virtual_trade_id),
+            )
+        self.conn.commit()
+
+    def list_shadow_virtual_trades_for_candidate(self, candidate_version: str) -> list[dict]:
+        """Return all shadow virtual trades for a specific candidate version."""
+        rows = self.conn.execute(
+            "SELECT * FROM shadow_virtual_trades WHERE candidate_version=? ORDER BY created_at",
+            (candidate_version,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def save_equity_snapshot(self, snapshot: dict[str, Any]) -> int:
         self.conn.execute(
@@ -1840,11 +2030,11 @@ class CryptoGuardRepository:
             ).fetchall()
         ]
 
-    def save_strategy_patch_candidate(self, patch: dict[str, Any], evidence: dict[str, Any] | None = None, trigger_id: int | None = None) -> int:
+    def save_strategy_patch_candidate(self, patch: dict[str, Any], evidence: dict[str, Any] | None = None, trigger_id: int | None = None, *, status: str = "draft") -> int:
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, evidence_json, trigger_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'shadow_testing')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 patch["strategy_name"],
@@ -1854,6 +2044,7 @@ class CryptoGuardRepository:
                 patch.get("change_reason"),
                 json.dumps(evidence or {}, ensure_ascii=False),
                 trigger_id,
+                status,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -1960,7 +2151,7 @@ class CryptoGuardRepository:
         change_reason: str,
         created_from_review_id: int | None = None,
     ) -> int:
-        if status not in {"active", "candidate", "shadow_testing", "deprecated", "review_required", "rejected"}:
+        if status not in {"active", "candidate", "shadow_testing", "deprecated", "review_required", "rejected", "draft"}:
             raise ValueError(f"invalid strategy status: {status}")
         self.conn.execute(
             """

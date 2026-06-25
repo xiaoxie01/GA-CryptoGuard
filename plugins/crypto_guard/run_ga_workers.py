@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
 from plugins.crypto_guard.config.loader import load_config
@@ -626,113 +627,237 @@ def handle_paper_drawdown_alert(repo: CryptoGuardRepository, payload: dict[str, 
     return {"ok": True, "sent": sent, "target": target, "text": text}
 
 
+def _fmt_utc8(ts: str | None) -> str:
+    """Format an ISO timestamp to UTC+8 display string.
+
+    Returns the time in 'YYYY-MM-DD HH:MM UTC+8' or '-' if None/unparseable.
+    """
+    if not ts:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_cn = dt.astimezone(timezone(timedelta(hours=8)))
+        return dt_cn.strftime("%Y-%m-%d %H:%M") + " UTC+8"
+    except (ValueError, TypeError):
+        return str(ts)[:16]
+
+
 def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
-    """Build detailed evolution status text for daily review notification."""
+    """Build detailed evolution status text for daily review notification.
+
+    Uses strategy_evaluations (WHERE is_shadow=1) for per-patch shadow stats,
+    NOT paper_trades. Shows data quality breakdown: total/real_pnl/pseudo_r samples,
+    win_rate, backtest status, effective_min_samples, blocking reason.
+    """
     import json
-    lines = []
-
-    # Get recent evolution triggers
-    triggers = repo.conn.execute(
-        "SELECT * FROM evolution_triggers WHERE status IN ('pending', 'shadow_testing', 'review_required') ORDER BY id DESC LIMIT 5"
-    ).fetchall()
-
-    if not triggers:
-        return ""
-
-    lines.append("")
-    lines.append("---")
-    lines.append("**自进化状态**")
-    lines.append("")
-
-    for t in triggers:
-        t = dict(t)
-        trigger_type_cn = {
-            "consecutive_stop_losses": "连续止损",
-            "daily_loss_threshold": "单日止损",
-            "account_drawdown": "账户回撤",
-        }.get(t.get("trigger_type"), t.get("trigger_type"))
-
-        trigger_value = t.get("trigger_value", 0)
-        threshold = t.get("threshold_value", 0)
-        related_ids = []
-        try:
-            related_ids = json.loads(t.get("related_trade_ids") or "[]")
-        except Exception:
-            pass
-
-        status_cn = {
-            "pending": "待处理",
-            "shadow_testing": "影子测试中",
-            "active": "已激活",
-            "rejected": "已拒绝",
-        }.get(t.get("status"), t.get("status"))
-
-        lines.append(f"[{status_cn}] {trigger_type_cn}")
-        lines.append(f"  触发值：{trigger_value}（阈值 {threshold}）")
-        if related_ids:
-            ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
-            lines.append(f"  关联交易：{ids_str}")
-        lines.append(f"  创建时间：{t.get('created_at', '-')}")
-        lines.append("")
-
-    # Get related patches
-    patches = repo.conn.execute(
-        "SELECT * FROM strategy_patches WHERE status IN ('candidate', 'shadow_testing') ORDER BY id DESC LIMIT 5"
-    ).fetchall()
-
-    if patches:
-        lines.append("**候选补丁**")
-        lines.append("")
-        for p in patches:
-            p = dict(p)
-            patch_json = {}
-            try:
-                patch_json = json.loads(p.get("patch_json") or "{}")
-            except Exception:
-                pass
-
-            patch_id = p.get("id")
-            version = p.get("candidate_version", "-")
-            reason = p.get("reason", "-")
-            created = p.get("created_at", "-")[:16]
-
-            # Get shadow test results if available
-            shadow_results = repo.conn.execute(
-                "SELECT COUNT(*) as total, SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins FROM paper_trades WHERE close_reason IS NOT NULL AND created_at >= ?",
-                (p.get("created_at", "2000-01-01"),)
-            ).fetchone()
-            total = int(shadow_results["total"] or 0) if shadow_results else 0
-            wins = int(shadow_results["wins"] or 0) if shadow_results else 0
-
-            if total > 0:
-                wr = wins / total * 100
-                lines.append(f"Patch #{patch_id}（{version}）：{reason}")
-                lines.append(f"  影子测试：{total}笔交易，胜率 {wr:.0f}%（{wins}W/{total - wins}L）")
-            else:
-                lines.append(f"Patch #{patch_id}（{version}）：{reason}")
-                lines.append(f"  影子测试：暂无数据")
-
-            lines.append(f"  创建时间：{created}")
-            lines.append("")
-
-    # Next steps - use actual config values
     from plugins.crypto_guard.config.loader import load_config as _load_cfg
+
     _cfg = _load_cfg().trading_mode
     _online_cfg = _cfg.get("evolution", {}).get("online_shadow", {})
     _min_after_bt = _online_cfg.get("min_samples_after_backtest", 5)
     _min_without_bt = _online_cfg.get("min_samples_without_backtest", 30)
     _backtest_enabled = _cfg.get("evolution", {}).get("backtest_gate", {}).get("enabled", True)
 
+    lines = []
+
+    # ── Triggers ──────────────────────────────────────────────
+    all_triggers = repo.conn.execute(
+        "SELECT * FROM evolution_triggers ORDER BY latest_triggered_at DESC"
+    ).fetchall()
+
+    open_triggers = [dict(t) for t in all_triggers if t["status"] in ("pending", "shadow_testing", "review_required")]
+    total_triggers = len(all_triggers)
+    open_trigger_count = len(open_triggers)
+
+    if not open_triggers:
+        if total_triggers > 0:
+            lines.append("")
+            lines.append("---")
+            lines.append("**自进化状态**")
+            lines.append("")
+            lines.append(f"共 {total_triggers} 个触发记录，全部已关闭。无活跃候选。")
+            lines.append("")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("---")
+    lines.append("**自进化状态**")
+    lines.append("")
+
+    lines.append(f"共 {open_trigger_count} 个活跃触发 / 共 {total_triggers} 个历史触发")
+    lines.append("")
+
+    trigger_type_cn = {
+        "consecutive_stop_losses": "连续止损",
+        "daily_loss_threshold": "单日止损",
+        "account_drawdown": "账户回撤",
+    }
+    status_cn = {
+        "pending": "待处理",
+        "shadow_testing": "影子测试中",
+        "active": "已激活",
+        "rejected": "已拒绝",
+    }
+
+    for t in open_triggers[:8]:
+        ttype = trigger_type_cn.get(t.get("trigger_type"), t.get("trigger_type"))
+        st = status_cn.get(t.get("status"), t.get("status"))
+        trigger_value = t.get("trigger_value", 0)
+        threshold = t.get("threshold_value", 0)
+
+        # Parse original and latest trade IDs separately
+        original_ids = _parse_json_list(t.get("original_related_trade_ids"))
+        latest_ids = _parse_json_list(t.get("latest_related_trade_ids"))
+
+        created = _fmt_utc8(t.get("created_at"))
+        latest_at = _fmt_utc8(t.get("latest_triggered_at"))
+
+        lines.append(f"[{st}] {ttype}")
+        lines.append(f"  触发值：{trigger_value}（阈值 {threshold}）")
+        if original_ids:
+            lines.append(f"  原始关联交易：{' / '.join(f'#{tid}' for tid in original_ids[:5])}")
+        if latest_ids and latest_ids != original_ids:
+            lines.append(f"  最新关联交易：{' / '.join(f'#{tid}' for tid in latest_ids[:5])}")
+        elif latest_ids:
+            lines.append(f"  关联交易：{' / '.join(f'#{tid}' for tid in latest_ids[:5])}")
+        lines.append(f"  首次触发：{created}")
+        if latest_at != created:
+            lines.append(f"  最近触发：{latest_at}")
+        lines.append("")
+
+    # ── Patches with shadow evaluation stats ──────────────────
+    all_patches = repo.conn.execute(
+        "SELECT * FROM strategy_patches WHERE status IN ('candidate', 'shadow_testing', 'review_required') ORDER BY id DESC"
+    ).fetchall()
+
+    open_patches = [dict(p) for p in all_patches]
+    total_patch_count = len(open_patches)
+
+    if open_patches:
+        lines.append(f"**候选补丁**（共 {total_patch_count} 个）")
+        lines.append("")
+
+        for p in open_patches[:10]:
+            p = dict(p)
+            patch_id = p.get("id")
+            strategy_name = p.get("strategy_name", "-")
+            candidate_version = p.get("candidate_version", "-")
+            reason = p.get("reason", "-")
+            created = _fmt_utc8(p.get("created_at"))
+
+            # Shadow evaluation stats from strategy_evaluations
+            stats = repo.conn.execute(
+                """SELECT COUNT(*) as total,
+                          COUNT(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN 1 END) as real_count,
+                          COUNT(CASE WHEN pnl_r IS NULL OR outcome_source IS NULL OR outcome_source!='real_pnl' THEN 1 END) as pseudo_count,
+                          AVG(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN pnl_r END) as avg_r,
+                          AVG(CASE WHEN pnl_r IS NULL OR outcome_source IS NULL OR outcome_source!='real_pnl' THEN (score - 0.5) * 2 END) as pseudo_avg_r
+                   FROM strategy_evaluations
+                   WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND ga_decision_id IS NOT NULL""",
+                (strategy_name, candidate_version),
+            ).fetchone()
+
+            total = int(stats["total"]) if stats else 0
+            real_count = int(stats["real_count"]) if stats else 0
+            pseudo_count = int(stats["pseudo_count"]) if stats else 0
+            avg_r = round(float(stats["avg_r"]), 3) if stats and stats["avg_r"] is not None else None
+
+            # Compute win_rate from real PnL evaluations only
+            if real_count >= 5:
+                win_row = repo.conn.execute(
+                    """SELECT COUNT(*) as wins FROM strategy_evaluations
+                       WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
+                    (strategy_name, candidate_version),
+                ).fetchone()
+                wins = int(win_row["wins"]) if win_row else 0
+                wr = wins / real_count * 100
+                win_text = f"胜率 {wr:.0f}%（{wins}W/{real_count - wins}L）"
+            elif real_count > 0:
+                win_text = "胜率不可计算（样本不足，需 ≥5 个真实 PnL 样本）"
+            else:
+                win_text = "胜率不可计算（无真实 PnL 样本）"
+
+            # Data quality
+            if real_count >= 5:
+                dq = "good"
+            elif real_count >= 1:
+                dq = "limited"
+            else:
+                dq = "no_real_pnl"
+
+            # Backtest status
+            bt = _get_backtest_status(repo, candidate_version)
+
+            lines.append(f"Patch #{patch_id}（{candidate_version}）")
+            lines.append(f"  策略：{strategy_name}")
+            lines.append(f"  原因：{reason}")
+            lines.append(f"  影子样本：{total} 个（真实 PnL: {real_count}，伪 R: {pseudo_count}）")
+            if avg_r is not None:
+                lines.append(f"  平均 R：{avg_r}")
+            lines.append(f"  {win_text}")
+            lines.append(f"  数据质量：{dq}")
+
+            # Backtest gate status
+            if bt.get("gate_disabled"):
+                lines.append(f"  回测门禁：已关闭")
+            elif bt.get("skipped"):
+                lines.append(f"  回测门禁：跳过（{bt.get('reason', '-')}）")
+            elif bt.get("passed"):
+                lines.append(f"  回测门禁：通过")
+            else:
+                lines.append(f"  回测门禁：未通过（{bt.get('reason', '-')}）")
+
+            # Effective min samples and blocking reason
+            has_backtest_pass = bt.get("passed") and not bt.get("skipped") and not bt.get("gate_disabled")
+            gate_disabled = bt.get("gate_disabled", False)
+            effective_min = _min_after_bt if (has_backtest_pass or gate_disabled) else _min_without_bt
+            gap = max(0, effective_min - real_count) if real_count < effective_min else 0
+
+            if gap > 0:
+                lines.append(f"  还需 {gap} 个真实 PnL 样本才能进入判决（需要 {effective_min}，当前 {real_count}）")
+            else:
+                lines.append(f"  样本充足（{real_count}/{effective_min}），等待 shadow verdict 判决")
+
+            # Last shadow sample time
+            last_eval = repo.conn.execute(
+                "SELECT created_at FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 ORDER BY created_at DESC LIMIT 1",
+                (strategy_name, candidate_version),
+            ).fetchone()
+            if last_eval:
+                lines.append(f"  最后影子样本：{_fmt_utc8(last_eval['created_at'])}")
+
+            lines.append(f"  创建时间：{created}")
+            lines.append("")
+
+        if total_patch_count > 10:
+            lines.append(f"  ... 还有 {total_patch_count - 10} 个候选未显示")
+            lines.append("")
+
+    # ── Next steps ────────────────────────────────────────────
     lines.append("**下一步**")
     if _backtest_enabled:
-        lines.append(f"- 影子测试需 {_min_after_bt} 个样本（通过回测门禁后）或 {_min_without_bt} 个样本（未通过回测）")
+        lines.append(f"- 影子测试需 {_min_after_bt} 个真实 PnL 样本（通过回测门禁后）或 {_min_without_bt} 个（未通过回测）")
     else:
-        lines.append(f"- 影子测试需至少 {_min_without_bt} 个样本确认效果")
+        lines.append(f"- 影子测试需至少 {_min_without_bt} 个真实 PnL 样本确认效果")
     lines.append("- 胜率和盈亏比达标后可进入 review 阶段")
     lines.append("- review 通过后可手动确认进入 active")
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _parse_json_list(val: Any) -> list:
+    """Parse a JSON-encoded list from DB, returning empty list on failure."""
+    if not val:
+        return []
+    try:
+        result = json.loads(val) if isinstance(val, str) else val
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
 
 
 def _get_backtest_status(repo: CryptoGuardRepository, candidate_version: str) -> dict[str, Any]:

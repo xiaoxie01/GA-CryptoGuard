@@ -70,20 +70,46 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
     )
     if review_patch and not review_patch.get("strategy_name"):
         review_patch["strategy_name"] = strategy_name
-    patch_id = repo.save_strategy_patch_candidate(review_patch, {"trade_id": trade_id, "review_id": review_id}) if review_patch and review.get("evolution_trigger_allowed", True) else None
-    if patch_id and review_patch:
-        repo.save_strategy_version(
-            strategy_name=review_patch.get("strategy_name", strategy_name),
-            version=review_patch["candidate_version"],
-            status="shadow_testing",
-            config=review_patch.get("patch", {}),
-            change_reason=review_patch.get("change_reason", "trade_review"),
-        )
+
+    patch_id = None
+    if review_patch and review.get("evolution_trigger_allowed", True):
+        # Wrap patch + version + cap in explicit BEGIN/COMMIT — all or nothing
+        repo.conn.execute("BEGIN")
+        try:
+            patch_id = repo.save_strategy_patch_candidate(
+                review_patch, {"trade_id": trade_id, "review_id": review_id},
+                status="candidate",
+            )
+            repo.save_strategy_version(
+                strategy_name=review_patch.get("strategy_name", strategy_name),
+                version=review_patch["candidate_version"],
+                status="candidate",
+                config=review_patch.get("patch", {}),
+                change_reason=review_patch.get("change_reason", "trade_review"),
+            )
+            # Enforce candidate cap AFTER creation, inside same transaction
+            from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
+            _enforce_candidate_cap(repo, review_patch.get("strategy_name", strategy_name), max_candidates=5)
+            repo.conn.commit()
+        except Exception:
+            repo.conn.execute("ROLLBACK")
+            raise
         # Run backtest gate if patch has score_adjustments
         candidate_patch_data = review_patch.get("patch", {})
         if candidate_patch_data.get("score_adjustments"):
             _run_backtest_for_candidate(repo, review_patch.get("strategy_name", strategy_name),
                                          review_patch["candidate_version"], patch_id)
+        else:
+            # No scoring changes — transition directly to shadow_testing
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
+                (review_patch.get("strategy_name", strategy_name), review_patch["candidate_version"]),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='shadow_testing' WHERE id=?",
+                (patch_id,),
+            )
+            repo.conn.commit()
     repo.update_strategy_memory_from_review(
         strategy_name=strategy_name,
         condition_hash=f"{trade.get('symbol')}:{primary}",
@@ -381,6 +407,16 @@ def _run_backtest_for_candidate(
         )
         repo.conn.execute(
             "UPDATE strategy_patches SET status='rejected' WHERE id=?",
+            (patch_id,),
+        )
+    else:
+        # Backtest passed or skipped — transition candidate to shadow_testing
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
+            (strategy_name, candidate_version),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_patches SET status='shadow_testing' WHERE id=?",
             (patch_id,),
         )
     repo.conn.commit()

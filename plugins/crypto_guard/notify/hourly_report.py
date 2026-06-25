@@ -385,11 +385,11 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         # pnl_r = 0 is real data (breakeven), only NULL is pseudo
         real_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND pnl_r IS NOT NULL
+            WHERE is_shadow = 1 AND outcome_source='real_pnl' AND pnl_r IS NOT NULL
         """)
         pseudo_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND pnl_r IS NULL
+            WHERE is_shadow = 1 AND (outcome_source != 'real_pnl' OR outcome_source IS NULL)
         """)
         total = real_count + pseudo_count
         return {

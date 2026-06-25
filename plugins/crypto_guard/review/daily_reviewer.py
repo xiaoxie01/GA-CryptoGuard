@@ -631,8 +631,9 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
     for p in related_patches:
         stats = repo.conn.execute(
             """SELECT COUNT(*) as sample_count,
-                      COUNT(CASE WHEN pnl_r IS NOT NULL THEN 1 END) as real_pnl_count,
-                      AVG(CASE WHEN pnl_r IS NOT NULL THEN pnl_r END) as avg_r
+                      COUNT(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN 1 END) as real_pnl_count,
+                      COUNT(CASE WHEN pnl_r IS NULL OR outcome_source IS NULL OR outcome_source!='real_pnl' THEN 1 END) as pseudo_r_count,
+                      AVG(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN pnl_r END) as avg_r
                FROM strategy_evaluations
                WHERE strategy_name=? AND strategy_version=? AND is_shadow=1""",
             (p.get("strategy_name"), p.get("candidate_version")),
@@ -640,6 +641,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
         if stats:
             p["sample_count"] = stats["sample_count"]
             p["real_pnl_count"] = stats["real_pnl_count"] or 0
+            p["pseudo_r_count"] = stats["pseudo_r_count"] or 0
             # avg_r is None when no real PnL data — not 0.0 (which reads as breakeven)
             raw_avg = stats["avg_r"]
             p["avg_r"] = round(float(raw_avg), 4) if raw_avg is not None else None
@@ -650,6 +652,18 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
                 p["data_quality"] = "limited"
             else:
                 p["data_quality"] = "no_real_pnl"
+
+            # Compute win_rate from real PnL evaluations only (not pseudo-R)
+            p["win_rate"] = None
+            if real_count >= 5:
+                win_row = repo.conn.execute(
+                    """SELECT COUNT(*) as wins FROM strategy_evaluations
+                       WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
+                    (p.get("strategy_name"), p.get("candidate_version")),
+                ).fetchone()
+                if win_row:
+                    wins = int(win_row["wins"]) or 0
+                    p["win_rate"] = round(wins / real_count, 4)
 
     # Build standard patch_summary list — single source of truth for all return lists.
     # Never leak raw strategy_patches rows (which contain backtest_result_json, etc.).
@@ -662,7 +676,9 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
             "backtest_result": p.get("backtest_parsed"),
             "shadow_sample_count": p.get("sample_count", 0),
             "real_pnl_count": p.get("real_pnl_count", 0),
+            "pseudo_r_count": p.get("pseudo_r_count", 0),
             "avg_r": p.get("avg_r"),
+            "win_rate": p.get("win_rate"),
             "data_quality": p.get("data_quality", "unknown"),
         })
 
@@ -681,12 +697,26 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
             "triggered_at": t.get("latest_triggered_at") or t.get("created_at"),
         })
 
+    # Compute global totals from the full query (not just window-filtered)
+    open_trigger_count = repo.conn.execute(
+        "SELECT COUNT(*) as cnt FROM evolution_triggers WHERE status IN ('pending','shadow_testing','review_required')"
+    ).fetchone()
+    total_trigger_count = repo.conn.execute(
+        "SELECT COUNT(*) as cnt FROM evolution_triggers"
+    ).fetchone()
+    total_patch_count = repo.conn.execute(
+        "SELECT COUNT(*) as cnt FROM strategy_patches"
+    ).fetchone()
+
     return {
         "triggers": trigger_items,
         "patches": patch_summaries,
         "review_required": review_required,
         "shadow_testing": shadow_testing,
         "rejected": rejected,
+        "total_triggers": int(total_trigger_count["cnt"]) if total_trigger_count else 0,
+        "total_open_triggers": int(open_trigger_count["cnt"]) if open_trigger_count else 0,
+        "total_patches": int(total_patch_count["cnt"]) if total_patch_count else 0,
     }
 
 

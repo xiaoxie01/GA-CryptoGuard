@@ -8,6 +8,55 @@ from plugins.crypto_guard.ga_master.decision_schema import controller_decision_f
 from plugins.crypto_guard.ga_master.feishu_action_builder import build_feishu_actions
 from plugins.crypto_guard.paper.execution_quality import close_quality_metrics, evaluate_exit, market_from_price, update_trade_path_metrics
 from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
+
+DEFAULT_ACCOUNT_BALANCE = 10000.0
+DEFAULT_RISK_PERCENT = 0.5
+DEFAULT_SLIPPAGE_PCT = 0.001
+
+
+def compute_position_size(
+    entry_price: float,
+    stop_loss: float,
+    *,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+) -> tuple[float, float] | None:
+    """Compute quantity and initial_risk_usdt from risk% sizing formula.
+
+    quantity = (account_balance * risk_pct) / abs(entry - stop)
+    initial_risk_usdt = account_balance * risk_pct
+
+    Returns (quantity, initial_risk_usdt) or None if risk_per_unit <= 0.
+    Reused by both paper_broker and shadow_virtual_trade creation.
+    """
+    risk_pct = risk_percent / 100.0
+    risk_usdt = account_balance * risk_pct
+    risk_per_unit = abs(entry_price - stop_loss)
+    if risk_per_unit <= 0:
+        return None
+    return (risk_usdt / risk_per_unit, risk_usdt)
+
+
+def compute_fill_price(
+    entry_price: float,
+    side: str,
+    *,
+    slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
+    order_type: str = "market",
+) -> float:
+    """Apply slippage to get the actual fill price for a market order.
+
+    For limit/trigger orders, slippage is not applied (fills at entry_price).
+    For market orders: LONG fills at entry * (1 + slippage), SHORT at entry * (1 - slippage).
+
+    Shared between paper_broker and shadow_virtual_trade to ensure consistent R-basis.
+    """
+    if str(order_type).lower() != "market":
+        return entry_price
+    side_upper = str(side).upper()
+    if side_upper == "SHORT":
+        return entry_price * (1 - slippage_pct)
+    return entry_price * (1 + slippage_pct)
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository, utc_iso
 from plugins.crypto_guard.utils import utc_ms
 
@@ -460,18 +509,13 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     entry_price = order.get("entry_price") or last_price
     fill_method = order.get("fill_method")
     # Calculate position size based on risk
-    risk_pct = float(order.get("risk_percent") or 0.5) / 100.0
-    account_balance = 10000.0
-    risk_usdt = account_balance * risk_pct
     stop = float(order.get("stop_loss") or 0)
-    risk_per_unit = abs(float(entry_price) - stop) if stop else 0
-    if risk_per_unit > 0:
-        order["quantity"] = risk_usdt / risk_per_unit
+    risk_pct = float(order.get("risk_percent") or 0.5)
     if order_type == "market":
         should_fill = True
         open_price = float(market.get("open", last_price))
-        slippage = float(market.get("market_slippage_pct", 0.001))
-        entry_price = open_price * (1 + slippage) if side == "LONG" else open_price * (1 - slippage)
+        slippage = float(market.get("market_slippage_pct", DEFAULT_SLIPPAGE_PCT))
+        entry_price = compute_fill_price(open_price, side, slippage_pct=slippage)
         fill_method = "next_candle_open_with_slippage"
     elif order_type == "limit":
         should_fill = bool(entry_price is not None and low <= float(entry_price) <= high)
@@ -483,6 +527,10 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
         fill_method = "trigger_touch" if should_fill else fill_method
     if not should_fill:
         return {"ok": True, "filled": False}
+    # Size AFTER fill price is determined (slippage applied for market orders)
+    sizing = compute_position_size(float(entry_price), stop, risk_percent=risk_pct)
+    if sizing is not None:
+        order["quantity"] = sizing[0]
     # Guard: don't create duplicate trades for the same order
     existing_trade = repo.get_open_trade_for_order(order["id"])
     if existing_trade:
@@ -553,8 +601,9 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
     )
     closed_at = utc_iso()
     repo.update_paper_order_status(order["id"], "closed", closed_at=closed_at)
-    # Backfill real pnl_r to shadow strategy_evaluations for this trade
-    repo.backfill_shadow_evaluation_pnl_r(trade, quality["pnl_r"])
+    # Backfill real pnl_r to active strategy_evaluations for this trade.
+    # Shadow evaluations get PnL exclusively from their independent virtual_trade lifecycle.
+    repo.backfill_active_evaluation_pnl_r(trade, quality["pnl_r"])
     repo.upsert_paper_position_from_trade(
         account_id=int(repo.ensure_paper_account()["id"]),
         trade={**trade, "current_price": exit_price},

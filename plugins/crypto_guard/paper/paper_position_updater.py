@@ -193,23 +193,77 @@ def _check_daily_loss_trigger(repo: CryptoGuardRepository, results: list[dict[st
 
 
 def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str, Any], trade: dict[str, Any], market: dict[str, Any]) -> dict[str, Any] | None:
+    """Unified breakeven logic using position_conflict config (P0-5).
+
+    Replaces the old breakeven_after_rr: 2.0 threshold with the same gates
+    used by the conflict path: min_hold_minutes, min_current_r_for_breakeven,
+    min_mfe_r_for_breakeven. Does NOT require reverse_confirmations (routine
+    breakeven doesn't need conflict confirmation).
+    """
+    from datetime import datetime, timezone
+    from plugins.crypto_guard.config.loader import load_config
+
     try:
         entry = float(trade["entry_price"])
-        stop = float(order["stop_loss"])
-        quantity = float(trade.get("quantity") or order.get("quantity") or 1)
+        stop = float(order.get("initial_stop_loss") or order.get("stop_loss") or 0)
+        quantity = float(trade.get("quantity") or order.get("quantity") or 0)
     except (TypeError, ValueError):
         return None
-    side = str(order["side"]).upper()
-    risk_value = abs(entry - stop) * quantity
-    mfe = float(trade.get("max_favorable_excursion") or 0)
-    already_safe = stop >= entry if side == "LONG" else stop <= entry
-    # Read breakeven threshold from config (default 2.0R)
-    from plugins.crypto_guard.config.loader import load_config
-    risk_cfg = load_config().trading_mode.get("risk", {})
-    breakeven_rr = float(risk_cfg.get("breakeven_after_rr", 2.0))
-    if already_safe or risk_value <= 0 or mfe < risk_value * breakeven_rr:
+
+    if entry <= 0 or stop <= 0:
         return None
-    repo.update_paper_order_stop_loss(order["id"], entry, reason=f"价格已运行 {breakeven_rr}R，止损移动到保本")
+
+    side = str(order["side"]).upper()
+    already_safe = stop >= entry if side == "LONG" else stop <= entry
+    if already_safe:
+        return None
+
+    # Load unified config from position_conflict section
+    cfg = load_config().trading_mode.get("position_conflict") or {}
+    min_hold_minutes = int(cfg.get("min_hold_minutes", 15))
+    min_current_r_for_breakeven = float(cfg.get("min_current_r_for_breakeven", 0.50))
+    min_mfe_r_for_breakeven = float(cfg.get("min_mfe_r_for_breakeven", 0.75))
+
+    # Gate 1: holding time — fail-closed on missing created_at
+    created_at = trade.get("created_at")
+    if not created_at:
+        return None
+    holding_minutes = None
+    try:
+        if isinstance(created_at, str):
+            open_time = datetime.fromisoformat(created_at)
+        else:
+            open_time = created_at
+        if open_time.tzinfo is None:
+            open_time = open_time.replace(tzinfo=timezone.utc)
+        holding_minutes = (datetime.now(timezone.utc) - open_time).total_seconds() / 60
+        if holding_minutes < min_hold_minutes:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    # Gate 2: current_r >= threshold — use market.close (not market.price)
+    current_price = float(market.get("close") or 0)
+    if current_price <= 0:
+        return None
+    initial_risk_usdt = float(trade.get("initial_risk_usdt") or 0)
+    if initial_risk_usdt <= 0:
+        return None  # fail-closed: no initial_risk_usdt available
+    if side == "LONG":
+        current_r = (current_price - entry) * quantity / initial_risk_usdt
+    else:
+        current_r = (entry - current_price) * quantity / initial_risk_usdt
+    if current_r < min_current_r_for_breakeven:
+        return None
+
+    # Gate 3: MFE/R >= threshold — MFE/R = max_favorable_excursion_usdt / initial_risk_usdt
+    mfe_usdt = float(trade.get("max_favorable_excursion") or 0)
+    mfe_r = mfe_usdt / initial_risk_usdt if initial_risk_usdt > 0 else 0
+    if mfe_r < min_mfe_r_for_breakeven:
+        return None
+
+    # All gates passed — move stop to breakeven
+    repo.update_paper_order_stop_loss(order["id"], entry, reason=f"统一保本门禁通过（持仓 {holding_minutes:.0f} 分钟，current_r={current_r:.2f}，MFE/R={mfe_r:.2f}）")
     repo.enqueue_job(
         "paper_event_alert",
         3,
@@ -222,8 +276,16 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
             "trade_id": trade["id"],
             "entry_price": entry,
             "new_stop_loss": entry,
-            "reason": "小级别走势向更大级别趋势演化，模拟盘止损移至保本。",
+            "reason": "统一保本门禁通过",
             "side": order.get("side"),
+            "audit": {
+                "open_time": created_at,
+                "action_time": datetime.now(timezone.utc).isoformat(),
+                "holding_minutes": round(holding_minutes, 1) if holding_minutes else None,
+                "current_r": round(current_r, 4),
+                "mfe_r": round(mfe_r, 4),
+                "gate_result": "all_passed",
+            },
         },
     )
     return {"ok": True, "stop_loss_adjusted": True, "order_id": order["id"], "new_stop_loss": entry}

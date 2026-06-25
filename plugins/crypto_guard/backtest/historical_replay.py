@@ -131,6 +131,122 @@ def _classify_market_regime(candles: list[dict[str, Any]], lookback: int = 20) -
     return "ranging"
 
 
+def _evaluate_conditional_adjustment(
+    candidate_patch: dict[str, Any] | None,
+    snapshot: dict[str, Any],
+    regime: str,
+    active_decision: dict[str, Any] | None = None,
+    market_bias: str = "",
+) -> tuple[float, dict[str, int]]:
+    """Evaluate when-conditioned score adjustments from the candidate patch.
+
+    If patch has score_adjustments with when-clauses (e.g., when: {side: "LONG"}),
+    only apply adjustments when the current context matches the when condition.
+
+    Returns (cumulative_score_adjustment, trigger_counts) tuple.
+    """
+    if not candidate_patch:
+        return 0.0, {}
+
+    score_adj = candidate_patch.get("score_adjustments") or candidate_patch.get("score_adjustment")
+    if score_adj is None:
+        return 0.0, {}
+
+    # Simple flat float
+    if isinstance(score_adj, (int, float)):
+        return float(score_adj), {}
+
+    # Dict of named adjustments with optional when clauses
+    if not isinstance(score_adj, dict):
+        return 0.0, {}
+
+    cumulative = 0.0
+    trigger_counts: dict[str, int] = {}
+
+    # Extract context from snapshot — read from modules for proper structure
+    modules = snapshot.get("modules") or {}
+    market_regime = modules.get("market_regime") or {}
+    trend_stage_module = modules.get("trend_stage") or {}
+
+    # Read side and entry_type from active_decision.trade_plan (not snapshot)
+    if active_decision:
+        trade_plan = active_decision.get("trade_plan") or {}
+        if isinstance(trade_plan, str):
+            try:
+                trade_plan = json.loads(trade_plan)
+            except (json.JSONDecodeError, TypeError):
+                trade_plan = {}
+        side = str(trade_plan.get("side", "")).upper() or ""
+        entry_type = str(trade_plan.get("entry_type") or "")
+    else:
+        side = str(snapshot.get("side", "")).upper() or ""
+        trade_plan = snapshot.get("trade_plan") or {}
+        if isinstance(trade_plan, str):
+            try:
+                trade_plan = json.loads(trade_plan)
+            except (json.JSONDecodeError, TypeError):
+                trade_plan = {}
+        entry_type = str(trade_plan.get("entry_type") or "")
+
+    market_phase = str(market_regime.get("market_phase") or regime or "")
+    trend_stage = str(trend_stage_module.get("trend_stage") or "")
+
+    for adj_name, adj_val in score_adj.items():
+        if isinstance(adj_val, (int, float)):
+            cumulative += float(adj_val)
+            continue
+        if isinstance(adj_val, dict):
+            value = float(adj_val.get("value", 0))
+            when = adj_val.get("when", {})
+            if not when:
+                cumulative += value
+                continue
+            # Evaluate when conditions with full context
+            if _matches_when(when, side=side, market_phase=market_phase,
+                            trend_stage=trend_stage, entry_type=entry_type,
+                            market_bias=market_bias):
+                cumulative += value
+                key = f"{adj_name}:matched"
+            else:
+                key = f"{adj_name}:skipped"
+            trigger_counts[key] = trigger_counts.get(key, 0) + 1
+
+    return cumulative, trigger_counts
+
+
+def _matches_when(
+    when: dict[str, Any],
+    *,
+    side: str,
+    market_phase: str,
+    trend_stage: str = "",
+    entry_type: str = "",
+    market_bias: str = "",
+) -> bool:
+    """Check whether current context matches a when-condition dict.
+
+    Supports ALL when condition keys: side, market_phase, trend_stage, entry_type, market_bias.
+    """
+    when_side = str(when.get("side", "")).upper() if when.get("side") else ""
+    when_phase = str(when.get("market_phase", "")).lower() if when.get("market_phase") else ""
+    when_trend = str(when.get("trend_stage", "")).lower() if when.get("trend_stage") else ""
+    when_entry = str(when.get("entry_type", "")).lower() if when.get("entry_type") else ""
+    when_bias = str(when.get("market_bias", "")).lower() if when.get("market_bias") else ""
+
+    if when_side and when_side != side:
+        return False
+    if when_phase and when_phase != str(market_phase).lower():
+        return False
+    if when_trend and when_trend != str(trend_stage).lower():
+        return False
+    if when_entry and when_entry != str(entry_type).lower():
+        return False
+    if when_bias and when_bias != str(market_bias).lower():
+        return False
+
+    return True
+
+
 def load_historical_klines(path: str | Path, *, symbol: str, interval: str) -> dict[str, Any]:
     return read_klines_file(path, symbol=symbol, interval=interval)
 
@@ -292,7 +408,7 @@ def run_paired_backtest(
     start_time: int,
     end_time: int,
     warmup: int = 30,
-    candidate_score_adjustment: float = 0.0,
+    candidate_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run paired backtest: same historical data, two strategy versions compared side-by-side.
 
@@ -300,7 +416,8 @@ def run_paired_backtest(
     configurations. Returns paired stats for backtest gate judgment.
 
     Args:
-        candidate_score_adjustment: Score adjustment for candidate evaluation (e.g., +0.05 means candidate is expected to score 5% higher)
+        candidate_patch: Full candidate patch dict with score_adjustments and when-conditions.
+            If provided, conditional adjustments are evaluated per-candle based on market context.
     """
     from datetime import datetime, timezone
 
@@ -321,6 +438,7 @@ def run_paired_backtest(
     active_signals: list[dict[str, Any]] = []
     candidate_signals: list[dict[str, Any]] = []
     no_lookahead_violations = 0
+    all_trigger_counts: dict[str, int] = {}
 
     with TemporaryDirectory() as tmp:
         replay_db = Path(tmp) / "paired_backtest.sqlite3"
@@ -357,12 +475,25 @@ def run_paired_backtest(
                     timeframes=[interval],
                 )
 
+                # Read real market_phase from snapshot modules
+                market_phase = str(
+                    (snapshot.get("modules") or {}).get("market_regime", {}).get("market_phase", "")
+                )
+
                 # Run active decision (no adjustment)
                 active_decision = run_ga_sop_decision(snapshot)
+                market_bias = str(active_decision.get("market_bias", ""))
                 active_signal = _build_signal(analysis_time, symbol, candle, active_decision, regime)
 
-                # Run candidate decision (with score adjustment)
-                candidate_decision = run_ga_sop_decision(snapshot, score_adjustment=candidate_score_adjustment)
+                # Run candidate decision with conditional adjustments from patch
+                candidate_adjustment, trigger_counts = _evaluate_conditional_adjustment(
+                    candidate_patch, snapshot, regime,
+                    active_decision=active_decision,
+                    market_bias=market_bias,
+                )
+                for k, v in trigger_counts.items():
+                    all_trigger_counts[k] = all_trigger_counts.get(k, 0) + v
+                candidate_decision = run_ga_sop_decision(snapshot, score_adjustment=candidate_adjustment)
                 candidate_signal = _build_signal(analysis_time, symbol, candle, candidate_decision, regime)
 
                 # Simulate trades for both if trade plan available
@@ -388,6 +519,10 @@ def run_paired_backtest(
     candidate_stats = _performance_stats(candidate_signals)
     paired_count = len(active_signals)
 
+    # Compute candidate_score_adjustment from patch for result
+    # Use the per-candle adjustments already computed during the loop
+    candidate_score_adjustment = candidate_patch.get("score_adjustments") if candidate_patch else None
+
     # Extract raw R sequences for accurate aggregation
     active_real_rs = [s["pnl_r"] for s in active_signals if s.get("pnl_r") is not None]
     candidate_real_rs = [s["pnl_r"] for s in candidate_signals if s.get("pnl_r") is not None]
@@ -410,6 +545,7 @@ def run_paired_backtest(
         "candidate_score_adjustment": candidate_score_adjustment,
         "no_lookahead": {"ok": no_lookahead_violations == 0, "violation_count": no_lookahead_violations},
         "regime_distribution": _regime_distribution(active_signals),
+        "when_rule_stats": all_trigger_counts,
     }
 
 
@@ -421,6 +557,12 @@ def _build_signal(
     regime: str,
 ) -> dict[str, Any]:
     """Build a signal dict from decision result."""
+    trade_plan = decision.get("trade_plan") or {}
+    if isinstance(trade_plan, str):
+        try:
+            trade_plan = json.loads(trade_plan)
+        except (json.JSONDecodeError, TypeError):
+            trade_plan = {}
     return {
         "analysis_time_utc": analysis_time,
         "symbol": symbol,
@@ -430,6 +572,9 @@ def _build_signal(
         "confidence": decision["confidence"],
         "market_bias": decision.get("market_bias"),
         "market_regime": regime,
+        "side": str(trade_plan.get("side", "")).upper() or None,
+        "entry_type": str(trade_plan.get("entry_type", "")).lower() or None,
+        "trend_stage": str(decision.get("trend_stage", "")),
     }
 
 
