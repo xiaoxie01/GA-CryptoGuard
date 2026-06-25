@@ -13210,11 +13210,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(eval2["outcome_source"], "pending_outcome")
         self.assertIsNone(eval2["pnl_r"])
 
-        # Verify candidate 2's virtual trade is still open
+        # Verify candidate 2's virtual trade is still pending_entry (not yet activated)
         vt2_row = self.repo.conn.execute(
             "SELECT status FROM shadow_virtual_trades WHERE id=?", (vt2,)
         ).fetchone()
-        self.assertEqual(vt2_row["status"], "open")
+        self.assertEqual(vt2_row["status"], "pending_entry")
 
     def test_restart_does_not_overwrite_closed_virtual_trade(self) -> None:
         """重启不覆盖已关闭的虚拟交易 — 幂等返回已有 ID。"""
@@ -14495,6 +14495,152 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         missing_eval_issues = [i for i in result["issues"] if i["type"] == "closed_vt_missing_real_pnl"]
         self.assertGreater(len(missing_eval_issues), 0,
                            "Closed VT missing evaluation should be detected")
+
+    def test_atomic_rollback_on_eval_link_failure(self):
+        """Verify that when the evaluation-VT link UPDATE fails after VT insert,
+        the VT is rolled back (no orphan VT remains)."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="1.1", status="candidate")
+        self._insert_ga_decision(decision_id=1)
+
+        # Patch _insert_shadow_virtual_trade to succeed but make the link UPDATE fail
+        original_insert = self.repo._insert_shadow_virtual_trade
+
+        def _insert_then_corrupt(*args, **kwargs):
+            vt_id = original_insert(*args, **kwargs)
+            # Corrupt the evaluation table so the UPDATE will fail
+            self.conn.execute("DROP TABLE IF EXISTS strategy_evaluations")
+            return vt_id
+
+        self.repo._insert_shadow_virtual_trade = _insert_then_corrupt
+
+        with self.assertRaises(Exception):
+            self.repo.create_shadow_evaluation_with_vt(
+                strategy_name="smc_pullback_long",
+                strategy_version="1.1",
+                ga_decision_id=1,
+                symbol="BTCUSDT",
+                analysis_time=1700000000000,
+                outcome_source="pending_outcome",
+                vt_kwargs={
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "stop_loss": 95.0,
+                    "initial_stop_loss": 95.0,
+                    "take_profit_json": "[]",
+                    "quantity": 1.0,
+                    "initial_risk_usdt": 5.0,
+                },
+            )
+
+        # Restore the table (the DROP was rolled back, but the in-memory table is gone)
+        # Actually, since we dropped the table inside the transaction and then
+        # the rollback should have restored it. But SQLite in-memory with DROP TABLE
+        # inside a transaction may not roll back the DROP. Let's verify differently.
+        # The key assertion: no orphan VT should exist.
+        # Since the transaction was rolled back, the VT insert should also be rolled back.
+        self.repo._insert_shadow_virtual_trade = original_insert
+
+        # Re-create the table if needed (DROP TABLE may not roll back in SQLite)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                analysis_time INTEGER NOT NULL,
+                strategy_name TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                score REAL,
+                decision TEXT,
+                evidence_json TEXT,
+                counter_evidence_json TEXT,
+                is_shadow INTEGER DEFAULT 0,
+                snapshot_id INTEGER,
+                pnl_r REAL,
+                ga_decision_id INTEGER,
+                paper_trade_id INTEGER,
+                shadow_virtual_trade_id INTEGER,
+                outcome_source TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Verify no orphan VT exists
+        vts = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM shadow_virtual_trades WHERE ga_decision_id=?",
+            (1,),
+        ).fetchone()
+        self.assertEqual(vts["cnt"], 0, "Orphan VT should not exist after rollback")
+
+    def test_market_activation_uses_candle_open_with_slippage(self):
+        """Market VT activation must update entry_price from candle.open + slippage,
+        recalculate quantity, and preserve initial_risk_usdt budget."""
+        # NOTE: Lazy import of activate_pending_entry only — avoid paper_broker
+        # import here because it creates a circular import chain
+        # (paper_broker -> controller -> paper_broker).
+
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="1.1", status="candidate")
+        self._insert_ga_decision(decision_id=1)
+
+        # Create VT with planned entry_price=100.0, stop_loss=95.0, initial_risk_usdt=100.0
+        vt_id = self._insert_virtual_trade(
+            strategy_name="smc_pullback_long", candidate_version="1.1", ga_decision_id=1,
+            symbol="BTCUSDT", side="LONG", entry_type="market",
+            entry_price=100.0, stop_loss=95.0, initial_stop_loss=95.0,
+            quantity=1.0, initial_risk_usdt=100.0, status="pending_entry",
+        )
+
+        trade = dict(self.conn.execute(
+            "SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+        ).fetchone())
+
+        # Simulate activation candle with open=102.0
+        candle = {
+            "open": 102.0,
+            "high": 103.0,
+            "low": 101.0,
+            "close": 102.5,
+            "open_time": 1700000000000,
+            "close_time": 1700000060000,
+            "is_closed": True,
+        }
+
+        from plugins.crypto_guard.paper.shadow_virtual_trade_updater import activate_pending_entry
+        activated = activate_pending_entry(self.repo, trade, candle)
+        self.assertTrue(activated, "Market VT should activate on first candle")
+
+        # Re-read the VT
+        vt_after = dict(self.conn.execute(
+            "SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+        ).fetchone())
+
+        # Verify status is 'open'
+        self.assertEqual(vt_after["status"], "open")
+
+        # Verify entry_price is updated to candle.open + slippage (0.001 default)
+        # LONG: fill = candle.open * (1 + slippage) = 102.0 * 1.001
+        expected_fill = 102.0 * 1.001
+        self.assertAlmostEqual(float(vt_after["entry_price"]), expected_fill,
+                               msg="entry_price should be candle.open + slippage")
+
+        # Verify quantity is recalculated against fill price.
+        # initial_risk_usdt was 100.0 → risk_percent = (100/10000)*100 = 1.0%
+        # risk_usdt = 10000 * 0.01 = 100.0
+        # quantity = 100.0 / abs(fill - stop)
+        expected_risk_usdt = 10000.0 * 0.01  # 100.0 (preserving original risk budget)
+        risk_per_unit = abs(expected_fill - 95.0)
+        expected_qty = expected_risk_usdt / risk_per_unit
+        self.assertAlmostEqual(float(vt_after["quantity"]), expected_qty,
+                               msg="quantity should be recalculated against fill price")
+
+        # Verify initial_risk_usdt is preserved from the original plan
+        self.assertAlmostEqual(float(vt_after["initial_risk_usdt"]), expected_risk_usdt,
+                               msg="initial_risk_usdt should be recalculated from risk budget")
+
+        # Also verify that the original planned entry_price (100.0) is DIFFERENT
+        # from the actual fill (102.0 * 1.001), confirming the activation updated it
+        self.assertNotEqual(float(vt_after["entry_price"]), 100.0,
+                            "entry_price should NOT remain at the planned value")
 
     def test_fill_price_long_slippage(self):
         """compute_fill_price for LONG applies positive slippage: entry * (1 + slippage)."""

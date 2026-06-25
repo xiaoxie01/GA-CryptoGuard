@@ -1290,6 +1290,33 @@ class CryptoGuardRepository:
 
     # ── shadow_virtual_trades ──────────────────────────────────────────
 
+    def _insert_shadow_virtual_trade(self, candidate_version: str, ga_decision_id: int,
+                                     symbol: str, side: str, entry_price: float,
+                                     stop_loss: float, initial_stop_loss: float,
+                                     take_profit_json: str, quantity: float,
+                                     initial_risk_usdt: float, *,
+                                     strategy_name: str = "smc_pullback_long",
+                                     entry_type: str = "market",
+                                     max_pending_minutes: int = 120) -> int:
+        """Insert a shadow_virtual_trade row WITHOUT committing. Caller manages transaction."""
+        entry_type_lower = str(entry_type).lower()
+        status = "pending_entry"
+        now = datetime.now(timezone.utc)
+        opened_at = None
+        expires_at = (now + timedelta(minutes=max_pending_minutes)).isoformat()
+
+        self.conn.execute(
+            """INSERT INTO shadow_virtual_trades(
+                strategy_name, candidate_version, ga_decision_id, symbol, side,
+                entry_type, entry_price, stop_loss, initial_stop_loss, take_profit_json,
+                quantity, initial_risk_usdt, status, opened_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (strategy_name, candidate_version, ga_decision_id, symbol, side,
+             entry_type_lower, entry_price, stop_loss, initial_stop_loss, take_profit_json,
+             quantity, initial_risk_usdt, status, opened_at, expires_at),
+        )
+        return int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
     def create_shadow_virtual_trade(self, candidate_version: str, ga_decision_id: int,
                                     symbol: str, side: str, entry_price: float,
                                     stop_loss: float, initial_stop_loss: float,
@@ -1302,16 +1329,16 @@ class CryptoGuardRepository:
 
         Idempotent: checks for existing row by (strategy_name, candidate_version, ga_decision_id)
         first. If it exists, returns the existing ID without overwriting.
-        Otherwise inserts a new row.
+        Otherwise inserts a new row and commits.
 
         Status logic:
-          - entry_type='market' → status='open', opened_at=NOW
-          - entry_type='limit'/'trigger'/'stop' → status='pending_entry', opened_at=NULL
+          - ALL entry types start as 'pending_entry' — the updater activates
+            them to 'open' when the first closed candle arrives.
+          - entry_type='market' activates immediately on first candle (always true).
+          - entry_type='limit'/'trigger'/'stop' activates when price condition is met.
 
         max_pending_minutes controls expires_at for pending_entry trades (default 120 min).
         """
-        from datetime import datetime, timezone
-
         # Check for existing row first (idempotent, avoids INSERT OR REPLACE which resets timestamps)
         existing = self.conn.execute(
             "SELECT id FROM shadow_virtual_trades"
@@ -1321,31 +1348,80 @@ class CryptoGuardRepository:
         if existing:
             return int(existing["id"])
 
-        entry_type_lower = str(entry_type).lower()
-        is_market = entry_type_lower == "market"
-        status = "open" if is_market else "pending_entry"
-        now = datetime.now(timezone.utc)
-        opened_at = now.isoformat() if is_market else None
-        # expires_at = opened_at + 72h for market, created_at + max_pending_minutes for pending_entry
-        if is_market:
-            expires_at = (now + timedelta(minutes=4320)).isoformat()
-        else:
-            expires_at = (now + timedelta(minutes=max_pending_minutes)).isoformat()
-
-        self.conn.execute(
-            """
-            INSERT INTO shadow_virtual_trades(
-                strategy_name, candidate_version, ga_decision_id, symbol, side,
-                entry_type, entry_price, stop_loss, initial_stop_loss, take_profit_json,
-                quantity, initial_risk_usdt, status, opened_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (strategy_name, candidate_version, ga_decision_id, symbol, side,
-             entry_type_lower, entry_price, stop_loss, initial_stop_loss, take_profit_json,
-             quantity, initial_risk_usdt, status, opened_at, expires_at),
+        vt_id = self._insert_shadow_virtual_trade(
+            candidate_version=candidate_version,
+            ga_decision_id=ga_decision_id,
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            initial_stop_loss=initial_stop_loss,
+            take_profit_json=take_profit_json,
+            quantity=quantity,
+            initial_risk_usdt=initial_risk_usdt,
+            strategy_name=strategy_name,
+            entry_type=entry_type,
+            max_pending_minutes=max_pending_minutes,
         )
         self.conn.commit()
-        return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        return vt_id
+
+    def create_shadow_evaluation_with_vt(self, strategy_name: str, strategy_version: str,
+                                          ga_decision_id: int, symbol: str, analysis_time: int,
+                                          outcome_source: str, *,
+                                          vt_kwargs: dict | None = None,
+                                          timeframe: str = "15m",
+                                          score: float = 0.0,
+                                          decision: str = "",
+                                          evidence: dict | None = None,
+                                          counter_evidence: dict | None = None,
+                                          snapshot_id: int | None = None) -> dict:
+        """Atomically create shadow evaluation + optional virtual trade.
+
+        Creates both the strategy_evaluation and optional shadow_virtual_trade in
+        a single transaction. If either fails, both roll back. When vt_kwargs is
+        provided, the created VT is linked to the evaluation via
+        shadow_virtual_trade_id.
+
+        Uses _insert_shadow_virtual_trade (no internal commit) so VT insertion
+        participates in the outer BEGIN IMMEDIATE transaction.
+
+        Returns {"eval_id": int, "vt_id": int | None}
+        """
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            # Insert evaluation
+            self.conn.execute(
+                """INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name,
+                   strategy_version, ga_decision_id, is_shadow, outcome_source, timeframe,
+                   score, decision, evidence_json, counter_evidence_json, snapshot_id,
+                   created_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (symbol, analysis_time, strategy_name, strategy_version,
+                 ga_decision_id, outcome_source, timeframe, score, decision,
+                 "{}" if evidence is None else json.dumps(evidence, ensure_ascii=False),
+                 "{}" if counter_evidence is None else json.dumps(counter_evidence, ensure_ascii=False),
+                 snapshot_id))
+            eval_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+            vt_id = None
+            if vt_kwargs:
+                vt_id = self._insert_shadow_virtual_trade(
+                    candidate_version=strategy_version,
+                    ga_decision_id=ga_decision_id,
+                    strategy_name=strategy_name,
+                    **vt_kwargs
+                )
+                # Link evaluation to VT
+                self.conn.execute(
+                    "UPDATE strategy_evaluations SET shadow_virtual_trade_id=? WHERE id=?",
+                    (vt_id, eval_id))
+
+            self.conn.commit()
+            return {"eval_id": eval_id, "vt_id": vt_id}
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def update_shadow_virtual_trade_prices(self, virtual_trade_id: int,
                                            current_price: float) -> None:
@@ -1388,7 +1464,7 @@ class CryptoGuardRepository:
         pnl_r, outcome_source='real_pnl', and shadow_virtual_trade_id.
         """
         trade = self.conn.execute(
-            "SELECT * FROM shadow_virtual_trades WHERE id=? AND status='open'",
+            "SELECT * FROM shadow_virtual_trades WHERE id=? AND status IN ('open', 'pending_entry')",
             (virtual_trade_id,),
         ).fetchone()
         if not trade:

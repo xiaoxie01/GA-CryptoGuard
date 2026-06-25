@@ -16,6 +16,7 @@ DEFAULT_MAX_PENDING_MINUTES = 120       # 2h for pending_entry expiry
 DEFAULT_MAX_HOLD_MINUTES = 4320         # 72h max holding time
 DEFAULT_MAX_STALE_MINUTES = 15          # skip update if latest candle is older
 DEFAULT_GAP_CATCHUP_LIMIT = 500         # max candles to fetch for gap catch-up
+MAX_PAGINATION_PAGES = 10               # safety cap: max pages to fetch per trade per update
 
 
 def _iso_to_unix_ms(iso_str: str | None) -> int | None:
@@ -137,6 +138,13 @@ def activate_pending_entry(
 ) -> bool:
     """Check if a pending_entry trade's entry condition is met and transition to open.
 
+    For market orders: activates immediately and updates entry_price to the actual
+    fill price (candle.open + slippage), recalculates quantity using
+    compute_position_size while preserving the original initial_risk_usdt budget.
+
+    For limit/trigger/stop orders: activates when price condition is met, using
+    the planned entry_price (no slippage adjustment).
+
     Returns True if the trade was activated, False otherwise.
     """
     side = str(trade.get("side", "LONG")).upper()
@@ -165,6 +173,55 @@ def activate_pending_entry(
 
     if activated:
         trade_id = int(trade["id"])
+
+        if entry_type == "market":
+            # Market entry: compute fill price from candle.open + slippage.
+            # Inlined to avoid circular import (paper_broker -> controller -> updater).
+            # Formula: LONG → open * (1 + slippage), SHORT → open * (1 - slippage)
+            slippage_pct = 0.001  # DEFAULT_SLIPPAGE_PCT from paper_broker
+            candle_open = float(candle.get("open", 0))
+            if candle_open <= 0:
+                LOGGER.warning(
+                    "shadow virtual trade activation: candle.open is zero id=%s symbol=%s — skipping fill price calc",
+                    trade_id, trade.get("symbol"),
+                )
+            else:
+                if side == "SHORT":
+                    fill_price = candle_open * (1 - slippage_pct)
+                else:
+                    fill_price = candle_open * (1 + slippage_pct)
+
+                stop_loss = float(trade["stop_loss"])
+                initial_risk_usdt = float(trade["initial_risk_usdt"])
+
+                # Recalculate quantity against actual fill price, preserving risk budget.
+                # compute_position_size inlined: risk_percent back-computed from initial_risk_usdt.
+                account_balance = 10000.0  # DEFAULT_ACCOUNT_BALANCE
+                risk_percent = (initial_risk_usdt / account_balance) * 100.0
+                risk_pct = risk_percent / 100.0
+                risk_usdt = account_balance * risk_pct
+                risk_per_unit = abs(fill_price - stop_loss)
+                if risk_per_unit > 0:
+                    new_quantity = risk_usdt / risk_per_unit
+                    new_risk = risk_usdt
+                    # Update entry_price, quantity, and initial_risk_usdt inline
+                    repo.conn.execute(
+                        "UPDATE shadow_virtual_trades SET entry_price=?, quantity=?, initial_risk_usdt=?"
+                        " WHERE id=?",
+                        (fill_price, new_quantity, new_risk, trade_id),
+                    )
+                    LOGGER.info(
+                        "shadow virtual trade market activation id=%s symbol=%s side=%s "
+                        "planned_entry=%.4f fill_entry=%.4f qty=%.6f risk=%.4f",
+                        trade_id, trade.get("symbol"), side, entry_price, fill_price,
+                        new_quantity, new_risk,
+                    )
+                else:
+                    LOGGER.warning(
+                        "shadow virtual trade activation: risk_per_unit <= 0 id=%s — using planned values",
+                        trade_id,
+                    )
+
         repo.update_shadow_virtual_trade_status(trade_id, "open", event_time=event_time)
         LOGGER.info(
             "shadow virtual trade activated id=%s symbol=%s side=%s entry_type=%s entry=%.4f",
@@ -488,91 +545,111 @@ def update_shadow_virtual_trades(
         status = str(trade.get("status", "open"))
 
         try:
-            start_time_ms = _get_replay_start(trade)
-            if start_time_ms is None:
-                LOGGER.warning(
-                    "shadow virtual trade has no replay start id=%s symbol=%s — skipping",
-                    trade_id, symbol,
-                )
-                continue
-
-            candles = _get_candles_for(symbol, start_time_ms)
-
-            if candles is None:
-                # fetch_klines failed — preserve cursor, skip this trade
-                LOGGER.debug(
-                    "shadow virtual trade fetch failed id=%s symbol=%s start_time_ms=%s — skipping",
-                    trade_id, symbol, start_time_ms,
-                )
-                continue
-
-            if not candles:
-                LOGGER.debug(
-                    "shadow virtual trade no candles id=%s symbol=%s start_time_ms=%s — skipping",
-                    trade_id, symbol, start_time_ms,
-                )
-                continue
-
-            for i, candle in enumerate(candles):
-                # Skip candles older than our cursor
-                candle_time = int(candle.get("open_time", 0))
-                if start_time_ms is not None and candle_time < start_time_ms:
-                    continue
-
-                # Only process finalized (is_closed=True) candles from Binance.
-                # Unclosed candles may have their high/low updated later —
-                # processing them would permanently lose subsequent price data.
-                # Mark-price snapshots (is_closed=False) update unrealized PnL
-                # but do NOT advance the cursor.
-                is_closed = candle.get("is_closed", True)  # default True for mock/test candles
-                if not is_closed:
-                    # Update unrealized PnL for open trades using mark price snapshot
-                    current_status = str(trade.get("status", ""))
-                    if current_status == "open":
-                        close_price = float(candle.get("close", 0))
-                        if close_price > 0:
-                            repo.update_shadow_virtual_trade_prices(trade_id, close_price)
-                    # Do NOT advance cursor — next update will re-fetch this candle
+            page_count = 0
+            while page_count < MAX_PAGINATION_PAGES:
+                start_time_ms = _get_replay_start(trade)
+                if start_time_ms is None:
+                    LOGGER.warning(
+                        "shadow virtual trade has no replay start id=%s symbol=%s — skipping",
+                        trade_id, symbol,
+                    )
                     break
 
-                # Staleness check: only skip if this is the LAST candle (current time)
-                # AND it's stale. Historical candles in the replay queue are always valid.
-                is_last_candle = (i == len(candles) - 1)
-                if is_last_candle and _is_candle_stale(candle, max_stale_minutes):
+                candles = _get_candles_for(symbol, start_time_ms)
+
+                if candles is None:
+                    # fetch_klines failed — preserve cursor, skip this trade
                     LOGGER.debug(
-                        "shadow virtual trade stale candle id=%s symbol=%s candle_time=%s",
-                        trade_id, symbol, candle_time,
+                        "shadow virtual trade fetch failed id=%s symbol=%s start_time_ms=%s — skipping",
+                        trade_id, symbol, start_time_ms,
                     )
-                    continue
+                    break
 
-                candle_dt = _candle_event_dt(candle)
-                action, closed_delta, activated_delta = _process_candle_for_trade(
-                    repo, trade, candle, max_hold_minutes=max_hold_minutes,
-                    max_pending_minutes=max_pending_minutes,
-                    candle_dt=candle_dt,
-                )
+                if not candles:
+                    LOGGER.debug(
+                        "shadow virtual trade no candles id=%s symbol=%s start_time_ms=%s — skipping",
+                        trade_id, symbol, start_time_ms,
+                    )
+                    break
 
-                if action == "updated":
-                    updated_count += 1
-                elif action == "activated":
-                    activated_count += activated_delta
-                elif action in ("closed_sl", "closed_tp", "closed_ambiguous", "closed_max_hold"):
-                    closed_count += closed_delta
-                    activated_count += activated_delta
-                elif action == "expired_pending":
-                    expired_count += activated_delta
+                for i, candle in enumerate(candles):
+                    # Skip candles older than our cursor
+                    candle_time = int(candle.get("open_time", 0))
+                    if start_time_ms is not None and candle_time < start_time_ms:
+                        continue
 
-                # Persist cursor
-                _persist_cursor(repo, trade_id, candle)
+                    # Only process finalized (is_closed=True) candles from Binance.
+                    # Unclosed candles may have their high/low updated later —
+                    # processing them would permanently lose subsequent price data.
+                    # Mark-price snapshots (is_closed=False) update unrealized PnL
+                    # but do NOT advance the cursor.
+                    is_closed = candle.get("is_closed", True)  # default True for mock/test candles
+                    if not is_closed:
+                        # Update unrealized PnL for open trades using mark price snapshot
+                        current_status = str(trade.get("status", ""))
+                        if current_status == "open":
+                            close_price = float(candle.get("close", 0))
+                            if close_price > 0:
+                                repo.update_shadow_virtual_trade_prices(trade_id, close_price)
+                        # Do NOT advance cursor — next update will re-fetch this candle
+                        break
 
-                # Re-read trade status after processing (may have changed)
+                    # Staleness check: only skip if this is the LAST candle (current time)
+                    # AND it's stale. Historical candles in the replay queue are always valid.
+                    is_last_candle = (i == len(candles) - 1)
+                    if is_last_candle and _is_candle_stale(candle, max_stale_minutes):
+                        LOGGER.debug(
+                            "shadow virtual trade stale candle id=%s symbol=%s candle_time=%s",
+                            trade_id, symbol, candle_time,
+                        )
+                        continue
+
+                    candle_dt = _candle_event_dt(candle)
+                    action, closed_delta, activated_delta = _process_candle_for_trade(
+                        repo, trade, candle, max_hold_minutes=max_hold_minutes,
+                        max_pending_minutes=max_pending_minutes,
+                        candle_dt=candle_dt,
+                    )
+
+                    if action == "updated":
+                        updated_count += 1
+                    elif action == "activated":
+                        activated_count += activated_delta
+                    elif action in ("closed_sl", "closed_tp", "closed_ambiguous", "closed_max_hold"):
+                        closed_count += closed_delta
+                        activated_count += activated_delta
+                    elif action == "expired_pending":
+                        expired_count += activated_delta
+
+                    # Persist cursor
+                    _persist_cursor(repo, trade_id, candle)
+
+                    # Re-read trade status after processing (may have changed)
+                    trade = dict(repo.conn.execute(
+                        "SELECT * FROM shadow_virtual_trades WHERE id=?", (trade_id,)
+                    ).fetchone() or trade)
+
+                    # Stop processing if trade is no longer open/pending
+                    new_status = str(trade.get("status", ""))
+                    if new_status not in ("open", "pending_entry"):
+                        break
+
+                # Re-read trade status after processing this page
                 trade = dict(repo.conn.execute(
                     "SELECT * FROM shadow_virtual_trades WHERE id=?", (trade_id,)
                 ).fetchone() or trade)
-
-                # Stop processing if trade is no longer open/pending
                 new_status = str(trade.get("status", ""))
                 if new_status not in ("open", "pending_entry"):
+                    break
+
+                # Pagination: if we got a full page, there may be more candles.
+                # Clear the cache key so the next iteration re-fetches with the updated cursor.
+                if len(candles) >= DEFAULT_GAP_CATCHUP_LIMIT:
+                    cache_key = (symbol, start_time_ms)
+                    symbol_candle_queues.pop(cache_key, None)
+                    page_count += 1
+                    continue
+                else:
                     break
 
         except Exception as exc:

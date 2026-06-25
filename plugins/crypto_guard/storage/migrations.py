@@ -954,6 +954,39 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
     # 1.4: shadow_virtual_trades add last_processed_candle_time for per-candle replay cursor
     _add_column(conn, "shadow_virtual_trades", "last_processed_candle_time", "INTEGER")
 
+    # 1.5: Partial unique index on strategy_evaluations for shadow dedup
+    # Soft-mark duplicate shadow evaluations (outcome_source='duplicate'),
+    # keeping the best row per group (VT-linked > has pnl_r > most recent).
+    # This preserves the audit trail instead of hard-deleting.
+    conn.execute(
+        """
+        UPDATE strategy_evaluations SET outcome_source = 'duplicate'
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY strategy_name, strategy_version, ga_decision_id
+                           ORDER BY
+                               CASE WHEN shadow_virtual_trade_id IS NOT NULL THEN 0 ELSE 1 END,
+                               CASE WHEN pnl_r IS NOT NULL THEN 0 ELSE 1 END,
+                               id DESC
+                       ) AS rn
+                FROM strategy_evaluations
+                WHERE is_shadow = 1 AND outcome_source != 'duplicate'
+            ) WHERE rn > 1
+        )
+        """
+    )
+    # Drop old index if it exists (may be a plain index, not partial)
+    conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_evals_shadow_unique
+        ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
+        WHERE is_shadow = 1 AND outcome_source != 'duplicate'
+        """
+    )
+
 
 def _apply_candidate_cap_cleanup(conn: sqlite3.Connection) -> None:
     """Reject excess candidates beyond 5 per strategy_name.
@@ -1055,6 +1088,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "idx_opportunity_watches_dedupe",
         "idx_one_open_trade_per_order",
         "idx_shadow_vt_unique",
+        "idx_strategy_evals_shadow_unique",
     ]
 
     missing: list[dict[str, str]] = []

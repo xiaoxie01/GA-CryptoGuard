@@ -14,6 +14,7 @@ from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decisio
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.strategy.shadow_testing import record_shadow_evaluation
 from plugins.crypto_guard.paper.shadow_virtual_trade_updater import DEFAULT_MAX_PENDING_MINUTES
+from plugins.crypto_guard.paper.paper_broker import compute_position_size
 import json
 
 
@@ -51,26 +52,15 @@ def _load_candidate_patch(repo: CryptoGuardRepository, strategy_name: str, candi
     return {}
 
 
-def _create_virtual_trade_for_candidate(
-    repo: CryptoGuardRepository,
-    ga_decision_id: int,
-    candidate_version: str,
+def _build_virtual_trade_kwargs(
     candidate_patch: dict[str, Any],
     active_decision: dict[str, Any],
     shadow_decision: dict[str, Any],
-    symbol: str,
-) -> int | None:
-    """Create a shadow_virtual_trade for a candidate's independent lifecycle.
+) -> dict[str, Any] | None:
+    """Build the vt_kwargs dict for create_shadow_virtual_trade or create_shadow_evaluation_with_vt.
 
-    Uses the dedicated shadow_virtual_trades table — never touches paper_orders
-    or paper_trades (which affect account statistics).
-
-    Always creates when the candidate has a trade_plan or opportunity_watch,
-    regardless of whether it matches the active decision. The candidate's
-    virtual trade tracks its own entry/SL/TP/risk and is independently
-    updated and closed.
-
-    Returns virtual_trade_id or None.
+    Extracts and patches trade_plan from shadow/active decisions.
+    Returns None if trade_plan is missing or prices are invalid.
     """
     try:
         candidate_decision = shadow_decision.get("decision", "")
@@ -118,19 +108,58 @@ def _create_virtual_trade_for_candidate(
         entry = float(entry_price)
         stop = float(stop_loss)
 
-        # Apply slippage FIRST, then size against the fill price (consistent R-basis)
-        from plugins.crypto_guard.paper.paper_broker import compute_position_size, compute_fill_price
-
-        fill_price = compute_fill_price(entry, side, order_type=trade_plan.get("entry_type", "market"))
-
         sizing = compute_position_size(
-            entry_price=fill_price,
+            entry_price=entry,
             stop_loss=stop,
             risk_percent=float(trade_plan.get("risk_percent") or 0.5),
         )
         if sizing is None:
             return None
         qty, initial_risk = sizing
+
+        return {
+            "symbol": "PLACEHOLDER_SYMBOL",
+            "side": side,
+            "entry_price": entry,
+            "stop_loss": stop,
+            "initial_stop_loss": stop,
+            "take_profit_json": json.dumps(trade_plan.get("take_profits", []), ensure_ascii=False),
+            "quantity": qty,
+            "initial_risk_usdt": initial_risk,
+            "entry_type": trade_plan.get("entry_type", "market"),
+            "max_pending_minutes": DEFAULT_MAX_PENDING_MINUTES,
+        }
+    except Exception:
+        return None
+
+
+def _create_virtual_trade_for_candidate(
+    repo: CryptoGuardRepository,
+    ga_decision_id: int,
+    candidate_version: str,
+    candidate_patch: dict[str, Any],
+    active_decision: dict[str, Any],
+    shadow_decision: dict[str, Any],
+    symbol: str,
+) -> int | None:
+    """Create a shadow_virtual_trade for a candidate's independent lifecycle.
+
+    Uses the dedicated shadow_virtual_trades table — never touches paper_orders
+    or paper_trades (which affect account statistics).
+
+    Always creates when the candidate has a trade_plan or opportunity_watch,
+    regardless of whether it matches the active decision. The candidate's
+    virtual trade tracks its own entry/SL/TP/risk and is independently
+    updated and closed.
+
+    Returns virtual_trade_id or None.
+    """
+    try:
+        vt_kwargs = _build_virtual_trade_kwargs(candidate_patch, active_decision, shadow_decision)
+        if vt_kwargs is None:
+            return None
+
+        vt_kwargs["symbol"] = symbol
 
         # Extract strategy_name from active_decision or shadow_decision
         strategy_name = str(active_decision.get("strategy_name") or shadow_decision.get("strategy_name") or "smc_pullback_long")
@@ -139,16 +168,7 @@ def _create_virtual_trade_for_candidate(
             strategy_name=strategy_name,
             candidate_version=candidate_version,
             ga_decision_id=ga_decision_id,
-            symbol=symbol,
-            side=side,
-            entry_price=fill_price,
-            stop_loss=stop,
-            initial_stop_loss=stop,
-            take_profit_json=json.dumps(trade_plan.get("take_profits", []), ensure_ascii=False),
-            quantity=qty,
-            initial_risk_usdt=initial_risk,
-            entry_type=trade_plan.get("entry_type", "market"),
-            max_pending_minutes=DEFAULT_MAX_PENDING_MINUTES,
+            **vt_kwargs,
         )
         return vt_id
     except Exception:
@@ -465,18 +485,45 @@ class GAMasterController:
                 candidate_dec = shadow_decision.get("decision", "")
                 active_dec = legacy.get("decision", "")
 
-                if candidate_dec in ("trade_plan_available", "opportunity_watch"):
-                    # Candidate would enter — create virtual trade for independent tracking
-                    virtual_trade_id = _create_virtual_trade_for_candidate(
-                        self.repo,
-                        ga_decision_id=ga_decision_id,
-                        candidate_version=sc["version"],
-                        candidate_patch=sc["candidate_patch"],
-                        active_decision=legacy,
-                        shadow_decision=shadow_decision,
-                        symbol=symbol,
+                if candidate_dec == "trade_plan_available":
+                    # Build VT kwargs from candidate decisions
+                    vt_kwargs = _build_virtual_trade_kwargs(
+                        sc["candidate_patch"], legacy, shadow_decision,
                     )
-                    outcome_source = "executed_virtual_trade"
+                    if vt_kwargs is not None:
+                        vt_kwargs["symbol"] = symbol
+                        # Use atomic eval+VT creation to avoid split-brain
+                        try:
+                            result = self.repo.create_shadow_evaluation_with_vt(
+                                strategy_name=strategy_name,
+                                strategy_version=sc["version"],
+                                ga_decision_id=ga_decision_id,
+                                symbol=symbol,
+                                analysis_time=int(context["analysis_time_utc"]),
+                                outcome_source="executed_virtual_trade",
+                                vt_kwargs=vt_kwargs,
+                                timeframe=snapshot.get("timeframe", "1h"),
+                                score=shadow_decision.get("score", 0.0),
+                                decision=candidate_dec,
+                                evidence=shadow_decision.get("evidence", {}),
+                                snapshot_id=context.get("snapshot_id"),
+                            )
+                            virtual_trade_id = result.get("vt_id")
+                            # eval_id is already created atomically; skip record_shadow_evaluation below
+                            continue
+                        except Exception:
+                            LOGGER.warning(
+                                "shadow_evaluation_atomic_failed: ga_decision=%s candidate=%s",
+                                ga_decision_id, sc.get("version"),
+                                exc_info=True,
+                            )
+                            outcome_source = "invalidated"
+                            virtual_trade_id = None
+                    else:
+                        outcome_source = "invalidated"  # VT kwargs build failed (bad price/risk)
+                elif candidate_dec == "opportunity_watch":
+                    virtual_trade_id = None
+                    outcome_source = "opportunity_watch_recorded"
                 elif candidate_dec == "monitor_only":
                     if active_dec in ("trade_plan_available", "opportunity_watch"):
                         outcome_source = "avoided_trade"
