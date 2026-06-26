@@ -650,7 +650,3 @@ CREATE TABLE IF NOT EXISTS shadow_virtual_trades (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_evals_shadow_unique
-ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
-WHERE is_shadow = 1 AND outcome_source != 'duplicate';

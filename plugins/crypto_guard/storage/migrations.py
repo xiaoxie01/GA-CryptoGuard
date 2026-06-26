@@ -958,6 +958,7 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
     # Soft-mark duplicate shadow evaluations (outcome_source='duplicate'),
     # keeping the best row per group (VT-linked > has pnl_r > most recent).
     # This preserves the audit trail instead of hard-deleting.
+    # NULL outcome_source rows are included: COALESCE handles the NULL != 'duplicate' gap.
     conn.execute(
         """
         UPDATE strategy_evaluations SET outcome_source = 'duplicate'
@@ -972,7 +973,8 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
                                id DESC
                        ) AS rn
                 FROM strategy_evaluations
-                WHERE is_shadow = 1 AND outcome_source != 'duplicate'
+                WHERE is_shadow = 1
+                  AND COALESCE(outcome_source, '') != 'duplicate'
             ) WHERE rn > 1
         )
         """
@@ -983,7 +985,7 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_evals_shadow_unique
         ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
-        WHERE is_shadow = 1 AND outcome_source != 'duplicate'
+        WHERE is_shadow = 1 AND COALESCE(outcome_source, '') != 'duplicate'
         """
     )
 

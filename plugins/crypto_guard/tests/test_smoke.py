@@ -14688,6 +14688,91 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertNotEqual(quantity, raw_quantity,
                             "Position size should differ when using slipped vs raw entry")
 
+    def test_dirty_db_with_duplicate_evals_migration_soft_marks(self):
+        """Dirty DB with duplicate shadow evaluations: migration soft-marks extras as 'duplicate'."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="dirty-v1", status="candidate")
+        self._insert_ga_decision(decision_id=7001)
+        self._insert_ga_decision(decision_id=7002)
+
+        # Simulate dirty DB: drop the unique index so duplicates can be inserted
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
+        self.repo.conn.commit()
+
+        # Insert 3 duplicate evaluations for ga_decision_id=7001 (same strategy+version)
+        for i in range(3):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+                "  ga_decision_id, is_shadow, outcome_source, created_at)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, 1, NULL,"
+                "  '2024-01-01T00:00:0{}Z')".format(i)
+            )
+        self.repo.conn.commit()
+
+        # Run the shadow_vt_v2 migration (which includes dedup)
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # Verify: only 1 non-duplicate eval remains for ga_decision_id=7001
+        remaining = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
+            " WHERE ga_decision_id=7001 AND is_shadow=1 AND COALESCE(outcome_source,'') != 'duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(remaining, 1, "Only 1 non-duplicate eval should remain")
+
+        # Verify: the other 2 are marked 'duplicate'
+        dup_count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
+            " WHERE ga_decision_id=7001 AND is_shadow=1 AND outcome_source='duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(dup_count, 2, "2 duplicates should be soft-marked")
+
+        # Verify: unique index now prevents inserting another non-duplicate shadow eval
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+                "  ga_decision_id, is_shadow, outcome_source, created_at)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, 1, NULL,"
+                "  '2024-01-01T00:00:04Z')"
+            )
+        self.repo.conn.rollback()
+
+    def test_null_outcome_source_duplicates_blocked_by_unique_index(self):
+        """Two shadow evaluations with NULL outcome_source: dedup catches them, index blocks re-insert."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="null-v1", status="candidate")
+        self._insert_ga_decision(decision_id=8001)
+
+        # Run migration first to ensure the index exists
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # Insert first NULL-outcome eval — should succeed
+        self.repo.conn.execute(
+            "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+            "  ga_decision_id, is_shadow, outcome_source, created_at)"
+            " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, 1, NULL,"
+            "  '2024-01-01T00:00:01Z')"
+        )
+        self.repo.conn.commit()
+
+        # Insert second NULL-outcome eval for same (strategy, version, ga_decision) — must FAIL
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+                "  ga_decision_id, is_shadow, outcome_source, created_at)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, 1, NULL,"
+                "  '2024-01-01T00:00:02Z')"
+            )
+        self.repo.conn.rollback()
+
+        # Verify only 1 eval exists
+        count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
+            " WHERE ga_decision_id=8001 AND is_shadow=1"
+        ).fetchone()["cnt"]
+        self.assertEqual(count, 1, "Only 1 shadow eval should exist — duplicate blocked by index")
+
 
 if __name__ == "__main__":
     unittest.main()
