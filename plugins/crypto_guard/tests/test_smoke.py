@@ -14773,6 +14773,280 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         ).fetchone()["cnt"]
         self.assertEqual(count, 1, "Only 1 shadow eval should exist — duplicate blocked by index")
 
+    def test_dirty_db_with_duplicate_vts_migration_soft_marks(self):
+        """Dirty DB with duplicate shadow_virtual_trades: migration soft-marks extras as 'duplicate'."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="vt-dirty-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9001)
+
+        # Simulate dirty DB: drop the unique index so duplicates can be inserted
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
+        self.repo.conn.commit()
+
+        # Insert 3 duplicate VTs for same (strategy_name, candidate_version, ga_decision_id)
+        for i in range(3):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:0{}Z')".format(i)
+            )
+        self.repo.conn.commit()
+
+        # Verify 3 duplicates exist before migration
+        before = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
+        ).fetchone()["cnt"]
+        self.assertEqual(before, 3, "3 duplicate VTs should exist before migration")
+
+        # Run the shadow_vt_v2 migration (which includes VT dedup)
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # Verify: only 1 non-duplicate VT remains
+        remaining = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
+            " AND COALESCE(status,'') != 'duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(remaining, 1, "Only 1 non-duplicate VT should remain")
+
+        # Verify: the other 2 are marked 'duplicate'
+        dup_count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
+            " AND status='duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(dup_count, 2, "2 duplicates should be soft-marked as 'duplicate'")
+
+        # Verify: unique index now prevents inserting another duplicate VT
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:04Z')"
+            )
+        self.repo.conn.rollback()
+
+    def test_vt_dedup_keeps_closed_with_pnl_r_over_open(self):
+        """VT dedup priority: closed with pnl_r > open > pending_entry."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="vt-prio-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9002)
+
+        # Drop index to allow duplicates
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
+        self.repo.conn.commit()
+
+        # Insert: pending_entry (should lose), open (should lose), closed with pnl_r (should win)
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+            " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+        )
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, opened_at, created_at)"
+            " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'open', '2024-01-01T00:00:02Z', '2024-01-01T00:00:02Z')"
+        )
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, opened_at, closed_at, pnl_r, close_reason, created_at)"
+            " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'closed', '2024-01-01T00:00:03Z', '2024-01-01T00:00:04Z', 1.5, 'take_profit', '2024-01-01T00:00:03Z')"
+        )
+        self.repo.conn.commit()
+
+        # Run migration
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # The closed VT with pnl_r should be the survivor
+        survivor = self.repo.conn.execute(
+            "SELECT status, pnl_r FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-prio-v1' AND ga_decision_id=9002"
+            " AND COALESCE(status,'') != 'duplicate'"
+        ).fetchone()
+        self.assertIsNotNone(survivor, "One VT should survive dedup")
+        self.assertEqual(survivor["status"], "closed", "Closed VT with pnl_r should win priority")
+        self.assertEqual(survivor["pnl_r"], 1.5, "pnl_r should be preserved")
+
+        # Verify 2 duplicates
+        dup_count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-prio-v1' AND ga_decision_id=9002"
+            " AND status='duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(dup_count, 2, "2 VTs should be soft-marked as duplicate")
+
+    def test_old_plain_index_replaced_by_partial_index(self):
+        """Migration replaces old plain unique index with partial unique index."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="idx-repl-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9003)
+
+        # Simulate: create old-style plain unique index (no WHERE clause)
+        self.repo.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)")
+        self.repo.conn.commit()
+
+        # Insert one valid VT
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+            " VALUES ('smc_pullback_long', 'idx-repl-v1', 9003,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+        )
+        self.repo.conn.commit()
+
+        # Run migration — should drop old index and create partial one
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # Verify: the index SQL in sqlite_master has the WHERE clause
+        idx_sql = self.repo.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_shadow_vt_unique'"
+        ).fetchone()
+        self.assertIsNotNone(idx_sql, "idx_shadow_vt_unique must exist in sqlite_master")
+        self.assertIn("WHERE", idx_sql["sql"] or "", "Index SQL must contain partial WHERE clause")
+        self.assertIn("duplicate", idx_sql["sql"] or "", "Index WHERE must reference 'duplicate' status")
+
+    def test_migration_allows_duplicate_status_vt_after_dedup(self):
+        """After migration, 1 valid VT + multiple status='duplicate' VTs in same group allowed."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="allowed-dup-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9004)
+
+        # Run migration first (creates partial index)
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # Insert 1 valid VT
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+            " VALUES ('smc_pullback_long', 'allowed-dup-v1', 9004,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+        )
+        self.repo.conn.commit()
+
+        # Insert 2 VTs with status='duplicate' — should NOT violate partial unique index
+        for i in range(2):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'allowed-dup-v1', 9004,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'duplicate', '2024-01-01T00:00:0{}Z')".format(i + 2)
+            )
+        self.repo.conn.commit()
+
+        # Verify all 3 exist (1 valid + 2 duplicate)
+        total = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='allowed-dup-v1' AND ga_decision_id=9004"
+        ).fetchone()["cnt"]
+        self.assertEqual(total, 3, "1 valid + 2 duplicate VTs should coexist")
+
+        # Verify re-insert of non-duplicate is blocked
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'allowed-dup-v1', 9004,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:05Z')"
+            )
+        self.repo.conn.rollback()
+
+    def test_diagnostic_skips_duplicate_status_vts(self):
+        """diagnose_state_consistency does not report duplicate when only status='duplicate' VTs exist."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="diag-skip-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9005)
+
+        # Run migration (creates partial index)
+        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
+        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
+        self.repo.conn.commit()
+
+        # 1 valid VT + 2 duplicate VTs
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+            " VALUES ('smc_pullback_long', 'diag-skip-v1', 9005,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+        )
+        for i in range(2):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'diag-skip-v1', 9005,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'duplicate', '2024-01-01T00:00:0{}Z')".format(i + 2)
+            )
+        self.repo.conn.commit()
+
+        # Run diagnostics
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+        self.assertTrue(result["ok"], "Diagnostics should be OK with 1 valid + 2 duplicate VTs")
+
+        # Verify specific: no duplicate_vt_per_candidate_decision issue
+        dup_issues = [i for i in result["issues"] if i["type"] == "duplicate_vt_per_candidate_decision"]
+        self.assertEqual(len(dup_issues), 0, "duplicate_vt_per_candidate_decision should not fire for status='duplicate' VTs")
+
+    def test_diagnostic_detects_real_duplicate_vts(self):
+        """diagnose_state_consistency DOES report duplicate when 2 non-duplicate VTs exist."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="diag-det-v1", status="candidate")
+        self._insert_ga_decision(decision_id=9006)
+
+        # Drop partial index to create real duplicates
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
+        self.repo.conn.commit()
+
+        # Insert 2 valid (non-duplicate) VTs for same group
+        for i in range(2):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'diag-det-v1', 9006,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:0{}Z')".format(i + 1)
+            )
+        self.repo.conn.commit()
+
+        # Run diagnostics
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        # Must report the real duplicate
+        dup_issues = [i for i in result["issues"] if i["type"] == "duplicate_vt_per_candidate_decision"]
+        self.assertGreaterEqual(len(dup_issues), 1,
+            "duplicate_vt_per_candidate_decision MUST fire for 2 non-duplicate VTs in same group")
+
 
 if __name__ == "__main__":
     unittest.main()

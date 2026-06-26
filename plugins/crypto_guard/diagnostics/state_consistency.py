@@ -886,6 +886,7 @@ def _check_duplicate_vt_per_candidate_decision(repo: CryptoGuardRepository) -> l
                GROUP_CONCAT(status) AS statuses
         FROM shadow_virtual_trades
         WHERE ga_decision_id IS NOT NULL
+          AND COALESCE(status, '') != 'duplicate'
         GROUP BY strategy_name, candidate_version, ga_decision_id
         HAVING cnt > 1
         """
@@ -983,14 +984,14 @@ def _check_cursor_regression(repo: CryptoGuardRepository) -> list[dict[str, Any]
 
 def _check_illegal_status_transitions(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
     """Check: shadow virtual trades must have legal status values.
-    Legal: pending_entry, open, closed, expired, cancelled."""
+    Legal: pending_entry, open, closed, expired, cancelled, duplicate."""
     issues: list[dict[str, Any]] = []
 
     rows = repo.conn.execute(
         """
         SELECT id, symbol, strategy_name, candidate_version, status, created_at
         FROM shadow_virtual_trades
-        WHERE status NOT IN ('pending_entry', 'open', 'closed', 'expired', 'cancelled')
+        WHERE status NOT IN ('pending_entry', 'open', 'closed', 'expired', 'cancelled', 'duplicate')
         """
     ).fetchall()
 

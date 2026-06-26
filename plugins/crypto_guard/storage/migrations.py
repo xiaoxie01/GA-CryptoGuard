@@ -939,7 +939,41 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
 
     # 1.1: shadow_virtual_trades add strategy_name + rebuild unique index
     _add_column(conn, "shadow_virtual_trades", "strategy_name", "TEXT NOT NULL DEFAULT 'smc_pullback_long'")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)")
+
+    # 1.1a: Soft-mark duplicate shadow_virtual_trades before creating unique index.
+    # Priority: closed with pnl_r > open > pending_entry; has initial_risk_usdt+quantity > bare;
+    # id DESC (most recent wins tiebreak).
+    conn.execute(
+        """
+        UPDATE shadow_virtual_trades SET status = 'duplicate'
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY strategy_name, candidate_version, ga_decision_id
+                           ORDER BY
+                               CASE WHEN status = 'closed' AND pnl_r IS NOT NULL THEN 0 ELSE 1 END,
+                               CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+                               CASE WHEN initial_risk_usdt > 0 AND quantity > 0 THEN 0 ELSE 1 END,
+                               id DESC
+                       ) AS rn
+                FROM shadow_virtual_trades
+                WHERE COALESCE(status, '') != 'duplicate'
+            ) WHERE rn > 1
+        )
+        """
+    )
+    # Drop any stale plain index (pre-dedup era) before creating the partial unique index.
+    # IF EXISTS makes this idempotent: no index, old plain index, or current partial index
+    # are all handled correctly.
+    conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique
+        ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)
+        WHERE COALESCE(status, '') != 'duplicate'
+        """
+    )
 
     # 1.2: strategy_evaluations add shadow_virtual_trade_id
     _add_column(conn, "strategy_evaluations", "shadow_virtual_trade_id", "INTEGER")
