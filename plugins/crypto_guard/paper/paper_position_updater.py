@@ -205,7 +205,7 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
 
     try:
         entry = float(trade["entry_price"])
-        stop = float(order.get("initial_stop_loss") or order.get("stop_loss") or 0)
+        stop = float(order.get("stop_loss") or order.get("initial_stop_loss") or 0)
         quantity = float(trade.get("quantity") or order.get("quantity") or 0)
     except (TypeError, ValueError):
         return None
@@ -262,13 +262,31 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
     if mfe_r < min_mfe_r_for_breakeven:
         return None
 
-    # All gates passed — move stop to breakeven
-    repo.update_paper_order_stop_loss(order["id"], entry, reason=f"统一保本门禁通过（持仓 {holding_minutes:.0f} 分钟，current_r={current_r:.2f}，MFE/R={mfe_r:.2f}）")
-    repo.enqueue_job(
+    # All gates passed — move stop to breakeven.
+    # The stop update is atomic and only emits a log when the row actually
+    # changed. We must only enqueue the paper_event_alert job when the
+    # update happened, otherwise we'd spam duplicate alerts on every tick
+    # (a concurrent writer, or a stop already at breakeven, returns False).
+    changed = repo.update_paper_order_stop_loss(
+        order["id"], entry,
+        reason=f"统一保本门禁通过（持仓 {holding_minutes:.0f} 分钟，current_r={current_r:.2f}，MFE/R={mfe_r:.2f}）",
+    )
+    if not changed:
+        # The atomic UPDATE was rejected (order not open, concurrent writer
+        # already moved the stop, or the new stop would widen risk). Do NOT
+        # report a successful adjustment or enqueue an alert — that would
+        # mislead callers/logs into believing a stop change happened.
+        return {"ok": True, "stop_loss_adjusted": False, "order_id": order["id"], "new_stop_loss": entry, "skip_reason": "no_change", "action": "skip"}
+
+    # Idempotency key is keyed on (order, entry) so that re-issuing the
+    # SAME breakeven stop is deduped, but raising the stop to a new
+    # (higher) breakeven price gets its own job.
+    dedupe_session = f"system:paper:stop_adjust:breakeven:{order['id']}:{round(entry, 8)}"
+    repo.enqueue_job_once(
         "paper_event_alert",
         3,
         "paper_worker",
-        f"system:paper:stop_adjust:{order['id']}",
+        dedupe_session,
         {
             "event_type": "stop_loss_adjustment",
             "symbol": order["symbol"],

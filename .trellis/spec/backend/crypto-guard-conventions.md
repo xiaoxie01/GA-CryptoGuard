@@ -865,3 +865,328 @@ AND id NOT IN (protected_ids)
 ---
 
 **Last updated**: 2026-06-04 (P2: State Diagnostics + Reports + Rules Dry-Run + Feedback TTL)
+
+---
+
+## Breakeven Stop-Loss Idempotency Contracts
+
+> **Trigger**: Production incident on 2026-06-27 — paper order #1 (XRPUSDT) produced 72 identical `stop_loss_adjustment` log/event/outbox rows with `old_stop == new_stop == 1.0494`; 17 hourly summary alerts and 1 `paper_order_filled` alert were wrongly soft-marked as `status='duplicate'` because the `alert_outbox.dedupe_key` unique index scope was too broad.
+>
+> This section captures the executable contracts that prevent a recurrence.
+
+### Contract 5.1: `update_paper_order_stop_loss` MUST be an atomic conditional UPDATE
+
+**What**: The repository method must use a single conditional `UPDATE ... WHERE` that embeds all inequality, status, and direction guards; check `cur.rowcount`; return `bool`. The caller MUST only enqueue downstream effects on `True`.
+
+**Why**: A `SELECT → compare in Python → UPDATE` sequence has a TOCTOU window. Two worker connections can both pass the Python check and both write a log/event/outbox, producing duplicate rows even when downstream dedupe exists. Embedding the guard in the SQL WHERE makes the check-and-write atomic.
+
+**Signatures**:
+```python
+def update_paper_order_stop_loss(
+    self, order_id: int, stop_loss: float, *, reason: str
+) -> bool:
+    """Returns True iff a row was actually changed. False on no-op, race-loss,
+    closed order, or direction violation. Never raises on these cases."""
+```
+
+**Required SQL shape** (side-conditional):
+```python
+# NULL stop_loss initialization
+"UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss IS NULL AND status='open'"
+
+# LONG: new stop must be >= old stop (move toward breakeven/profit only)
+"UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? AND status='open' AND ? >= stop_loss"
+
+# SHORT: new stop must be <= old stop
+"UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? AND status='open' AND ? <= stop_loss"
+```
+
+**Validation & Error Matrix**:
+| Condition | Return | Side effect |
+|---|---|---|
+| Row missing | `False` | None |
+| `new_stop == old_stop` (within 1e-8) | `False` | None — DB untouched |
+| `status != 'open'` (closed/cancelled) | `False` | None — closed orders are immutable |
+| LONG and `new_stop < old_stop` | `False` | None — forbids widening risk |
+| SHORT and `new_stop > old_stop` | `False` | None — forbids widening risk |
+| Lost race (another conn won) | `False` | None |
+| Successful update | `True` | 1 log row in `paper_trade_logs` with `event_json={order_id, old_stop_loss, new_stop_loss}` |
+
+**Forbidden patterns**:
+- `float(row["stop_loss"])` without `is not None` guard — crashes on NULL.
+- Python-level `if abs(old-new) < 1e-8: return` followed by unconditional UPDATE — non-atomic.
+- Returning `None` — caller cannot distinguish no-op from success.
+- Writing the `paper_trade_logs` row before the UPDATE commits — log without state change.
+
+**Reference**: `plugins/crypto_guard/storage/repository.py:1076-1131` (atomic conditional UPDATE + rowcount guard + bool return); `plugins/crypto_guard/storage/repository.py:1115-1118` (NULL-safe branch).
+
+**Tests required**:
+- `test_update_paper_order_stop_loss_rejects_closed_order` — status='closed' → `False`, no log row written
+- `test_update_paper_order_stop_loss_rejects_wrong_direction_long` — LONG 95→90 → `False`, stop unchanged
+- `test_update_paper_order_stop_loss_rejects_wrong_direction_short` — SHORT 105→110 → `False`; 105→100 still allowed
+- `test_update_paper_order_stop_loss_atomic_concurrent` — two connections same stop → only one log
+- `test_update_paper_order_stop_loss_null_safe` — `stop_loss IS NULL` → updates, no crash
+- `test_stop_loss_update_empty_guard_skips_duplicate` — same stop call → `False`, no log
+
+**Audit (grep)**:
+```bash
+# Must return 0 lines (no Python-side SELECT-then-UPDATE path that ignores rowcount):
+grep -nP "SELECT \* FROM paper_orders WHERE id=\?.*\n.*if.*stop_loss.*return\n.*UPDATE paper_orders SET stop_loss" plugins/crypto_guard/storage/repository.py
+# Must return the conditional UPDATE:
+grep -nP "UPDATE paper_orders SET stop_loss=\? WHERE id=\? AND stop_loss=\?" plugins/crypto_guard/storage/repository.py
+```
+
+---
+
+### Contract 5.2: Caller MUST report the real outcome of stop-loss updates
+
+**What**: `_maybe_adjust_stop_to_breakeven` (and any future caller of `update_paper_order_stop_loss`) MUST branch on the `bool` return. `False` MUST short-circuit before `enqueue_job_once` and return a result with `stop_loss_adjusted=False, skip_reason="no_change"`.
+
+**Why**: Before the fix, the caller ignored the method's outcome and always set `stop_loss_adjusted=True`. Downstream consumers (logs, alert delivery, hourly report) treated rejected/raced/same-value updates as successful, which made the duplicated alert problem invisible in production for weeks.
+
+**Reference**: `plugins/crypto_guard/paper/paper_position_updater.py:270-279` — `changed = repo.update_paper_order_stop_loss(...)`; `if changed:` enqueues `paper_event_alert`; else returns `{"ok": True, "stop_loss_adjusted": False, "skip_reason": "no_change", "action": "skip"}`.
+
+**Forbidden patterns**:
+```python
+# FORBIDDEN — ignores return value, fabricates success
+repo.update_paper_order_stop_loss(order["id"], entry, reason="...")
+repo.enqueue_job_once("paper_event_alert", ...)              # enqueues even on no-op
+result["stop_loss_adjusted"] = True                           # always True
+```
+
+**Correct**:
+```python
+changed = repo.update_paper_order_stop_loss(order["id"], entry, reason="...")
+if not changed:
+    return {"ok": True, "stop_loss_adjusted": False, "skip_reason": "no_change", "action": "skip"}
+repo.enqueue_job_once("paper_event_alert", ...)
+return {"ok": True, "stop_loss_adjusted": True}
+```
+
+**Tests required**:
+- `test_breakeven_returns_no_change_when_atomic_update_fails` — closed order → caller returns `stop_loss_adjusted=False`, `paper_event_alert` job absent
+
+---
+
+### Contract 5.3: `alert_outbox.dedupe_key` unique index MUST be pending-only
+
+**What**: The partial unique index on `alert_outbox(dedupe_key)` MUST cover `WHERE dedupe_key IS NOT NULL AND status='pending'` — NOT `status IN ('pending', 'sent')`.
+
+**Why**: A sent row is historical evidence that an alert was delivered. If the same `dedupe_key` is reused by a later periodic alert (e.g. next hour's `hourly_summary`) or by a retry-after-send, the new pending row must be allowed. The over-broad index made 17 hourly summaries and 1 order-fill alert unservable; the dispatcher silently deduped them against the sent history and they never reached the user.
+
+**Required schema**:
+```sql
+-- schema.sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique
+    ON alert_outbox(dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status = 'pending';
+```
+
+**`enqueue_alert` dedup check**:
+```python
+# repository.py
+if dedupe_key:
+    existing = self.conn.execute(
+        "SELECT id FROM alert_outbox WHERE dedupe_key=? AND status='pending' LIMIT 1",
+        (dedupe_key,),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
+# proceed with INSERT
+```
+
+**Default `dedupe_key` policy** (in callers, not in `enqueue_alert` itself):
+```python
+# alert_delivery.py
+PERIODIC_ALERT_TYPES = {"hourly_summary", "daily_summary", "weekly_summary"}
+
+# Time-bucketed keys: each period produces an independent pending row.
+# A fixed key like "-:hourly_summary" would make the next period's enqueue
+# collide with the previous period's pending row and silently reuse the
+# stale payload (e.g. if the dispatcher is slow or the outbox backs up).
+now_utc = datetime.now(timezone.utc)
+if alert_type == "hourly_summary":
+    default_dedupe_key = f"hourly_summary:{now_utc.strftime('%Y-%m-%dT%H')}"
+elif alert_type == "daily_summary":
+    default_dedupe_key = f"daily_summary:{now_utc.strftime('%Y-%m-%d')}"
+elif alert_type == "weekly_summary":
+    default_dedupe_key = f"weekly_summary:{now_utc.strftime('%Y-W%W')}"
+else:
+    default_dedupe_key = None  # one-shot events: no default dedupe_key
+```
+
+**Why time-bucketed**: A fixed key like `-:hourly_summary` is permanently unique across all time. If the 14:00 report is still pending when the 15:00 report is enqueued, the 15:00 enqueue would collide with the 14:00 pending row and return the 14:00 id — the 15:00 payload is silently lost. Time-bucketed keys let adjacent periods coexist; within the same bucket, the pending-only unique index still prevents true duplicates.
+
+**Reference**: `plugins/crypto_guard/storage/schema.sql:559-564`; `plugins/crypto_guard/storage/repository.py:1938-1953` (pending-only dedup check + IntegrityError catch); `plugins/crypto_guard/notify/alert_delivery.py:32-36` + `:78-95` (PERIODIC_ALERT_TYPES + time-bucketed dedupe_key).
+
+**Tests required**:
+- `test_alert_outbox_pending_only_unique_allows_sent_rerun` — same `dedupe_key`, row A `sent`, new enqueue returns a DIFFERENT id (payload B persisted)
+- `test_non_periodic_alert_no_default_dedupe_key` — two `paper_order_filled` enqueues for the same symbol both persist; one `hourly_summary` still folds by its fixed key
+- `test_alert_outbox_dedupe_key_prevents_duplicates` — two concurrent pending same-key enqueues collapse to one id (this test existed before)
+
+**Audit**:
+```bash
+# Index must NOT contain 'sent':
+grep -nP "idx_alert_outbox_dedupe_unique" plugins/crypto_guard/storage/schema.sql
+# enqueue_alert SQL must filter status='pending' only:
+grep -nP "alert_outbox WHERE dedupe_key=\?\s+AND status" plugins/crypto_guard/storage/repository.py
+```
+
+---
+
+### Contract 5.4: Business idempotency keys MUST include the target value
+
+**What**: A dedupe key that identifies "this kind of action on this entity" MUST also embed the action's target value (rounded to a stable precision). Keys that omit the target cause legitimate follow-up actions to be silently dropped.
+
+**Why**: Using `system:paper:stop_adjust:{order_id}` made the SECOND breakeven adjustment on the same order (e.g. tightened further) get dropped as a duplicate of the first. The same defect appeared in the migration cleanup: grouping `agent_jobs` by `(order_id, event_type)` soft-marked valid follow-up adjustments as duplicates of the first.
+
+**Required key shapes**:
+```python
+# Caller (paper_position_updater.py)
+dedupe_session = f"system:paper:stop_adjust:breakeven:{order['id']}:{round(entry, 8)}"
+```
+
+```sql
+-- Migration cleanup (migrations.py _apply_stop_loss_adjustment_dedup)
+PARTITION BY json_extract(payload_json, '$.order_id'),
+             json_extract(payload_json, '$.event_type'),
+             ROUND(json_extract(payload_json, '$.new_stop_loss'), 8)
+```
+
+For `enqueue_alert` callers building their own `dedupe_key`: include `(order_id or symbol, alert_type, normalized_target_value)` — never `(symbol, alert_type)` alone.
+
+**Reference**: `plugins/crypto_guard/paper/paper_position_updater.py:284`; `plugins/crypto_guard/storage/migrations.py` (agent_jobs cleanup, partition by 3-tuple including `ROUND(new_stop_loss, 8)`).
+
+**Tests required**:
+- `test_breakeven_dedupe_key_different_stops_allowed` — same order, breakeven to 1.0494 and then to 1.0500 → both jobs persist
+- `test_agent_jobs_dedup_considers_new_stop` — same order, three event_alert jobs: stop=1.0494, stop=1.0500 (both kept pending), stop=1.0494 again (third soft-marked duplicate)
+
+**Audit**:
+```bash
+# Caller must include `:breakeven:` and rounded entry:
+grep -nP "system:paper:stop_adjust:breakeven:\{order" plugins/crypto_guard/paper/paper_position_updater.py
+# Migration must partition by 3-tuple incl ROUND(_,8):
+grep -nP "ROUND\(json_extract\(payload_json, '\\\$.new_stop_loss'\), 8\)" plugins/crypto_guard/storage/migrations.py
+```
+
+---
+
+### Contract 5.5: One-shot migrations MUST be marker-guarded and idempotent
+
+**What**: Any migration that does heavy table-scans, soft-marks rows, or rebuilds indexes MUST:
+1. Be marker-guarded by `_migration_state(key TEXT PRIMARY KEY, applied_at TEXT)`.
+2. Use `IF NOT EXISTS` for index creation (NOT `DROP INDEX` + `CREATE`).
+3. Run **before** `executescript(schema.sql)` in `initialize_database()`, not after — otherwise `CREATE UNIQUE INDEX` inside schema can collide with dirty existing rows.
+4. Early-return on missing required tables (brand-new DB case): the marker is NOT set, so the next call (after schema creates the tables) does the work.
+
+**Why**: `initialize_database()` is called on every worker startup. Without a marker, the heavy dedup scan runs every time (33s extra startup latency per worker, and re-marking the same rows). Without `IF NOT EXISTS`, the index is dropped and rebuilt every boot, briefly removing the uniqueness guarantee. Without pre-schema ordering, a dirty production DB crashes the first `CREATE UNIQUE INDEX` with `UNIQUE constraint failed: alert_outbox.dedupe_key`.
+
+**Required skeleton**:
+```python
+def _apply_stop_loss_adjustment_dedup(conn: sqlite3.Connection) -> None:
+    # Brand-new DB: required tables don't exist yet → skip, leave marker unset
+    required = ("alert_outbox", "paper_trade_logs", "agent_jobs")
+    have = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?, ?)",
+        required,
+    ).fetchall()}
+    if not required.issubset(have):
+        return
+
+    conn.execute("CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT)")
+    if conn.execute("SELECT key FROM _migration_state WHERE key=?", ("stop_loss_adjustment_dedup_v1",)).fetchone():
+        return  # already applied — fast path on every subsequent worker boot
+
+    # ... one-shot cleanup, soft-mark duplicates, etc. ...
+
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique ON alert_outbox(dedupe_key) WHERE dedupe_key IS NOT NULL AND status='pending'")
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("stop_loss_adjustment_dedup_v1",),
+    )
+    conn.commit()
+```
+
+**Wiring in `initialize_database`**:
+```python
+def initialize_database(config=None) -> dict[str, Any]:
+    conn = ...
+    _apply_stop_loss_adjustment_dedup(conn)  # BEFORE executescript
+    with SCHEMA_PATH.open() as f:
+        conn.executescript(f.read())
+    ...
+```
+
+**Reference**: `plugins/crypto_guard/storage/migrations.py:26` (early call); `:1111-1131` (table-guard + marker-guard); `:1148-1151` (`IF NOT EXISTS`); `plugins/crypto_guard/storage/schema.sql:564-571` (`_migration_state` declaration).
+
+**Tests required**:
+- `test_initialize_database_idempotent_on_dirty_db` — populated dirty `alert_outbox` + `paper_trade_logs`, run `initialize_database()` twice — both succeed, marker set after first, second call scans 0 rows
+- `test_migration_state_table_prevents_repeat_scan` — fresh temp DB: first call leaves marker unset (tables absent), second call does the work + sets marker, third call skips
+- `test_dedup_migration_soft_marks_duplicates` — 72 duplicate rows → 71 marked `is_duplicate=true`, earliest one unmarked
+
+**Audit**:
+```bash
+# Marker table declared in schema:
+grep -nP "_migration_state" plugins/crypto_guard/storage/schema.sql
+# Migration uses IF NOT EXISTS, not DROP INDEX:
+grep -nP "DROP INDEX.*idx_alert_outbox_dedupe_unique" plugins/crypto_guard/storage/migrations.py  # must return 0
+grep -nP "CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique" plugins/crypto_guard/storage/migrations.py  # must return 1
+# Migration invoked before executescript in initialize_database:
+sed -n '/def initialize_database/,/executescript/p' plugins/crypto_guard/storage/migrations.py | grep -n "_apply_stop_loss_adjustment_dedup"
+```
+
+---
+
+### Contract 5.6: Each write operation MUST have exactly one scheduler entry
+
+**What**: A function that mutates DB state (e.g. `update_paper_positions`, `update_shadow_virtual_trades`) MUST be triggered by exactly ONE scheduler job. A background `_loop` thread that calls the same function — even with minute-offset "avoidance" — is forbidden. Idle-path loops MAY exist as heartbeats but MUST NOT call write paths.
+
+**Why**: A 180s `_paper_loop` calling `update_paper_positions` "when minute % 3 != 0" still races the 3min scheduler job — minute boundaries shift under load, GC pauses, sleep drift. Two concurrent calls on the same order enter `_maybe_adjust_stop_to_breakeven` together and both pass the candidate evaluation, both enqueue duplicate event_alerts and write duplicate stop_loss_adjustment logs. This was the proximate cause of the 72 duplicate rows for order #1.
+
+**Required shape**:
+```python
+# scheduler.py — sole dispatch
+if minute % 3 == 0:
+    jobs.append("update_paper_positions_3m")
+
+# service_manager.py — _paper_loop must NOT import or call the writer
+def _paper_loop(_: Any = None) -> None:
+    while True:
+        try:
+            time.sleep(180)  # heartbeat-only; no DB writes
+        except Exception:
+            ...
+```
+
+**Module import hygiene**: When a loop stops calling a function, that import should also be removed from the loop's module to prevent accidental reintroduction.
+
+**Reference**: `plugins/crypto_guard/service_manager.py:118-126` (loop is heartbeat-only); `run_scheduler.py` (sole dispatch for `update_paper_positions_3m` and `update_shadow_virtual_trades_3m`).
+
+**Tests required**:
+- `test_paper_loop_does_not_call_update_paper_positions` — monkeypatch `update_paper_positions` to a sentinel; `_paper_loop` iteration must not invoke it
+
+**Audit**:
+```bash
+# _paper_loop must not write through update_paper_positions/shadow_virtual_trades:
+grep -nP "update_paper_positions|update_shadow_virtual_trades" plugins/crypto_guard/service_manager.py
+```
+The loop file should reference neither (only the scheduler entry point should).
+
+---
+
+### Production Recovery Runbook (01-jun-2026 incident)
+
+When this contract is violated in production again, the recovery sequence is:
+
+1. **Backup the DB before touching anything.** shutil.copy2 + record sha256.
+2. **Restore mis-marked `alert_outbox` rows**: `UPDATE alert_outbox SET status='sent' WHERE dedupe_key LIKE '%hourly_summary' AND status='duplicate'` and `UPDATE alert_outbox SET status='pending' WHERE dedupe_key LIKE '%paper_order_filled' AND status='duplicate'`. (Order-fill alert should be re-dispatched, not silently archived.)
+3. **DROP the over-broad unique index** if it predates the pending-only fix: `DROP INDEX IF EXISTS idx_alert_outbox_dedupe_unique`.
+4. **DELETE the migration marker** so the new pending-only index + cleanup runs on the existing dirty DB: `DELETE FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'`.
+5. **Run `initialize_database(cfg)`** — the migration does the dirty-data scan + builds the pending-only index + re-sets the marker.
+6. **`check_schema_health()`** to verify.
+
+Reference execution (2026-06-27): 17 hourly_summary rows restored to `sent`, 1 `XRPUSDT:paper_order_filled` restored to `pending`, 72 spurious `paper_trade_logs` stop_loss_adjustment rows soft-marked `is_duplicate=true` (71 from the 72-row tick storm; the earliest was preserved), `agent_jobs` paper_event_alert stop-loss duplicates soft-marked. Backup at `data/crypto_guard/crypto_guard.sqlite3.bak.check_recover_20260627_140929` (sha256 `55042e9d631091fca390c4016060c3a478c67d60c60c6ffd225e565eabc7ee79`).
+
+---
+
+**Last updated**: 2026-06-27 (P1: Breakeven stop-loss idempotency — atomic conditional UPDATE, pending-only outbox dedupe, marker-guarded one-shot migration, single-scheduler enforcement)

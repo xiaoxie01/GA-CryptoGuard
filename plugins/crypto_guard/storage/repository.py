@@ -10,23 +10,6 @@ def utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _extract_strategy_name(raw: dict[str, Any]) -> str | None:
-    """Extract strategy_name from ga_decision raw_decision_json.
-
-    Real data has strategy_name at raw_decision_json.raw_legacy_decision.strategy_name.
-    Also supports top-level strategy_name for forward compatibility.
-    """
-    name = raw.get("strategy_name")
-    if name:
-        return name
-    legacy = raw.get("raw_legacy_decision")
-    if isinstance(legacy, dict):
-        name = legacy.get("strategy_name")
-        if name:
-            return name
-    return None
-
-
 def _compute_initial_risk_usdt(order: dict[str, Any], entry_price: float) -> float | None:
     """Compute initial_risk_usdt = |entry_price - stop_loss| * quantity.
 
@@ -1090,19 +1073,62 @@ class CryptoGuardRepository:
             (status, filled_at, closed_at, int(order_id)),
         )
 
-    def update_paper_order_stop_loss(self, order_id: int, stop_loss: float, *, reason: str) -> None:
+    def update_paper_order_stop_loss(self, order_id: int, stop_loss: float, *, reason: str) -> bool:
+        """Atomically update the stop_loss on a paper_order.
+
+        Returns True if the row was actually changed (and a log was emitted),
+        False if the order does not exist, the new stop equals the current
+        one, or a concurrent writer already changed the row (rowcount == 0).
+        """
+        new_stop = float(stop_loss)
         row = self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (int(order_id),)).fetchone()
-        self.conn.execute("UPDATE paper_orders SET stop_loss=? WHERE id=?", (float(stop_loss), int(order_id)))
-        if row:
-            self.log_paper_trade_event(
-                event_type="stop_loss_adjustment",
-                symbol=row["symbol"],
-                side=row["side"],
-                price=float(stop_loss),
-                quantity=row["quantity"],
-                reason=reason,
-                event={"order_id": int(order_id), "old_stop_loss": row["stop_loss"], "new_stop_loss": float(stop_loss)},
+        if not row:
+            return False
+        old_stop = row["stop_loss"]
+        if old_stop is not None and abs(float(old_stop) - new_stop) < 1e-8:
+            return False
+        side = str(row["side"]).lower()
+        if old_stop is None:
+            # NULL-stop initialization branch. Only allowed on open orders.
+            cur = self.conn.execute(
+                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss IS NULL AND status='open'",
+                (new_stop, int(order_id)),
             )
+        elif side == "long":
+            # LONG: new stop must be >= old stop (move toward breakeven/profit).
+            # Reject lowering the stop (would widen risk) and reject mutating
+            # non-open orders. Comparing in SQL avoids a TOCTOU between the
+            # Python check and the UPDATE.
+            cur = self.conn.execute(
+                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
+                "AND status='open' AND ? >= stop_loss",
+                (new_stop, int(order_id), float(old_stop), new_stop),
+            )
+        elif side == "short":
+            # SHORT: new stop must be <= old stop.
+            cur = self.conn.execute(
+                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
+                "AND status='open' AND ? <= stop_loss",
+                (new_stop, int(order_id), float(old_stop), new_stop),
+            )
+        else:
+            # Unknown side — fail-closed.
+            return False
+        if cur.rowcount == 0:
+            # Concurrent writer already moved the stop, the order is not open,
+            # or the new stop would widen risk — treat as a no-op without
+            # emitting an audit log.
+            return False
+        self.log_paper_trade_event(
+            event_type="stop_loss_adjustment",
+            symbol=row["symbol"],
+            side=row["side"],
+            price=new_stop,
+            quantity=row["quantity"],
+            reason=reason,
+            event={"order_id": int(order_id), "old_stop_loss": old_stop, "new_stop_loss": new_stop},
+        )
+        return True
 
     def create_paper_trade(self, order: dict[str, Any], entry_price: float, *, fill_method: str | None = None) -> int:
         # Guard: one order can only have one open trade
@@ -1906,13 +1932,36 @@ class CryptoGuardRepository:
             except (json.JSONDecodeError, TypeError) as e:
                 raise ValueError(f"evolution_review content must be valid JSON: {e}") from e
 
-        self.conn.execute(
-            """
-            INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json, next_retry_at, dedupe_key)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            """,
-            (alert_type, symbol, int(priority), json.dumps(payload, ensure_ascii=False), dedupe_key),
-        )
+        # Dedup: only dedupe against pending alerts. Sent rows keep their
+        # history, so a new enqueue with a fresh payload can reuse the same
+        # dedupe_key after a previous send (e.g. periodic reports, retries).
+        if dedupe_key:
+            existing = self.conn.execute(
+                "SELECT id FROM alert_outbox WHERE dedupe_key=? AND status='pending' LIMIT 1",
+                (dedupe_key,),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json, next_retry_at, dedupe_key)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                (alert_type, symbol, int(priority), json.dumps(payload, ensure_ascii=False), dedupe_key),
+            )
+        except sqlite3.IntegrityError:
+            # Race: another connection inserted the same dedupe_key between our
+            # SELECT and INSERT. Return the winner's id.
+            if dedupe_key:
+                winner = self.conn.execute(
+                    "SELECT id FROM alert_outbox WHERE dedupe_key=? AND status='pending' LIMIT 1",
+                    (dedupe_key,),
+                ).fetchone()
+                if winner:
+                    return int(winner["id"])
+            raise
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
     def should_silence_alert(self, *, alert_type: str, symbol: str | None, quiet_minutes: int, never_silence: set[str]) -> bool:

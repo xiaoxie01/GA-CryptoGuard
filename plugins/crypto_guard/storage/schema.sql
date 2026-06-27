@@ -555,6 +555,21 @@ CREATE TABLE IF NOT EXISTS alert_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_retry ON alert_outbox(status, next_retry_at, priority);
 CREATE INDEX IF NOT EXISTS idx_alert_outbox_dedupe ON alert_outbox(dedupe_key, created_at);
+-- Partial unique: only pending alerts are deduplicated by dedupe_key.
+-- Sent alerts keep their history; new pending rows can reuse the same key
+-- (e.g. periodic hourly_summary reports, retry-after-send scenarios).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique
+    ON alert_outbox(dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status = 'pending';
+
+-- Migration state marker table. Used by _apply_stop_loss_adjustment_dedup()
+-- to skip the expensive one-shot historical cleanup on worker startups after
+-- the first successful run. Kept here so schema.sql and migrations.py agree
+-- on the table shape.
+CREATE TABLE IF NOT EXISTS _migration_state (
+    key TEXT PRIMARY KEY,
+    applied_at TEXT
+);
 
 CREATE TABLE IF NOT EXISTS alert_failure_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

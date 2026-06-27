@@ -18,6 +18,12 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
     cfg = config or load_config()
     conn = connect_db(cfg.database_path)
     try:
+        # Run dedup cleanup BEFORE executescript: schema.sql defines the partial
+        # unique index on alert_outbox(dedupe_key) WHERE status='pending'. If a
+        # dirty DB has duplicate pending rows, the executescript would fail.
+        # Dedup first, then apply schema. The migration is table-guarded so it
+        # is a no-op on a fresh DB.
+        _apply_stop_loss_adjustment_dedup(conn)
         with SCHEMA_PATH.open("r", encoding="utf-8") as f:
             conn.executescript(f.read())
         _apply_phase_01_02_migrations(conn)
@@ -879,21 +885,23 @@ def _apply_legacy_fuzzy_migration(conn: sqlite3.Connection) -> None:
     - Clean stalled momentum_continuation_long candidate (Item 12)
     """
     # Mark ga_decision_id IS NULL rows
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE strategy_evaluations
         SET outcome_source='legacy_fuzzy'
         WHERE ga_decision_id IS NULL AND outcome_source IS NULL
         """,
     )
+    marked_null_ga = int(cur.rowcount or 0)
     # Mark paper_trade_id IS NULL AND outcome_source IS NULL rows
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE strategy_evaluations
         SET outcome_source='legacy_fuzzy'
         WHERE paper_trade_id IS NULL AND outcome_source IS NULL AND ga_decision_id IS NOT NULL
         """,
     )
+    marked_pending = int(cur.rowcount or 0)
 
     # Item 12: Clean stalled momentum_continuation_long candidate
     stalled = conn.execute(
@@ -906,27 +914,27 @@ def _apply_legacy_fuzzy_migration(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
 
+    stalled_cleaned = 0
     for row in stalled:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
             ("stalled_candidate_cleanup:超过48小时未进入shadow_testing", int(row["version_id"])),
         )
+        stalled_cleaned += int(cur.rowcount or 0)
         conn.execute(
             "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
             (row["version"],),
         )
 
-    updated = int(conn.execute(
-        "SELECT COUNT(*) as cnt FROM strategy_evaluations WHERE outcome_source='legacy_fuzzy'"
-    ).fetchone()["cnt"])
-
-    if updated:
+    marked = marked_null_ga + marked_pending
+    if marked or stalled_cleaned:
         conn.commit()
 
     LOGGER = __import__("logging", fromlist=["getLogger"]).getLogger("crypto_guard.migrations")
-    LOGGER.info(
+    log = LOGGER.info if (marked or stalled_cleaned) else LOGGER.debug
+    log(
         "legacy_fuzzy_migration: marked %d evaluations as legacy_fuzzy, cleaned %d stalled candidates",
-        updated, len(stalled),
+        marked, stalled_cleaned,
     )
 
 
@@ -1085,6 +1093,192 @@ def _apply_candidate_cap_cleanup(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_stop_loss_adjustment_dedup(conn: sqlite3.Connection) -> None:
+    """Soft-mark duplicate stop_loss_adjustment paper_trade_logs entries.
+
+    For each (order_id, old_stop_loss, new_stop_loss) combination, keep the
+    earliest entry and mark the rest with event_json.is_duplicate=true.
+
+    Also adds the partial unique index on alert_outbox(dedupe_key) restricted
+    to status='pending' (mirrors schema.sql). Sent alerts keep their full
+    history so a future enqueue can reuse the same dedupe_key.
+
+    Idempotent: no-op if no duplicates exist or already marked. Safe to call
+    before executescript — guards on required tables existing.
+
+    Migration state guard: worker startup calls initialize_database() at high
+    frequency. The expensive scan-and-clean below is only needed once per
+    database to tidy historical dirty data; subsequent runs skip the entire
+    function via the _migration_state marker table.
+    """
+    # Lightweight migration-state table — self-contained so the marker works
+    # even before schema.sql is executed on a brand-new DB. IF NOT EXISTS
+    # makes this harmless on re-runs.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS _migration_state (
+            key TEXT PRIMARY KEY,
+            applied_at TEXT
+        )
+        """
+    )
+
+    # 0a. Migration marker: skip the expensive scan-and-clean once it has run
+    # successfully on this database. HOWEVER, we must still verify the partial
+    # unique index definition matches the current contract (pending-only). If
+    # the database was migrated under an older version that used the over-broad
+    # 'pending OR sent' scope, the marker alone does NOT guarantee correctness.
+    marker_row = conn.execute(
+        "SELECT key FROM _migration_state WHERE key=?",
+        ("stop_loss_adjustment_dedup_v1",),
+    ).fetchone()
+    if marker_row:
+        # Verify the index is pending-only. If it still has the old scope
+        # (status IN ('pending','sent')), drop it and let the IF NOT EXISTS
+        # below recreate it with the correct pending-only scope.
+        old_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_alert_outbox_dedupe_unique'"
+        ).fetchone()
+        if old_index and "sent" in (old_index["sql"] or ""):
+            conn.execute("DROP INDEX IF EXISTS idx_alert_outbox_dedupe_unique")
+            conn.commit()
+            # Fall through to the IF NOT EXISTS CREATE below — marker stays
+            # set so we skip the heavy scan, but the index gets corrected.
+        else:
+            # Index is already pending-only — fully applied, nothing to do.
+            return
+
+    # 0b. Guard: required tables must exist. Called early in initialize_database
+    # (before executescript), so on a fresh DB some tables may not yet exist.
+    required = conn.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name IN ('alert_outbox', 'paper_trade_logs', 'agent_jobs')
+        """
+    ).fetchall()
+    existing = {row["name"] for row in required}
+    if not {"alert_outbox", "paper_trade_logs", "agent_jobs"}.issubset(existing):
+        # Not all required tables exist yet — nothing to dedupe. Do NOT mark
+        # the migration as applied, so the next run can attempt cleanup once
+        # the schema is in place.
+        return
+
+    # 1. Clean existing duplicate dedupe_keys before creating unique index.
+    # Only pending rows are constrained by the unique index; sent rows keep
+    # their history. So we only need to collapse duplicate pending rows:
+    # keep the earliest pending id per dedupe_key and mark the rest duplicate.
+    dup_keys = conn.execute(
+        """
+        SELECT dedupe_key FROM (
+            SELECT dedupe_key, COUNT(*) AS cnt
+            FROM alert_outbox
+            WHERE dedupe_key IS NOT NULL AND status='pending'
+            GROUP BY dedupe_key
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchall()
+    for (dk,) in dup_keys:
+        conn.execute(
+            """
+            UPDATE alert_outbox SET status='duplicate'
+            WHERE dedupe_key=? AND status='pending'
+              AND id > (SELECT MIN(id) FROM alert_outbox WHERE dedupe_key=? AND status='pending')
+            """,
+            (dk, dk),
+        )
+    if dup_keys:
+        conn.commit()
+
+    # 2. Add partial unique index on alert_outbox (idempotent). Mirrors
+    # schema.sql: dedupe_key unique only among status='pending' rows. Use
+    # IF NOT EXISTS so we never DROP/CREATE on already-applied databases.
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique
+        ON alert_outbox(dedupe_key)
+        WHERE dedupe_key IS NOT NULL AND status='pending'
+        """
+    )
+
+    # 3. Soft-mark duplicate stop_loss_adjustment logs
+    dupes = conn.execute(
+        """
+        SELECT id, order_id, event_json
+        FROM (
+            SELECT id,
+                   json_extract(event_json, '$.order_id') AS order_id,
+                   json_extract(event_json, '$.old_stop_loss') AS old_stop,
+                   json_extract(event_json, '$.new_stop_loss') AS new_stop,
+                   event_json,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY json_extract(event_json, '$.order_id'),
+                                    json_extract(event_json, '$.old_stop_loss'),
+                                    json_extract(event_json, '$.new_stop_loss')
+                       ORDER BY created_at ASC
+                   ) AS rn
+            FROM paper_trade_logs
+            WHERE event_type='stop_loss_adjustment'
+              AND json_extract(event_json, '$.is_duplicate') IS NULL
+        ) WHERE rn > 1
+        """
+    ).fetchall()
+
+    for row in dupes:
+        try:
+            event = json.loads(row["event_json"])
+            event["is_duplicate"] = True
+            conn.execute(
+                "UPDATE paper_trade_logs SET event_json=? WHERE id=?",
+                (json.dumps(event, ensure_ascii=False), int(row["id"])),
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if dupes:
+        conn.commit()
+
+    # 4. Soft-mark duplicate agent_jobs for paper_event_alert stop_loss_adjustment.
+    # Key the partition on (order_id, event_type, normalized_new_stop) so that
+    # two LEGITIMATE stop adjustments on the same order (different new_stop)
+    # are NOT marked as duplicates of each other.
+    dup_jobs_pending_rows = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM (
+            SELECT id, payload_json,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY json_extract(payload_json, '$.order_id'),
+                                    json_extract(payload_json, '$.event_type'),
+                                    ROUND(json_extract(payload_json, '$.new_stop_loss'), 8)
+                       ORDER BY created_at ASC
+                   ) AS rn
+            FROM agent_jobs
+            WHERE job_type='paper_event_alert'
+              AND json_extract(payload_json, '$.event_type')='stop_loss_adjustment'
+              AND status IN ('pending', 'success')
+        ) WHERE rn > 1
+        """
+    ).fetchall()
+
+    for row in dup_jobs_pending_rows:
+        conn.execute(
+            "UPDATE agent_jobs SET status='duplicate' WHERE id=?",
+            (int(row["id"]),),
+        )
+
+    if dup_jobs_pending_rows:
+        conn.commit()
+
+    # 5. Record the migration marker LAST, after all cleanup has committed.
+    # This ensures a partial failure does not silently skip future retries.
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("stop_loss_adjustment_dedup_v1",),
+    )
+    conn.commit()
+
+
 def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
 
@@ -1125,6 +1319,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "idx_one_open_trade_per_order",
         "idx_shadow_vt_unique",
         "idx_strategy_evals_shadow_unique",
+        "idx_alert_outbox_dedupe_unique",
     ]
 
     missing: list[dict[str, str]] = []

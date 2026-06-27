@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from plugins.crypto_guard.config.loader import load_config
@@ -20,6 +21,19 @@ DEFAULT_NEVER_SILENCE = {
     "paper_order_filled",
     "paper_order_expired",
     "evolution_trigger",
+}
+
+# Truly periodic alert types may share a fixed dedupe_key (symbol:alert_type):
+# they are produced at most once per cycle per symbol, so a stable key enables
+# the pending-only dedup check in enqueue_alert to collapse retry storms.
+# Every OTHER alert_type is a one-shot event (a fill, a stop move, etc.) and
+# must NOT use a fixed key — otherwise two simultaneously-pending events
+# sharing the same (symbol, alert_type) would collide and the second enqueue
+# would be wrongly rejected by the pending-only dedup check.
+PERIODIC_ALERT_TYPES = {
+    "hourly_summary",
+    "daily_summary",
+    "weekly_summary",
 }
 
 
@@ -62,12 +76,29 @@ def send_markdown_alert(
         "content": build_markdown_card_json(text),
         "fallback_text": text,
     }
+    # Only genuinely periodic alerts reuse a time-bucketed dedupe_key so that
+    # successive periods (e.g. 14:00 vs 15:00) produce independent pending rows
+    # even when the dispatcher is slow. A fixed key like "-:hourly_summary"
+    # would make the next period's enqueue collide with the previous period's
+    # pending row and silently reuse the stale payload.
+    now_utc = datetime.now(timezone.utc)
+    if alert_type in PERIODIC_ALERT_TYPES:
+        if alert_type == "hourly_summary":
+            default_dedupe_key = f"hourly_summary:{now_utc.strftime('%Y-%m-%dT%H')}"
+        elif alert_type == "daily_summary":
+            default_dedupe_key = f"daily_summary:{now_utc.strftime('%Y-%m-%d')}"
+        elif alert_type == "weekly_summary":
+            default_dedupe_key = f"weekly_summary:{now_utc.strftime('%Y-W%W')}"
+        else:
+            default_dedupe_key = f"{symbol or '-'}:{alert_type}"
+    else:
+        default_dedupe_key = None
     alert_id = repo.enqueue_alert(
         alert_type=alert_type,
         symbol=symbol,
         priority=priority,
         payload=payload,
-        dedupe_key=dedupe_key or f"{symbol or '-'}:{alert_type}",
+        dedupe_key=dedupe_key or default_dedupe_key,
     )
     if not send_message:
         return {"ok": True, "sent": False, "queued": True, "alert_id": alert_id}

@@ -9,8 +9,6 @@ from typing import Any, Callable
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger, log_path
-from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
-from plugins.crypto_guard.paper.shadow_virtual_trade_updater import update_shadow_virtual_trades
 from plugins.crypto_guard.run_ga_workers import run_once
 from plugins.crypto_guard.run_scheduler import run_job
 from plugins.crypto_guard.storage.migrations import initialize_database
@@ -53,7 +51,6 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
         _spawn("crypto_guard_user_worker", _user_worker_loop, send_message)
         _spawn("crypto_guard_background_worker", _background_worker_loop, send_message)
         _spawn("crypto_guard_scheduler", _scheduler_loop, None)
-        _spawn("crypto_guard_paper_worker", _paper_loop, None)
 
         _STARTED = True
         LOGGER.info("CryptoGuard services started threads=%s", [t.name for t in _THREADS])
@@ -117,28 +114,6 @@ def _scheduler_loop(_: Any = None) -> None:
             LOGGER.exception("scheduler loop failed")
             traceback.print_exc()
         time.sleep(20)
-
-
-def _paper_loop(_: Any = None) -> None:
-    while True:
-        try:
-            cfg = load_config()
-            initialize_database(cfg)
-            conn = connect_db(cfg.database_path)
-            try:
-                repo = CryptoGuardRepository(conn)
-                result = update_paper_positions(repo)
-                if result.get("results"):
-                    LOGGER.info("paper_worker update results=%s", result.get("results"))
-                shadow_result = update_shadow_virtual_trades(repo)
-                if shadow_result.get("updated_count") or shadow_result.get("closed_count"):
-                    LOGGER.info("paper_worker shadow_virtual_trade_update result=%s", shadow_result)
-            finally:
-                conn.close()
-        except Exception:
-            LOGGER.exception("paper_worker loop failed")
-            traceback.print_exc()
-        time.sleep(180)
 
 
 def _due_scheduler_jobs(now: datetime) -> list[str]:

@@ -3987,6 +3987,15 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         now = datetime.now(timezone.utc)
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
+        # Insert a real open long order with stop_loss=98 so the atomic
+        # update_paper_order_stop_loss can win and report stop_loss_adjusted=True.
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
         trade = {
             "id": 100, "symbol": "BTCUSDT", "side": "LONG",
             "entry_price": 100.0, "quantity": 1.0,
@@ -3994,11 +4003,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 1.5,
             "initial_risk_usdt": 2.0,
         }
-        order = {
-            "id": 100, "symbol": "BTCUSDT", "side": "LONG",
-            "stop_loss": 98.0, "quantity": 1.0,
-            "initial_stop_loss": 98.0,
-        }
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
 
         # market without "close" → fail-closed
         market_no_close = {"price": 101.5}
@@ -4022,6 +4027,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         market = {"close": 101.0, "high": 102.0, "low": 99.0}
 
         # qty=2, MFE=3, risk=(100-98)*2=4, MFE/R=0.75 → passes
+        # Insert a real open long order with stop_loss=98 to back the atomic update.
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 2.0, 100.0, 98.0, 98.0, 'open')"
+        )
+        oid_q2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
         trade_q2 = {
             "id": 101, "symbol": "BTCUSDT", "side": "LONG",
             "entry_price": 100.0, "quantity": 2.0,
@@ -4029,16 +4042,19 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 3.0,
             "initial_risk_usdt": 4.0,
         }
-        order_q2 = {
-            "id": 101, "symbol": "BTCUSDT", "side": "LONG",
-            "stop_loss": 98.0, "quantity": 2.0,
-            "initial_stop_loss": 98.0,
-        }
+        order_q2 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q2,)).fetchone())
         result = _maybe_adjust_stop_to_breakeven(self.repo, order_q2, trade_q2, market)
         self.assertIsNotNone(result, "qty=2, MFE=3, risk=4, MFE/R=0.75 → should pass gate")
         self.assertTrue(result.get("stop_loss_adjusted"))
 
         # qty=0.5, MFE=3, risk=1, MFE/R=3.0 → passes
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 0.5, 100.0, 98.0, 98.0, 'open')"
+        )
+        oid_q05 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
         trade_q05 = {
             "id": 102, "symbol": "BTCUSDT", "side": "LONG",
             "entry_price": 100.0, "quantity": 0.5,
@@ -4046,11 +4062,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 3.0,
             "initial_risk_usdt": 1.0,
         }
-        order_q05 = {
-            "id": 102, "symbol": "BTCUSDT", "side": "LONG",
-            "stop_loss": 98.0, "quantity": 0.5,
-            "initial_stop_loss": 98.0,
-        }
+        order_q05 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q05,)).fetchone())
         result2 = _maybe_adjust_stop_to_breakeven(self.repo, order_q05, trade_q05, market)
         self.assertIsNotNone(result2, "qty=0.5, MFE=3, risk=1, MFE/R=3.0 → should pass")
 
@@ -13919,6 +13931,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             _apply_legacy_fuzzy_migration,
             _apply_phase_shadow_vt_v2_migration,
             _apply_candidate_cap_cleanup,
+            _apply_stop_loss_adjustment_dedup,
         )
         _apply_phase_01_02_migrations(self.conn)
         _apply_phase_13_migrations(self.conn)
@@ -13933,6 +13946,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         _apply_legacy_fuzzy_migration(self.conn)
         _apply_phase_shadow_vt_v2_migration(self.conn)
         _apply_candidate_cap_cleanup(self.conn)
+        _apply_stop_loss_adjustment_dedup(self.conn)
         self.conn.commit()
 
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository
@@ -15046,6 +15060,1029 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         dup_issues = [i for i in result["issues"] if i["type"] == "duplicate_vt_per_candidate_decision"]
         self.assertGreaterEqual(len(dup_issues), 1,
             "duplicate_vt_per_candidate_decision MUST fire for 2 non-duplicate VTs in same group")
+
+    # ── active evaluation diagnostic tests ───────────────────────────────
+
+    def test_diagnostic_detects_active_eval_missing_ga_decision_id(self):
+        """Diagnostic reports new-pipeline active evals with NULL ga_decision_id as error,
+        and legacy_fuzzy/duplicate/invalidated as info only."""
+        self._insert_strategy_version(strategy_name="deterministic_sop", version="1.0", status="active")
+
+        # Insert new-pipeline active eval with NULL ga_decision_id and NULL outcome_source
+        self.repo.conn.execute(
+            "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name,"
+            "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
+            "  is_shadow, ga_decision_id, outcome_source)"
+            " VALUES ('BTCUSDT', 1700000000000, 'deterministic_sop', '1.0', 0.8, 'trade',"
+            "  '{}', '{}', 0, NULL, NULL)"
+        )
+        # Insert legacy_fuzzy active eval with NULL ga_decision_id
+        self.repo.conn.execute(
+            "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name,"
+            "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
+            "  is_shadow, ga_decision_id, outcome_source)"
+            " VALUES ('BTCUSDT', 1700000000000, 'deterministic_sop', '1.0', 0.8, 'trade',"
+            "  '{}', '{}', 0, NULL, 'legacy_fuzzy')"
+        )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "active_eval_missing_ga_decision_id"]
+
+        # Should have at least 2 issues: one error (new_pipeline), one info (legacy_artifact)
+        error_issues = [i for i in issues if i["severity"] == "error"]
+        info_issues = [i for i in issues if i["severity"] == "info"]
+
+        self.assertGreaterEqual(len(error_issues), 1,
+            "Must report new_pipeline NULL ga_decision_id as error")
+        self.assertGreaterEqual(len(info_issues), 1,
+            "Must report legacy_fuzzy NULL ga_decision_id as info only")
+
+        # Verify the error issue is for new_pipeline category
+        new_pipeline_err = [i for i in error_issues
+                           if i["details"].get("category") == "new_pipeline"]
+        self.assertEqual(len(new_pipeline_err), 1,
+            "New-pipeline eval with NULL outcome_source must be error")
+
+        # Verify the info issue is for legacy_artifact category
+        legacy_info = [i for i in info_issues
+                      if i["details"].get("category") == "legacy_artifact"]
+        self.assertEqual(len(legacy_info), 1,
+            "Legacy_fuzzy eval with NULL ga_decision_id must be info only")
+
+    def test_diagnostic_detects_paper_order_missing_active_eval(self):
+        """Diagnostic reports paper_orders with ga_decision_id but no active eval."""
+        self._insert_strategy_version(strategy_name="deterministic_sop", version="1.0", status="active")
+        self._insert_ga_decision(decision_id=9104)
+
+        self.repo.conn.execute(
+            "INSERT INTO paper_orders(id, ga_decision_id, symbol, side, order_type,"
+            "  entry_price, stop_loss, initial_stop_loss, take_profit_json, quantity,"
+            "  risk_percent, status)"
+            " VALUES (9104, 9104, 'BTCUSDT', 'LONG', 'market',"
+            "  100.0, 95.0, 95.0, '[]', 1.0, 0.01, 'open')"
+        )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "paper_order_missing_active_eval"]
+        self.assertGreaterEqual(len(issues), 1,
+            "Must report paper_order_missing_active_eval")
+
+    def test_diagnostic_detects_closed_trade_missing_active_real_pnl(self):
+        """Diagnostic reports closed trades with pnl_r but no active real_pnl eval."""
+        self._insert_strategy_version(strategy_name="deterministic_sop", version="1.0", status="active")
+        self._insert_ga_decision(decision_id=9105)
+
+        self.repo.conn.execute(
+            "INSERT INTO paper_orders(id, ga_decision_id, symbol, side, order_type,"
+            "  entry_price, stop_loss, initial_stop_loss, take_profit_json, quantity,"
+            "  risk_percent, status)"
+            " VALUES (9105, 9105, 'BTCUSDT', 'LONG', 'market',"
+            "  100.0, 95.0, 95.0, '[]', 1.0, 0.01, 'closed')"
+        )
+        self.repo.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, exit_price, quantity,"
+            "  pnl_r, closed_at, close_reason)"
+            " VALUES (9105, 9105, 'BTCUSDT', 'LONG', 100.0, 110.0, 1.0, 2.0, '2024-06-15T12:00:00Z', 'take_profit')"
+        )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "closed_trade_missing_active_real_pnl"]
+        self.assertGreaterEqual(len(issues), 1,
+            "Must report closed_trade_missing_active_real_pnl")
+
+    def test_diagnostic_skips_duplicate_cleanup_closed_trade(self):
+        """Diagnostic does NOT flag closed trade with close_reason='duplicate_cleanup'."""
+        self._insert_strategy_version(strategy_name="deterministic_sop", version="1.0", status="active")
+        self._insert_ga_decision(decision_id=9124)
+
+        self.repo.conn.execute(
+            "INSERT INTO paper_orders(id, ga_decision_id, symbol, side, order_type,"
+            "  entry_price, stop_loss, initial_stop_loss, take_profit_json, quantity,"
+            "  risk_percent, status)"
+            " VALUES (9124, 9124, 'BTCUSDT', 'LONG', 'market',"
+            "  100.0, 95.0, 95.0, '[]', 1.0, 0.01, 'closed')"
+        )
+        self.repo.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, exit_price, quantity,"
+            "  pnl_r, closed_at, close_reason)"
+            " VALUES (9124, 9124, 'BTCUSDT', 'LONG', 100.0, 110.0, 1.0, 2.0, '2024-06-15T12:00:00Z', 'duplicate_cleanup')"
+        )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "closed_trade_missing_active_real_pnl"]
+        self.assertEqual(len(issues), 0,
+            "Must NOT report closed_trade_missing_active_real_pnl for duplicate_cleanup")
+
+    def test_diagnostic_detects_shadow_candidate_legacy_only(self):
+        """Diagnostic reports shadow candidates (>24h old) with only legacy/duplicate samples."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="legacy-cand-v1",
+                                       status="shadow_testing")
+        self._insert_ga_decision(decision_id=9106)
+
+        # Set strategy_version created_at to >24h ago
+        old_date = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        self.repo.conn.execute(
+            "UPDATE strategy_versions SET created_at=? WHERE strategy_name=? AND version=?",
+            (old_date, "smc_pullback_long", "legacy-cand-v1"),
+        )
+        self.repo.conn.commit()
+
+        # Drop partial unique index so we can insert multiple shadow evals for same group
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
+        self.repo.conn.commit()
+
+        # Insert only legacy_fuzzy shadow evals
+        for i in range(5):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name,"
+                "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
+                "  is_shadow, ga_decision_id, outcome_source)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'legacy-cand-v1',"
+                "  0.8, 'trade', '{}', '{}', 1, 9106, 'legacy_fuzzy')"
+            )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "shadow_candidate_legacy_only"]
+        self.assertGreaterEqual(len(issues), 1,
+            "Must report shadow_candidate_legacy_only for legacy-only candidate >24h old")
+
+    def test_diagnostic_skips_fresh_shadow_candidate(self):
+        """Diagnostic does NOT flag shadow candidate created <24h ago (too new)."""
+        self._insert_strategy_version(strategy_name="smc_pullback_long", version="fresh-cand-v1",
+                                       status="shadow_testing")
+        self._insert_ga_decision(decision_id=9125)
+
+        # created_at is current (within setUp) — should be <24h old
+        self.repo.conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
+        self.repo.conn.commit()
+
+        for i in range(5):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name,"
+                "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
+                "  is_shadow, ga_decision_id, outcome_source)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'fresh-cand-v1',"
+                "  0.8, 'trade', '{}', '{}', 1, 9125, 'legacy_fuzzy')"
+            )
+        self.repo.conn.commit()
+
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+        result = diagnose_state_consistency(self.repo)
+
+        issues = [i for i in result["issues"] if i["type"] == "shadow_candidate_legacy_only"]
+        self.assertEqual(len(issues), 0,
+            "Must NOT flag candidate <24h old as legacy_only")
+
+    def test_hourly_report_renders_new_diagnostic_types(self):
+        """hourly_report render functions include new diagnostic types with critical/info severity."""
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary,
+            render_hourly_report_text,
+        )
+
+        # Build a summary dict with all 4 new diagnostic types
+        summary = {
+            "active_eval_missing_ga_decision_id": 3,
+            "paper_order_missing_active_eval": 2,
+            "closed_trade_missing_active_real_pnl": 1,
+            "shadow_candidate_legacy_only": 4,
+            "orphan_patches": 0,
+            "status_mismatches": 0,
+            "stale_shadows": 0,
+            "draft_limbo": 0,
+            "duplicate_patches": 0,
+            "duplicate_open_trades": 0,
+            "candidate_queue_overflow": 0,
+            "stalled_candidate": 0,
+            "no_real_pnl_progress": 0,
+            "strategy_name_mismatch": 0,
+            "zero_quantity_vt": 0,
+            "zero_risk_vt": 0,
+            "three_table_status_mismatch": 0,
+            "closed_vt_missing_real_pnl": 0,
+            "ambiguous_vt_missing_ambiguous_eval": 0,
+            "ambiguous_eval_not_real_pnl": 0,
+            "duplicate_vt_per_candidate_decision": 0,
+            "closed_vt_still_processed": 0,
+            "cursor_regression": 0,
+            "illegal_status_transition": 0,
+        }
+
+        generated_at = "2024-06-15T12:00:00Z"
+        active_symbols = ["BTCUSDT"]
+        ga_decisions: list = []
+        open_orders: list = []
+        active_watches: list = []
+        failed_jobs: list = []
+        queue_counts: dict = {"pending_user": 0, "pending_background": 0, "running": 0}
+        equity_snapshot: dict = {}
+        # Pass summary as state_consistency kwarg
+        sc_result = {"ok": False, "issues": [], "summary": summary, "total_issues": 10}
+
+        # Test render_ga_hourly_summary
+        summary_text = render_ga_hourly_summary(
+            generated_at, active_symbols, ga_decisions, open_orders,
+            active_watches, failed_jobs, queue_counts,
+            equity_snapshot=equity_snapshot,
+            state_consistency=sc_result,
+        )
+        self.assertIn("Active缺GA决策ID=3", summary_text)
+        self.assertIn("订单缺Active评估=2", summary_text)
+        self.assertIn("平仓缺Active实PnL=1", summary_text)
+        self.assertIn("候选仅旧样本=4", summary_text)
+        self.assertIn("关键问题", summary_text)
+
+        # Test render_hourly_report_text
+        report_text = render_hourly_report_text(
+            generated_at, active_symbols, ga_decisions, open_orders,
+            failed_jobs, queue_counts,
+            equity_snapshot=equity_snapshot,
+            state_consistency=sc_result,
+        )
+        self.assertIn("Active缺GA决策ID=3", report_text)
+        self.assertIn("订单缺Active评估=2", report_text)
+        self.assertIn("平仓缺Active实PnL=1", report_text)
+        self.assertIn("候选仅旧样本=4", report_text)
+        self.assertIn("关键问题", report_text)
+
+    # ── stop-loss idempotency tests (Round 8) ─────────────────────────────
+
+    def test_stop_loss_update_empty_guard_skips_duplicate(self):
+        """Fix 2: update_paper_order_stop_loss returns early when new == old stop_loss."""
+        self._insert_strategy_version()
+        self._insert_ga_decision()
+        self._insert_virtual_trade(status="open", entry_price=100.0, stop_loss=95.0, initial_stop_loss=95.0)
+
+        # Create paper_order
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status, ga_decision_id) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Count trade_logs before
+        before = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+
+        # First call: updates stop_loss from 95 → 100 (breakeven)
+        self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="test breakeven")
+        after_first = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+        self.assertEqual(after_first, before + 1, "First breakeven should create 1 log")
+
+        # Second call: same stop_loss (100 → 100), should be empty-update skipped
+        self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="test duplicate")
+        after_second = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+        self.assertEqual(after_second, after_first, "Duplicate stop_loss should NOT create log")
+
+        # Verify stop_loss unchanged
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
+
+    def test_enqueue_job_once_stop_adjust_idempotent(self):
+        """Fix 4: enqueue_job_once for stop_loss_adjustment returns same job ID for duplicate."""
+        self._insert_strategy_version()
+        self._insert_ga_decision()
+
+        session_id = "system:paper:stop_adjust:999"
+
+        # First enqueue
+        jid1 = self.repo.enqueue_job_once(
+            "paper_event_alert", 3, "paper_worker", session_id,
+            {"event_type": "stop_loss_adjustment", "order_id": 999},
+        )
+        self.assertIsNotNone(jid1)
+
+        # Second enqueue with same session_id — returns existing job ID, not a new one
+        jid2 = self.repo.enqueue_job_once(
+            "paper_event_alert", 3, "paper_worker", session_id,
+            {"event_type": "stop_loss_adjustment", "order_id": 999},
+        )
+        self.assertEqual(jid1, jid2, "Duplicate session_id should return existing job ID")
+
+        # Verify only one job exists
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
+        self.assertEqual(count, 1, "Only one agent_job should exist for this session_id")
+
+    def test_alert_outbox_dedupe_key_prevents_duplicates(self):
+        """Fix 5: enqueue_alert with same dedupe_key returns existing alert ID."""
+        dedupe_key = "stop_loss_adjustment:1:1700000000"
+
+        # First alert
+        aid1 = self.repo.enqueue_alert(
+            alert_type="stop_loss_adjustment",
+            payload={"order_id": 1},
+            symbol="BTCUSDT",
+            dedupe_key=dedupe_key,
+        )
+        self.assertIsNotNone(aid1)
+
+        # Second alert with same dedupe_key — should return existing ID
+        aid2 = self.repo.enqueue_alert(
+            alert_type="stop_loss_adjustment",
+            payload={"order_id": 1},
+            symbol="BTCUSDT",
+            dedupe_key=dedupe_key,
+        )
+        self.assertEqual(aid1, aid2, "Duplicate dedupe_key should return existing alert ID")
+
+        # Verify only one row
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key=?", (dedupe_key,)
+        ).fetchone()[0]
+        self.assertEqual(count, 1, "Only one alert_outbox row for this dedupe_key")
+
+    def test_stop_loss_reads_current_not_initial(self):
+        """Fix 1: _maybe_adjust_stop_to_breakeven uses current stop_loss, not initial_stop_loss.
+
+        After a breakeven adjustment (stop_loss=entry), subsequent calls detect already_safe=True.
+        """
+        self._insert_strategy_version()
+        self._insert_ga_decision()
+        self._insert_virtual_trade(status="open", entry_price=100.0, stop_loss=100.0, initial_stop_loss=95.0)
+
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status, ga_decision_id) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 100.0, 95.0, 'open', 1)"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, "
+            "initial_risk_usdt, created_at) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 5.0, '2023-11-14T22:13:20')",
+            (order_id,),
+        )
+        trade_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
+
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone())
+        market = {"symbol": "BTCUSDT", "close": 105.0, "open": 100.0, "high": 106.0, "low": 99.0}
+
+        # stop_loss=100.0 == entry=100.0 for LONG → already_safe → returns None
+        result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+        self.assertIsNone(result, "already_safe (stop==entry) should skip adjustment")
+
+        # Verify no duplicate stop_loss_adjustment events in agent_jobs
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' AND session_id LIKE 'system:paper:stop_adjust:%'"
+        ).fetchone()[0]
+        self.assertEqual(count, 0, "No event_alert should be created for already_safe position")
+
+    def test_dedup_migration_soft_marks_duplicates(self):
+        """Fix 6: _apply_stop_loss_adjustment_dedup soft-marks duplicate paper_trade_logs."""
+        # Insert 3 identical stop_loss_adjustment logs for the same (order_id, old_stop, new_stop)
+        for _ in range(3):
+            self.conn.execute(
+                "INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, "
+                "event_json) VALUES (1, 'stop_loss_adjustment', 'BTCUSDT', 'LONG', "
+                "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}')"
+            )
+        self.conn.commit()
+
+        # Run dedup migration. setUp already ran it once on a fresh DB and
+        # recorded the _migration_state marker, so we must clear the marker
+        # to force the soft-mark scan to actually run on the historical rows
+        # we just inserted.
+        self.conn.execute("DELETE FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'")
+        self.conn.commit()
+        from plugins.crypto_guard.storage.migrations import _apply_stop_loss_adjustment_dedup
+        _apply_stop_loss_adjustment_dedup(self.conn)
+        self.conn.commit()
+
+        # Should have 3 rows total
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(total, 3)
+
+        # First (earliest) should NOT be marked duplicate
+        rows = self.conn.execute(
+            "SELECT id, event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' ORDER BY id"
+        ).fetchall()
+        import json
+        first = json.loads(rows[0]["event_json"])
+        self.assertFalse(first.get("is_duplicate"), "Earliest log should not be marked duplicate")
+
+        # Later 2 should be marked duplicate
+        for r in rows[1:]:
+            data = json.loads(r["event_json"])
+            self.assertTrue(data.get("is_duplicate"), f"Log id={r['id']} should be marked duplicate")
+
+    # ── P1 position-conflict fix tests (Round 9) ──────────────────────────
+
+    def test_alert_outbox_pending_only_unique_allows_sent_rerun(self):
+        """enqueue_alert dedup only blocks pending rows; a sent row with the
+        same dedupe_key does NOT block a new enqueue (new payload, new id)."""
+        dedupe_key = "stop_loss_adjustment:7777:1700000000"
+
+        # First enqueue creates a pending row.
+        aid1 = self.repo.enqueue_alert(
+            alert_type="stop_loss_adjustment",
+            payload={"order_id": 7777, "seq": 1},
+            symbol="BTCUSDT",
+            dedupe_key=dedupe_key,
+        )
+        self.assertIsNotNone(aid1)
+
+        # Mark it sent. Sent rows are NOT deduped by the partial unique index
+        # (schema.sql: status='pending' only) and should not block reuse.
+        self.repo.conn.execute(
+            "UPDATE alert_outbox SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (int(aid1),),
+        )
+        self.repo.conn.commit()
+
+        # A brand-new pending enqueue with the same key must succeed and
+        # return a new, distinct id.
+        aid2 = self.repo.enqueue_alert(
+            alert_type="stop_loss_adjustment",
+            payload={"order_id": 7777, "seq": 2},
+            symbol="BTCUSDT",
+            dedupe_key=dedupe_key,
+        )
+        self.assertIsNotNone(aid2)
+        self.assertNotEqual(aid2, aid1, "Sent history must not block a new pending enqueue")
+
+        rows = self.repo.conn.execute(
+            "SELECT id, status FROM alert_outbox WHERE dedupe_key=? ORDER BY id",
+            (dedupe_key,),
+        ).fetchall()
+        statuses = {r["status"] for r in rows}
+        self.assertIn("sent", statuses, "Sent row should still exist as history")
+        self.assertIn("pending", statuses, "New pending row should have been inserted")
+        self.assertEqual(len(rows), 2, "Exactly two rows: one sent, one pending")
+
+    def test_initialize_database_idempotent_on_dirty_db(self):
+        """initialize_database must be idempotent on a DB that already has
+        duplicate pending alert_outbox rows (dedup runs before executescript
+        so the partial unique index does not fail)."""
+        # This test class shares an in-memory handle that initialize_database()
+        # cannot reach, so spin up an isolated on-disk DB to exercise the real
+        # initialize_database() code path (schema.sql + dedup ordering).
+        import tempfile as _tempfile
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+        tmp_dir = _tempfile.TemporaryDirectory()
+        try:
+            db_path = os.path.join(tmp_dir.name, "dirty.sqlite3")
+            # First init to create the schema + dedup index.
+            old_db = os.environ.get("CRYPTO_GUARD_DB")
+            os.environ["CRYPTO_GUARD_DB"] = db_path
+            try:
+                self.assertTrue(initialize_database()["ok"], "bootstrap initialize_database must succeed")
+
+                # Simulate a dirty DB: drop the partial unique index and inject
+                # duplicate pending rows + one sent row sharing the same dedupe_key.
+                seed = connect_db(db_path)
+                seed.execute("DROP INDEX IF EXISTS idx_alert_outbox_dedupe_unique")
+                dup_key = "dedupe_idempotent:1:1700000000"
+                seed.execute(
+                    "INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json,"
+                    "  next_retry_at, dedupe_key, status) VALUES"
+                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'pending'),"
+                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'pending'),"
+                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'sent')",
+                    (dup_key, dup_key, dup_key),
+                )
+                seed.commit()
+                seed.close()
+
+                # Two consecutive initialize_database() calls on the dirty DB must
+                # both succeed (dedup runs before executescript → index recreate safe).
+                self.assertTrue(initialize_database()["ok"], "First initialize_database on dirty DB must succeed")
+                self.assertTrue(initialize_database()["ok"], "Second initialize_database on dirty DB must succeed")
+
+                check = connect_db(db_path)
+                rows = check.execute(
+                    "SELECT id, status FROM alert_outbox WHERE dedupe_key=? ORDER BY id",
+                    (dup_key,),
+                ).fetchall()
+                pending = [r for r in rows if r["status"] == "pending"]
+                sent = [r for r in rows if r["status"] == "sent"]
+                duplicate = [r for r in rows if r["status"] == "duplicate"]
+                check.close()
+
+                self.assertEqual(len(pending), 1, "Exactly one pending row must survive dedup")
+                self.assertEqual(len(sent), 1, "Sent history must be preserved")
+                self.assertEqual(len(duplicate), 1, "Excess pending duplicates become 'duplicate'")
+            finally:
+                if old_db is None:
+                    os.environ.pop("CRYPTO_GUARD_DB", None)
+                else:
+                    os.environ["CRYPTO_GUARD_DB"] = old_db
+        finally:
+            tmp_dir.cleanup()
+
+    def test_paper_loop_does_not_call_update_paper_positions(self):
+        """_paper_loop has been removed. The scheduler owns all paper write paths.
+        Verify that service_manager no longer defines _paper_loop and no longer
+        spawns a crypto_guard_paper_worker thread."""
+        import plugins.crypto_guard.service_manager as sm
+
+        self.assertFalse(hasattr(sm, "_paper_loop"),
+            "service_manager must not define _paper_loop — scheduler owns paper writes")
+        # Verify the thread is no longer spawned: inspect the start_all_services source
+        import inspect
+        start_src = inspect.getsource(sm.start_all_services)
+        self.assertNotIn("crypto_guard_paper_worker", start_src,
+            "start_services must not spawn crypto_guard_paper_worker")
+
+    def test_update_paper_order_stop_loss_atomic_concurrent(self):
+        """Two concurrent connections calling update_paper_order_stop_loss on
+        the same order with the same stop: exactly one succeeds and emits a log."""
+        # The ShadowVTLifecycleTest class runs on a private isolated connection.
+        # For a REAL concurrency test we need two independent connections sharing
+        # a single on-disk database, so spin up an isolated tmp DB and re-seed it
+        # via initialize_database (full schema + dedup).
+        import tempfile as _tempfile
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.migrations import initialize_database
+
+        tmp_dir = _tempfile.TemporaryDirectory()
+        old_db = os.environ.get("CRYPTO_GUARD_DB")
+        try:
+            db_path = os.path.join(tmp_dir.name, "atomic.sqlite3")
+            os.environ["CRYPTO_GUARD_DB"] = db_path
+            self.assertTrue(initialize_database()["ok"], "bootstrap initialize_database must succeed")
+
+            conn_a = connect_db(db_path)
+            conn_b = connect_db(db_path)
+            repo_a = CryptoGuardRepository(conn_a)
+            repo_b = CryptoGuardRepository(conn_b)
+            # Insert one order with stop_loss=95 on repo_a.
+            conn_a.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status, ga_decision_id) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', NULL)"
+            )
+            conn_a.commit()
+            order_id = int(conn_a.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+            logs_before = conn_a.execute(
+                "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+            ).fetchone()[0]
+
+            # First writer moves 95 → 100 atomically; should succeed.
+            ok_a = repo_a.update_paper_order_stop_loss(order_id, 100.0, reason="writer-a")
+            self.assertTrue(ok_a, "First writer should win the conditional UPDATE")
+            conn_a.commit()
+
+            # Second writer also tries 95 → 100 against the (now stale) snapshot
+            # it read; the conditional UPDATE sees stop_loss=100 != 95 → rowcount 0.
+            ok_b = repo_b.update_paper_order_stop_loss(order_id, 100.0, reason="writer-b")
+            self.assertFalse(ok_b, "Second writer must lose (concurrent update wins)")
+            conn_b.commit()
+
+            logs_after = conn_a.execute(
+                "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+            ).fetchone()[0]
+            self.assertEqual(logs_after, logs_before + 1,
+                "Exactly one stop_loss_adjustment log should be produced, even with two writers")
+
+            row = conn_a.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+            self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
+            conn_a.close()
+            conn_b.close()
+        finally:
+            if old_db is None:
+                os.environ.pop("CRYPTO_GUARD_DB", None)
+            else:
+                os.environ["CRYPTO_GUARD_DB"] = old_db
+            tmp_dir.cleanup()
+
+    def test_update_paper_order_stop_loss_null_safe(self):
+        """stop_loss=NULL (e.g. a never-adjusted order) must not crash the
+        atomic conditional UPDATE — the NULL-safe branch handles it."""
+        self._insert_strategy_version()
+        self._insert_ga_decision()
+
+        # Insert an order with stop_loss=NULL.
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status, ga_decision_id) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, NULL, 95.0, 'open', 1)"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+
+        logs_before = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+
+        ok = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="null-safe test")
+        self.assertTrue(ok, "Updating NULL stop must succeed")
+
+        logs_after = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(logs_after, logs_before + 1, "NULL-safe update should emit exactly one log")
+
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
+
+        # Replaying the same stop now compares 100 vs 100 → no-op → False.
+        ok2 = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="dup")
+        self.assertFalse(ok2, "Replaying same stop against a non-NULL value must be a no-op")
+        logs_final = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(logs_final, logs_after, "No new log for identical stop")
+
+    def test_breakeven_dedupe_key_different_stops_allowed(self):
+        """enqueued paper_event_alert for breakeven uses a session_id keyed on
+        (order_id, entry); different breakeven prices for the same order must
+        each get their own job, while the same price is deduped."""
+        self._insert_strategy_version()
+        self._insert_ga_decision()
+
+        # Real order in DB so the atomic update can win.
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status, ga_decision_id) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+
+        from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
+
+        now = datetime.now(timezone.utc)
+        thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
+
+        def run_breakeven(entry: float):
+            trade = {
+                "id": 200, "symbol": "BTCUSDT", "side": "LONG",
+                "entry_price": entry, "quantity": 1.0,
+                "created_at": thirty_min_ago,
+                "max_favorable_excursion": 3.0,
+                "initial_risk_usdt": 1.0,
+            }
+            order = dict(self.conn.execute(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            ).fetchone())
+            market = {"close": entry + 5.0, "high": entry + 6.0, "low": entry - 1.0}
+            return _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+
+        # First breakeven at entry=100.0 → updates stop 95→100, enqueues one job.
+        r1 = run_breakeven(100.0)
+        self.assertIsNotNone(r1)
+        self.assertTrue(r1["stop_loss_adjusted"])
+        jid1 = self.conn.execute(
+            "SELECT id FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "  AND session_id=?",
+            (f"system:paper:stop_adjust:breakeven:{order_id}:{round(100.0, 8)}",),
+        ).fetchone()
+        self.assertIsNotNone(jid1, "First breakeven price should enqueue a job")
+
+        # Same price again: already_safe (stop==entry) short-circuits → no new job.
+        # Move stop back down to re-enter; not done here — already_safe branch
+        # handles the duplicate-price path. Instead, raise the breakeven price:
+        # update stop directly to a new value so the next breakeven (different
+        # entry) can run a fresh atomic update.
+        self.conn.execute(
+            "UPDATE paper_orders SET stop_loss=95.0 WHERE id=?",
+            (order_id,),
+        )
+        self.conn.commit()
+
+        r2 = run_breakeven(110.0)
+        self.assertIsNotNone(r2)
+        jid2 = self.conn.execute(
+            "SELECT id FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "  AND session_id=?",
+            (f"system:paper:stop_adjust:breakeven:{order_id}:{round(110.0, 8)}",),
+        ).fetchone()
+        self.assertIsNotNone(jid2, "Different breakeven price should enqueue its OWN job")
+        self.assertNotEqual(jid2["id"], jid1["id"],
+            "Different breakeven prices must map to distinct agent_jobs")
+
+        # Verify two distinct jobs exist for this order's breakeven alerts.
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "  AND session_id LIKE ?",
+            (f"system:paper:stop_adjust:breakeven:{order_id}:%",),
+        ).fetchone()[0]
+        self.assertEqual(count, 2, "Two distinct breakeven prices → two jobs")
+
+    # ── Round 10: 4-item final-audit fixes ────────────────────────────────
+
+    def test_update_paper_order_stop_loss_rejects_closed_order(self):
+        """A status='closed' order must NOT have its stop_loss mutated, even if
+        the supplied old_stop matches the row. The atomic UPDATE carries
+        AND status='open' so closed/pending orders are immutable."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        logs_before = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+
+        ok = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="closed-order")
+        self.assertFalse(ok, "Closed order must reject stop_loss update")
+        logs_after = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(logs_after, logs_before, "No log must be emitted for a closed order")
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertAlmostEqual(float(row["stop_loss"]), 95.0)
+
+    def test_update_paper_order_stop_loss_rejects_wrong_direction_long(self):
+        """A LONG order must not be able to LOWER its stop_loss (that would
+        widen risk). The new_stop >= stop_loss branch in SQL rejects it."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        logs_before = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+
+        # Lowering from 95 → 90 must be rejected.
+        ok = self.repo.update_paper_order_stop_loss(order_id, 90.0, reason="lower")
+        self.assertFalse(ok, "LONG must reject lowering stop_loss")
+        logs_after = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(logs_after, logs_before)
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertAlmostEqual(float(row["stop_loss"]), 95.0)
+
+    def test_update_paper_order_stop_loss_rejects_wrong_direction_short(self):
+        """A SHORT order must not be able to RAISE its stop_loss (that would
+        widen risk). The new_stop <= stop_loss branch in SQL rejects it."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'SHORT', 'market', 1.0, 100.0, 105.0, 105.0, 'open')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        logs_before = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+
+        # Raising from 105 → 110 must be rejected.
+        ok = self.repo.update_paper_order_stop_loss(order_id, 110.0, reason="raise")
+        self.assertFalse(ok, "SHORT must reject raising stop_loss")
+        logs_after = self.conn.execute(
+            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
+        ).fetchone()[0]
+        self.assertEqual(logs_after, logs_before)
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertAlmostEqual(float(row["stop_loss"]), 105.0)
+
+        # Sanity: lowering SHORT stop 105 → 100 should still be allowed.
+        ok_ok = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="lower")
+        self.assertTrue(ok_ok, "SHORT lowering stop_loss toward entry/breakeven is allowed")
+
+    def test_breakeven_returns_no_change_when_atomic_update_fails(self):
+        """When the atomic stop update is rejected (e.g. order not open),
+        _maybe_adjust_stop_to_breakeven must NOT report stop_loss_adjusted=True."""
+        from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
+
+        now = datetime.now(timezone.utc)
+        thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
+        # Closed order — atomic update will be rejected.
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        trade = {
+            "id": 999, "symbol": "BTCUSDT", "side": "LONG",
+            "entry_price": 100.0, "quantity": 1.0,
+            "created_at": thirty_min_ago,
+            "max_favorable_excursion": 3.0,
+            "initial_risk_usdt": 1.0,
+        }
+        market = {"close": 105.0, "high": 106.0, "low": 99.0}
+        result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+        # Must return a dict (not None) but with stop_loss_adjusted=False —
+        # it passed all gates but the atomic update rejected the closed order.
+        self.assertIsNotNone(result, "Function reached the update call (gates passed) so it returns a dict")
+        self.assertFalse(result.get("stop_loss_adjusted"),
+            "Rejected atomic update must NOT report stop_loss_adjusted=True")
+        # No agent_job should have been enqueued.
+        jobs = self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "  AND session_id LIKE 'system:paper:stop_adjust:breakeven:%'"
+        ).fetchone()[0]
+        self.assertEqual(jobs, 0, "No alert job when the atomic update failed")
+
+    def test_migration_state_table_prevents_repeat_scan(self):
+        """_apply_stop_loss_adjustment_dedup uses a _migration_state marker so
+        the second initialize_database() call does NOT re-scan history. We
+        verify by inserting dirty duplicate logs AFTER the first run has
+        marked the migration applied, and confirming they remain unmarked."""
+        import tempfile as _tempfile
+        import gc
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import (
+            initialize_database,
+            _apply_stop_loss_adjustment_dedup,
+        )
+
+        tmp_dir = _tempfile.TemporaryDirectory()
+        old_db = os.environ.get("CRYPTO_GUARD_DB")
+        conn = None
+        try:
+            db_path = os.path.join(tmp_dir.name, "migr.sqlite3")
+            os.environ["CRYPTO_GUARD_DB"] = db_path
+            # First initialize on a fresh DB: _apply_stop_loss_adjustment_dedup
+            # sees no required tables yet (schema.sql runs AFTER the dedup) so
+            # it guards out and the marker is intentionally NOT set yet.
+            self.assertTrue(initialize_database()["ok"], "first initialize_database must succeed")
+
+            conn = connect_db(db_path)
+            marker_first = conn.execute(
+                "SELECT key FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
+            ).fetchone()
+            self.assertIsNone(marker_first,
+                "On a fresh DB the dedup migration guards out (no tables yet) "
+                "and must NOT set the marker until schema.sql has applied tables.")
+
+            # A second initialize_database now sees the tables existed (from the
+            # first run's executescript) and runs the dedup scan over an empty
+            # dataset — this is the run that records the marker. Must close the
+            # open connection first so the WAL can flush to disk cleanly.
+            conn.close()
+            conn = None
+            gc.collect()
+            self.assertTrue(initialize_database()["ok"], "second initialize_database must succeed")
+
+            conn = connect_db(db_path)
+            marker = conn.execute(
+                "SELECT key FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
+            ).fetchone()
+            self.assertIsNotNone(marker, "marker must be set after schema tables exist + dedup scan ran")
+
+            # Insert dirty duplicate paper_trade_logs that the migration would
+            # normally soft-mark. The next run must skip cleanup because the
+            # marker is already set.
+            for _ in range(3):
+                conn.execute(
+                    "INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, "
+                    "event_json) VALUES (1, 'stop_loss_adjustment', 'BTCUSDT', 'LONG', "
+                    "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}')"
+                )
+            conn.commit()
+
+            # Third run — should bail out early via the marker.
+            _apply_stop_loss_adjustment_dedup(conn)
+            conn.commit()
+
+            rows = conn.execute(
+                "SELECT event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' "
+                "ORDER BY id"
+            ).fetchall()
+            import json as _json
+            for r in rows:
+                ev = _json.loads(r["event_json"])
+                self.assertFalse(ev.get("is_duplicate"),
+                    "Duplicate logs inserted AFTER migration marker set should NOT be re-cleaned")
+        finally:
+            if conn is not None:
+                conn.close()
+            conn = None
+            gc.collect()
+            if old_db is None:
+                os.environ.pop("CRYPTO_GUARD_DB", None)
+            else:
+                os.environ["CRYPTO_GUARD_DB"] = old_db
+            # On Windows, sqlite WAL/shm file handles may briefly outlive
+            # conn.close(); swallow cleanup errors so the test result is not
+            # polluted by temp-dir teardown failures unrelated to the assertion.
+            try:
+                tmp_dir.cleanup()
+            except OSError:
+                pass
+
+    def test_non_periodic_alert_no_default_dedupe_key(self):
+        """Non-periodic alert types (e.g. paper_order_filled) must default to
+        NO dedupe_key so two simultaneously-pending alerts of the same type
+        for the same symbol can both exist in the outbox."""
+        # Use the repo directly (in-memory ShadowVTLifecycleTest setup).
+        aid1 = self.repo.enqueue_alert(
+            alert_type="paper_order_filled",
+            payload={"order_id": 111, "seq": 1},
+            symbol="BTCUSDT",
+            # No dedupe_key — simulate non-periodic enqueue path.
+        )
+        aid2 = self.repo.enqueue_alert(
+            alert_type="paper_order_filled",
+            payload={"order_id": 222, "seq": 2},
+            symbol="BTCUSDT",
+        )
+        self.assertIsNotNone(aid1)
+        self.assertIsNotNone(aid2)
+        self.assertNotEqual(aid1, aid2, "Two non-periodic alerts must get distinct outbox ids")
+        rows = self.conn.execute(
+            "SELECT id FROM alert_outbox WHERE alert_type='paper_order_filled' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2, "Both alerts must persist in the outbox")
+
+        # Sanity: a periodic alert_type with the same symbol must still dedupe.
+        aid3 = self.repo.enqueue_alert(
+            alert_type="hourly_summary",  # in PERIODIC_ALERT_TYPES
+            payload={"seq": 1},
+            symbol="BTCUSDT",
+            dedupe_key="BTCUSDT:hourly_summary",
+        )
+        aid4 = self.repo.enqueue_alert(
+            alert_type="hourly_summary",
+            payload={"seq": 2},
+            symbol="BTCUSDT",
+            dedupe_key="BTCUSDT:hourly_summary",
+        )
+        self.assertEqual(aid3, aid4, "Periodic alert with a fixed dedupe_key must collapse")
+
+        # Verify the default-dedupe decision lives in alert_delivery for the
+        # path that callers actually use (send_markdown_alert).
+        from plugins.crypto_guard.notify.alert_delivery import PERIODIC_ALERT_TYPES
+        self.assertIn("hourly_summary", PERIODIC_ALERT_TYPES)
+        self.assertNotIn("paper_order_filled", PERIODIC_ALERT_TYPES)
+
+    def test_agent_jobs_dedup_considers_new_stop(self):
+        """Two legitimate stop_loss_adjustment agent_jobs on the same order
+        with DIFFERENT new_stop values must NOT be marked as duplicates of
+        each other. The PARTITION keys on (order_id, event_type, new_stop)."""
+        # Clear the migration marker so the cleanup actually runs.
+        self.conn.execute("DELETE FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'")
+        self.conn.commit()
+
+        # Two agent_jobs for the same order but DIFFERENT new_stop_loss.
+        payload_alpha = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 100.0}
+        payload_beta = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 110.0}
+        for p in (payload_alpha, payload_beta):
+            self.conn.execute(
+                "INSERT INTO agent_jobs(job_type, source, session_id, payload_json, status) "
+                "VALUES ('paper_event_alert', 'test', ?, ?, 'pending')",
+                (f"system:paper:stop_adjust:breakeven:7777:{p['new_stop_loss']}", json.dumps(p)),
+            )
+        self.conn.commit()
+
+        # Duplicates with the SAME new_stop should be marked duplicate.
+        payload_dup = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 100.0}
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, source, session_id, payload_json, status) "
+            "VALUES ('paper_event_alert', 'test', 'system:paper:stop_adjust:breakeven:7777:100.0dup', "
+            "?, 'pending')",
+            (json.dumps(payload_dup),),
+        )
+        self.conn.commit()
+
+        from plugins.crypto_guard.storage.migrations import _apply_stop_loss_adjustment_dedup
+        _apply_stop_loss_adjustment_dedup(self.conn)
+        self.conn.commit()
+
+        surviving = self.conn.execute(
+            "SELECT session_id, status FROM agent_jobs "
+            "WHERE job_type='paper_event_alert' ORDER BY id"
+        ).fetchall()
+        statuses = {r["session_id"]: r["status"] for r in surviving}
+        alpha_sid = "system:paper:stop_adjust:breakeven:7777:100.0"
+        beta_sid = "system:paper:stop_adjust:breakeven:7777:110.0"
+        dup_sid = "system:paper:stop_adjust:breakeven:7777:100.0dup"
+
+        # Beta (different new_stop) must remain pending — NOT marked duplicate.
+        self.assertEqual(statuses[beta_sid], "pending",
+            "Different new_stop_loss jobs must not be marked duplicate")
+        # One of (alpha, dup) — same new_stop — must be marked duplicate.
+        dup_count = sum(1 for s in (alpha_sid, dup_sid) if statuses.get(s) == "duplicate")
+        self.assertEqual(dup_count, 1, "Exactly one of the same-new_stop pair must be marked duplicate")
 
 
 if __name__ == "__main__":
