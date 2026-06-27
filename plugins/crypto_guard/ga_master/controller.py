@@ -14,7 +14,7 @@ from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decisio
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.strategy.shadow_testing import record_shadow_evaluation
 from plugins.crypto_guard.paper.shadow_virtual_trade_updater import DEFAULT_MAX_PENDING_MINUTES
-from plugins.crypto_guard.paper.paper_broker import compute_position_size
+from plugins.crypto_guard.paper.sizing import compute_position_size
 import json
 
 

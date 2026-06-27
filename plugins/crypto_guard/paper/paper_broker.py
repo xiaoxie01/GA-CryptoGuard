@@ -7,56 +7,15 @@ from typing import Any
 from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy
 from plugins.crypto_guard.ga_master.feishu_action_builder import build_feishu_actions
 from plugins.crypto_guard.paper.execution_quality import close_quality_metrics, evaluate_exit, market_from_price, update_trade_path_metrics
+from plugins.crypto_guard.paper.sizing import (
+    DEFAULT_ACCOUNT_BALANCE,
+    DEFAULT_RISK_PERCENT,
+    DEFAULT_SLIPPAGE_PCT,
+    compute_fill_price,
+    compute_position_size,
+)
 from plugins.crypto_guard.risk.risk_engine import validate_trade_plan
 
-DEFAULT_ACCOUNT_BALANCE = 10000.0
-DEFAULT_RISK_PERCENT = 0.5
-DEFAULT_SLIPPAGE_PCT = 0.001
-
-
-def compute_position_size(
-    entry_price: float,
-    stop_loss: float,
-    *,
-    risk_percent: float = DEFAULT_RISK_PERCENT,
-    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
-) -> tuple[float, float] | None:
-    """Compute quantity and initial_risk_usdt from risk% sizing formula.
-
-    quantity = (account_balance * risk_pct) / abs(entry - stop)
-    initial_risk_usdt = account_balance * risk_pct
-
-    Returns (quantity, initial_risk_usdt) or None if risk_per_unit <= 0.
-    Reused by both paper_broker and shadow_virtual_trade creation.
-    """
-    risk_pct = risk_percent / 100.0
-    risk_usdt = account_balance * risk_pct
-    risk_per_unit = abs(entry_price - stop_loss)
-    if risk_per_unit <= 0:
-        return None
-    return (risk_usdt / risk_per_unit, risk_usdt)
-
-
-def compute_fill_price(
-    entry_price: float,
-    side: str,
-    *,
-    slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
-    order_type: str = "market",
-) -> float:
-    """Apply slippage to get the actual fill price for a market order.
-
-    For limit/trigger orders, slippage is not applied (fills at entry_price).
-    For market orders: LONG fills at entry * (1 + slippage), SHORT at entry * (1 - slippage).
-
-    Shared between paper_broker and shadow_virtual_trade to ensure consistent R-basis.
-    """
-    if str(order_type).lower() != "market":
-        return entry_price
-    side_upper = str(side).upper()
-    if side_upper == "SHORT":
-        return entry_price * (1 - slippage_pct)
-    return entry_price * (1 + slippage_pct)
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository, utc_iso
 from plugins.crypto_guard.utils import utc_ms
 
