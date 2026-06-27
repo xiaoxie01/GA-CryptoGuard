@@ -239,22 +239,36 @@ def render_ga_hourly_summary(
         total = state_consistency.get("total_issues", 0)
         if total > 0:
             lines.extend(["", "**状态一致性诊断**"])
-            alert_parts = []
+            critical_parts = []
+            info_parts = []
+            # Critical: active PnL loop integrity
+            if summary.get("active_eval_missing_ga_decision_id", 0) > 0:
+                critical_parts.append(f"Active缺GA决策ID={summary['active_eval_missing_ga_decision_id']}")
+            if summary.get("paper_order_missing_active_eval", 0) > 0:
+                critical_parts.append(f"订单缺Active评估={summary['paper_order_missing_active_eval']}")
+            if summary.get("closed_trade_missing_active_real_pnl", 0) > 0:
+                critical_parts.append(f"平仓缺Active实PnL={summary['closed_trade_missing_active_real_pnl']}")
+            # Standard issues
             if summary.get("duplicate_open_trades", 0) > 0:
-                alert_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
+                critical_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
             if summary.get("orphan_patches", 0) > 0:
-                alert_parts.append(f"孤儿补丁={summary['orphan_patches']}")
+                critical_parts.append(f"孤儿补丁={summary['orphan_patches']}")
             if summary.get("status_mismatches", 0) > 0:
-                alert_parts.append(f"状态不一致={summary['status_mismatches']}")
+                critical_parts.append(f"状态不一致={summary['status_mismatches']}")
             if summary.get("duplicate_patches", 0) > 0:
-                alert_parts.append(f"重复补丁={summary['duplicate_patches']}")
+                critical_parts.append(f"重复补丁={summary['duplicate_patches']}")
             if summary.get("stale_shadows", 0) > 0:
-                alert_parts.append(f"过期影子={summary['stale_shadows']}")
+                critical_parts.append(f"过期影子={summary['stale_shadows']}")
             if summary.get("draft_limbo", 0) > 0:
-                alert_parts.append(f"草稿滞留={summary['draft_limbo']}")
-            if alert_parts:
-                lines.append(f"- 发现问题 {total} 个：{'，'.join(alert_parts)}")
-            else:
+                critical_parts.append(f"草稿滞留={summary['draft_limbo']}")
+            # Warning: shadow candidate quality
+            if summary.get("shadow_candidate_legacy_only", 0) > 0:
+                info_parts.append(f"候选仅旧样本={summary['shadow_candidate_legacy_only']}")
+            if critical_parts:
+                lines.append(f"- **关键问题 {len(critical_parts)} 项**：{'，'.join(critical_parts)}")
+            if info_parts:
+                lines.append(f"- 提示：{'，'.join(info_parts)}")
+            if not critical_parts and not info_parts:
                 lines.append(f"- 发现问题 {total} 个（非关键）")
         else:
             lines.extend(["", "**状态一致性诊断**", "- 全部正常，未发现状态不一致"])
@@ -833,22 +847,36 @@ def render_hourly_report_text(
         total = state_consistency.get("total_issues", 0)
         if total > 0:
             lines.extend(["", "**状态一致性诊断：**"])
-            alert_parts = []
+            critical_parts = []
+            info_parts = []
+            # Critical: active PnL loop integrity
+            if summary.get("active_eval_missing_ga_decision_id", 0) > 0:
+                critical_parts.append(f"Active缺GA决策ID={summary['active_eval_missing_ga_decision_id']}")
+            if summary.get("paper_order_missing_active_eval", 0) > 0:
+                critical_parts.append(f"订单缺Active评估={summary['paper_order_missing_active_eval']}")
+            if summary.get("closed_trade_missing_active_real_pnl", 0) > 0:
+                critical_parts.append(f"平仓缺Active实PnL={summary['closed_trade_missing_active_real_pnl']}")
+            # Standard issues
             if summary.get("duplicate_open_trades", 0) > 0:
-                alert_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
+                critical_parts.append(f"重复开仓={summary['duplicate_open_trades']}")
             if summary.get("orphan_patches", 0) > 0:
-                alert_parts.append(f"孤儿补丁={summary['orphan_patches']}")
+                critical_parts.append(f"孤儿补丁={summary['orphan_patches']}")
             if summary.get("status_mismatches", 0) > 0:
-                alert_parts.append(f"状态不一致={summary['status_mismatches']}")
+                critical_parts.append(f"状态不一致={summary['status_mismatches']}")
             if summary.get("duplicate_patches", 0) > 0:
-                alert_parts.append(f"重复补丁={summary['duplicate_patches']}")
+                critical_parts.append(f"重复补丁={summary['duplicate_patches']}")
             if summary.get("stale_shadows", 0) > 0:
-                alert_parts.append(f"过期影子={summary['stale_shadows']}")
+                critical_parts.append(f"过期影子={summary['stale_shadows']}")
             if summary.get("draft_limbo", 0) > 0:
-                alert_parts.append(f"草稿滞留={summary['draft_limbo']}")
-            if alert_parts:
-                lines.append(f"- 发现问题 {total} 个：{'，'.join(alert_parts)}")
-            else:
+                critical_parts.append(f"草稿滞留={summary['draft_limbo']}")
+            # Warning: shadow candidate quality
+            if summary.get("shadow_candidate_legacy_only", 0) > 0:
+                info_parts.append(f"候选仅旧样本={summary['shadow_candidate_legacy_only']}")
+            if critical_parts:
+                lines.append(f"- **关键问题 {len(critical_parts)} 项**：{'，'.join(critical_parts)}")
+            if info_parts:
+                lines.append(f"- 提示：{'，'.join(info_parts)}")
+            if not critical_parts and not info_parts:
                 lines.append(f"- 发现问题 {total} 个（非关键）")
         else:
             lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])

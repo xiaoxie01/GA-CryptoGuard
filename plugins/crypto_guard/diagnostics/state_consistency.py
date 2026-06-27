@@ -51,6 +51,10 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_closed_vt_still_processed(repo))
     issues.extend(_check_cursor_regression(repo))
     issues.extend(_check_illegal_status_transitions(repo))
+    issues.extend(_check_active_eval_missing_ga_decision_id(repo))
+    issues.extend(_check_paper_order_missing_active_eval(repo))
+    issues.extend(_check_closed_trade_missing_active_real_pnl(repo))
+    issues.extend(_check_shadow_candidate_legacy_only_samples(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -73,6 +77,10 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "closed_vt_still_processed": len([i for i in issues if i["type"] == "closed_vt_still_processed"]),
         "cursor_regression": len([i for i in issues if i["type"] == "cursor_regression"]),
         "illegal_status_transition": len([i for i in issues if i["type"] == "illegal_status_transition"]),
+        "active_eval_missing_ga_decision_id": len([i for i in issues if i["type"] == "active_eval_missing_ga_decision_id"]),
+        "paper_order_missing_active_eval": len([i for i in issues if i["type"] == "paper_order_missing_active_eval"]),
+        "closed_trade_missing_active_real_pnl": len([i for i in issues if i["type"] == "closed_trade_missing_active_real_pnl"]),
+        "shadow_candidate_legacy_only": len([i for i in issues if i["type"] == "shadow_candidate_legacy_only"]),
     }
 
     return {
@@ -1009,5 +1017,221 @@ def _check_illegal_status_transitions(repo: CryptoGuardRepository) -> list[dict[
             },
             "suggested_action": "Correct status to a legal value",
         })
+
+    return issues
+
+
+def _check_active_eval_missing_ga_decision_id(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: active evaluations (is_shadow=0) with NULL ga_decision_id.
+
+    Excludes legacy/duplicate/invalidated outcome_sources — those are pre-backfill
+    artifacts that will never receive real_pnl. Only flags evaluations that were
+    created through the current pipeline but are missing ga_decision_id (outcome_source
+    IS NULL or 'pending_outcome').
+    """
+    issues: list[dict[str, Any]] = []
+
+    # New-pipeline evals: outcome_source IS NULL or 'pending_outcome' but no ga_decision_id
+    new_pipeline = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS cnt, MIN(created_at) AS earliest, MAX(created_at) AS latest
+        FROM strategy_evaluations
+        WHERE is_shadow=0
+          AND ga_decision_id IS NULL
+          AND (outcome_source IS NULL OR outcome_source='pending_outcome')
+        """
+    ).fetchone()
+
+    if new_pipeline and new_pipeline["cnt"] > 0:
+        issues.append({
+            "type": "active_eval_missing_ga_decision_id",
+            "severity": "error",
+            "details": {
+                "count": new_pipeline["cnt"],
+                "earliest": new_pipeline["earliest"],
+                "latest": new_pipeline["latest"],
+                "category": "new_pipeline",
+            },
+            "suggested_action": (
+                "Investigate active evaluations with NULL ga_decision_id; "
+                "backfill ga_decision_id linkage from paper_orders if available"
+            ),
+        })
+
+    # Legacy evals: outcome_source IN ('legacy_fuzzy','duplicate','invalidated') — info only
+    legacy = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM strategy_evaluations
+        WHERE is_shadow=0
+          AND ga_decision_id IS NULL
+          AND outcome_source IN ('legacy_fuzzy', 'duplicate', 'invalidated')
+        """
+    ).fetchone()
+
+    if legacy and legacy["cnt"] > 0:
+        issues.append({
+            "type": "active_eval_missing_ga_decision_id",
+            "severity": "info",
+            "details": {
+                "count": legacy["cnt"],
+                "category": "legacy_artifact",
+            },
+            "suggested_action": (
+                "These are pre-backfill legacy evaluations. They do not block "
+                "the active PnL loop but represent historical data gaps."
+            ),
+        })
+
+    return issues
+
+
+def _check_paper_order_missing_active_eval(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: paper_orders with ga_decision_id that SHOULD have an active evaluation
+    but don't. Only checks orders that can produce meaningful outcomes:
+    open, pending, needs_recheck, closed (with valid non-duplicate_cleanup trade)."""
+    issues: list[dict[str, Any]] = []
+
+    rows = repo.conn.execute(
+        """
+        SELECT po.id AS order_id, po.ga_decision_id, po.symbol, po.status
+        FROM paper_orders po
+        WHERE po.ga_decision_id IS NOT NULL
+          AND po.status IN ('open', 'pending', 'needs_recheck')
+          AND NOT EXISTS (
+              SELECT 1 FROM strategy_evaluations se
+              WHERE se.ga_decision_id=po.ga_decision_id AND se.is_shadow=0
+          )
+        LIMIT 50
+        """
+    ).fetchall()
+
+    for row in rows:
+        issues.append({
+            "type": "paper_order_missing_active_eval",
+            "severity": "error",
+            "details": {
+                "order_id": row["order_id"],
+                "ga_decision_id": row["ga_decision_id"],
+                "symbol": row["symbol"],
+                "order_status": row["status"],
+            },
+            "suggested_action": (
+                "Investigate paper_orders missing an active evaluation; "
+                "create the evaluation via the normal trade pipeline if applicable"
+            ),
+        })
+
+    return issues
+
+
+def _check_closed_trade_missing_active_real_pnl(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: closed paper_trades with pnl_r should have an active evaluation
+    with outcome_source='real_pnl' and matching paper_trade_id.
+    Excludes close_reason='duplicate_cleanup'."""
+    issues: list[dict[str, Any]] = []
+
+    rows = repo.conn.execute(
+        """
+        SELECT pt.id AS trade_id, pt.order_id, pt.pnl_r, pt.close_reason,
+               po.ga_decision_id
+        FROM paper_trades pt
+        JOIN paper_orders po ON po.id=pt.order_id
+        WHERE pt.closed_at IS NOT NULL
+          AND pt.pnl_r IS NOT NULL
+          AND po.ga_decision_id IS NOT NULL
+          AND (pt.close_reason IS NULL OR pt.close_reason != 'duplicate_cleanup')
+          AND NOT EXISTS (
+              SELECT 1 FROM strategy_evaluations se
+              WHERE se.ga_decision_id=po.ga_decision_id
+                AND se.is_shadow=0
+                AND se.outcome_source='real_pnl'
+                AND se.paper_trade_id=pt.id
+          )
+        LIMIT 50
+        """
+    ).fetchall()
+
+    for row in rows:
+        issues.append({
+            "type": "closed_trade_missing_active_real_pnl",
+            "severity": "error",
+            "details": {
+                "trade_id": row["trade_id"],
+                "order_id": row["order_id"],
+                "ga_decision_id": row["ga_decision_id"],
+                "pnl_r": row["pnl_r"],
+                "close_reason": row["close_reason"],
+            },
+            "suggested_action": (
+                "Investigate closed trades missing a real_pnl active evaluation; "
+                "backfill the evaluation via the normal trade pipeline if applicable"
+            ),
+        })
+
+    return issues
+
+
+def _check_shadow_candidate_legacy_only_samples(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: shadow candidates whose evaluations are all legacy/duplicate/pseudo
+    with no real_pnl or executed_virtual_trade samples.
+
+    Only flags candidates created more than 24 hours ago to avoid false positives
+    on freshly created candidates that haven't had time to accumulate samples.
+    """
+    issues: list[dict[str, Any]] = []
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    candidates = repo.conn.execute(
+        """
+        SELECT sv.strategy_name, sv.version, sv.status, sv.created_at,
+               (SELECT COUNT(*) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name
+                  AND se.strategy_version=sv.version
+                  AND se.is_shadow=1) AS total_evals,
+               (SELECT COUNT(*) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name
+                  AND se.strategy_version=sv.version
+                  AND se.is_shadow=1
+                  AND se.outcome_source IN ('real_pnl', 'executed_virtual_trade')) AS real_samples,
+               (SELECT COUNT(*) FROM strategy_evaluations se
+                WHERE se.strategy_name=sv.strategy_name
+                  AND se.strategy_version=sv.version
+                  AND se.is_shadow=1
+                  AND se.outcome_source IN ('legacy_fuzzy', 'duplicate', 'invalidated')) AS legacy_samples
+        FROM strategy_versions sv
+        WHERE sv.status IN ('candidate', 'shadow_testing')
+          AND sv.created_at < ?
+        ORDER BY sv.created_at DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    for row in candidates:
+        total = int(row["total_evals"] or 0)
+        real = int(row["real_samples"] or 0)
+        legacy = int(row["legacy_samples"] or 0)
+
+        if total > 0 and real == 0 and legacy >= total * 0.5:
+            issues.append({
+                "type": "shadow_candidate_legacy_only",
+                "severity": "warning",
+                "details": {
+                    "strategy_name": row["strategy_name"],
+                    "version": row["version"],
+                    "status": row["status"],
+                    "total_evals": total,
+                    "real_samples": real,
+                    "legacy_samples": legacy,
+                    "created_at": row["created_at"],
+                },
+                "suggested_action": (
+                    "Candidate has no real_pnl or executed_virtual_trade samples "
+                    "and is >24h old. Consider soft-rejecting and creating a fresh "
+                    "candidate from the next trade review cycle, or wait for new "
+                    "samples if the service was recently restarted."
+                ),
+            })
 
     return issues
