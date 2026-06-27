@@ -743,3 +743,38 @@ New module paper/position_conflict_revalidator.py that turns passive position co
 ### Next Steps
 
 - None - task complete
+
+
+## Session 23: Breakeven Stop-Loss Idempotency — 9 Fixes + Production Recovery
+
+**Date**: 2026-06-27
+**Task**: Breakeven Stop-Loss Idempotency — 9 Fixes + Production Recovery
+**Branch**: `main`
+
+### Summary
+
+Fixed 5-layer idempotency defect causing 72 duplicate stop_loss_adjustment rows for paper order #1. Root causes: (1) breakeven check read initial_stop_loss instead of current stop_loss, (2) non-atomic SELECT-then-UPDATE in update_paper_order_stop_loss, (3) dual dispatch from _paper_loop + scheduler, (4) enqueue_job instead of enqueue_job_once, (5) alert_outbox dedupe_key unique index covering sent rows. Fixes: atomic conditional UPDATE with direction+status guards returning bool, pending-only outbox dedupe index, time-bucketed periodic alert keys, IntegrityError-safe enqueue_alert, marker-guarded one-shot migration, removed dead _paper_loop thread. Production DB recovered: 17 hourly_summary + 1 paper_order_filled rows restored from duplicate, 71 spurious stop_loss_adjustment rows soft-marked. 431 tests passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef2ea8c` | (see git log) |
+| `ebc9899` | (see git log) |
+| `efd3101` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
