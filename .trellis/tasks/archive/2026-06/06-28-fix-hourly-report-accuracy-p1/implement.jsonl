@@ -1,0 +1,1 @@
+{"file": "spec/backend/crypto-guard-conventions.md", "reason": "P0-1~P0-7, P1-8~P1-12 合约更新: batch_symbol_status 原子表、grade_with_hysteresis 签名、4H range conflict、is_valid_trade_plan、run_for_report fail-closed、可配置 batch gate timeout"}

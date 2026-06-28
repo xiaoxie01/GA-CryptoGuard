@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 24
+- **Total Sessions**: 25
 - **Last Active**: 2026-06-28
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~813 | Active |
+| `journal-1.md` | ~846 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 25 | 2026-06-28 | Fix hourly report accuracy: 15 review issues (P0-7, P1-5, P2-3) | `ba1a1a1` | `main` |
 | 24 | 2026-06-28 | Hourly report accuracy: batch gate, opportunity classification, deterministic text override, grade hysteresis | `3677a6f` | `main` |
 | 23 | 2026-06-27 | Breakeven Stop-Loss Idempotency — 9 Fixes + Production Recovery | `ef2ea8c`, `ebc9899`, `efd3101` | `main` |
 | 22 | 2026-06-22 | Session 22 - Position conflict revalidator for open paper trades | `84cb212` | `main` |

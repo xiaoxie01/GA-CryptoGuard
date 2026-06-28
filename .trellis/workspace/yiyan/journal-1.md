@@ -811,3 +811,36 @@ Implemented hourly report market accuracy fix: batch completion gate (analysis_b
 ### Next Steps
 
 - None - task complete
+
+
+## Session 25: Fix hourly report accuracy: 15 review issues (P0-7, P1-5, P2-3)
+
+**Date**: 2026-06-28
+**Task**: Fix hourly report accuracy: 15 review issues (P0-7, P1-5, P2-3)
+**Branch**: `main`
+
+### Summary
+
+Fixed 15 review issues from hourly report accuracy initial implementation. P0: migration ordering (before executescript), batch_symbol_status atomic detail table, batch auto-finish, skipped-pending status=pending, batch_id filter on decisions, precise incomplete detection, grade_with_hysteresis uses current_grade not confidence. P1: 4H range=conflict, rendered_summary preferred, expanded forbidden phrases + is_valid_trade_plan, 5 diagnostic false-positive fixes, configurable timeout. P2: age from analysis_time, abs() drawdown, SMC terminology. 505 tests pass. trellis-check found and fixed 4 additional bugs.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ba1a1a1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -1,0 +1,1 @@
+{"file": "spec/backend/crypto-guard-conventions.md", "reason": "验证合约 25.1~25.5 更新是否覆盖 batch_symbol_status、grade_hysteresis 签名变更、4H range conflict、is_valid_trade_plan"}
