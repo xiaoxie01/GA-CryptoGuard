@@ -192,6 +192,14 @@ CREATE TABLE IF NOT EXISTS analysis_batches (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time ON analysis_batches(status, analysis_time);
 
+CREATE TABLE IF NOT EXISTS batch_symbol_status (
+    batch_id  TEXT NOT NULL,
+    symbol    TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'pending',  -- 'completed' | 'failed' | 'pending'
+    updated_at TEXT,
+    PRIMARY KEY (batch_id, symbol)
+);
+
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,

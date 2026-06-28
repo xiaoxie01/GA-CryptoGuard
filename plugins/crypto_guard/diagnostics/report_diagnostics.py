@@ -43,7 +43,7 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     """
     issues: list[dict[str, Any]] = []
     issues.extend(_check_hourly_report_incomplete_batch(repo, batch_id))
-    issues.extend(_check_hourly_report_stale_decision(repo))
+    issues.extend(_check_hourly_report_stale_decision(repo, batch_id=batch_id))
     issues.extend(_check_executable_opportunity_without_trade_plan(repo))
     issues.extend(_check_executable_opportunity_risk_rejected(repo))
     issues.extend(_check_opportunity_below_confidence(repo))
@@ -74,11 +74,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
 
 
 def run_for_report(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
-    """Wrapper for render-time invocation; never raises."""
+    """Wrapper for render-time invocation; never raises.
+
+    P1-11e: returns ok=False on error (fail-closed).
+    """
     try:
         return diagnose_report_accuracy(repo, batch_id=batch_id)
-    except Exception as exc:  # pragma: no cover - defensive
-        return {"ok": True, "error": str(exc), "summary": {}, "total_issues": 0, "issues": []}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "summary": {}, "total_issues": 0, "issues": []}
 
 
 # ── issue codes omit "rate,"; for schema simplicity keep both forms documented. ──
@@ -92,12 +95,13 @@ def _issue(code: str, severity: str, details: dict[str, Any], action: str) -> di
 
 def _check_hourly_report_incomplete_batch(repo: CryptoGuardRepository, batch_id: str | None) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
+    # P0-6: also check batches that are not 'running' — a 'success' batch
+    # with pending symbols is still incomplete.
     rows = repo.conn.execute(
         """
         SELECT batch_id, primary_interval, analysis_time, status,
-               enabled_symbols_json, completed_symbols_json, failed_symbols_json
+               enabled_symbols_json
         FROM analysis_batches
-        WHERE status = 'running'
         ORDER BY started_at DESC
         LIMIT 10
         """
@@ -106,26 +110,47 @@ def _check_hourly_report_incomplete_batch(repo: CryptoGuardRepository, batch_id:
         bid = row["batch_id"] if row["batch_id"] else None
         if batch_id and bid != batch_id:
             continue
-        import json
         enabled = _json_list(row["enabled_symbols_json"])
-        completed = _json_list(row["completed_symbols_json"])
-        failed = _json_list(row["failed_symbols_json"])
-        missing = sorted(set(enabled) - set(completed) - set(failed))
-        if missing:
+        # P0-2/6: use batch_symbol_status for accurate counts
+        completed_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                (bid,),
+            ).fetchall()
+        ]
+        failed_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+                (bid,),
+            ).fetchall()
+        ]
+        pending_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+                (bid,),
+            ).fetchall()
+        ]
+        missing = sorted(set(enabled) - set(completed_syms) - set(failed_syms))
+        if missing or pending_syms:
             issues.append(_issue(
                 HOURLY_REPORT_INCOMPLETE_BATCH, "warning",
                 {
                     "batch_id": bid, "primary_interval": row["primary_interval"],
-                    "missing_symbols": missing, "failed_symbols": failed,
+                    "missing_symbols": missing, "failed_symbols": failed_syms,
+                    "pending_symbols": pending_syms,
                 },
-                "等待批次完成或超时；标记 incomplete 并列 missing/failed symbols",
+                "等待批次完成或超时；标记 incomplete 并列 missing/failed/pending symbols",
             ))
     return issues
 
 
-def _check_hourly_report_stale_decision(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+def _check_hourly_report_stale_decision(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> list[dict[str, Any]]:
     """Flag ga_decisions whose analysis_time is older than one analysis cycle
-    when the report renders them as fresh."""
+    when the report renders them as fresh.
+
+    P1-11a: only scan decisions matching the current report batch, not the
+    most recent 120 historical records.
+    """
     issues: list[dict[str, Any]] = []
     try:
         from plugins.crypto_guard.utils import latest_closed_close_time_ms, INTERVAL_MS, utc_ms
@@ -134,10 +159,20 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository) -> list[dic
     now_ms = utc_ms()
     cutoff = latest_closed_close_time_ms("15m", now_ms)
     span = INTERVAL_MS["15m"]
-    rows = repo.conn.execute(
-        "SELECT id, symbol, analysis_time, signal_grade, batch_id "
-        "FROM ga_decisions ORDER BY id DESC LIMIT 120"
-    ).fetchall()
+    # P1-11a: filter by batch_id if available; otherwise fall back to time window
+    if batch_id:
+        rows = repo.conn.execute(
+            "SELECT id, symbol, analysis_time, signal_grade, batch_id "
+            "FROM ga_decisions WHERE batch_id=? ORDER BY id DESC LIMIT 120",
+            (batch_id,),
+        ).fetchall()
+    else:
+        min_time = cutoff - span
+        rows = repo.conn.execute(
+            "SELECT id, symbol, analysis_time, signal_grade, batch_id "
+            "FROM ga_decisions WHERE analysis_time >= ? ORDER BY id DESC LIMIT 120",
+            (min_time,),
+        ).fetchall()
     for r in rows:
         at = int(r["analysis_time"] or 0)
         if at == 0:
@@ -161,6 +196,9 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository) -> list[dic
 
 
 def _check_executable_opportunity_without_trade_plan(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """P1-11b: Only flag decisions that claim create_paper_order or trade_plan_available
+    but lack a trade plan — other decisions (monitor_only, etc.) are expected
+    to not have one."""
     issues: list[dict[str, Any]] = []
     rows = repo.conn.execute(
         """
@@ -168,6 +206,7 @@ def _check_executable_opportunity_without_trade_plan(repo: CryptoGuardRepository
                trade_plan_json, risk_check_json
         FROM ga_decisions
         WHERE signal_grade IN ('S','A','B')
+          AND decision IN ('create_paper_order', 'trade_plan_available')
         ORDER BY id DESC LIMIT 120
         """
     ).fetchall()
@@ -187,12 +226,15 @@ def _check_executable_opportunity_without_trade_plan(repo: CryptoGuardRepository
 
 
 def _check_executable_opportunity_risk_rejected(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """P1-11b: Only flag decisions that claim create_paper_order or trade_plan_available
+    but risk_check failed — other decisions (monitor_only, etc.) already know."""
     issues: list[dict[str, Any]] = []
     rows = repo.conn.execute(
         """
         SELECT id, symbol, signal_grade, decision, risk_check_json
         FROM ga_decisions
         WHERE signal_grade IN ('S','A','B')
+          AND decision IN ('create_paper_order', 'trade_plan_available')
         ORDER BY id DESC LIMIT 120
         """
     ).fetchall()
@@ -311,13 +353,17 @@ def _check_excessive_grade_flip(repo: CryptoGuardRepository) -> list[dict[str, A
 
 def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
     """Flag symbol-level direction flips that lack a closed candle
-    breakthrough evidence in counter_evidence."""
+    breakthrough evidence.
+
+    P1-11c: also checks market_bias changes and smc_events (BOS/CHoCH) for
+    confirmation, not just counter_evidence.
+    """
     issues: list[dict[str, Any]] = []
     cutoff_ms = int((datetime.now(timezone.utc).timestamp() - 4 * 3600) * 1000)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, analysis_time, market_bias, counter_evidence_json,
-               trade_plan_json
+               trade_plan_json, evidence_json
         FROM ga_decisions
         WHERE analysis_time >= ?
         ORDER BY symbol, analysis_time ASC
@@ -331,19 +377,32 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
             "ts": int(r["analysis_time"]),
             "counter": _safe_json(r["counter_evidence_json"]) or [],
             "side": (_safe_json(r["trade_plan_json"]) or {}).get("side"),
+            "evidence": _safe_json(r["evidence_json"]) or [],
         })
     for symbol, seq in by_symbol.items():
         for prev, cur in zip(seq, seq[1:]):
             prev_side = prev.get("side") or _bias_side(prev.get("bias"))
             cur_side = cur.get("side") or _bias_side(cur.get("bias"))
             if prev_side and cur_side and prev_side != cur_side:
+                # P1-11c: check multiple confirmation sources
                 merged_counter = " ".join(str(x) for x in (cur["counter"] or []))
+                merged_evidence = " ".join(str(x) for x in (cur["evidence"] or []))
+                combined = merged_counter + " " + merged_evidence
                 closed_candle_signal = any(
-                    token in merged_counter
+                    token in combined
                     for token in ("收盘突破", "收盘跌破", "收盘站上", "收盘站回",
-                                  "closed candle", "closed_candle")
+                                  "closed candle", "closed_candle",
+                                  "BOS", "CHoCH", "Break of Structure",
+                                  "Change of Character")
                 )
-                if not closed_candle_signal:
+                # Also check market_bias change as confirmation
+                prev_bias = (prev.get("bias") or "").lower()
+                cur_bias = (cur.get("bias") or "").lower()
+                bias_flip_confirmed = (
+                    (prev_bias in ("bullish", "long", "多") and cur_bias in ("bearish", "short", "空"))
+                    or (prev_bias in ("bearish", "short", "空") and cur_bias in ("bullish", "long", "多"))
+                )
+                if not closed_candle_signal and not bias_flip_confirmed:
                     issues.append(_issue(
                         DIRECTION_FLIP_NO_CLOSED_CANDLE, "warning",
                         {
@@ -370,15 +429,19 @@ def _check_invalid_liquidity_sweep_semantics(repo: CryptoGuardRepository) -> lis
     ).fetchall()
     for r in rows:
         text = (r["final_summary"] or "")
-        # The known-good mapping: sell_side → bullish. Flag any human-readable
-        # text that pairs "sell_side" with bearish direction or "buy_side" with bullish.
-        if "sell_side" in text and ("向下" in text or "看空" in text or "bearish" in text.lower()):
+        # P1-11d: sell_side sweep sweeps low (price goes down) which is
+        # the NORMAL direction for a sell-side sweep. "向下" (downward)
+        # with sell_side is correct behavior — only flag explicit direction
+        # contradictions like "看空" (bearish conviction) with sell_side.
+        # Similarly, buy_side sweeps high ("向上" = upward) is normal —
+        # only flag "看多" (bullish conviction) with buy_side.
+        if "sell_side" in text and ("看空" in text or "bearish" in text.lower()):
             issues.append(_issue(
                 INVALID_LIQUIDITY_SWEEP, "warning",
                 {"decision_id": int(r["id"]), "symbol": r["symbol"], "snippet": text[:200]},
                 "sell_side liquidity sweep 应映射 bullish reclaim；勿反向解读",
             ))
-        elif "buy_side" in text and ("向上" in text or "看多" in text or "bullish" in text.lower()):
+        elif "buy_side" in text and ("看多" in text or "bullish" in text.lower()):
             issues.append(_issue(
                 INVALID_LIQUIDITY_SWEEP, "warning",
                 {"decision_id": int(r["id"]), "symbol": r["symbol"], "snippet": text[:200]},

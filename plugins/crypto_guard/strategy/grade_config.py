@@ -65,24 +65,30 @@ def is_paper_order_eligible(grade: str, confidence: float) -> bool:
 
 
 def grade_with_hysteresis(
-    current_score: float,
+    current_grade: str,
     previous_grade: str | None,
     *,
-    up_buffer: float = GRADE_UP_BUFFER,
     emergency_down: bool = False,
 ) -> tuple[str, str]:
     """Apply grade hysteresis against the previous decision's grade.
 
     Returns (effective_grade, reason). ``reason`` is empty when no clamp was
-    applied. Promotion requires the score to clear the new tier by an extra
-    ``up_buffer`` (default 0.02). Demotion within the same 4h window is dampened
-    to one tier unless ``emergency_down`` is True, in which case the raw score
-    grade is returned so genuine risk can drop the grade immediately.
+    applied. Promotion requires the new grade to be at least 2 tiers above
+    the previous grade (otherwise clamped to prev+1). Demotion within the
+    same 4h window is dampened to one tier unless ``emergency_down`` is True,
+    in which case the raw grade is returned so genuine risk can drop the
+    grade immediately.
+
+    P0-7 fix: ``current_grade`` is the actual signal_grade string (e.g. "B"),
+    NOT the confidence score. The caller must pass the real grade, not
+    re-derive it from confidence.
 
     The reason string is reported to the user / diagnostics audit so we never
     silently mask real risk changes.
     """
-    raw_grade = grade_from_score(current_score)
+    raw_grade = str(current_grade).upper() if current_grade else "D"
+    if raw_grade not in GRADE_ORDER:
+        raw_grade = grade_from_score(float(current_grade) if isinstance(current_grade, (int, float)) else 0.0)
     if not previous_grade or previous_grade not in GRADE_ORDER:
         return raw_grade, ""
 
@@ -91,11 +97,10 @@ def grade_with_hysteresis(
     reason = ""
 
     if raw_val > prev_val:
-        # promotion: require score to clear the new tier + buffer
-        new_threshold = GRADE_THRESHOLDS[raw_grade] + up_buffer
-        if current_score < new_threshold and not emergency_down:
+        # promotion: require at least 2-tier gap; otherwise stabilize at prev+1
+        if raw_val > prev_val + 1 and not emergency_down:
             stabilized = GRADE_BY_NUM[prev_val + 1] if prev_val + 1 in GRADE_BY_NUM else raw_grade
-            reason = f"评级升级迟滞：score={current_score:.4f} 未越过 {raw_grade} 上沿（含 +{up_buffer} 缓冲），暂保留 {stabilized}"
+            reason = f"评级升级迟滞：{previous_grade}→{raw_grade} 跨度超过 1 级，暂缓为 {stabilized}"
             return stabilized, reason
     elif raw_val < prev_val:
         if not emergency_down:

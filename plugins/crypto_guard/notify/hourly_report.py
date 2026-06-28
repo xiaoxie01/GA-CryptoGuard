@@ -56,7 +56,7 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     batch_state = _await_batch_completion(repo, primary_interval="15m")
     min_analysis_time = batch_state["min_analysis_time"]
     batches_reported = batch_state.get("batch_id")
-    ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time)
+    ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time, batch_id=batches_reported)
     signals = repo.latest_signals_by_symbol(limit=80)
     states = repo.latest_analysis_states(limit=120)
     open_orders = repo.list_open_paper_orders()
@@ -113,22 +113,19 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
     """Poll the latest analysis_batches row for the current 15m slot until the
     enabled symbols are accounted for or the timeout budget is exhausted.
 
-    Timeout and poll interval are configurable via scheduler.yaml under
-    ``hourly_report.batch_gate`` (see research 01/02).  When the batch is
-    not running (e.g. report invoked outside the cron minute) we still
-    anchor ``min_analysis_time`` to the previous 15m close so stale
-    decisions from earlier batches cannot bleed through.  Returns a dict
-    describing the batch state for renderer/diagnostics use.
+    P0-6: uses batch_symbol_status for precise counting regardless of batch status.
+    P1-12: timeout is configurable via HOURLY_REPORT_BATCH_GATE_TIMEOUT env var.
+
+    Returns a dict describing the batch state for renderer/diagnostics use.
     """
     cfg = _hourly_report_gate_config()
-    timeout_seconds = int(cfg.get("timeout_seconds", 300))  # default 5 minutes
+    env_timeout = os.environ.get("HOURLY_REPORT_BATCH_GATE_TIMEOUT")
+    timeout_seconds = int(env_timeout) if env_timeout else int(cfg.get("timeout_seconds", 300))
     poll_interval = float(cfg.get("poll_interval_seconds", 5))
     max_polls = max(1, int(timeout_seconds / max(poll_interval, 0.1)))
 
     cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
     span = INTERVAL_MS[primary_interval]
-    # min_analysis_time = previous 15m candle close_time so the renderer can
-    # also rely on it for the SQL filter even when no batch row exists.
     expected_batch_id = f"{primary_interval}:{cutoff_ms}"
 
     def _snapshot() -> dict[str, Any] | None:
@@ -139,7 +136,7 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
         row = repo.conn.execute(
             """
             SELECT batch_id, primary_interval, analysis_time, status,
-                   enabled_symbols_json, completed_symbols_json, failed_symbols_json
+                   enabled_symbols_json
             FROM analysis_batches
             WHERE primary_interval=? AND analysis_time >= ?
             ORDER BY analysis_time DESC, id DESC LIMIT 1
@@ -148,38 +145,47 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
         ).fetchone()
         if not row:
             return None
-        return {
-            "batch_id": row["batch_id"], "status": row["status"],
-            "enabled_symbols": _json_list(row["enabled_symbols_json"]),
-            "completed_symbols": _json_list(row["completed_symbols_json"]),
-            "failed_symbols": _json_list(row["failed_symbols_json"]),
-        }
+        # Use get_analysis_batch for consistent batch_symbol_status data
+        return repo.get_analysis_batch(row["batch_id"])
 
     snapshot = _snapshot()
     incomplete = False
     missing: list[str] = []
     failed: list[str] = []
     still_running: list[str] = []
+    pending_symbols: list[str] = []
     enabled_symbols: list[str] = []
     status = "absent"
+    completed_count = 0
+    total_count = 0
 
     if snapshot is not None:
         enabled_symbols = list(snapshot.get("enabled_symbols") or [])
-        completed = set(snapshot.get("completed_symbols") or [])
+        total_count = len(enabled_symbols)
+        # P0-6: use batch_symbol_status-derived lists (from get_analysis_batch)
+        completed_syms = list(snapshot.get("completed_symbols") or [])
         failed = list(snapshot.get("failed_symbols") or [])
+        pending_symbols = list(snapshot.get("pending_symbols") or [])
         status = str(snapshot.get("status") or "running")
-        missing = sorted(set(enabled_symbols) - completed - set(failed))
+        completed_count = len(completed_syms)
+        missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
+        # P0-6: incomplete if ANY pending symbols exist, regardless of batch status
+        incomplete = bool(missing or pending_symbols)
         if status == "running" and missing:
             for _ in range(max_polls):
                 snap2 = _snapshot()
                 if snap2 is None:
                     break
                 enabled_symbols = list(snap2.get("enabled_symbols") or enabled_symbols)
-                completed = set(snap2.get("completed_symbols") or [])
+                completed_syms = list(snap2.get("completed_symbols") or [])
                 failed = list(snap2.get("failed_symbols") or [])
+                pending_symbols = list(snap2.get("pending_symbols") or [])
                 status = str(snap2.get("status") or "running")
-                missing = sorted(set(enabled_symbols) - completed - set(failed))
+                completed_count = len(completed_syms)
+                total_count = len(enabled_symbols)
+                missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
                 still_running = sorted(missing)
+                incomplete = bool(missing or pending_symbols)
                 if not missing or status != "running":
                     break
                 _short_sleep(poll_interval)
@@ -187,25 +193,30 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
             snap3 = _snapshot()
             if snap3:
                 enabled_symbols = list(snap3.get("enabled_symbols") or enabled_symbols)
-                completed = set(snap3.get("completed_symbols") or [])
+                completed_syms = list(snap3.get("completed_symbols") or [])
                 failed = list(snap3.get("failed_symbols") or [])
+                pending_symbols = list(snap3.get("pending_symbols") or [])
                 status = str(snap3.get("status") or status)
-                missing = sorted(set(enabled_symbols) - completed - set(failed))
+                completed_count = len(completed_syms)
+                total_count = len(enabled_symbols)
+                missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
                 still_running = sorted(missing)
-            if missing:
-                incomplete = True
+                incomplete = bool(missing or pending_symbols)
 
     return {
         "batch_id": (snapshot or {}).get("batch_id") if snapshot else expected_batch_id,
         "primary_interval": primary_interval,
         "analysis_time": cutoff_ms,
-        "min_analysis_time": cutoff_ms - span + 1,  # start of expected batch slot
+        "min_analysis_time": cutoff_ms - span + 1,
         "status": status,
         "incomplete": incomplete,
         "enabled_symbols": enabled_symbols,
         "missing_symbols": missing,
         "failed_symbols": failed,
         "still_running": still_running,
+        "pending_symbols": pending_symbols,
+        "completed_count": completed_count,
+        "total_count": total_count,
         "timeout_seconds": timeout_seconds,
     }
 
@@ -337,7 +348,9 @@ def render_ga_hourly_summary(
         if risk_state.get("daily_loss_pause"):
             risk_status.append("daily_loss_pause")
         if risk_status:
-            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {risk_state.get('drawdown_pct', 0):.1f}%）")
+            # P2-14: drawdown display as non-negative amplitude
+            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
         else:
             lines.append("- 风险状态：正常")
 
@@ -991,7 +1004,9 @@ def render_hourly_report_text(
         if risk_state.get("daily_loss_pause"):
             risk_status.append("daily_loss_pause")
         if risk_status:
-            lines.append(f"- **风险状态：{', '.join(risk_status)}**（回撤 {risk_state.get('drawdown_pct', 0):.1f}%）")
+            # P2-14: drawdown display as non-negative amplitude
+            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+            lines.append(f"- **风险状态：{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
         else:
             lines.append("- 风险状态：正常")
 
@@ -1211,6 +1226,10 @@ def _count(repo: CryptoGuardRepository, sql: str) -> int:
 def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
     raw = _safe_json(row.get("raw_decision_json"), {})
     trade_plan = _safe_json(row.get("trade_plan_json"), {})
+    # P1-9: prefer rendered_summary, fallback to final_summary
+    rendered_summary = row.get("rendered_summary")
+    final_summary = row.get("final_summary")
+    summary_to_use = rendered_summary if rendered_summary else final_summary
     return {
         "ga_decision_id": row.get("id"),
         "symbol": row.get("symbol"),
@@ -1220,7 +1239,8 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "confidence": row.get("confidence"),
         "market_bias": row.get("market_bias"),
         "trend_stage": row.get("trend_stage"),
-        "final_summary": row.get("final_summary"),
+        "final_summary": summary_to_use,
+        "rendered_summary": rendered_summary,
         "risk_check": _safe_json(row.get("risk_check_json"), {}),
         "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
         "trade_plan": trade_plan,
@@ -1255,6 +1275,7 @@ def _opportunity_classifier(row: dict[str, Any]) -> dict[str, Any]:
             trade_plan = json.loads(trade_plan)
         except Exception:
             trade_plan = {}
+    from plugins.crypto_guard.notify.report_consistency import is_valid_trade_plan
     decision = str(row.get("decision") or "")
     blockers: list[str] = []
 
@@ -1263,7 +1284,7 @@ def _opportunity_classifier(row: dict[str, Any]) -> dict[str, Any]:
 
     if confidence < MIN_CONFIDENCE_FOR_PAPER_ORDER:
         blockers.append(f"confidence<{MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}")
-    if not trade_plan:
+    if not is_valid_trade_plan(trade_plan):
         blockers.append("missing_trade_plan")
     if not bool(risk_check.get("ok")):
         blockers.append("risk_check_failed")
@@ -1298,8 +1319,11 @@ def _format_opportunity_row(
     decision_text = _decision_text(row.get("decision"))
     analysis_time = int(row.get("analysis_time") or 0)
     created_at = row.get("created_at")
+    # P2-13: age based on analysis_time (market time), not created_at (DB insert time)
     age_min = ""
-    if created_at:
+    if analysis_time > 0:
+        age_min = f"{int((utc_ms() - analysis_time) / 60000)}m"
+    elif created_at:
         try:
             parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
             age_min = f"{int((utc_ms() - int(parsed.timestamp() * 1000)) / 60000)}m"

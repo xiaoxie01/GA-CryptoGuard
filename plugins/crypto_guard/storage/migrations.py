@@ -23,8 +23,13 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         # dirty DB has duplicate pending rows, the executescript would fail.
         # Dedup first, then apply schema. The migration is table-guarded so it
         # is a no-op on a fresh DB.
+        # P0-1: Run hourly_report_accuracy migration BEFORE executescript so that
+        # _add_column(batch_id, previous_grade, rendered_summary) completes before
+        # schema.sql tries CREATE INDEX ON ga_decisions(batch_id).  Old DBs that
+        # lack the column would otherwise crash with OperationalError.
         _apply_stop_loss_adjustment_dedup(conn)
         _ensure_profit_protection_cutoff_marker(conn)
+        _apply_hourly_report_accuracy_migration(conn)
         with SCHEMA_PATH.open("r", encoding="utf-8") as f:
             conn.executescript(f.read())
         _apply_phase_01_02_migrations(conn)
@@ -42,7 +47,6 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_legacy_fuzzy_migration(conn)
         _apply_phase_shadow_vt_v2_migration(conn)
         _apply_candidate_cap_cleanup(conn)
-        _apply_hourly_report_accuracy_migration(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -1312,16 +1316,25 @@ def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
     - New analysis_batches table tracks scheduler analysis batch identity and
       per-symbol completion state, enabling the hourly report batch
       completion gate.
-    - Idempotent: ALTER TABLE is guarded by _add_column; CREATE TABLE is
-      guarded by IF NOT EXISTS.
+    - New batch_symbol_status table replaces JSON columns for atomic per-symbol
+      completion tracking (P0-2: concurrent write safety).
+    - Idempotent: ALTER TABLE is guarded by _add_column (which checks PRAGMA
+      table_info first); CREATE TABLE is guarded by IF NOT EXISTS. Also guards
+      that ga_decisions table exists before trying ALTER TABLE (called before
+      executescript on fresh DBs).
     """
-    _add_column(conn, "ga_decisions", "batch_id", "TEXT")
-    _add_column(conn, "ga_decisions", "previous_grade", "TEXT")
-    _add_column(conn, "ga_decisions", "rendered_summary", "TEXT")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_ga_decisions_batch "
-        "ON ga_decisions(batch_id) WHERE batch_id IS NOT NULL"
-    )
+    # Guard: ga_decisions must exist before we ALTER it.
+    ga_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ga_decisions'"
+    ).fetchone()
+    if ga_table:
+        _add_column(conn, "ga_decisions", "batch_id", "TEXT")
+        _add_column(conn, "ga_decisions", "previous_grade", "TEXT")
+        _add_column(conn, "ga_decisions", "rendered_summary", "TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ga_decisions_batch "
+            "ON ga_decisions(batch_id) WHERE batch_id IS NOT NULL"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS analysis_batches (
@@ -1344,6 +1357,60 @@ def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time "
         "ON analysis_batches(status, analysis_time)"
     )
+    # P0-2: batch_symbol_status for atomic per-symbol completion tracking
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS batch_symbol_status (
+            batch_id  TEXT NOT NULL,
+            symbol    TEXT NOT NULL,
+            status    TEXT NOT NULL DEFAULT 'pending',
+            updated_at TEXT,
+            PRIMARY KEY (batch_id, symbol)
+        )
+        """
+    )
+    # One-shot migration: populate batch_symbol_status from existing JSON columns
+    _migrate_batch_json_to_symbol_status(conn)
+
+
+def _migrate_batch_json_to_symbol_status(conn: sqlite3.Connection) -> None:
+    """One-shot migration: populate batch_symbol_status from existing JSON columns.
+
+    Reads completed_symbols_json and failed_symbols_json from each analysis_batches
+    row and inserts them into batch_symbol_status. Idempotent: rows with existing
+    batch_id+symbol pairs are skipped via INSERT OR IGNORE.
+    """
+    # Check if there's any data to migrate
+    rows = conn.execute(
+        "SELECT batch_id, completed_symbols_json, failed_symbols_json FROM analysis_batches"
+    ).fetchall()
+    for row in rows:
+        bid = row["batch_id"]
+        completed = _json_list_from_raw(row["completed_symbols_json"])
+        failed = _json_list_from_raw(row["failed_symbols_json"])
+        for sym in completed:
+            conn.execute(
+                "INSERT OR IGNORE INTO batch_symbol_status(batch_id, symbol, status, updated_at) VALUES (?, ?, 'completed', CURRENT_TIMESTAMP)",
+                (bid, sym),
+            )
+        for sym in failed:
+            conn.execute(
+                "INSERT OR IGNORE INTO batch_symbol_status(batch_id, symbol, status, updated_at) VALUES (?, ?, 'failed', CURRENT_TIMESTAMP)",
+                (bid, sym),
+            )
+    if rows:
+        conn.commit()
+
+
+def _json_list_from_raw(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        import json as _json
+        data = _json.loads(raw) if isinstance(raw, str) else raw
+        return list(data) if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -1390,7 +1457,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
     ]
 
     # Required tables
-    required_tables = ["analysis_batches"]
+    required_tables = ["analysis_batches", "batch_symbol_status"]
 
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []

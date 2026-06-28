@@ -10,7 +10,7 @@ def analyze_smc(candles: list[dict[str, Any]], price_action: dict[str, Any], *, 
     prior_high = max(float(c["high"]) for c in candles[-8:-1])
     prior_low = min(float(c["low"]) for c in candles[-8:-1])
     # SMC mapping (do not reverse): a sweep of swing lows takes sell-side
-    # liquidity (resting buy-stops below the prior low) and a subsequent
+    # liquidity (resting sell-stops (long stop-loss orders) below the prior low) and a subsequent
     # reclaim above that low is a bullish reversal. Symmetrically, taking
     # buy-side liquidity above the prior high with a close-back below it is
     # bearish. See research/07-liquidity-sweep-semantics.md.

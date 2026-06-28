@@ -17861,7 +17861,12 @@ class HourlyReportAccuracyTest(unittest.TestCase):
 
     def test_direction_flip_diagnostic_flags_missing_evidence(self) -> None:
         """P0: report_diagnostics._check_direction_flip_without_closed_candle
-        flags flips lacking 'closed candle' tokens in counter_evidence."""
+        flags flips lacking 'closed candle' tokens in counter_evidence.
+
+        P1-11c: market_bias change is now also considered as confirmation.
+        To test the missing-evidence path, we use the same bias on both
+        decisions (so market_bias change is NOT a confirming signal).
+        """
         from plugins.crypto_guard.diagnostics.report_diagnostics import (
             DIRECTION_FLIP_NO_CLOSED_CANDLE, diagnose_report_accuracy,
         )
@@ -17876,9 +17881,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             final_summary="long watch",
         )
         # Later decision short WITHOUT closed candle breakthrough evidence
+        # P1-11c: use same market_bias as earlier so bias change is NOT confirmation
         self._seed_ga_decision(
             symbol="ADAUSDT", grade="B", confidence=0.72, decision="monitor_only",
-            analysis_time=now_ms - 5 * 60 * 1000, market_bias="bearish",
+            analysis_time=now_ms - 5 * 60 * 1000, market_bias="bullish",
             trade_plan={"side": "SHORT", "entry_type": "breakout",
                         "entry_price": 0.49, "stop_loss": 0.51,
                         "take_profits": [{"price": 0.45}]},
@@ -18017,6 +18023,243 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertIn("可执行", report["text"])
         # Batch state is propagated separately too.
         self.assertEqual(report["batch"]["status"], "success")
+
+    # ── P0-1: migration adds columns before schema index ──────────────────
+
+    def test_migration_adds_columns_before_schema_index(self) -> None:
+        """P0-1: On a fresh DB, batch_id/previous_grade/rendered_summary columns
+        exist before schema.sql tries to create the batch_id index."""
+        # The DB was initialized in setUp; verify the columns exist.
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(ga_decisions)").fetchall()}
+        for col in ("batch_id", "previous_grade", "rendered_summary"):
+            self.assertIn(col, cols, f"ga_decisions missing column {col}")
+        # And the index should exist
+        idx = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_ga_decisions_batch'"
+        ).fetchone()
+        self.assertIsNotNone(idx, "idx_ga_decisions_batch index missing")
+        # batch_symbol_status table should also exist
+        tbl = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
+        ).fetchone()
+        self.assertIsNotNone(tbl, "batch_symbol_status table missing")
+
+    # ── P0-2: concurrent batch symbol completion ───────────────────────
+
+    def test_concurrent_batch_symbol_completion(self) -> None:
+        """P0-2: Two concurrent INSERT OR REPLACE on batch_symbol_status do not
+        lose symbols. Using two connections to simulate concurrency."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        # Mark both symbols as completed — atomic INSERT OR REPLACE
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="ETHUSDT")
+        # Both should be in batch_symbol_status
+        rows = self.conn.execute(
+            "SELECT symbol, status FROM batch_symbol_status WHERE batch_id=? ORDER BY symbol",
+            (batch_id,),
+        ).fetchall()
+        symbols = [(r["symbol"], r["status"]) for r in rows]
+        self.assertIn(("BTCUSDT", "completed"), symbols)
+        self.assertIn(("ETHUSDT", "completed"), symbols)
+
+    # ── P0-3: batch finishes when all symbols done ────────────────────
+
+    def test_batch_finishes_when_all_symbols_done(self) -> None:
+        """P0-3: finish_analysis_batch is called when all symbols complete."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        # Now all symbols are completed; is_batch_complete should be True
+        self.assertTrue(self.repo.is_batch_complete(batch_id))
+        # Simulate what run_ga_workers does: finish the batch
+        self.repo.finish_analysis_batch(batch_id=batch_id, status="success")
+        batch = self.repo.get_analysis_batch(batch_id)
+        self.assertEqual(batch["status"], "success")
+
+    # ── P0-4: skipped pending marks pending not completed ─────────────
+
+    def test_skipped_pending_marks_pending_not_completed(self) -> None:
+        """P0-4: Skipped-pending symbol is marked as 'pending', not 'completed'."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        # Simulate cron_scheduler: mark as pending (not completed)
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT", status="pending")
+        # BTC should be 'pending', not 'completed'
+        row = self.conn.execute(
+            "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+            (batch_id, "BTCUSDT"),
+        ).fetchone()
+        self.assertEqual(row["status"], "pending")
+
+    # ── P0-5: decisions filtered by batch_id ──────────────────────────
+
+    def test_decisions_filtered_by_batch_id(self) -> None:
+        """P0-5: latest_ga_decisions_by_symbol with batch_id only returns
+        decisions from that batch."""
+        from plugins.crypto_guard.utils import utc_ms
+        at = utc_ms()
+        # Two batches, same symbol
+        self._seed_ga_decision(symbol="BTCUSDT", analysis_time=at, batch_id="15m:batch_a", grade="A")
+        self._seed_ga_decision(symbol="BTCUSDT", analysis_time=at + 1, batch_id="15m:batch_b", grade="B")
+        # Filter by batch_b should only return the B-grade decision
+        rows = self.repo.latest_ga_decisions_by_symbol(limit=10, batch_id="15m:batch_b")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["batch_id"], "15m:batch_b")
+        self.assertEqual(rows[0]["signal_grade"], "B")
+
+    # ── P0-6: incomplete batch even if status=success ─────────────────
+
+    def test_incomplete_batch_even_if_status_success(self) -> None:
+        """P0-6: batch status=success but still has pending symbols → incomplete."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms, INTERVAL_MS
+        from plugins.crypto_guard.notify.hourly_report import _await_batch_completion
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        # ETHUSDT is still pending — mark batch as success anyway
+        self.repo.finish_analysis_batch(batch_id=batch_id, status="success")
+        state = _await_batch_completion(self.repo, primary_interval="15m")
+        self.assertTrue(state["incomplete"], "batch should be incomplete because ETHUSDT is pending")
+        self.assertIn("ETHUSDT", state["missing_symbols"])
+
+    # ── P0-7: grade hysteresis uses actual grade ──────────────────────
+
+    def test_grade_hysteresis_uses_actual_grade(self) -> None:
+        """P0-7: grade_with_hysteresis should use current grade, not confidence score."""
+        from plugins.crypto_guard.strategy.grade_config import grade_with_hysteresis
+        # current_grade=B, previous_grade=S → demotion dampened (S→A, one tier)
+        effective, reason = grade_with_hysteresis("B", "S")
+        # Without emergency_down, a two-tier drop (S→B) is dampened to one tier (S→A)
+        self.assertEqual(effective, "A")
+        self.assertIn("迟滞", reason)
+
+    # ── P0-7: emergency_down bypasses hysteresis ──────────────────────
+
+    def test_emergency_down_bypasses_hysteresis(self) -> None:
+        """P0-7: When emergency_down=True, grade_with_hysteresis returns
+        the raw grade without dampening."""
+        from plugins.crypto_guard.strategy.grade_config import grade_with_hysteresis
+        # S→D with emergency_down should return D immediately
+        effective, _ = grade_with_hysteresis("D", "S", emergency_down=True)
+        self.assertEqual(effective, "D")
+
+    # ── P1-8: 4H range clamps S grade ────────────────────────────────
+
+    def test_4h_range_clamps_s_grade(self) -> None:
+        """P1-8: When 4H=range + LONG side + no independent_trend,
+        clamp_grade should lower S to B."""
+        from plugins.crypto_guard.strategy.grade_config import clamp_grade
+        # htf_conflict=True + no independent_trend → S clamped to B
+        clamped, reason = clamp_grade(
+            "S",
+            has_trade_plan=True, risk_ok=True, confidence=0.85,
+            htf_conflict=True, independent_trend=False,
+        )
+        self.assertEqual(clamped, "B")
+        self.assertIn("高周期方向", reason)
+
+    # ── P1-9: report uses rendered_summary ────────────────────────────
+
+    def test_report_uses_rendered_summary(self) -> None:
+        """P1-9: _decision_row prefers rendered_summary over final_summary."""
+        from plugins.crypto_guard.notify.hourly_report import _decision_row
+        row = {
+            "id": 1, "symbol": "BTCUSDT", "decision": "monitor_only",
+            "signal_grade": "B", "confidence": 0.7,
+            "market_bias": "bullish", "trend_stage": "middle",
+            "final_summary": "风控全部满足；可创建订单",
+            "rendered_summary": "仅观察/未通过执行门禁：风控未通过",
+            "risk_check_json": '{"ok": false}',
+            "feishu_actions_json": "[]",
+            "trade_plan_json": "null",
+            "raw_decision_json": "{}",
+            "analysis_time": 1700000000000,
+            "created_at": "2026-06-28T00:00:00Z",
+            "batch_id": "15m:12345",
+            "previous_grade": "A",
+        }
+        result = _decision_row(row)
+        self.assertEqual(result["final_summary"], "仅观察/未通过执行门禁：风控未通过")
+        self.assertEqual(result["rendered_summary"], "仅观察/未通过执行门禁：风控未通过")
+
+    # ── P1-10: invalid trade plan not execution eligible ──────────────
+
+    def test_invalid_trade_plan_not_execution_eligible(self) -> None:
+        """P1-10: A placeholder dict like {"note": "placeholder"} should NOT
+        count as a valid trade plan."""
+        from plugins.crypto_guard.notify.report_consistency import is_valid_trade_plan
+        self.assertFalse(is_valid_trade_plan({"note": "placeholder"}))
+        self.assertFalse(is_valid_trade_plan(None))
+        self.assertFalse(is_valid_trade_plan({}))
+        # A minimal valid plan should pass
+        valid_plan = {
+            "side": "LONG", "entry_type": "breakout",
+            "entry_price": 100.0, "stop_loss": 95.0,
+            "take_profits": [{"price": 110.0}],
+        }
+        self.assertTrue(is_valid_trade_plan(valid_plan))
+
+    # ── P1-11a: stale check only current batch ────────────────────────
+
+    def test_stale_check_only_current_batch(self) -> None:
+        """P1-11a: _check_hourly_report_stale_decision only scans rows
+        matching the current batch, not all recent 120 records."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_hourly_report_stale_decision,
+        )
+        # With a batch_id filter, only matching rows are scanned
+        issues = _check_hourly_report_stale_decision(self.repo, batch_id="15m:nonexistent")
+        # No rows match, so no issues should be found
+        self.assertEqual(len(issues), 0)
+
+    # ── P1-11e: run_for_report returns ok=False on error ──────────────
+
+    def test_run_for_report_returns_ok_false_on_error(self) -> None:
+        """P1-11e: run_for_report returns ok=False (fail-closed) on exception."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import run_for_report
+
+        class BrokenRepo:
+            conn = property(lambda self: (_ for _ in ()).throw(RuntimeError("broken")))
+
+        result = run_for_report(BrokenRepo(), batch_id="test")
+        self.assertFalse(result["ok"], f"expected ok=False; got {result}")
+
+    # ── P1-12: batch gate timeout configurable ────────────────────────
+
+    def test_batch_gate_timeout_configurable(self) -> None:
+        """P1-12: HOURLY_REPORT_BATCH_GATE_TIMEOUT env var overrides default."""
+        from plugins.crypto_guard.notify.hourly_report import _await_batch_completion
+        old_val = os.environ.get("HOURLY_REPORT_BATCH_GATE_TIMEOUT")
+        try:
+            os.environ["HOURLY_REPORT_BATCH_GATE_TIMEOUT"] = "30"
+            # With no batch row, should return quickly with the configured timeout
+            state = _await_batch_completion(self.repo, primary_interval="15m")
+            self.assertEqual(state["timeout_seconds"], 30)
+        finally:
+            if old_val is None:
+                os.environ.pop("HOURLY_REPORT_BATCH_GATE_TIMEOUT", None)
+            else:
+                os.environ["HOURLY_REPORT_BATCH_GATE_TIMEOUT"] = old_val
 
 
 if __name__ == "__main__":

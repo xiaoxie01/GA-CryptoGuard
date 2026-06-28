@@ -319,12 +319,16 @@ class CryptoGuardRepository:
                 item[key] = default
         return item
 
-    def latest_ga_decisions_by_symbol(self, limit: int = 80, *, min_analysis_time: int | None = None) -> list[dict[str, Any]]:
+    def latest_ga_decisions_by_symbol(self, limit: int = 80, *, min_analysis_time: int | None = None, batch_id: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []
-        where = ""
+        conds: list[str] = []
         if min_analysis_time is not None:
-            where = "WHERE analysis_time >= ?"
+            conds.append("analysis_time >= ?")
             params.append(int(min_analysis_time))
+        if batch_id is not None:
+            conds.append("batch_id = ?")
+            params.append(batch_id)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
         rows = self.conn.execute(
             f"""
             SELECT gd.*
@@ -377,33 +381,16 @@ class CryptoGuardRepository:
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
-    def mark_batch_symbol_completed(self, *, batch_id: str, symbol: str, failed: bool = False) -> None:
-        """Append ``symbol`` to completed/failed list on its batch row."""
-        row = self.conn.execute(
-            "SELECT id, completed_symbols_json, failed_symbols_json FROM analysis_batches WHERE batch_id=?",
-            (batch_id,),
-        ).fetchone()
-        if not row:
-            return
-        try:
-            completed = set(json.loads(row["completed_symbols_json"] or "[]"))
-            failed_syms = set(json.loads(row["failed_symbols_json"] or "[]"))
-        except Exception:
-            completed, failed_syms = set(), set()
-        if failed:
-            failed_syms.add(symbol)
-        else:
-            completed.add(symbol)
-        # also drop from failed if it later completed
-        if not failed:
-            failed_syms.discard(symbol)
+    def mark_batch_symbol_completed(self, *, batch_id: str, symbol: str, failed: bool = False, status: str | None = None) -> None:
+        """Mark a symbol as completed/failed/pending for a batch.
+
+        Uses atomic INSERT OR REPLACE on batch_symbol_status (P0-2: concurrent safety).
+        If *status* is given it takes precedence; otherwise derived from *failed*.
+        """
+        final_status = status if status is not None else ("failed" if failed else "completed")
         self.conn.execute(
-            "UPDATE analysis_batches SET completed_symbols_json=?, failed_symbols_json=? WHERE id=?",
-            (
-                json.dumps(sorted(completed), ensure_ascii=False),
-                json.dumps(sorted(failed_syms), ensure_ascii=False),
-                int(row["id"]),
-            ),
+            "INSERT OR REPLACE INTO batch_symbol_status(batch_id, symbol, status, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (batch_id, symbol, final_status),
         )
 
     def finish_analysis_batch(self, *, batch_id: str, status: str = "success", summary: dict[str, Any] | None = None) -> None:
@@ -414,6 +401,48 @@ class CryptoGuardRepository:
             """,
             (status, json.dumps(summary, ensure_ascii=False) if summary is not None else None, batch_id),
         )
+
+    def is_batch_complete(self, batch_id: str) -> bool:
+        """Return True if all enabled symbols have been processed (no pending
+        and no missing symbols) for the given batch.
+
+        Checks both that there are no pending rows AND that the total count
+        in batch_symbol_status matches the enabled_symbols count. A symbol
+        that was never registered in batch_symbol_status is still missing.
+        """
+        pending_row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+            (batch_id,),
+        ).fetchone()
+        if int(pending_row["cnt"]) > 0:
+            return False
+        # Also verify all enabled symbols are accounted for
+        batch = self.get_analysis_batch(batch_id)
+        if not batch:
+            return False
+        enabled = set(batch.get("enabled_symbols") or [])
+        if not enabled:
+            return True
+        # Get all symbols registered in batch_symbol_status for this batch
+        registered_rows = self.conn.execute(
+            "SELECT DISTINCT symbol FROM batch_symbol_status WHERE batch_id=?",
+            (batch_id,),
+        ).fetchall()
+        registered = {r["symbol"] for r in registered_rows}
+        return enabled.issubset(registered)
+
+    def batch_symbol_counts(self, batch_id: str) -> dict[str, int]:
+        """Return {completed, failed, pending} counts for a batch from batch_symbol_status."""
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM batch_symbol_status WHERE batch_id=? GROUP BY status",
+            (batch_id,),
+        ).fetchall()
+        counts = {"completed": 0, "failed": 0, "pending": 0}
+        for r in rows:
+            key = str(r["status"])
+            if key in counts:
+                counts[key] = int(r["cnt"])
+        return counts
 
     def get_analysis_batch(self, batch_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -428,6 +457,22 @@ class CryptoGuardRepository:
                 item[key] = json.loads(item.get(col) or "[]")
             except Exception:
                 item[key] = []
+        # P0-2: also populate from batch_symbol_status for accurate counts
+        completed_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+            (batch_id,),
+        ).fetchall()
+        failed_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+            (batch_id,),
+        ).fetchall()
+        pending_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+            (batch_id,),
+        ).fetchall()
+        item["completed_symbols"] = [r["symbol"] for r in completed_rows]
+        item["failed_symbols"] = [r["symbol"] for r in failed_rows]
+        item["pending_symbols"] = [r["symbol"] for r in pending_rows]
         return item
 
     def latest_analysis_batch_id(self, primary_interval: str) -> str | None:

@@ -399,10 +399,14 @@ class GAMasterController:
         legacy["previous_grade"] = previous_grade if previous_grade else legacy.get("previous_grade")
 
         # Grade hysteresis (research 10): apply against previous grade
+        # P0-7: pass the actual signal_grade, not confidence score
         prev_for_hys = legacy.get("previous_grade") or previous_grade
         if prev_for_hys:
+            # Determine emergency_down from risk state
+            emergency_down = bool(legacy.get("hard_risk_off") or legacy.get("daily_loss_pause"))
             effective_grade, hys_reason = grade_with_hysteresis(
-                float(legacy.get("confidence") or 0.0), prev_for_hys,
+                legacy.get("signal_grade") or "D", prev_for_hys,
+                emergency_down=emergency_down,
             )
             if effective_grade != legacy.get("signal_grade"):
                 legacy["signal_grade"] = effective_grade
@@ -425,14 +429,19 @@ class GAMasterController:
         if hasattr(risk, "get"):
             pass  # risk is a dict
         # Determine HTF conflict for clamp (low-cost heuristic from snapshot)
+        # P1-8: 4H range/transition/unknown also creates conflict unless independent_trend
         htf_conflict = False
         independent_trend = bool(((legacy.get("market_regime_gate") or {}).get("adjustments") or {}).get("regime_alignment") == "independent_trend")
         if legacy.get("trade_plan") and risk.get("ok", False):
             side = str((legacy.get("trade_plan") or {}).get("side") or "").upper()
             htf_structure = str(((snapshot.get("profiles") or {}).get("4h") or {}).get("market_structure") or "unknown").lower()
-            if side == "LONG" and htf_structure not in {"bullish", "transition", "range", "unknown", ""}:
+            # P1-8: Only bullish/bearish are non-conflicting. Everything else (range,
+            # transition, unknown, empty) means the 4H has not confirmed direction.
+            allowed_long = {"bullish"} if not independent_trend else {"bullish", "transition", "range", "unknown", ""}
+            allowed_short = {"bearish"} if not independent_trend else {"bearish", "transition", "range", "unknown", ""}
+            if side == "LONG" and htf_structure not in allowed_long:
                 htf_conflict = True
-            elif side == "SHORT" and htf_structure not in {"bearish", "transition", "range", "unknown", ""}:
+            elif side == "SHORT" and htf_structure not in allowed_short:
                 htf_conflict = True
         clamped_grade, clamp_reason = clamp_grade(
             legacy.get("signal_grade") or "D",

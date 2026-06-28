@@ -1386,7 +1386,7 @@ event_time = format_event_time_cst(payload.get("event_time"))
 
 ### Contract 25.1: Batch completion gate — report MUST wait for all symbols
 
-**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol is tracked as `completed` or `failed`. The report renderer MUST poll until all enabled symbols are resolved or a timeout (default 300s) is reached. Incomplete reports are marked with `incomplete=true`.
+**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol's status is tracked atomically in `batch_symbol_status` (independent detail table, not JSON columns). The report renderer MUST poll until all enabled symbols are resolved or a configurable timeout (default 300s, override via `HOURLY_REPORT_BATCH_GATE_TIMEOUT` env var). Incomplete reports are marked with `incomplete=true`.
 
 **Why**: Without a batch gate, the report could render mid-cycle — some symbols had fresh decisions while others still showed stale rows from the previous cycle. This produced "phantom opportunities" that no longer existed.
 
@@ -1394,30 +1394,56 @@ event_time = format_event_time_cst(payload.get("event_time"))
 ```python
 # repository.py
 def start_analysis_batch(self, batch_id, primary_interval, analysis_time, enabled_symbols) -> None:
-def mark_batch_symbol_completed(self, batch_id, symbol) -> None:
-def mark_batch_symbol_failed(self, batch_id, symbol) -> None:
+def mark_batch_symbol_completed(self, batch_id, symbol, *, status="completed", failed=False) -> None:
+    # Atomic INSERT OR REPLACE into batch_symbol_status
+    # status: "completed" | "failed" | "pending" (for skipped-pending dedup)
 def finish_analysis_batch(self, batch_id) -> None:
+    # Called automatically by run_ga_workers when is_batch_complete=True
+def is_batch_complete(self, batch_id) -> bool:
+    # Checks: all enabled_symbols registered + no status='pending' rows remaining
+def batch_symbol_counts(self, batch_id) -> dict:
+    # Returns {completed: N, failed: N, pending: N, total: N}
 def get_analysis_batch(self, batch_id) -> dict | None:
-def latest_analysis_batch_id(self, primary_interval) -> str | None:
+    # Populates completed/pending/failed counts from batch_symbol_status
+def latest_ga_decisions_by_symbol(self, *, batch_id=None, min_analysis_time=None) -> dict:
+    # When batch_id given, adds WHERE batch_id=? to SQL
 
 # hourly_report.py
-def _await_batch_completion(repo, batch_id, *, timeout_seconds=300) -> dict:
-    """Polls analysis_batches until all symbols completed/failed or timeout.
-    Returns {complete: bool, incomplete: bool, missing_symbols: [...]}"""
+def _await_batch_completion(repo, batch_id, *, timeout_seconds=None) -> dict:
+    """Polls batch_symbol_status until all symbols resolved or timeout.
+    Returns {complete, incomplete, completed_count, total_count, pending_symbols, ...}"""
 ```
 
-**Scheduler wiring**: `enqueue_market_analysis` in `cron_scheduler.py` creates the batch row. `run_ga_workers.py` marks each symbol completed/failed on job resolution. When a symbol is skipped (already pending), `mark_batch_symbol_completed` is called immediately to prevent the batch from hanging in "running" state forever.
+**Scheduler wiring**: `enqueue_market_analysis` in `cron_scheduler.py` creates the batch row + inserts `batch_symbol_status` rows for each enabled symbol (status="pending"). `run_ga_workers.py` marks each symbol completed/failed on job resolution, then checks `is_batch_complete` and calls `finish_analysis_batch`. When a symbol is skipped (already pending), `mark_batch_symbol_completed(batch_id, symbol, status="pending")` marks it as pending (not completed) — the existing job will change it to completed/failed when it resolves.
 
-**Database**: `analysis_batches` table with columns `batch_id, primary_interval, analysis_time, status, enabled_symbols_json, completed_symbols_json, failed_symbols_json, started_at, completed_at`. `ga_decisions` references `batch_id`.
+**Database**:
+- `analysis_batches` table: `batch_id, primary_interval, analysis_time, status, enabled_symbols_json, started_at, finished_at`. No JSON status columns (completed/failed/pending tracked in detail table).
+- `batch_symbol_status` table: `batch_id TEXT, symbol TEXT, status TEXT DEFAULT 'pending', updated_at TEXT, PRIMARY KEY (batch_id, symbol)`. This is the single source of truth for per-symbol completion state. Atomic `INSERT OR REPLACE` prevents concurrent write loss.
+
+**Migration**: `_apply_hourly_report_accuracy_migration` runs BEFORE `executescript(schema.sql)` to add `batch_id/previous_grade/rendered_summary` columns and create `batch_symbol_status` table on old databases. `_migrate_batch_json_to_symbol_status` populates the new table from existing JSON columns. Schema indexes use `IF NOT EXISTS`.
 
 **Forbidden**:
 ```python
-# WRONG: Render report without checking batch completion
-decisions = repo.latest_ga_decisions_by_symbol()
+# WRONG: Read-modify-write JSON for batch completion (concurrent loss)
+completed = json.loads(row["completed_symbols_json"])
+completed.add(symbol)
+conn.execute("UPDATE ... SET completed_symbols_json=?", json.dumps(completed))
 
-# CORRECT: Wait for batch, then filter
-batch_state = _await_batch_completion(repo, batch_id)
+# CORRECT: Atomic INSERT OR REPLACE on detail table
+conn.execute("INSERT OR REPLACE INTO batch_symbol_status (batch_id, symbol, status, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)", ...)
+
+# WRONG: Mark skipped-pending as completed (analysis hasn't finished)
+mark_batch_symbol_completed(batch_id, symbol)  # default status="completed"
+
+# CORRECT: Mark as pending (existing job will resolve it later)
+mark_batch_symbol_completed(batch_id, symbol, status="pending")
+
+# WRONG: Render report without batch_id filter (may mix batches)
 decisions = repo.latest_ga_decisions_by_symbol(min_analysis_time=analysis_time)
+
+# CORRECT: Filter by batch_id for precise report content
+batch_state = _await_batch_completion(repo, batch_id)
+decisions = repo.latest_ga_decisions_by_symbol(batch_id=batch_id, min_analysis_time=analysis_time)
 ```
 
 ---
@@ -1435,7 +1461,7 @@ decisions = repo.latest_ga_decisions_by_symbol(min_analysis_time=analysis_time)
 ```python
 def _opportunity_classifier(decision: dict) -> str:
     """Returns 'executable_opportunity', 'observation_candidate', or 'no_edge'."""
-    from plugins.crypto_guard.notify.report_consistency import execution_eligible
+    from plugins.crypto_guard.notify.report_consistency import execution_eligible, is_valid_trade_plan
     grade = str(decision.get("signal_grade") or "").upper()
     if grade in {"S", "A", "B"}:
         if execution_eligible(decision) and not _is_stale_decision(decision):
@@ -1443,6 +1469,8 @@ def _opportunity_classifier(decision: dict) -> str:
         return "observation_candidate"
     return "no_edge"
 ```
+
+**Trade plan validation**: `is_valid_trade_plan(plan)` checks that the plan dict contains required fields: `side`, `entry_type`, `entry_price` or `trigger_price`, `stop_loss`, `take_profit` or `take_profits`. A placeholder dict like `{"note": "no plan"}` returns False. Used in both `execution_eligible` and `_opportunity_classifier`.
 
 **Staleness check**: A decision is stale if `analysis_time` is older than one analysis cycle (15m) from the report's batch `analysis_time`.
 
@@ -1462,15 +1490,17 @@ FORBIDDEN_EXECUTABLE_PHRASES: tuple[str, ...] = (
     "具备模拟盘条件", "具备模拟盘做多条件", "具备模拟盘做空条件",
     "风控全部满足", "风控指标全部满足",
     "可创建订单", "风控通过", "存在可执行",
+    "建议设置 limit", "建议设置 trigger",
+    "建议做多", "建议做空", "可开仓", "可入场",
 )
 ```
 
-**Override clause**: When phrases are stripped, `仅观察/未通过执行门禁：{gate_blockers}` is appended once, where `_gate_blockers` lists the specific failing conditions (missing trade_plan, risk reasons, low confidence).
+**Override clause**: When phrases are stripped, `仅观察/未通过执行门禁：{gate_blockers}` is appended once, where `_gate_blockers` lists the specific failing conditions (invalid trade_plan, risk reasons, low confidence). `_gate_blockers` uses `is_valid_trade_plan` for plan validity, not just `bool(has_trade_plan)`.
 
 **Integration points**:
 1. `controller.py analyze_symbol()` — applies `rewrite_inconsistent_summary` before persistence
 2. `llm_agent_judge.py _normalize_llm_decision` — applies for non-LLM path
-3. `hourly_report.py render_ga_hourly_summary` — double-check at render time
+3. `hourly_report.py render_ga_hourly_summary` — double-check at render time; `_decision_row` prefers `rendered_summary` over `final_summary`
 
 **Forbidden**:
 ```python
@@ -1489,19 +1519,24 @@ from plugins.crypto_guard.notify.report_consistency import FORBIDDEN_EXECUTABLE_
 
 ### Contract 25.4: Grade hysteresis — dampen wild grade swings between cycles
 
-**What**: `grade_with_hysteresis` in `strategy/grade_config.py` dampens large single-cycle grade jumps. When `grade_delta >= GRADE_UP_BUFFER` (default 2, e.g. D→S), the grade is clamped to one step above the previous grade (D→C instead of D→S). `clamp_grade` prevents S-grade when 4H=range/transition without `independent_trend` evidence, and limits counter_evidence items to `SA_MAX_COUNTER_EVIDENCE` (default 3).
+**What**: `grade_with_hysteresis` in `strategy/grade_config.py` dampens large single-cycle grade jumps. It accepts the current grade (string, not numeric score) and the previous grade. When the grade delta is ≥ 2 tiers, the grade is clamped to one step above/below the previous grade. `emergency_down=True` bypasses hysteresis for genuine risk events (hard_risk_off, daily_loss_pause). `clamp_grade` prevents S/A-grade when 4H structure is range/transition/unknown without `independent_trend` evidence, and limits counter_evidence items to `SA_MAX_COUNTER_EVIDENCE` (default 3).
 
-**Why**: An S→D→S oscillation within two cycles indicates instability, not a genuine signal change. Hysteresis prevents whipsaw-induced false opportunities from entering the executable tier.
+**Why**: An S→D→S oscillation within two cycles indicates instability, not a genuine signal change. Hysteresis prevents whipsaw-induced false opportunities from entering the executable tier. Without `emergency_down`, real risk deterioration could be masked by hysteresis dampening.
 
 **Signatures**:
 ```python
-def grade_with_hysteresis(current_grade: str, previous_grade: str | None) -> str:
-    """Dampen large jumps. D→S becomes D→C; S→D becomes S→B."""
+def grade_with_hysteresis(current_grade: str, previous_grade: str | None, *,
+                          emergency_down: bool = False) -> tuple[str, str]:
+    """Dampen large jumps. D→S becomes D→C; S→D becomes S→B.
+    emergency_down=True: bypass hysteresis (for hard_risk_off/daily_loss_pause)."""
 
-def clamp_grade(grade: str, market_bias_4h: str | None,
-                counter_evidence: list | None,
-                independent_trend: bool | None) -> str:
-    """Prevent S when 4H=range/transition without independent_trend.
+def clamp_grade(grade: str, *,
+                has_trade_plan: bool, risk_ok: bool,
+                confidence: float | None = None,
+                htf_conflict: bool = False,
+                independent_trend: bool = False,
+                counter_evidence_count: int = 0) -> tuple[str, str]:
+    """Prevent S/A when 4H=range/transition/unknown without independent_trend.
     Cap counter_evidence to SA_MAX_COUNTER_EVIDENCE items."""
 
 def grade_delta(current: str, previous: str | None) -> int:
@@ -1510,32 +1545,36 @@ def grade_delta(current: str, previous: str | None) -> int:
 
 **Previous grade source**: `previous_ga_decision_grade(exclude_batch_id=)` skips current batch decisions to avoid same-batch contamination. The controller passes `exclude_batch_id=request.batch_id`.
 
+**emergency_down activation**: In `controller.py`, when `risk_check.hard_risk_off` or `risk_check.daily_loss_pause` is True, `emergency_down=True` is passed to `grade_with_hysteresis`. This allows immediate downgrade without hysteresis dampening.
+
+**4H conflict**: When 4H market structure is `range`, `transition`, `unknown`, or empty, `htf_conflict=True` unless `independent_trend` is True. Only `bullish` is non-conflicting for LONG, only `bearish` for SHORT. This prevents S-grade on unconfirmed higher-timeframe direction.
+
 **Database**: `ga_decisions.previous_grade` column stores the grade used for hysteresis calculation.
 
 ---
 
 ### Contract 25.5: Report diagnostics — 10 P2 checks for accuracy
 
-**What**: `diagnose_report_accuracy(repo)` in `diagnostics/report_diagnostics.py` runs 10 checks covering the known issue categories. It returns the standard `{ok, issues, summary, total_issues}` shape so it can be merged into `diagnose_state_consistency` output or rendered standalone.
+**What**: `diagnose_report_accuracy(repo, *, batch_id=None)` in `diagnostics/report_diagnostics.py` runs 10 checks covering the known issue categories. It returns the standard `{ok, issues, summary, total_issues}` shape so it can be merged into `diagnose_state_consistency` output or rendered standalone.
 
 **Issue codes**:
 | Code | Severity | What it checks |
 |------|----------|---------------|
-| `hourly_report_incomplete_batch` | warning | Running batches with missing symbols |
-| `hourly_report_stale_decision` | warning | Decisions older than one 15m cycle |
-| `executable_opportunity_without_trade_plan` | warning | S/A/B grade missing trade_plan |
-| `executable_opportunity_risk_rejected` | warning | S/A/B grade with risk_check=false |
+| `hourly_report_incomplete_batch` | warning | Batches with pending symbols (uses `batch_symbol_status`, not JSON columns; checks all statuses, not just running) |
+| `hourly_report_stale_decision` | warning | Decisions older than one 15m cycle (scoped to `batch_id` when provided) |
+| `executable_opportunity_without_trade_plan` | warning | S/A/B grade + `create_paper_order`/`trade_plan_available` decision missing trade_plan |
+| `executable_opportunity_risk_rejected` | warning | S/A/B grade + `create_paper_order`/`trade_plan_available` decision with risk_check=false |
 | `opportunity_below_confidence_threshold` | warning | S/A/B grade below min_confidence |
 | `summary_execution_state_conflict` | error | Forbidden phrases in summary despite gate failure |
 | `excessive_grade_flip` | warning | S/A→D/C within 4 hours |
-| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence |
-| `invalid_liquidity_sweep_semantics` | warning | sell_side paired with bearish or buy_side with bullish |
+| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence OR market_bias/BOS/CHoCH confirmation |
+| `invalid_liquidity_sweep_semantics` | warning | sell_side paired with explicit bearish belief words ("看空"/"bearish"), or buy_side with explicit bullish belief words ("看多"/"bullish"). Neutral direction words like "向下"/"向上" are NOT flagged. |
 | `negative_drawdown_display` | warning | Positive drawdown_percent when equity shows loss |
 
-**Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use.
+**Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use. On exception, returns `ok=False` (fail-closed, not fail-open).
 
 **Drawdown sign convention**: Internal `_drawdown_percent` returns negative values for losses. External display must be non-negative (e.g. "回撤 0.50%"). The diagnostic uses `initial_balance` from `paper_accounts` for relative comparison, not a hardcoded threshold.
 
 ---
 
-**Last updated**: 2026-06-28 (P0: Hourly report accuracy — batch completion gate, opportunity classification, deterministic text override, grade hysteresis, report diagnostics)
+**Last updated**: 2026-06-28 (P0: Hourly report accuracy — batch_symbol_status atomic table, grade_hysteresis signature fix, 4H range conflict, is_valid_trade_plan, diagnostics false-positive fixes, migration ordering)

@@ -63,12 +63,18 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
             if batch_id:
                 try:
                     repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"])
+                    # P0-3: finish the batch when all symbols are done
+                    if repo.is_batch_complete(batch_id):
+                        repo.finish_analysis_batch(batch_id=batch_id, status="success")
                 except Exception:
                     LOGGER.warning("mark_batch_symbol_completed failed batch=%s symbol=%s", batch_id, snapshot["symbol"])
         except Exception as analysis_exc:
             if batch_id:
                 try:
                     repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"], failed=True)
+                    # P0-3: finish the batch when all symbols are done
+                    if repo.is_batch_complete(batch_id):
+                        repo.finish_analysis_batch(batch_id=batch_id, status="success")
                 except Exception:
                     pass
             raise

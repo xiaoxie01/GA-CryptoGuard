@@ -111,9 +111,9 @@ def enqueue_market_analysis(
             if pending:
                 skipped_pending += 1
                 # The symbol already has a pending/running job for this tick;
-                # mark it completed in the batch so the completion gate doesn't
-                # wait forever for a job that was already queued earlier.
-                repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol)
+                # P0-4: mark it as 'pending' (not 'completed') in batch_symbol_status
+                # so _await_batch_completion won't count it as completed.
+                repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol, status="pending")
                 continue
             snapshot = build_market_state_snapshot(repo, symbol=symbol, analysis_time_utc=analysis_time, mode=mode, timeframes=timeframes)
             snapshot_id = repo.save_market_snapshot(snapshot)
