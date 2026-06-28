@@ -64,8 +64,15 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                 try:
                     repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"])
                     # P0-3: finish the batch when all symbols are done
+                    # P1-4 (Round 3): check for failed symbols to set correct batch status
                     if repo.is_batch_complete(batch_id):
-                        repo.finish_analysis_batch(batch_id=batch_id, status="success")
+                        if repo.batch_all_failed(batch_id):
+                            batch_status = "failed"
+                        elif repo.batch_has_failures(batch_id):
+                            batch_status = "partial_failed"
+                        else:
+                            batch_status = "success"
+                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
                 except Exception:
                     LOGGER.warning("mark_batch_symbol_completed failed batch=%s symbol=%s", batch_id, snapshot["symbol"])
         except Exception as analysis_exc:
@@ -73,8 +80,15 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                 try:
                     repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"], failed=True)
                     # P0-3: finish the batch when all symbols are done
+                    # P1-4 (Round 3): check for failed symbols to set correct batch status
                     if repo.is_batch_complete(batch_id):
-                        repo.finish_analysis_batch(batch_id=batch_id, status="success")
+                        if repo.batch_all_failed(batch_id):
+                            batch_status = "failed"
+                        elif repo.batch_has_failures(batch_id):
+                            batch_status = "partial_failed"
+                        else:
+                            batch_status = "success"
+                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
                 except Exception:
                     pass
             raise
@@ -236,7 +250,11 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
         return result
     if job_type == "hourly_feishu_report":
-        report = build_hourly_report(repo)
+        retry_count = int(payload.get("retry_count") or 0)
+        report = build_hourly_report(repo, retry_count=retry_count)
+        if report.get("error") == "batch_incomplete_requeued":
+            LOGGER.info("hourly_feishu_report requeued retry=%s batch=%s", report.get("retry_count"), report.get("batch_id"))
+            return report
         target = resolve_report_target(repo, payload)
         if target and send_message:
             sent_result = send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=report["text"], alert_type="hourly_summary", priority=3)
@@ -695,7 +713,7 @@ def handle_paper_drawdown_alert(repo: CryptoGuardRepository, payload: dict[str, 
             f"- 账户权益：{float(snapshot.get('account_equity') or 0):.2f}",
             f"- 已实现盈亏：{float(snapshot.get('realized_pnl') or 0):.2f}",
             f"- 未实现盈亏：{float(snapshot.get('unrealized_pnl') or 0):.2f}",
-            f"- 回撤：{float(snapshot.get('drawdown_percent') or 0):.2f}%",
+            f"- 回撤：{abs(float(snapshot.get('drawdown_percent') or 0)):.2f}%",
             "",
             "不构成实盘建议，仅用于模拟盘与策略研究。",
         ]

@@ -1358,12 +1358,13 @@ def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
         "ON analysis_batches(status, analysis_time)"
     )
     # P0-2: batch_symbol_status for atomic per-symbol completion tracking
+    # P2-10 (Round 3): CHECK constraint on status column
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS batch_symbol_status (
             batch_id  TEXT NOT NULL,
             symbol    TEXT NOT NULL,
-            status    TEXT NOT NULL DEFAULT 'pending',
+            status    TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
             updated_at TEXT,
             PRIMARY KEY (batch_id, symbol)
         )

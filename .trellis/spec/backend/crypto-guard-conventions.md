@@ -1386,7 +1386,7 @@ event_time = format_event_time_cst(payload.get("event_time"))
 
 ### Contract 25.1: Batch completion gate — report MUST wait for all symbols
 
-**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol's status is tracked atomically in `batch_symbol_status` (independent detail table, not JSON columns). The report renderer MUST poll until all enabled symbols are resolved or a configurable timeout (default 300s, override via `HOURLY_REPORT_BATCH_GATE_TIMEOUT` env var). Incomplete reports are marked with `incomplete=true`.
+**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol's status is tracked atomically in `batch_symbol_status` (independent detail table, not JSON columns). The report renderer takes a single snapshot; if the batch is incomplete, the hourly report job is re-enqueued with a 30-second delay (up to 12 retries = 6 minutes max). After max retries, the report renders with `incomplete=true`. **The worker never polls or sleeps** — it returns instantly and re-enqueues.
 
 **Why**: Without a batch gate, the report could render mid-cycle — some symbols had fresh decisions while others still showed stale rows from the previous cycle. This produced "phantom opportunities" that no longer existed.
 
@@ -1409,9 +1409,10 @@ def latest_ga_decisions_by_symbol(self, *, batch_id=None, min_analysis_time=None
     # When batch_id given, adds WHERE batch_id=? to SQL
 
 # hourly_report.py
-def _await_batch_completion(repo, batch_id, *, timeout_seconds=None) -> dict:
-    """Polls batch_symbol_status until all symbols resolved or timeout.
-    Returns {complete, incomplete, completed_count, total_count, pending_symbols, ...}"""
+def _await_batch_completion(repo, *, primary_interval: str = "15m") -> dict:
+    """Single snapshot of batch state — NO polling, NO sleep.
+    Returns {complete, incomplete, completed_count, total_count, pending_symbols, ...}
+    Caller (build_hourly_report) re-enqueues if incomplete."""
 ```
 
 **Scheduler wiring**: `enqueue_market_analysis` in `cron_scheduler.py` creates the batch row + inserts `batch_symbol_status` rows for each enabled symbol (status="pending"). `run_ga_workers.py` marks each symbol completed/failed on job resolution, then checks `is_batch_complete` and calls `finish_analysis_batch`. When a symbol is skipped (already pending), `mark_batch_symbol_completed(batch_id, symbol, status="pending")` marks it as pending (not completed) — the existing job will change it to completed/failed when it resolves.
@@ -1545,7 +1546,7 @@ def grade_delta(current: str, previous: str | None) -> int:
 
 **Previous grade source**: `previous_ga_decision_grade(exclude_batch_id=)` skips current batch decisions to avoid same-batch contamination. The controller passes `exclude_batch_id=request.batch_id`.
 
-**emergency_down activation**: In `controller.py`, when `risk_check.hard_risk_off` or `risk_check.daily_loss_pause` is True, `emergency_down=True` is passed to `grade_with_hysteresis`. This allows immediate downgrade without hysteresis dampening.
+**emergency_down activation**: `risk_gate.check()` runs BEFORE `grade_with_hysteresis`. When the risk gate result's `account_risk.hard_risk_off` or `account_risk.daily_loss_pause` is True, `emergency_down=True` is passed to `grade_with_hysteresis`. This allows immediate downgrade without hysteresis dampening.
 
 **4H conflict**: When 4H market structure is `range`, `transition`, `unknown`, or empty, `htf_conflict=True` unless `independent_trend` is True. Only `bullish` is non-conflicting for LONG, only `bearish` for SHORT. This prevents S-grade on unconfirmed higher-timeframe direction.
 
@@ -1567,14 +1568,14 @@ def grade_delta(current: str, previous: str | None) -> int:
 | `opportunity_below_confidence_threshold` | warning | S/A/B grade below min_confidence |
 | `summary_execution_state_conflict` | error | Forbidden phrases in summary despite gate failure |
 | `excessive_grade_flip` | warning | S/A→D/C within 4 hours |
-| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence OR market_bias/BOS/CHoCH confirmation |
+| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence or BOS/CHoCH structural confirmation (market_bias flip alone is NOT confirmation) |
 | `invalid_liquidity_sweep_semantics` | warning | sell_side paired with explicit bearish belief words ("看空"/"bearish"), or buy_side with explicit bullish belief words ("看多"/"bullish"). Neutral direction words like "向下"/"向上" are NOT flagged. |
 | `negative_drawdown_display` | warning | Positive drawdown_percent when equity shows loss |
 
-**Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use. On exception, returns `ok=False` (fail-closed, not fail-open).
+**Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use. On exception, returns `ok=False` (fail-closed, not fail-open). `_check_summary_execution_state_conflict` uses `is_valid_trade_plan()` for trade plan validation, not simple dict non-empty check.
 
 **Drawdown sign convention**: Internal `_drawdown_percent` returns negative values for losses. External display must be non-negative (e.g. "回撤 0.50%"). The diagnostic uses `initial_balance` from `paper_accounts` for relative comparison, not a hardcoded threshold.
 
 ---
 
-**Last updated**: 2026-06-28 (P0: Hourly report accuracy — batch_symbol_status atomic table, grade_hysteresis signature fix, 4H range conflict, is_valid_trade_plan, diagnostics false-positive fixes, migration ordering)
+**Last updated**: 2026-06-28 (P0: Hourly report accuracy R3 — re-enqueue instead of polling, ROW_NUMBER window query, risk_gate before hysteresis, deterministic summary generation, batch status three-way logic)

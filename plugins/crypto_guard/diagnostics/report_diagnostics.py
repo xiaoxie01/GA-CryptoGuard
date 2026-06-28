@@ -281,7 +281,7 @@ def _check_opportunity_below_confidence(repo: CryptoGuardRepository) -> list[dic
 
 
 def _check_summary_execution_state_conflict(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    from plugins.crypto_guard.notify.report_consistency import FORBIDDEN_EXECUTABLE_PHRASES
+    from plugins.crypto_guard.notify.report_consistency import FORBIDDEN_EXECUTABLE_PHRASES, is_valid_trade_plan
     issues: list[dict[str, Any]] = []
     rows = repo.conn.execute(
         """
@@ -294,7 +294,8 @@ def _check_summary_execution_state_conflict(repo: CryptoGuardRepository) -> list
     for r in rows:
         risk = _safe_json(r["risk_check_json"]) or {}
         plan = _safe_json(r["trade_plan_json"])
-        plan_ok = isinstance(plan, dict) and bool(plan)
+        # P1-7 (Round 3): use is_valid_trade_plan instead of simple truthiness
+        plan_ok = is_valid_trade_plan(plan)
         risk_ok = bool(isinstance(risk, dict) and risk.get("ok"))
         if risk_ok and plan_ok:
             continue
@@ -355,8 +356,12 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
     """Flag symbol-level direction flips that lack a closed candle
     breakthrough evidence.
 
-    P1-11c: also checks market_bias changes and smc_events (BOS/CHoCH) for
+    P1-11c: also checks counter_evidence and evidence (BOS/CHoCH) for
     confirmation, not just counter_evidence.
+
+    P1-6 (Round 3): market_bias flip is the TRIGGER (the flip happened)
+    but NOT the CONFIRMATION (the flip was structurally justified).
+    Only closed-candle tokens and BOS/CHoCH events count as confirmation.
     """
     issues: list[dict[str, Any]] = []
     cutoff_ms = int((datetime.now(timezone.utc).timestamp() - 4 * 3600) * 1000)
@@ -385,24 +390,19 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
             cur_side = cur.get("side") or _bias_side(cur.get("bias"))
             if prev_side and cur_side and prev_side != cur_side:
                 # P1-11c: check multiple confirmation sources
+                # P1-6 (Round 3): market_bias flip is NOT confirmation.
+                # Only closed-candle tokens and BOS/CHoCH events count.
                 merged_counter = " ".join(str(x) for x in (cur["counter"] or []))
                 merged_evidence = " ".join(str(x) for x in (cur["evidence"] or []))
                 combined = merged_counter + " " + merged_evidence
-                closed_candle_signal = any(
+                structural_confirmation = any(
                     token in combined
                     for token in ("收盘突破", "收盘跌破", "收盘站上", "收盘站回",
                                   "closed candle", "closed_candle",
                                   "BOS", "CHoCH", "Break of Structure",
                                   "Change of Character")
                 )
-                # Also check market_bias change as confirmation
-                prev_bias = (prev.get("bias") or "").lower()
-                cur_bias = (cur.get("bias") or "").lower()
-                bias_flip_confirmed = (
-                    (prev_bias in ("bullish", "long", "多") and cur_bias in ("bearish", "short", "空"))
-                    or (prev_bias in ("bearish", "short", "空") and cur_bias in ("bullish", "long", "多"))
-                )
-                if not closed_candle_signal and not bias_flip_confirmed:
+                if not structural_confirmation:
                     issues.append(_issue(
                         DIRECTION_FLIP_NO_CLOSED_CANDLE, "warning",
                         {

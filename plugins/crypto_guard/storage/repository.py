@@ -323,23 +323,22 @@ class CryptoGuardRepository:
         params: list[Any] = []
         conds: list[str] = []
         if min_analysis_time is not None:
-            conds.append("analysis_time >= ?")
+            conds.append("gd.analysis_time >= ?")
             params.append(int(min_analysis_time))
         if batch_id is not None:
-            conds.append("batch_id = ?")
+            conds.append("gd.batch_id = ?")
             params.append(batch_id)
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
         rows = self.conn.execute(
             f"""
-            SELECT gd.*
-            FROM ga_decisions gd
-            JOIN (
-                SELECT symbol, MAX(analysis_time) AS max_time
-                FROM ga_decisions
+            SELECT * FROM (
+                SELECT gd.*, ROW_NUMBER() OVER (
+                    PARTITION BY gd.symbol ORDER BY gd.analysis_time DESC, gd.id DESC
+                ) AS rn
+                FROM ga_decisions gd
                 {where}
-                GROUP BY symbol
-            ) latest ON latest.symbol=gd.symbol AND latest.max_time=gd.analysis_time
-            ORDER BY gd.analysis_time DESC, gd.id DESC
+            ) sub WHERE rn = 1
+            ORDER BY analysis_time DESC, id DESC
             LIMIT ?
             """,
             params + [int(limit)],
@@ -443,6 +442,24 @@ class CryptoGuardRepository:
             if key in counts:
                 counts[key] = int(r["cnt"])
         return counts
+
+    def batch_has_failures(self, batch_id: str) -> bool:
+        """Return True if any symbol in batch_symbol_status has status='failed'."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+            (batch_id,),
+        ).fetchone()
+        return int(row["cnt"]) > 0
+
+    def batch_all_failed(self, batch_id: str) -> bool:
+        """Return True if ALL symbols in batch_symbol_status have status='failed'."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_cnt FROM batch_symbol_status WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        total = int(row["total"]) if row else 0
+        failed_cnt = int(row["failed_cnt"]) if row else 0
+        return total > 0 and failed_cnt == total
 
     def get_analysis_batch(self, batch_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

@@ -398,12 +398,19 @@ class GAMasterController:
         legacy["batch_id"] = request.batch_id
         legacy["previous_grade"] = previous_grade if previous_grade else legacy.get("previous_grade")
 
+        # P0-3 (Round 3): run risk_gate FIRST so emergency_down can use
+        # the account_risk result (hard_risk_off / daily_loss_pause).
+        risk = self.risk_gate.check(legacy, context)
+        legacy["risk_check"] = risk
+
         # Grade hysteresis (research 10): apply against previous grade
         # P0-7: pass the actual signal_grade, not confidence score
         prev_for_hys = legacy.get("previous_grade") or previous_grade
         if prev_for_hys:
-            # Determine emergency_down from risk state
-            emergency_down = bool(legacy.get("hard_risk_off") or legacy.get("daily_loss_pause"))
+            # P0-3 (Round 3): compute emergency_down from risk gate result,
+            # not from legacy (which never has hard_risk_off before risk gate runs).
+            account_risk = risk.get("account_risk") or {}
+            emergency_down = bool(account_risk.get("hard_risk_off") or account_risk.get("daily_loss_pause"))
             effective_grade, hys_reason = grade_with_hysteresis(
                 legacy.get("signal_grade") or "D", prev_for_hys,
                 emergency_down=emergency_down,
@@ -414,9 +421,6 @@ class GAMasterController:
                 if hys_reason:
                     notes.append(hys_reason)
                 legacy["risk_notes"] = notes
-
-        risk = self.risk_gate.check(legacy, context)
-        legacy["risk_check"] = risk
         if legacy.get("has_trade_plan") and legacy.get("trade_plan") and not risk.get("ok"):
             legacy["has_trade_plan"] = False
             legacy["decision"] = "monitor_only"

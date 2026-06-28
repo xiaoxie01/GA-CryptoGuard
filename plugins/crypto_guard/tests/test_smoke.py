@@ -382,7 +382,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(call.called)
         self.assertEqual(decision["analysis_source"], "llm_agent")
         self.assertEqual(decision["llm_status"], "ok")
-        self.assertIn("没有可执行机会", decision["summary"])
+        # P1-8 (Round 3): non-executable decisions get deterministic "[观察]" summary
+        self.assertIn("[观察]", decision["summary"])
 
     def test_llm_opportunity_watch_bidirectional_is_normalized(self) -> None:
         from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision, validate_json
@@ -17806,8 +17807,8 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     # ── P0 test 7: conflicting summary text deterministic override ───────
 
     def test_forbidden_phrases_rewritten_when_risk_fails(self) -> None:
-        """P0: rewrite_inconsistent_summary strips '风控全部满足' etc when the
-        structured state forbids executable wording."""
+        """P0: rewrite_inconsistent_summary produces a deterministic summary
+        when the structured state forbids executable wording."""
         from plugins.crypto_guard.notify.report_consistency import (
             rewrite_inconsistent_summary, contains_forbidden_phrase,
         )
@@ -17822,7 +17823,8 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertNotEqual(rewritten, original)
         self.assertFalse(contains_forbidden_phrase(rewritten),
                         f"rewritten still contains forbidden phrase: {rewritten}")
-        self.assertIn("仅观察/未通过执行门禁", rewritten)
+        # P1-8 (Round 3): deterministic summary uses "[观察]" prefix
+        self.assertIn("[观察]", rewritten)
 
     # ── P0 test 8: BTC range/unconfirmed volume → no executable S ────────
 
@@ -18260,6 +18262,314 @@ class HourlyReportAccuracyTest(unittest.TestCase):
                 os.environ.pop("HOURLY_REPORT_BATCH_GATE_TIMEOUT", None)
             else:
                 os.environ["HOURLY_REPORT_BATCH_GATE_TIMEOUT"] = old_val
+
+    # ── P0-1 (Round 3): hourly report requeues on incomplete batch ─────────
+
+    def test_hourly_report_requeues_on_incomplete_batch(self) -> None:
+        """P0-1: build_hourly_report returns batch_incomplete_requeued and
+        enqueues a new hourly_feishu_report job when the batch is incomplete
+        and retry_count < max."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        # Only BTC completed; ETH still pending → incomplete
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+        report = build_hourly_report(self.repo, retry_count=0)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["error"], "batch_incomplete_requeued")
+        self.assertEqual(report["retry_count"], 1)
+        # A requeued job should exist in agent_jobs
+        requeued = self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE job_type='hourly_feishu_report'"
+        ).fetchone()[0]
+        self.assertGreater(requeued, 0)
+
+    # ── P0-1 (Round 3): max retries → renders with incomplete ─────────
+
+    def test_hourly_report_max_retries_renders_incomplete(self) -> None:
+        """P0-1: When retry_count >= max (12), build_hourly_report renders
+        normally even though the batch is incomplete."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT"],
+        )
+        # Batch incomplete, but retry_count=12 → should render anyway
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+        report = build_hourly_report(self.repo, retry_count=12)
+        self.assertTrue(report["ok"])
+
+    # ── P0-2 (Round 3): ROW_NUMBER window query prevents cross-batch contamination ─
+
+    def test_latest_decisions_row_number_no_cross_batch(self) -> None:
+        """P0-2: latest_ga_decisions_by_symbol with ROW_NUMBER correctly
+        picks only one decision per symbol even when multiple decisions
+        share the same analysis_time from different batches."""
+        from plugins.crypto_guard.utils import utc_ms
+        at = utc_ms()
+        # Insert two decisions for BTCUSDT with same analysis_time but different batches
+        self._seed_ga_decision(symbol="BTCUSDT", analysis_time=at, batch_id="15m:batch_a", grade="A", final_summary="batch A")
+        self._seed_ga_decision(symbol="BTCUSDT", analysis_time=at, batch_id="15m:batch_b", grade="B", final_summary="batch B")
+        # Should return exactly 1 row for BTCUSDT (highest id = most recent insert)
+        rows = self.repo.latest_ga_decisions_by_symbol(limit=10)
+        btc_rows = [r for r in rows if r["symbol"] == "BTCUSDT"]
+        self.assertEqual(len(btc_rows), 1, f"expected 1 BTC row, got {len(btc_rows)}")
+        # The row with higher id (batch_b) should win due to id DESC tiebreak
+        self.assertEqual(btc_rows[0]["signal_grade"], "B")
+
+    # ── P0-3 (Round 3): emergency_down from risk gate result ──────────────
+
+    def test_emergency_down_from_risk_gate(self) -> None:
+        """P0-3: emergency_down is computed from risk_gate.check() result,
+        not from legacy dict (which never has hard_risk_off before risk gate runs).
+        This is a structural test: verify the code path exists by checking
+        that risk_gate.check is called before grade_with_hysteresis."""
+        import inspect
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        source = inspect.getsource(GAMasterController.analyze_symbol)
+        # Find the actual risk gate call (risk = self.risk_gate.check)
+        risk_pos = source.find("risk = self.risk_gate.check")
+        # Find the grade_with_hysteresis call (not the import)
+        hysteresis_pos = source.find("grade_with_hysteresis(")
+        self.assertLess(risk_pos, hysteresis_pos,
+                        "risk_gate.check must be called BEFORE grade_with_hysteresis")
+        # Also verify emergency_down uses account_risk from risk gate result
+        self.assertIn("account_risk", source)
+        # And verify the emergency_down line references risk gate result
+        self.assertIn("account_risk.get(\"hard_risk_off\")", source)
+
+    # ── P1-4 (Round 3): batch status reflects failed symbols ──────────────
+
+    def test_batch_status_partial_failed(self) -> None:
+        """P1-4: When some symbols failed, finish_analysis_batch should use
+        status='partial_failed' instead of 'success'."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="ETHUSDT", failed=True)
+        # batch_has_failures should return True
+        self.assertTrue(self.repo.batch_has_failures(batch_id))
+        # Simulate what run_ga_workers does: determine status
+        if self.repo.is_batch_complete(batch_id):
+            if self.repo.batch_all_failed(batch_id):
+                batch_status = "failed"
+            elif self.repo.batch_has_failures(batch_id):
+                batch_status = "partial_failed"
+            else:
+                batch_status = "success"
+            self.repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
+        batch = self.repo.get_analysis_batch(batch_id)
+        self.assertEqual(batch["status"], "partial_failed")
+
+    # ── P1-4 (Round 3): batch status all failed ──────────────────────
+
+    def test_batch_status_all_failed(self) -> None:
+        """P1-4: When all symbols failed, finish_analysis_batch should use
+        status='failed'."""
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT", failed=True)
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="ETHUSDT", failed=True)
+        # batch_all_failed should return True
+        self.assertTrue(self.repo.batch_all_failed(batch_id))
+        # Simulate what run_ga_workers does: determine status
+        if self.repo.is_batch_complete(batch_id):
+            if self.repo.batch_all_failed(batch_id):
+                batch_status = "failed"
+            elif self.repo.batch_has_failures(batch_id):
+                batch_status = "partial_failed"
+            else:
+                batch_status = "success"
+            self.repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
+        batch = self.repo.get_analysis_batch(batch_id)
+        self.assertEqual(batch["status"], "failed")
+
+    # ── P1-5 (Round 3): await_batch returns instantly (no sleep) ──────────
+
+    def test_await_batch_no_real_sleep(self) -> None:
+        """P1-5: _await_batch_completion completes in under 1 second even
+        when batch is incomplete (no polling loop, no sleep)."""
+        import time as _time
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        from plugins.crypto_guard.notify.hourly_report import _await_batch_completion
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        # ETH still pending → incomplete, but function returns instantly
+        start = _time.monotonic()
+        state = _await_batch_completion(self.repo, primary_interval="15m")
+        elapsed = _time.monotonic() - start
+        self.assertTrue(state["incomplete"])
+        self.assertLess(elapsed, 1.0, f"_await_batch_completion took {elapsed:.2f}s; should be instant")
+
+    # ── P1-6 (Round 3): bias flip not counted as confirmation ────────────
+
+    def test_direction_flip_bias_not_confirmation(self) -> None:
+        """P1-6: market_bias flip alone does NOT confirm a direction change.
+        A flip with only bias change (no closed candle / BOS / CHoCH) should
+        still be flagged."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            DIRECTION_FLIP_NO_CLOSED_CANDLE, diagnose_report_accuracy,
+        )
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Earlier decision: bullish bias, LONG side
+        self._seed_ga_decision(
+            symbol="XRPUSDT", grade="B", confidence=0.7, decision="monitor_only",
+            analysis_time=now_ms - 30 * 60 * 1000, market_bias="bullish",
+            trade_plan={"side": "LONG", "entry_type": "breakout",
+                        "entry_price": 0.5, "stop_loss": 0.48,
+                        "take_profits": [{"price": 0.55}]},
+            final_summary="long watch",
+        )
+        # Later decision: bearish bias, SHORT side (direction flip)
+        # market_bias flips from bullish to bearish — this is the TRIGGER
+        # but NOT confirmation per P1-6
+        self._seed_ga_decision(
+            symbol="XRPUSDT", grade="B", confidence=0.72, decision="monitor_only",
+            analysis_time=now_ms - 5 * 60 * 1000, market_bias="bearish",
+            trade_plan={"side": "SHORT", "entry_type": "breakout",
+                        "entry_price": 0.49, "stop_loss": 0.51,
+                        "take_profits": [{"price": 0.45}]},
+            final_summary="short bias",
+        )
+        # Set counter_evidence to NOT contain closed-candle/BOS/CHoCH tokens
+        self.conn.execute(
+            "UPDATE ga_decisions SET counter_evidence_json=? WHERE symbol='XRPUSDT'",
+            (json.dumps(["tempo divergence", "MACD bearish divergence"]),),
+        )
+        self.conn.commit()
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(DIRECTION_FLIP_NO_CLOSED_CANDLE, codes,
+                      "bias flip without structural confirmation should still be flagged")
+
+    # ── P1-7 (Round 3): diagnostics uses is_valid_trade_plan ──────────────
+
+    def test_diagnostics_uses_is_valid_trade_plan(self) -> None:
+        """P1-7: _check_summary_execution_state_conflict uses is_valid_trade_plan
+        instead of isinstance(plan, dict) and bool(plan)."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            SUMMARY_EXECUTION_CONFLICT, diagnose_report_accuracy,
+        )
+        # Seed a decision with a placeholder trade_plan (invalid per is_valid_trade_plan)
+        # that has risk_ok=False and a forbidden phrase in final_summary
+        self._seed_ga_decision(
+            symbol="SOLUSDT", grade="A", confidence=0.8,
+            decision="monitor_only", risk_ok=False,
+            trade_plan={"note": "placeholder"},  # invalid per is_valid_trade_plan
+            final_summary="风控全部满足；可创建订单",
+        )
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(SUMMARY_EXECUTION_CONFLICT, codes,
+                      "placeholder trade_plan should be detected as invalid")
+
+    # ── P1-8 (Round 3): non-executable gets deterministic summary ──────────
+
+    def test_non_executable_gets_deterministic_summary(self) -> None:
+        """P1-8: When execution_eligible is False, rewrite_inconsistent_summary
+        returns a deterministic summary instead of blacklist-replaced text."""
+        from plugins.crypto_guard.notify.report_consistency import (
+            rewrite_inconsistent_summary, execution_eligible,
+        )
+        decision = {
+            "signal_grade": "A", "confidence": 0.7,
+            "risk_check": {"ok": False, "reasons": ["min_rr 不达标"]},
+            "trade_plan": None, "has_trade_plan": False,
+            "decision": "monitor_only",
+            "symbol": "BTCUSDT",
+        }
+        self.assertFalse(execution_eligible(decision))
+        # Use an LLM-style phrase that's NOT in the blacklist
+        original = "满足创建条件；可创建模拟盘空单；提供入场窗口"
+        rewritten = rewrite_inconsistent_summary(original, decision)
+        # Should get deterministic "[观察]" prefix, not blacklist-replaced text
+        self.assertIn("[观察]", rewritten)
+        self.assertIn("BTCUSDT", rewritten)
+        self.assertIn("A级", rewritten)
+        # The original LLM phrases should NOT appear in the deterministic output
+        self.assertNotIn("满足创建条件", rewritten)
+        self.assertNotIn("可创建模拟盘空单", rewritten)
+
+    # ── P1-9 (Round 3): fallback batch uses own time ──────────────────────
+
+    def test_fallback_batch_uses_own_time(self) -> None:
+        """P1-9: When falling back to a previous batch, min_analysis_time
+        is based on the fallback batch's analysis_time, not the current slot."""
+        from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
+        from plugins.crypto_guard.notify.hourly_report import _await_batch_completion
+        cur_close = latest_closed_close_time_ms("15m", utc_ms())
+        span = INTERVAL_MS["15m"]
+        # Create a previous batch (one cycle ago)
+        prev_at = cur_close - span
+        prev_batch_id = f"15m:{prev_at}"
+        self.repo.start_analysis_batch(
+            batch_id=prev_batch_id, primary_interval="15m",
+            analysis_time=prev_at, enabled_symbols=["BTCUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=prev_batch_id, symbol="BTCUSDT")
+        self.repo.finish_analysis_batch(batch_id=prev_batch_id, status="success")
+        # No current batch exists → should fall back to the previous one
+        state = _await_batch_completion(self.repo, primary_interval="15m")
+        # The fallback batch_id should be the previous batch
+        self.assertEqual(state["batch_id"], prev_batch_id)
+        # min_analysis_time should be based on the previous batch's analysis_time
+        expected_min = prev_at - span + 1
+        self.assertEqual(state["min_analysis_time"], expected_min,
+                         f"fallback batch should use its own time: expected {expected_min}, got {state['min_analysis_time']}")
+
+    # ── P2-10 (Round 3): batch_symbol_status CHECK constraint ──────────────
+
+    def test_batch_symbol_status_check_constraint(self) -> None:
+        """P2-10: batch_symbol_status enforces CHECK(status IN ('pending', 'completed', 'failed'))."""
+        # Valid statuses should work
+        self.repo.mark_batch_symbol_completed(batch_id="test:check", symbol="BTCUSDT", status="pending")
+        self.repo.mark_batch_symbol_completed(batch_id="test:check", symbol="ETHUSDT", status="completed")
+        self.repo.mark_batch_symbol_completed(batch_id="test:check", symbol="SOLUSDT", status="failed")
+        # Invalid status should raise IntegrityError
+        with self.assertRaises(Exception):
+            self.conn.execute(
+                "INSERT INTO batch_symbol_status(batch_id, symbol, status) VALUES (?, ?, ?)",
+                ("test:check", "XRPUSDT", "invalid_status"),
+            )
+
+    # ── P2-11 (Round 3): drawdown display uses abs() ──────────────────────
+
+    def test_drawdown_alert_uses_abs(self) -> None:
+        """P2-11: drawdown alert text shows non-negative drawdown value."""
+        from plugins.crypto_guard.run_ga_workers import handle_paper_drawdown_alert
+        result = handle_paper_drawdown_alert(
+            self.repo,
+            {
+                "snapshot": {"account_equity": 9950, "realized_pnl": -50, "unrealized_pnl": 0, "drawdown_percent": -2.5},
+                "event_time": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        self.assertTrue(result["ok"])
+        # drawdown_percent=-2.5 should display as 2.50 (abs value)
+        self.assertIn("2.50%", result["text"])
+        self.assertNotIn("-2.50%", result["text"])
 
 
 if __name__ == "__main__":

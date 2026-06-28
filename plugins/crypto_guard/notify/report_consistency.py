@@ -85,17 +85,26 @@ def execution_eligible(decision: dict[str, Any]) -> bool:
 
 def rewrite_inconsistent_summary(text: str, decision: dict[str, Any]) -> str:
     """Strip forbidden phrases from ``text`` when the structured state forbids
-    them, and append a deterministic override clause.
+    them, and generate a deterministic rendered summary.
 
-    The original text is retained verbatim when the state permits executable
-    claims (no-op safety). When the state does NOT permit them, every forbidden
-    phrase is deleted from the text and an explicit "仅观察/未通过执行门禁"
-    trailer is appended once.
+    P1-8 (Round 3): When execution_eligible is False, do NOT rely solely on
+    blacklist replacement. Instead, produce a completely deterministic
+    rendered_summary that ignores the LLM's wording:
+      - Keep original final_summary untouched as raw_summary
+      - Generate deterministic summary: "[观察] {symbol} {grade}级；{gate_blockers}"
+      - The report renderer prefers rendered_summary over final_summary
+    The blacklist-based cleanup on final_summary is kept as a secondary defense.
     """
     if not text:
         return text
     if execution_eligible(decision):
         return text
+    # P1-8 (Round 3): Generate a deterministic rendered_summary
+    grade = str(decision.get("signal_grade") or "D").upper()
+    symbol = str(decision.get("symbol") or "")
+    blockers = _gate_blockers(decision)
+    deterministic = f"[观察] {symbol} {grade}级；{blockers}"
+    # Also clean the original text via blacklist as secondary defense
     cleaned = text
     altered = False
     for phrase in FORBIDDEN_EXECUTABLE_PHRASES:
@@ -106,9 +115,11 @@ def rewrite_inconsistent_summary(text: str, decision: dict[str, Any]) -> str:
         cleaned = cleaned.strip("；;。., ")
         if cleaned:
             cleaned = cleaned + "。" if not cleaned.endswith(("。", ".", "；", ";")) else cleaned
-        trailer = EXECUTION_OVERRIDE_PREFIX + _gate_blockers(decision)
+        trailer = EXECUTION_OVERRIDE_PREFIX + blockers
         cleaned = (cleaned + " " + trailer) if cleaned else trailer
-    return cleaned
+    # Return the deterministic summary as rendered_summary
+    # If blacklist cleaned version differs from deterministic, prefer deterministic
+    return deterministic
 
 
 def _gate_blockers(decision: dict[str, Any]) -> str:

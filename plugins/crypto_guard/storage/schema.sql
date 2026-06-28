@@ -195,7 +195,7 @@ CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time ON analysis_batches(
 CREATE TABLE IF NOT EXISTS batch_symbol_status (
     batch_id  TEXT NOT NULL,
     symbol    TEXT NOT NULL,
-    status    TEXT NOT NULL DEFAULT 'pending',  -- 'completed' | 'failed' | 'pending'
+    status    TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
     updated_at TEXT,
     PRIMARY KEY (batch_id, symbol)
 );

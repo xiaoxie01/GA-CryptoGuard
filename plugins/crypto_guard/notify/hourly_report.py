@@ -32,7 +32,7 @@ def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] |
     return repo.latest_feishu_target()
 
 
-def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
+def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0) -> dict[str, Any]:
     # Check schema health first
     schema = check_schema_health()
     if not schema["ok"]:
@@ -47,13 +47,34 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     active_symbols = repo.active_analysis_symbols()
 
     # P0 batch-completion gate (research 01/02): use the current 15m
-    # analysis batch as the report cutoff. If the batch is still running
-    # within the configured timeout budget, wait briefly for completion;
-    # on timeout, mark the report incomplete and persist missing/failed
-    # symbols.  Never sleep blindly — poll at most `max_polls` times with
-    # short wait, controlled entirely by scheduler config (no hardcoded
-    # sleep patch).
+    # analysis batch as the report cutoff.  P0-1 (Round 3): no longer
+    # polls — takes a single snapshot. If the batch is still incomplete
+    # and we haven't exhausted retries, re-enqueue the report job with
+    # a delay so the worker is freed immediately.
+    MAX_HOURLY_REPORT_RETRIES = 12
+    POLL_INTERVAL_SECONDS = 30
+
     batch_state = _await_batch_completion(repo, primary_interval="15m")
+    if batch_state["incomplete"] and retry_count < MAX_HOURLY_REPORT_RETRIES:
+        # Re-enqueue self with delay; worker is freed immediately.
+        from datetime import timedelta as _td
+        scheduled_at = (datetime.now(timezone.utc) + _td(seconds=POLL_INTERVAL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        repo.enqueue_job(
+            "hourly_feishu_report",
+            priority=3,
+            source="hourly_report_requeue",
+            session_id=f"hourly_report_requeue:{batch_state.get('batch_id', 'none')}:{retry_count + 1}",
+            payload={"retry_count": retry_count + 1},
+            scheduled_at=scheduled_at,
+        )
+        return {
+            "ok": False,
+            "error": "batch_incomplete_requeued",
+            "retry_count": retry_count + 1,
+            "batch_id": batch_state.get("batch_id"),
+            "generated_at_utc": now,
+        }
+
     min_analysis_time = batch_state["min_analysis_time"]
     batches_reported = batch_state.get("batch_id")
     ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time, batch_id=batches_reported)
@@ -110,19 +131,18 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
 
 
 def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: str = "15m") -> dict[str, Any]:
-    """Poll the latest analysis_batches row for the current 15m slot until the
-    enabled symbols are accounted for or the timeout budget is exhausted.
+    """Take a single snapshot of the current analysis batch for the hourly report.
 
-    P0-6: uses batch_symbol_status for precise counting regardless of batch status.
-    P1-12: timeout is configurable via HOURLY_REPORT_BATCH_GATE_TIMEOUT env var.
+    P0-1 (Round 3): No longer polls or sleeps. Returns instantly with the
+    current batch state. If the batch is incomplete, the caller should
+    re-enqueue the hourly_feishu_report job with a delay instead of blocking
+    the worker.
 
     Returns a dict describing the batch state for renderer/diagnostics use.
     """
     cfg = _hourly_report_gate_config()
     env_timeout = os.environ.get("HOURLY_REPORT_BATCH_GATE_TIMEOUT")
     timeout_seconds = int(env_timeout) if env_timeout else int(cfg.get("timeout_seconds", 300))
-    poll_interval = float(cfg.get("poll_interval_seconds", 5))
-    max_polls = max(1, int(timeout_seconds / max(poll_interval, 0.1)))
 
     cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
     span = INTERVAL_MS[primary_interval]
@@ -149,10 +169,8 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
         return repo.get_analysis_batch(row["batch_id"])
 
     snapshot = _snapshot()
-    incomplete = False
     missing: list[str] = []
     failed: list[str] = []
-    still_running: list[str] = []
     pending_symbols: list[str] = []
     enabled_symbols: list[str] = []
     status = "absent"
@@ -162,58 +180,40 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
     if snapshot is not None:
         enabled_symbols = list(snapshot.get("enabled_symbols") or [])
         total_count = len(enabled_symbols)
-        # P0-6: use batch_symbol_status-derived lists (from get_analysis_batch)
         completed_syms = list(snapshot.get("completed_symbols") or [])
         failed = list(snapshot.get("failed_symbols") or [])
         pending_symbols = list(snapshot.get("pending_symbols") or [])
         status = str(snapshot.get("status") or "running")
         completed_count = len(completed_syms)
         missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
-        # P0-6: incomplete if ANY pending symbols exist, regardless of batch status
-        incomplete = bool(missing or pending_symbols)
-        if status == "running" and missing:
-            for _ in range(max_polls):
-                snap2 = _snapshot()
-                if snap2 is None:
-                    break
-                enabled_symbols = list(snap2.get("enabled_symbols") or enabled_symbols)
-                completed_syms = list(snap2.get("completed_symbols") or [])
-                failed = list(snap2.get("failed_symbols") or [])
-                pending_symbols = list(snap2.get("pending_symbols") or [])
-                status = str(snap2.get("status") or "running")
-                completed_count = len(completed_syms)
-                total_count = len(enabled_symbols)
-                missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
-                still_running = sorted(missing)
-                incomplete = bool(missing or pending_symbols)
-                if not missing or status != "running":
-                    break
-                _short_sleep(poll_interval)
-            # final snapshot after polls
-            snap3 = _snapshot()
-            if snap3:
-                enabled_symbols = list(snap3.get("enabled_symbols") or enabled_symbols)
-                completed_syms = list(snap3.get("completed_symbols") or [])
-                failed = list(snap3.get("failed_symbols") or [])
-                pending_symbols = list(snap3.get("pending_symbols") or [])
-                status = str(snap3.get("status") or status)
-                completed_count = len(completed_syms)
-                total_count = len(enabled_symbols)
-                missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
-                still_running = sorted(missing)
-                incomplete = bool(missing or pending_symbols)
+
+    incomplete = bool(missing or pending_symbols)
+    # P1-9 (Round 3): when falling back to a previous batch, use that
+    # batch's analysis_time for min_analysis_time rather than the current
+    # slot's time, so decisions from the fallback batch are actually found.
+    fallback_batch = snapshot
+    effective_batch_id = expected_batch_id
+    effective_min_time = cutoff_ms - span + 1
+    if fallback_batch is not None:
+        fb_batch_id = fallback_batch.get("batch_id")
+        if fb_batch_id and fb_batch_id != expected_batch_id:
+            # Falling back to a previous batch: use its own timestamps
+            effective_batch_id = fb_batch_id
+            fb_analysis_time = int(fallback_batch.get("analysis_time") or 0)
+            if fb_analysis_time > 0:
+                effective_min_time = fb_analysis_time - span + 1
 
     return {
-        "batch_id": (snapshot or {}).get("batch_id") if snapshot else expected_batch_id,
+        "batch_id": effective_batch_id,
         "primary_interval": primary_interval,
         "analysis_time": cutoff_ms,
-        "min_analysis_time": cutoff_ms - span + 1,
+        "min_analysis_time": effective_min_time,
         "status": status,
         "incomplete": incomplete,
         "enabled_symbols": enabled_symbols,
         "missing_symbols": missing,
         "failed_symbols": failed,
-        "still_running": still_running,
+        "still_running": sorted(missing),
         "pending_symbols": pending_symbols,
         "completed_count": completed_count,
         "total_count": total_count,
@@ -1057,7 +1057,7 @@ def render_hourly_report_text(
                 f"- 当前权益：{float(equity_snapshot.get('account_equity') or 0):.2f}；"
                 f"未实现盈亏：{float(equity_snapshot.get('unrealized_pnl') or 0):.2f}；"
                 f"已实现盈亏：{float(equity_snapshot.get('realized_pnl') or 0):.2f}；"
-                f"回撤：{float(snap.get('drawdown_percent') or 0):.2f}%"
+                f"回撤：{abs(float(snap.get('drawdown_percent') or 0)):.2f}%"
             )
         except Exception:
             lines.append("- 暂无可解析净值快照")
