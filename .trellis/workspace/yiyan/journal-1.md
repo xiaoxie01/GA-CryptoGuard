@@ -844,3 +844,36 @@ Fixed 15 review issues from hourly report accuracy initial implementation. P0: m
 ### Next Steps
 
 - None - task complete
+
+
+## Session 26: Fix hourly report accuracy R3: worker blocking, cross-batch query, emergency_down, deterministic summary
+
+**Date**: 2026-06-28
+**Task**: Fix hourly report accuracy R3: worker blocking, cross-batch query, emergency_down, deterministic summary
+**Branch**: `main`
+
+### Summary
+
+Fixed 12 review issues: P0-1 replace polling with re-enqueue (no worker blocking), P0-2 ROW_NUMBER window query prevents cross-batch contamination, P0-3 risk_gate before hysteresis so emergency_down actually triggers, P1-4 batch status three-way logic, P1-5 no real sleep in tests, P1-6 market_bias alone not confirmation for direction flip, P1-7 is_valid_trade_plan in diagnostics, P1-8 deterministic [观察] summary instead of blacklist cleanup, P1-9 fallback batch uses own time, P2-10 CHECK constraint on batch_symbol_status, P2-11 abs() drawdown in all paths. 518 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ba134b6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
