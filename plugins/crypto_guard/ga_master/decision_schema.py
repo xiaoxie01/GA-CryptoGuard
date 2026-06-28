@@ -17,6 +17,7 @@ class GAAnalysisRequest:
     requested_by: str | None = None
     request_text: str = ""
     allow_realtime_signal_alert: bool = False
+    batch_id: str | None = None
 
 
 def iso_from_ms(value: int) -> str:
@@ -32,6 +33,9 @@ def controller_decision_from_legacy(
     feishu_actions: list[str],
     snapshot_id: int | None = None,
     analysis_state_id: int | None = None,
+    batch_id: str | None = None,
+    previous_grade: str | None = None,
+    grade_delta_value: str | None = None,
 ) -> dict[str, Any]:
     risk_check = legacy.get("risk_check") or {"ok": False, "reasons": ["缺少风控记录"]}
     old_decision = str(legacy.get("decision") or "no_edge")
@@ -64,6 +68,9 @@ def controller_decision_from_legacy(
         "analysis_source": legacy.get("analysis_source") or "ga_master_controller",
         "llm_status": legacy.get("llm_status") or "ok",
         "llm_error": legacy.get("llm_error"),
+        "batch_id": batch_id,
+        "previous_grade": previous_grade,
+        "grade_delta": grade_delta_value,
     }
 
 

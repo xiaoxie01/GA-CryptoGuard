@@ -81,10 +81,21 @@ def enqueue_market_analysis(
     try:
         repo = CryptoGuardRepository(conn)
         analysis_time = latest_closed_close_time_ms(primary_interval, analysis_time_utc or utc_ms())
+        # Hourly Report Accuracy: register a single analysis_batches row that
+        # aggregates this scheduler tick across every enabled symbol. ga_decisions
+        # reference this batch_id so the report renderer can gate on completion.
+        batch_id = f"{primary_interval}:{analysis_time}"
+        enabled_symbols = repo.active_analysis_symbols()
+        repo.start_analysis_batch(
+            batch_id=batch_id,
+            primary_interval=primary_interval,
+            analysis_time=analysis_time,
+            enabled_symbols=enabled_symbols,
+        )
         job_ids: list[int] = []
         skipped_pending = 0
         priority = 6 if primary_interval == "5m" else 5
-        for symbol in repo.active_analysis_symbols():
+        for symbol in enabled_symbols:
             session_id = f"system:scheduled:{primary_interval}:{symbol}:{analysis_time}"
             pending = conn.execute(
                 """
@@ -99,21 +110,34 @@ def enqueue_market_analysis(
             ).fetchone()
             if pending:
                 skipped_pending += 1
+                # The symbol already has a pending/running job for this tick;
+                # mark it completed in the batch so the completion gate doesn't
+                # wait forever for a job that was already queued earlier.
+                repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol)
                 continue
             snapshot = build_market_state_snapshot(repo, symbol=symbol, analysis_time_utc=analysis_time, mode=mode, timeframes=timeframes)
             snapshot_id = repo.save_market_snapshot(snapshot)
+            # Pass batch_id through the job payload so the controller can attach
+            # it to the ga_decisions row it creates.
+            payload = {
+                "snapshot_id": snapshot_id,
+                "snapshot": snapshot,
+                "primary_interval": primary_interval,
+                "batch_id": batch_id,
+            }
             job_id = repo.enqueue_job(
                 "scheduled_market_analysis",
                 priority,
                 "scheduler",
                 session_id,
-                {"snapshot_id": snapshot_id, "snapshot": snapshot, "primary_interval": primary_interval},
+                payload,
             )
             job_ids.append(job_id)
         return {
             "ok": True,
             "primary_interval": primary_interval,
             "analysis_time_utc": analysis_time,
+            "batch_id": batch_id,
             "queued": len(job_ids),
             "skipped_pending": skipped_pending,
             "priority": priority,

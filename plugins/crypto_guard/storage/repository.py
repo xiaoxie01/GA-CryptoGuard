@@ -250,6 +250,12 @@ class CryptoGuardRepository:
     def create_ga_decision(self, decision: dict[str, Any]) -> int:
         trade_plan = decision.get("trade_plan")
         opportunity_watch = decision.get("opportunity_watch")
+        # Hourly Report Accuracy: optional batch linkage + previous grade +
+        # deterministic rendered summary (may be None when upstream does
+        # not set them; the columns are nullable).
+        batch_id = decision.get("batch_id")
+        previous_grade = decision.get("previous_grade")
+        rendered_summary = decision.get("rendered_summary")
         self.conn.execute(
             """
             INSERT INTO ga_decisions(
@@ -257,9 +263,10 @@ class CryptoGuardRepository:
                 confidence, market_bias, trend_stage, decision, skill_result_refs_json,
                 evidence_json, counter_evidence_json, risk_check_json, trade_plan_json,
                 opportunity_watch_json, feishu_actions_json, final_summary, raw_decision_json,
-                analysis_state_id, snapshot_id, created_by
+                analysis_state_id, snapshot_id, created_by,
+                batch_id, previous_grade, rendered_summary
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 decision["symbol"],
@@ -283,6 +290,9 @@ class CryptoGuardRepository:
                 decision.get("analysis_state_id"),
                 decision.get("snapshot_id"),
                 decision.get("created_by", "ga_master_controller"),
+                batch_id,
+                previous_grade,
+                rendered_summary,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -331,6 +341,119 @@ class CryptoGuardRepository:
             params + [int(limit)],
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Analysis batch lifecycle helpers (Hourly Report Accuracy) ──────────
+    def start_analysis_batch(
+        self, *, batch_id: str, primary_interval: str, analysis_time: int, enabled_symbols: list[str],
+    ) -> int:
+        """Create (or upsert) an analysis_batches row marking the batch running.
+
+        Idempotent on batch_id via UNIQUE constraint; enabling symbols are
+        preserved on re-entry. Returns the row id.
+        """
+        existing = self.conn.execute(
+            "SELECT id, enabled_symbols_json FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if existing:
+            row_id = int(existing["id"])
+            try:
+                e_syms = json.loads(existing["enabled_symbols_json"] or "[]")
+            except Exception:
+                e_syms = []
+            if not e_syms:
+                self.conn.execute(
+                    "UPDATE analysis_batches SET enabled_symbols_json=? WHERE id=?",
+                    (json.dumps(enabled_symbols, ensure_ascii=False), row_id),
+                )
+            return row_id
+        self.conn.execute(
+            """
+            INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time,
+                                          status, enabled_symbols_json)
+            VALUES (?, ?, ?, 'running', ?)
+            """,
+            (batch_id, primary_interval, int(analysis_time), json.dumps(enabled_symbols, ensure_ascii=False)),
+        )
+        return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def mark_batch_symbol_completed(self, *, batch_id: str, symbol: str, failed: bool = False) -> None:
+        """Append ``symbol`` to completed/failed list on its batch row."""
+        row = self.conn.execute(
+            "SELECT id, completed_symbols_json, failed_symbols_json FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            completed = set(json.loads(row["completed_symbols_json"] or "[]"))
+            failed_syms = set(json.loads(row["failed_symbols_json"] or "[]"))
+        except Exception:
+            completed, failed_syms = set(), set()
+        if failed:
+            failed_syms.add(symbol)
+        else:
+            completed.add(symbol)
+        # also drop from failed if it later completed
+        if not failed:
+            failed_syms.discard(symbol)
+        self.conn.execute(
+            "UPDATE analysis_batches SET completed_symbols_json=?, failed_symbols_json=? WHERE id=?",
+            (
+                json.dumps(sorted(completed), ensure_ascii=False),
+                json.dumps(sorted(failed_syms), ensure_ascii=False),
+                int(row["id"]),
+            ),
+        )
+
+    def finish_analysis_batch(self, *, batch_id: str, status: str = "success", summary: dict[str, Any] | None = None) -> None:
+        self.conn.execute(
+            """
+            UPDATE analysis_batches SET finished_at=CURRENT_TIMESTAMP, status=?, summary_json=?
+            WHERE batch_id=?
+            """,
+            (status, json.dumps(summary, ensure_ascii=False) if summary is not None else None, batch_id),
+        )
+
+    def get_analysis_batch(self, batch_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM analysis_batches WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        for col in ("enabled_symbols_json", "completed_symbols_json", "failed_symbols_json", "summary_json"):
+            key = col.removesuffix("_json")
+            try:
+                item[key] = json.loads(item.get(col) or "[]")
+            except Exception:
+                item[key] = []
+        return item
+
+    def latest_analysis_batch_id(self, primary_interval: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT batch_id FROM analysis_batches WHERE primary_interval=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+            (primary_interval,),
+        ).fetchone()
+        return row["batch_id"] if row else None
+
+    def previous_ga_decision_grade(self, symbol: str, *, exclude_batch_id: str | None = None) -> str | None:
+        """Return the signal_grade of the most recent ga_decision for ``symbol``.
+
+        If ``exclude_batch_id`` is given, skip decisions from that batch
+        so the result comes from a genuinely earlier batch.
+        """
+        if exclude_batch_id:
+            row = self.conn.execute(
+                "SELECT signal_grade FROM ga_decisions WHERE symbol=? AND (batch_id IS NULL OR batch_id!=?) ORDER BY analysis_time DESC, id DESC LIMIT 1",
+                (symbol, exclude_batch_id),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT signal_grade FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return row["signal_grade"] if row else None
 
     def latest_skill_result_refs(self, symbol: str, analysis_time_utc: int) -> dict[str, int]:
         rows = self.conn.execute(

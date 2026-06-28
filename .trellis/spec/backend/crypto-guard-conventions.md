@@ -1377,3 +1377,165 @@ event_time = format_event_time_cst(payload.get("event_time"))
 ---
 
 **Last updated**: 2026-06-27 (P0: Mark price contract, profit protection contract, notification time contract)
+
+---
+
+## 25. Hourly Report Accuracy Contracts
+
+> **Trigger**: Production hourly report contained stale decisions, misclassified executable opportunities, and LLM summary text that contradicted structured execution state.
+
+### Contract 25.1: Batch completion gate — report MUST wait for all symbols
+
+**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol is tracked as `completed` or `failed`. The report renderer MUST poll until all enabled symbols are resolved or a timeout (default 300s) is reached. Incomplete reports are marked with `incomplete=true`.
+
+**Why**: Without a batch gate, the report could render mid-cycle — some symbols had fresh decisions while others still showed stale rows from the previous cycle. This produced "phantom opportunities" that no longer existed.
+
+**Signatures**:
+```python
+# repository.py
+def start_analysis_batch(self, batch_id, primary_interval, analysis_time, enabled_symbols) -> None:
+def mark_batch_symbol_completed(self, batch_id, symbol) -> None:
+def mark_batch_symbol_failed(self, batch_id, symbol) -> None:
+def finish_analysis_batch(self, batch_id) -> None:
+def get_analysis_batch(self, batch_id) -> dict | None:
+def latest_analysis_batch_id(self, primary_interval) -> str | None:
+
+# hourly_report.py
+def _await_batch_completion(repo, batch_id, *, timeout_seconds=300) -> dict:
+    """Polls analysis_batches until all symbols completed/failed or timeout.
+    Returns {complete: bool, incomplete: bool, missing_symbols: [...]}"""
+```
+
+**Scheduler wiring**: `enqueue_market_analysis` in `cron_scheduler.py` creates the batch row. `run_ga_workers.py` marks each symbol completed/failed on job resolution. When a symbol is skipped (already pending), `mark_batch_symbol_completed` is called immediately to prevent the batch from hanging in "running" state forever.
+
+**Database**: `analysis_batches` table with columns `batch_id, primary_interval, analysis_time, status, enabled_symbols_json, completed_symbols_json, failed_symbols_json, started_at, completed_at`. `ga_decisions` references `batch_id`.
+
+**Forbidden**:
+```python
+# WRONG: Render report without checking batch completion
+decisions = repo.latest_ga_decisions_by_symbol()
+
+# CORRECT: Wait for batch, then filter
+batch_state = _await_batch_completion(repo, batch_id)
+decisions = repo.latest_ga_decisions_by_symbol(min_analysis_time=analysis_time)
+```
+
+---
+
+### Contract 25.2: Opportunity classification — three tiers obeying execution gates
+
+**What**: The report classifies each symbol into exactly one of three tiers:
+1. **executable_opportunity**: grade ∈ {S,A,B}, confidence ≥ MIN_CONFIDENCE_FOR_PAPER_ORDER, has trade_plan, risk_check.ok, decision=create_paper_order or trade_plan_available, non-stale
+2. **observation_candidate**: grade ∈ {S,A,B} but missing at least one execution gate
+3. **no_edge**: grade ∈ {C,D} or decision ∈ {monitor_only, no_edge, hold_position}
+
+**Why**: Previously, all S/A/B grades were labeled "executable" regardless of risk_check, trade_plan, or confidence. A B-grade with risk_check=false was shown as a trading opportunity.
+
+**Classification function**:
+```python
+def _opportunity_classifier(decision: dict) -> str:
+    """Returns 'executable_opportunity', 'observation_candidate', or 'no_edge'."""
+    from plugins.crypto_guard.notify.report_consistency import execution_eligible
+    grade = str(decision.get("signal_grade") or "").upper()
+    if grade in {"S", "A", "B"}:
+        if execution_eligible(decision) and not _is_stale_decision(decision):
+            return "executable_opportunity"
+        return "observation_candidate"
+    return "no_edge"
+```
+
+**Staleness check**: A decision is stale if `analysis_time` is older than one analysis cycle (15m) from the report's batch `analysis_time`.
+
+**Report rendering**: Executable opportunities show in the "可执行机会" section; observation candidates show separately with blocking reasons; no_edge symbols show in the observation section without executable claims.
+
+---
+
+### Contract 25.3: Deterministic text override — structured state overrides LLM summary
+
+**What**: The validator in `notify/report_consistency.py` rewrites `final_summary` when structured fields contradict executable claims in the text. When `execution_eligible(decision)` is False, all `FORBIDDEN_EXECUTABLE_PHRASES` are stripped and an override clause is appended.
+
+**Why**: The LLM may generate summary text claiming "具备模拟盘条件" (eligible for paper trading) even when risk_check=false or trade_plan is missing. The structured fields are the ground truth; the summary must not contradict them.
+
+**Canonical phrase list** (single source of truth in `report_consistency.py`):
+```python
+FORBIDDEN_EXECUTABLE_PHRASES: tuple[str, ...] = (
+    "具备模拟盘条件", "具备模拟盘做多条件", "具备模拟盘做空条件",
+    "风控全部满足", "风控指标全部满足",
+    "可创建订单", "风控通过", "存在可执行",
+)
+```
+
+**Override clause**: When phrases are stripped, `仅观察/未通过执行门禁：{gate_blockers}` is appended once, where `_gate_blockers` lists the specific failing conditions (missing trade_plan, risk reasons, low confidence).
+
+**Integration points**:
+1. `controller.py analyze_symbol()` — applies `rewrite_inconsistent_summary` before persistence
+2. `llm_agent_judge.py _normalize_llm_decision` — applies for non-LLM path
+3. `hourly_report.py render_ga_hourly_summary` — double-check at render time
+
+**Forbidden**:
+```python
+# WRONG: Duplicating the forbidden phrases list
+FORBIDDEN = ["具备模拟盘条件", "可创建订单"]  # drift risk
+
+# CORRECT: Import from single source
+from plugins.crypto_guard.notify.report_consistency import FORBIDDEN_EXECUTABLE_PHRASES
+
+# WRONG: Using bare "可执行" as forbidden phrase
+# This matches negative statements like "没有可执行机会" (no executable opportunity)
+# Use "存在可执行" which only matches affirmative claims
+```
+
+---
+
+### Contract 25.4: Grade hysteresis — dampen wild grade swings between cycles
+
+**What**: `grade_with_hysteresis` in `strategy/grade_config.py` dampens large single-cycle grade jumps. When `grade_delta >= GRADE_UP_BUFFER` (default 2, e.g. D→S), the grade is clamped to one step above the previous grade (D→C instead of D→S). `clamp_grade` prevents S-grade when 4H=range/transition without `independent_trend` evidence, and limits counter_evidence items to `SA_MAX_COUNTER_EVIDENCE` (default 3).
+
+**Why**: An S→D→S oscillation within two cycles indicates instability, not a genuine signal change. Hysteresis prevents whipsaw-induced false opportunities from entering the executable tier.
+
+**Signatures**:
+```python
+def grade_with_hysteresis(current_grade: str, previous_grade: str | None) -> str:
+    """Dampen large jumps. D→S becomes D→C; S→D becomes S→B."""
+
+def clamp_grade(grade: str, market_bias_4h: str | None,
+                counter_evidence: list | None,
+                independent_trend: bool | None) -> str:
+    """Prevent S when 4H=range/transition without independent_trend.
+    Cap counter_evidence to SA_MAX_COUNTER_EVIDENCE items."""
+
+def grade_delta(current: str, previous: str | None) -> int:
+    """Compute signed delta between grades. S=5, A=4, B=3, C=2, D=1."""
+```
+
+**Previous grade source**: `previous_ga_decision_grade(exclude_batch_id=)` skips current batch decisions to avoid same-batch contamination. The controller passes `exclude_batch_id=request.batch_id`.
+
+**Database**: `ga_decisions.previous_grade` column stores the grade used for hysteresis calculation.
+
+---
+
+### Contract 25.5: Report diagnostics — 10 P2 checks for accuracy
+
+**What**: `diagnose_report_accuracy(repo)` in `diagnostics/report_diagnostics.py` runs 10 checks covering the known issue categories. It returns the standard `{ok, issues, summary, total_issues}` shape so it can be merged into `diagnose_state_consistency` output or rendered standalone.
+
+**Issue codes**:
+| Code | Severity | What it checks |
+|------|----------|---------------|
+| `hourly_report_incomplete_batch` | warning | Running batches with missing symbols |
+| `hourly_report_stale_decision` | warning | Decisions older than one 15m cycle |
+| `executable_opportunity_without_trade_plan` | warning | S/A/B grade missing trade_plan |
+| `executable_opportunity_risk_rejected` | warning | S/A/B grade with risk_check=false |
+| `opportunity_below_confidence_threshold` | warning | S/A/B grade below min_confidence |
+| `summary_execution_state_conflict` | error | Forbidden phrases in summary despite gate failure |
+| `excessive_grade_flip` | warning | S/A→D/C within 4 hours |
+| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence |
+| `invalid_liquidity_sweep_semantics` | warning | sell_side paired with bearish or buy_side with bullish |
+| `negative_drawdown_display` | warning | Positive drawdown_percent when equity shows loss |
+
+**Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use.
+
+**Drawdown sign convention**: Internal `_drawdown_percent` returns negative values for losses. External display must be non-negative (e.g. "回撤 0.50%"). The diagnostic uses `initial_balance` from `paper_accounts` for relative comparison, not a hardcoded threshold.
+
+---
+
+**Last updated**: 2026-06-28 (P0: Hourly report accuracy — batch completion gate, opportunity classification, deterministic text override, grade hysteresis, report diagnostics)

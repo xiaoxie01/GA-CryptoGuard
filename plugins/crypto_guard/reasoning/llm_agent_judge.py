@@ -347,6 +347,21 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         watch = dict(watch)
         watch["direction"] = _normalize_watch_direction(watch.get("direction"), decision.get("trade_plan"))
         decision["opportunity_watch"] = watch
+
+    # Deterministic consistency override (P0): strip forbidden executable
+    # phrases from final_summary when the structured execution gate is not
+    # satisfied. apply_risk_to_decision may have already downgraded
+    # decision/has_trade_plan; here we only silence the LLM's own text.
+    from plugins.crypto_guard.notify.report_consistency import rewrite_inconsistent_summary
+    summary_text = decision.get("final_summary") or decision.get("summary") or ""
+    rewritten = rewrite_inconsistent_summary(summary_text, decision)
+    if rewritten != summary_text:
+        decision["final_summary"] = rewritten
+        if "summary" in decision:
+            decision["summary"] = rewritten
+        notes = list(decision.get("risk_notes") or [])
+        notes.append("final_summary 与结构化执行状态冲突，已确定性覆盖为未通过执行门禁。")
+        decision["risk_notes"] = notes
     return decision
 
 

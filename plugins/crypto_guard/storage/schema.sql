@@ -166,11 +166,31 @@ CREATE TABLE IF NOT EXISTS ga_decisions (
     snapshot_id INTEGER,
     account_feedback_gate_json TEXT,
     market_regime_gate_json TEXT,
+    batch_id TEXT,
+    previous_grade TEXT,
+    rendered_summary TEXT,
     created_by TEXT DEFAULT 'ga_master_controller',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_ga_decisions_symbol_time ON ga_decisions(symbol, analysis_time);
 CREATE INDEX IF NOT EXISTS idx_ga_decisions_grade_time ON ga_decisions(signal_grade, analysis_time);
+CREATE INDEX IF NOT EXISTS idx_ga_decisions_batch ON ga_decisions(batch_id) WHERE batch_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS analysis_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL UNIQUE,
+    primary_interval TEXT NOT NULL,
+    analysis_time INTEGER NOT NULL,
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT,
+    status TEXT DEFAULT 'running',
+    enabled_symbols_json TEXT NOT NULL DEFAULT '[]',
+    completed_symbols_json TEXT NOT NULL DEFAULT '[]',
+    failed_symbols_json TEXT NOT NULL DEFAULT '[]',
+    summary_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time ON analysis_batches(status, analysis_time);
 
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

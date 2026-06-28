@@ -45,17 +45,33 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         return result
     if job_type == "scheduled_market_analysis":
         snapshot = payload["snapshot"]
-        decision = GAMasterController(repo).analyze_symbol(
-            GAAnalysisRequest(
-                symbol=snapshot["symbol"],
-                decision_type="scheduled_analysis",
-                analysis_time_utc=int(snapshot.get("analysis_time_utc") or 0),
-                mode=snapshot.get("mode") or "scheduled",
-                snapshot=snapshot,
-                snapshot_id=payload.get("snapshot_id"),
-                allow_realtime_signal_alert=bool(payload.get("allow_realtime_signal_alert")),
+        batch_id = payload.get("batch_id")
+        try:
+            decision = GAMasterController(repo).analyze_symbol(
+                GAAnalysisRequest(
+                    symbol=snapshot["symbol"],
+                    decision_type="scheduled_analysis",
+                    analysis_time_utc=int(snapshot.get("analysis_time_utc") or 0),
+                    mode=snapshot.get("mode") or "scheduled",
+                    snapshot=snapshot,
+                    snapshot_id=payload.get("snapshot_id"),
+                    allow_realtime_signal_alert=bool(payload.get("allow_realtime_signal_alert")),
+                    batch_id=batch_id,
+                )
             )
-        )
+            # Hourly Report Accuracy: record batch progress for completion gate.
+            if batch_id:
+                try:
+                    repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"])
+                except Exception:
+                    LOGGER.warning("mark_batch_symbol_completed failed batch=%s symbol=%s", batch_id, snapshot["symbol"])
+        except Exception as analysis_exc:
+            if batch_id:
+                try:
+                    repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=snapshot["symbol"], failed=True)
+                except Exception:
+                    pass
+            raise
         signal_id = int(decision["signal_id"])
         sent = False
         target = None

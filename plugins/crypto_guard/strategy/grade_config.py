@@ -29,6 +29,12 @@ PAPER_ORDER_GRADES = {"S", "A"}  # Grades eligible for paper orders
 MIN_CONFIDENCE_FOR_PAPER_ORDER = 0.72  # Must be >= A grade
 MIN_CONFIDENCE_DEFAULT = 0.72
 
+# Hysteresis buffers (research 10/11): grade promotion needs to clear the new
+# tier by an extra buffer; demotion within the same 4h window needs two
+# consecutive confirmations unless an emergency downgrade is flagged.
+GRADE_UP_BUFFER = 0.02
+SA_MAX_COUNTER_EVIDENCE = 3  # S/A 至多允许 3 条矛盾证据，超过封顶 B
+
 
 def grade_from_score(score: float) -> str:
     """Derive grade from numeric score. Single source of truth."""
@@ -56,6 +62,98 @@ def grade_from_order_value(value: int) -> str:
 def is_paper_order_eligible(grade: str, confidence: float) -> bool:
     """Check if grade and confidence qualify for paper order creation."""
     return grade in PAPER_ORDER_GRADES and confidence >= MIN_CONFIDENCE_FOR_PAPER_ORDER
+
+
+def grade_with_hysteresis(
+    current_score: float,
+    previous_grade: str | None,
+    *,
+    up_buffer: float = GRADE_UP_BUFFER,
+    emergency_down: bool = False,
+) -> tuple[str, str]:
+    """Apply grade hysteresis against the previous decision's grade.
+
+    Returns (effective_grade, reason). ``reason`` is empty when no clamp was
+    applied. Promotion requires the score to clear the new tier by an extra
+    ``up_buffer`` (default 0.02). Demotion within the same 4h window is dampened
+    to one tier unless ``emergency_down`` is True, in which case the raw score
+    grade is returned so genuine risk can drop the grade immediately.
+
+    The reason string is reported to the user / diagnostics audit so we never
+    silently mask real risk changes.
+    """
+    raw_grade = grade_from_score(current_score)
+    if not previous_grade or previous_grade not in GRADE_ORDER:
+        return raw_grade, ""
+
+    prev_val = GRADE_ORDER[previous_grade]
+    raw_val = GRADE_ORDER[raw_grade]
+    reason = ""
+
+    if raw_val > prev_val:
+        # promotion: require score to clear the new tier + buffer
+        new_threshold = GRADE_THRESHOLDS[raw_grade] + up_buffer
+        if current_score < new_threshold and not emergency_down:
+            stabilized = GRADE_BY_NUM[prev_val + 1] if prev_val + 1 in GRADE_BY_NUM else raw_grade
+            reason = f"评级升级迟滞：score={current_score:.4f} 未越过 {raw_grade} 上沿（含 +{up_buffer} 缓冲），暂保留 {stabilized}"
+            return stabilized, reason
+    elif raw_val < prev_val:
+        if not emergency_down:
+            # dampen: a single-period drop more than one tier is clamped to one tier down
+            if raw_val < prev_val - 1:
+                stabilized = GRADE_BY_NUM[prev_val - 1] if prev_val - 1 in GRADE_BY_NUM else raw_grade
+                reason = f"评级降级迟滞：单周期从 {previous_grade} 跳到 {raw_grade}，暂缓为 {stabilized}（无紧急降级）"
+                return stabilized, reason
+    return raw_grade, reason
+
+
+def clamp_grade(
+    grade: str,
+    *,
+    has_trade_plan: bool,
+    risk_ok: bool,
+    confidence: float | None = None,
+    htf_conflict: bool = False,
+    independent_trend: bool = False,
+    counter_evidence_count: int = 0,
+) -> tuple[str, str]:
+    """Cap S/A grades when execution-gate evidence is missing.
+
+    Research 11: S/A 评级要求 has_trade_plan / risk_ok / 高周期方向支持 /
+    counter_evidence 上限。缺一就封顶 B（仍保留 trend_stage/momentum 信号体
+    量，但显式不可执行）。Returns (clamped_grade, reason).
+    """
+    g = str(grade or "D").upper()
+    if g not in {"S", "A"}:
+        return g, ""
+    blockers: list[str] = []
+    if confidence is not None and float(confidence) < MIN_CONFIDENCE_FOR_PAPER_ORDER:
+        blockers.append(f"置信度 {float(confidence):.2f} < {MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}")
+    if not has_trade_plan:
+        blockers.append("缺 trade_plan")
+    if not risk_ok:
+        blockers.append("risk_check 未通过")
+    if htf_conflict and not independent_trend:
+        blockers.append("高周期方向与 side 冲突且未通过 independent_trend")
+    if counter_evidence_count >= SA_MAX_COUNTER_EVIDENCE:
+        blockers.append(f"反向证据 {counter_evidence_count} >= {SA_MAX_COUNTER_EVIDENCE}")
+    if blockers:
+        reason = "S/A 评级降为 B：" + "；".join(blockers)
+        return "B", reason
+    return g, ""
+
+
+def grade_delta(previous_grade: str | None, grade: str) -> str:
+    """Stable render of grade change for reports/diagnostics."""
+    if not previous_grade:
+        return "-"
+    p = GRADE_ORDER.get(str(previous_grade).upper(), 0)
+    c = GRADE_ORDER.get(str(grade).upper(), 0)
+    if c > p:
+        return f"+{c - p}"
+    if c < p:
+        return f"{c - p}"
+    return "0"
 
 
 def alert_level_for_grade(grade: str | None) -> str:

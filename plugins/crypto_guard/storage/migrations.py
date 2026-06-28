@@ -42,6 +42,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_legacy_fuzzy_migration(conn)
         _apply_phase_shadow_vt_v2_migration(conn)
         _apply_candidate_cap_cleanup(conn)
+        _apply_hourly_report_accuracy_migration(conn)
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -1304,6 +1305,47 @@ def _apply_stop_loss_adjustment_dedup(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
+    """Hourly Report Accuracy (2026-06-28) schema migration.
+
+    - ga_decisions gains batch_id, previous_grade, rendered_summary columns.
+    - New analysis_batches table tracks scheduler analysis batch identity and
+      per-symbol completion state, enabling the hourly report batch
+      completion gate.
+    - Idempotent: ALTER TABLE is guarded by _add_column; CREATE TABLE is
+      guarded by IF NOT EXISTS.
+    """
+    _add_column(conn, "ga_decisions", "batch_id", "TEXT")
+    _add_column(conn, "ga_decisions", "previous_grade", "TEXT")
+    _add_column(conn, "ga_decisions", "rendered_summary", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ga_decisions_batch "
+        "ON ga_decisions(batch_id) WHERE batch_id IS NOT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL UNIQUE,
+            primary_interval TEXT NOT NULL,
+            analysis_time INTEGER NOT NULL,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            status TEXT DEFAULT 'running',
+            enabled_symbols_json TEXT NOT NULL DEFAULT '[]',
+            completed_symbols_json TEXT NOT NULL DEFAULT '[]',
+            failed_symbols_json TEXT NOT NULL DEFAULT '[]',
+            summary_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time "
+        "ON analysis_batches(status, analysis_time)"
+    )
+
+
 def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
 
@@ -1329,7 +1371,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
     # Required columns for skill_feedback_memory
     required_columns = {
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
-        "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json"],
+        "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json", "batch_id", "previous_grade", "rendered_summary"],
         "opportunity_watches": ["dedupe_key"],
         "paper_positions": ["updated_at"],
         "strategy_evaluations": ["ga_decision_id", "paper_trade_id", "outcome_source", "shadow_virtual_trade_id"],
@@ -1346,6 +1388,9 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "idx_strategy_evals_shadow_unique",
         "idx_alert_outbox_dedupe_unique",
     ]
+
+    # Required tables
+    required_tables = ["analysis_batches"]
 
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []
@@ -1378,6 +1423,15 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
             ).fetchone()
             if not idx_exists:
                 missing.append({"table": "(index)", "column": idx_name})
+
+        # Check required tables
+        for tbl_name in required_tables:
+            tbl_exists = _conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (tbl_name,),
+            ).fetchone()
+            if not tbl_exists:
+                missing.append({"table": tbl_name, "column": "(table)"})
 
         return {
             "ok": len(missing) == 0,

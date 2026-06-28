@@ -9,12 +9,19 @@ def analyze_smc(candles: list[dict[str, Any]], price_action: dict[str, Any], *, 
     cur = candles[-1]
     prior_high = max(float(c["high"]) for c in candles[-8:-1])
     prior_low = min(float(c["low"]) for c in candles[-8:-1])
+    # SMC mapping (do not reverse): a sweep of swing lows takes sell-side
+    # liquidity (resting buy-stops below the prior low) and a subsequent
+    # reclaim above that low is a bullish reversal. Symmetrically, taking
+    # buy-side liquidity above the prior high with a close-back below it is
+    # bearish. See research/07-liquidity-sweep-semantics.md.
     sweep_low = cur["low"] < prior_low and cur["close"] > prior_low
     sweep_high = cur["high"] > prior_high and cur["close"] < prior_high
     if sweep_low:
+        # sweep_low → sell-side liquidity taken → bullish reclaim
         last_event = "sell_side_liquidity_sweep"
         direction = "bullish"
     elif sweep_high:
+        # sweep_high → buy-side liquidity taken → bearish reclaim
         last_event = "buy_side_liquidity_sweep"
         direction = "bearish"
     else:

@@ -338,11 +338,18 @@ class AccountRiskGuard:
 
 
 def _drawdown_percent(account: dict[str, Any]) -> float:
+    """Internal drawdown sign convention: loss is negative (<= 0).
+
+    Matches paper/execution_quality.py:152 so external renderers can rely on a
+    single sign direction. A positive (equity>initial) return is reported as
+    0 — the display layer surfaces the magnitude separately when needed.
+    """
     initial = float(account.get("initial_balance") or 10000.0)
     if initial <= 0:
         return 0.0
     equity = float(account.get("equity") or initial)
-    return (equity - initial) / initial * 100.0
+    raw = (equity - initial) / initial * 100.0
+    return min(0.0, raw)
 
 
 def _ok_result(drawdown_pct: float) -> dict[str, Any]:

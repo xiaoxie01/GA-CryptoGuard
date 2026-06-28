@@ -382,8 +382,34 @@ class GAMasterController:
     def analyze_symbol(self, request: GAAnalysisRequest) -> dict[str, Any]:
         context = self.context_builder.build(request)
         snapshot = context["snapshot"]
+
+        # Hourly Report Accuracy: previous grade + hysteresis + clampgate
+        from plugins.crypto_guard.strategy.grade_config import (
+            grade_with_hysteresis, clamp_grade, grade_delta, SA_MAX_COUNTER_EVIDENCE,
+        )
+        previous_grade = self.repo.previous_ga_decision_grade(
+            snapshot.get("symbol", ""),
+            exclude_batch_id=request.batch_id,
+        ) if hasattr(self.repo, "previous_ga_decision_grade") else None
+        context["previous_grade"] = previous_grade
+
         legacy = run_agent_sop_decision(snapshot, context=context)
         legacy["analysis_source"] = "ga_master_controller"
+        legacy["batch_id"] = request.batch_id
+        legacy["previous_grade"] = previous_grade if previous_grade else legacy.get("previous_grade")
+
+        # Grade hysteresis (research 10): apply against previous grade
+        prev_for_hys = legacy.get("previous_grade") or previous_grade
+        if prev_for_hys:
+            effective_grade, hys_reason = grade_with_hysteresis(
+                float(legacy.get("confidence") or 0.0), prev_for_hys,
+            )
+            if effective_grade != legacy.get("signal_grade"):
+                legacy["signal_grade"] = effective_grade
+                notes = list(legacy.get("risk_notes") or [])
+                if hys_reason:
+                    notes.append(hys_reason)
+                legacy["risk_notes"] = notes
 
         risk = self.risk_gate.check(legacy, context)
         legacy["risk_check"] = risk
@@ -392,6 +418,36 @@ class GAMasterController:
             legacy["decision"] = "monitor_only"
             notes = list(legacy.get("risk_notes") or [])
             notes.append("GA Master 风控未通过：" + "；".join(risk.get("reasons") or []))
+            legacy["risk_notes"] = notes
+
+        # S/A clamp (research 11): cap grade when execution evidence is missing.
+        counter_count = len(legacy.get("counter_evidence") or [])
+        if hasattr(risk, "get"):
+            pass  # risk is a dict
+        # Determine HTF conflict for clamp (low-cost heuristic from snapshot)
+        htf_conflict = False
+        independent_trend = bool(((legacy.get("market_regime_gate") or {}).get("adjustments") or {}).get("regime_alignment") == "independent_trend")
+        if legacy.get("trade_plan") and risk.get("ok", False):
+            side = str((legacy.get("trade_plan") or {}).get("side") or "").upper()
+            htf_structure = str(((snapshot.get("profiles") or {}).get("4h") or {}).get("market_structure") or "unknown").lower()
+            if side == "LONG" and htf_structure not in {"bullish", "transition", "range", "unknown", ""}:
+                htf_conflict = True
+            elif side == "SHORT" and htf_structure not in {"bearish", "transition", "range", "unknown", ""}:
+                htf_conflict = True
+        clamped_grade, clamp_reason = clamp_grade(
+            legacy.get("signal_grade") or "D",
+            has_trade_plan=bool(legacy.get("has_trade_plan") and legacy.get("trade_plan")),
+            risk_ok=bool(risk.get("ok")),
+            confidence=float(legacy.get("confidence") or 0),
+            htf_conflict=htf_conflict,
+            independent_trend=independent_trend,
+            counter_evidence_count=counter_count,
+        )
+        if clamped_grade != legacy.get("signal_grade"):
+            legacy["signal_grade"] = clamped_grade
+            notes = list(legacy.get("risk_notes") or [])
+            if clamp_reason:
+                notes.append(clamp_reason)
             legacy["risk_notes"] = notes
 
         # Account risk_off state — visible in ga_decisions for monitoring
@@ -466,7 +522,21 @@ class GAMasterController:
             feishu_actions=feishu_actions,
             snapshot_id=context.get("snapshot_id"),
             analysis_state_id=analysis_state_id,
+            batch_id=request.batch_id,
+            previous_grade=legacy.get("previous_grade") or previous_grade,
+            grade_delta_value=grade_delta(legacy.get("previous_grade") or previous_grade, legacy.get("signal_grade") or "D"),
         )
+        # Deterministic consistency override of final_summary text (rendered_summary)
+        # before persistence (P0 text/field consistency check).
+        from plugins.crypto_guard.notify.report_consistency import rewrite_inconsistent_summary, contains_forbidden_phrase
+        rendered = rewrite_inconsistent_summary(ga_decision.get("final_summary") or "", ga_decision)
+        ga_decision["rendered_summary"] = rendered
+        # If LLM or template text still carried forbidden phrases, replace
+        # final_summary itself so downstream (signals table, agent brief) does
+        # not leak inconsistent wording.
+        if contains_forbidden_phrase(ga_decision.get("final_summary") or "") and rendered != ga_decision.get("final_summary"):
+            ga_decision["final_summary"] = rendered
+            ga_decision["summary"] = rendered
         saved = self.persistence.save(ga_decision)
 
         # P0: 写入 shadow 评估 — 为所有 shadow_testing 候选积累样本（多候选不饥饿）

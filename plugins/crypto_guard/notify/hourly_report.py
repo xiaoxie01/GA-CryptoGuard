@@ -9,6 +9,14 @@ from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
 from plugins.crypto_guard.storage.migrations import check_schema_health
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+from plugins.crypto_guard.diagnostics.report_diagnostics import run_for_report
+from plugins.crypto_guard.notify.report_consistency import (
+    FORBIDDEN_EXECUTABLE_PHRASES, contains_forbidden_phrase, rewrite_inconsistent_summary,
+)
+from plugins.crypto_guard.strategy.grade_config import (
+    MIN_CONFIDENCE_FOR_PAPER_ORDER, grade_delta,
+)
+from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
 
 
 def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -37,7 +45,18 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     active_symbols = repo.active_analysis_symbols()
-    ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120)
+
+    # P0 batch-completion gate (research 01/02): use the current 15m
+    # analysis batch as the report cutoff. If the batch is still running
+    # within the configured timeout budget, wait briefly for completion;
+    # on timeout, mark the report incomplete and persist missing/failed
+    # symbols.  Never sleep blindly — poll at most `max_polls` times with
+    # short wait, controlled entirely by scheduler config (no hardcoded
+    # sleep patch).
+    batch_state = _await_batch_completion(repo, primary_interval="15m")
+    min_analysis_time = batch_state["min_analysis_time"]
+    batches_reported = batch_state.get("batch_id")
+    ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time)
     signals = repo.latest_signals_by_symbol(limit=80)
     states = repo.latest_analysis_states(limit=120)
     open_orders = repo.list_open_paper_orders()
@@ -57,6 +76,7 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
     account_feedback_gate = _fetch_account_feedback_gate_stats(repo)
     market_regime_gate = _fetch_market_regime_gate_stats(repo)
     state_consistency = _fetch_state_consistency(repo)
+    report_accuracy_diagnostics = run_for_report(repo, batch_id=batches_reported)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -78,13 +98,141 @@ def build_hourly_report(repo: CryptoGuardRepository) -> dict[str, Any]:
         "account_feedback_gate": account_feedback_gate,
         "market_regime_gate": market_regime_gate,
         "state_consistency": state_consistency,
+        "report_accuracy_diagnostics": report_accuracy_diagnostics,
+        "batch": batch_state,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics)
         ),
     }
+
+
+def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: str = "15m") -> dict[str, Any]:
+    """Poll the latest analysis_batches row for the current 15m slot until the
+    enabled symbols are accounted for or the timeout budget is exhausted.
+
+    Timeout and poll interval are configurable via scheduler.yaml under
+    ``hourly_report.batch_gate`` (see research 01/02).  When the batch is
+    not running (e.g. report invoked outside the cron minute) we still
+    anchor ``min_analysis_time`` to the previous 15m close so stale
+    decisions from earlier batches cannot bleed through.  Returns a dict
+    describing the batch state for renderer/diagnostics use.
+    """
+    cfg = _hourly_report_gate_config()
+    timeout_seconds = int(cfg.get("timeout_seconds", 300))  # default 5 minutes
+    poll_interval = float(cfg.get("poll_interval_seconds", 5))
+    max_polls = max(1, int(timeout_seconds / max(poll_interval, 0.1)))
+
+    cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
+    span = INTERVAL_MS[primary_interval]
+    # min_analysis_time = previous 15m candle close_time so the renderer can
+    # also rely on it for the SQL filter even when no batch row exists.
+    expected_batch_id = f"{primary_interval}:{cutoff_ms}"
+
+    def _snapshot() -> dict[str, Any] | None:
+        batch = repo.get_analysis_batch(expected_batch_id)
+        if batch:
+            return batch
+        # fall back to the most recent running/finished batch within cutoff window
+        row = repo.conn.execute(
+            """
+            SELECT batch_id, primary_interval, analysis_time, status,
+                   enabled_symbols_json, completed_symbols_json, failed_symbols_json
+            FROM analysis_batches
+            WHERE primary_interval=? AND analysis_time >= ?
+            ORDER BY analysis_time DESC, id DESC LIMIT 1
+            """,
+            (primary_interval, cutoff_ms - span),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "batch_id": row["batch_id"], "status": row["status"],
+            "enabled_symbols": _json_list(row["enabled_symbols_json"]),
+            "completed_symbols": _json_list(row["completed_symbols_json"]),
+            "failed_symbols": _json_list(row["failed_symbols_json"]),
+        }
+
+    snapshot = _snapshot()
+    incomplete = False
+    missing: list[str] = []
+    failed: list[str] = []
+    still_running: list[str] = []
+    enabled_symbols: list[str] = []
+    status = "absent"
+
+    if snapshot is not None:
+        enabled_symbols = list(snapshot.get("enabled_symbols") or [])
+        completed = set(snapshot.get("completed_symbols") or [])
+        failed = list(snapshot.get("failed_symbols") or [])
+        status = str(snapshot.get("status") or "running")
+        missing = sorted(set(enabled_symbols) - completed - set(failed))
+        if status == "running" and missing:
+            for _ in range(max_polls):
+                snap2 = _snapshot()
+                if snap2 is None:
+                    break
+                enabled_symbols = list(snap2.get("enabled_symbols") or enabled_symbols)
+                completed = set(snap2.get("completed_symbols") or [])
+                failed = list(snap2.get("failed_symbols") or [])
+                status = str(snap2.get("status") or "running")
+                missing = sorted(set(enabled_symbols) - completed - set(failed))
+                still_running = sorted(missing)
+                if not missing or status != "running":
+                    break
+                _short_sleep(poll_interval)
+            # final snapshot after polls
+            snap3 = _snapshot()
+            if snap3:
+                enabled_symbols = list(snap3.get("enabled_symbols") or enabled_symbols)
+                completed = set(snap3.get("completed_symbols") or [])
+                failed = list(snap3.get("failed_symbols") or [])
+                status = str(snap3.get("status") or status)
+                missing = sorted(set(enabled_symbols) - completed - set(failed))
+                still_running = sorted(missing)
+            if missing:
+                incomplete = True
+
+    return {
+        "batch_id": (snapshot or {}).get("batch_id") if snapshot else expected_batch_id,
+        "primary_interval": primary_interval,
+        "analysis_time": cutoff_ms,
+        "min_analysis_time": cutoff_ms - span + 1,  # start of expected batch slot
+        "status": status,
+        "incomplete": incomplete,
+        "enabled_symbols": enabled_symbols,
+        "missing_symbols": missing,
+        "failed_symbols": failed,
+        "still_running": still_running,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _hourly_report_gate_config() -> dict[str, Any]:
+    """Load batch-gate config from scheduler.yaml (no exception noise)."""
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        report_cfg = (load_config().scheduler or {}).get("hourly_report") or {}
+        return report_cfg.get("batch_gate") or {}
+    except Exception:
+        return {}
+
+
+def _short_sleep(seconds: float) -> None:
+    import time as _time
+    _time.sleep(max(0.0, float(seconds)))
+
+
+def _json_list(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return list(data) if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def render_ga_hourly_summary(
@@ -104,24 +252,80 @@ def render_ga_hourly_summary(
     account_feedback_gate: dict[str, Any] | None = None,
     market_regime_gate: dict[str, Any] | None = None,
     state_consistency: dict[str, Any] | None = None,
+    batch_state: dict[str, Any] | None = None,
+    report_accuracy_diagnostics: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
     for row in rows:
         grade = str(row.get("signal_grade") or "D")
         grade_counts[grade] = grade_counts.get(grade, 0) + 1
-    high_grade = [r for r in rows if str(r.get("signal_grade")) in {"S", "A", "B"}]
-    no_edge = [r for r in rows if str(r.get("signal_grade")) in {"C", "D"}]
-    lines = [
+    # P0: classify opportunities by execution gate instead of grade-only.
+    executable: list[dict[str, Any]] = []
+    observation: list[dict[str, Any]] = []
+    no_edge: list[dict[str, Any]] = []
+    now_ms = utc_ms()
+    # The renderer's stale cutoff mirrors the batch completion gate (one
+    # analysis cycle aged beyond the current 15m slot = stale).
+    stale_cutoff_ms = latest_closed_close_time_ms("15m", now_ms) - INTERVAL_MS["15m"]
+    for row in rows:
+        tier = _opportunity_classifier(row)
+        row["_tier"] = tier["tier"]
+        row["_blockers"] = tier["blockers"]
+        row["_stale"] = _is_stale_decision(row, stale_cutoff_ms)
+        if row["_stale"] and tier["tier"] == "executable":
+            # stale + executable → demote to observation with explicit blocker
+            row["_tier"] = "observation"
+            row["_blockers"] = row["_blockers"] + ["stale_decision"]
+        if str(row.get("signal_grade")) in {"C", "D"}:
+            no_edge.append(row)
+            continue
+        if tier["tier"] == "executable":
+            executable.append(row)
+        else:
+            observation.append(row)
+    high_grade = executable + observation  # legacy alias for position conflict logic
+    lines: list[str] = [
         "**GA CryptoGuard 每小时摘要**",
         f"北京时间（UTC+8）：{_format_time_utc8(generated_at_utc)}",
         f"UTC 时间：{generated_at_utc}",
         "",
+    ]
+    # P0: report batch completion / incompleteness header.
+    if batch_state:
+        bid = batch_state.get("batch_id") or "-"
+        status = batch_state.get("status") or "-"
+        incomplete = bool(batch_state.get("incomplete"))
+        enabled_syms = batch_state.get("enabled_symbols") or []
+        completed_syms_raw = batch_state.get("completed_symbols") or []
+        if isinstance(completed_syms_raw, str):
+            completed_syms = _json_list(completed_syms_raw)
+        else:
+            completed_syms = list(completed_syms_raw)
+        failed_syms = batch_state.get("failed_symbols") or []
+        if isinstance(failed_syms, str):
+            failed_syms = _json_list(failed_syms)
+        lines.append("**零、分析批次状态**")
+        lines.append(
+            f"- batch_id={bid}；状态={status}；"
+            f"enabled={len(enabled_syms)}；completed={len(completed_syms)}；failed={len(failed_syms)}"
+        )
+        if failed_syms:
+            lines.append("- 失败 symbols：" + ", ".join(failed_syms))
+        if incomplete:
+            missing = batch_state.get("missing_symbols") or []
+            still_running = batch_state.get("still_running") or []
+            lines.append(
+                f"- ⚠ 本报告 incomplete：missing={missing or []}；still_running={still_running or []}"
+            )
+        lines.append("")
+
+    lines.extend([
         "**一、系统状态**",
         f"- scheduler：运行中；队列 user={queue_counts.get('pending_user', 0)} background={queue_counts.get('pending_background', 0)} running={queue_counts.get('running', 0)}",
-        "- market data：SQLite 热数据；Redis/Parquet/DuckDB 状态见 /status",
+        "- market data：Binance USDⓈ-M 期货公共 K 线（SQLite 热数据）；Redis/Parquet/DuckDB 状态见 /status",
         f"- 任务队列：最近失败任务 {len(failed_jobs)}",
-    ]
+    ])
 
     # P2-B: Add risk_off state
     if risk_state:
@@ -140,11 +344,18 @@ def render_ga_hourly_summary(
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
         snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
+        dd_value = float(snap.get("drawdown_percent") or 0)
+        dd_display = abs(dd_value)  # P1: external amplitude is non-negative
         lines.append(
             f"- equity={float(equity_snapshot.get('account_equity') or 0):.2f}；"
             f"unrealized={float(equity_snapshot.get('unrealized_pnl') or 0):.2f}；"
             f"realized={float(equity_snapshot.get('realized_pnl') or 0):.2f}；"
-            f"drawdown={float(snap.get('drawdown_percent') or 0):.2f}%"
+            f"回撤={dd_display:.2f}%"
+            + ("（账号权益低于初始）" if dd_value < 0 else "（未回撤）" if dd_value >= 0 else "")
+        )
+        lines.append(
+            f"- decision_source=ga_decisions；distribution_source={((duckdb_stats or {}).get('source') or 'sqlite_fresh')}；"
+            f"market_data_source=Binance USDⓈ-M futures；fallback={'no' if (duckdb_stats or {}).get('ok') else 'duckdb_unavailable'}"
         )
     else:
         lines.append("- 暂无净值快照")
@@ -163,54 +374,35 @@ def render_ga_hourly_summary(
                 win_rate = short["wins"] / short["count"] * 100 if short["count"] > 0 else 0
                 lines.append(f"- SHORT：{short['count']} 笔，胜率 {win_rate:.0f}%，avg R={short['avg_r']:.2f}")
 
-    lines.extend(["", "**三、高等级机会（S/A/B）**"])
-    if not high_grade:
-        lines.append("- 暂无 S/A/B 级机会")
+    lines.extend(["", "**三、可执行机会（S/A/B 且通过执行门禁）**"])
+    if not executable:
+        lines.append("- 暂无可执行机会")
     # Index open orders by symbol for position-aware display
     open_by_symbol: dict[str, list[dict[str, Any]]] = {}
     for o in open_orders:
         open_by_symbol.setdefault(o["symbol"], []).append(o)
-    for row in high_grade[:10]:
-        symbol = row["symbol"]
-        # signal side: trade_plan.side > market_bias mapping
-        trade_plan = row.get("trade_plan") or {}
-        signal_side = str(trade_plan.get("side", "")).upper()
-        if not signal_side:
-            bias = str(row.get("market_bias") or "").lower()
-            signal_side = {"bullish": "LONG", "bearish": "SHORT"}.get(bias, "")
-        symbol_orders = open_by_symbol.get(symbol, [])
-        position_status = ""
-        if symbol_orders:
-            open_orders_list = [o for o in symbol_orders if o.get("status") == "open"]
-            pending_orders = [o for o in symbol_orders if o.get("status") == "pending"]
-            recheck_orders = [o for o in symbol_orders if o.get("status") == "needs_recheck"]
-            if open_orders_list:
-                order_sides = {str(o.get("side", "")).upper() for o in open_orders_list}
-                order_ids = [f"#{o['id']}" for o in open_orders_list]
-                if signal_side and signal_side not in order_sides:
-                    position_status = f"，**已持仓 {'/'.join(sorted(order_sides))} {'/'.join(order_ids)} / 当前信号 {signal_side}，方向冲突需复核**"
-                else:
-                    position_status = f"，已持仓 {'/'.join(sorted(order_sides))} {'/'.join(order_ids)}"
-            elif pending_orders:
-                position_status = "，挂单等待"
-            elif recheck_orders:
-                position_status = "，等待重检"
-        lines.append(
-            f"- {symbol}：{row.get('signal_grade')}，{float(row.get('confidence') or 0) * 100:.0f}%；"
-            f"{_decision_text(row.get('decision'))}{position_status}；{row.get('final_summary') or '-'}"
-        )
+    for row in executable[:10]:
+        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="可执行"))
 
-    lines.extend(["", "**四、当前机会监控**"])
+    lines.extend(["", "**四、观察候选（评级较高但未通过执行门禁）**"])
+    if not observation:
+        lines.append("- 暂无观察候选")
+    for row in observation[:20]:
+        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="观察候选"))
+
+    lines.extend(["", "**五、当前机会监控**"])
     if not active_watches:
         lines.append("- 暂无 active 机会监控")
     for watch in active_watches[:10]:
         condition = _compact_items(_safe_json(watch.get("watch_condition_json"), []), max_items=2)
         lines.append(f"- #{watch['id']} {watch['symbol']} {watch.get('direction') or '-'}：{condition or watch.get('watch_reason') or '-'}")
 
-    lines.extend(["", "**五、C/D 无优势品种汇总**"])
+    lines.extend(["", "**六、无优势品种汇总（C/D）**"])
     distribution = (duckdb_stats or {}).get("signal_distribution") or grade_counts
-    source = (duckdb_stats or {}).get("source") or "in_memory_fallback"
-    lines.append("- 等级分布：" + "，".join(f"{k}={v}" for k, v in distribution.items()) + f"（{source}）")
+    source_raw = (duckdb_stats or {}).get("source") or "in_memory_fallback"
+    # P2 语法澄清 (research 09): describe the fallback honestly
+    source_label = _distribution_source_label(source_raw, duckdb_stats)
+    lines.append("- 等级分布：" + "，".join(f"{k}={v}" for k, v in distribution.items()) + f"（{source_label}）")
     if no_edge:
         symbols = ", ".join(row["symbol"] for row in no_edge[:30])
         lines.append(f"- C/D：{symbols}")
@@ -221,7 +413,7 @@ def render_ga_hourly_summary(
 
     # P2-B: Add shadow data quality
     if shadow_data_quality and not shadow_data_quality.get("error"):
-        lines.extend(["", "**六、影子测试数据质量**"])
+        lines.extend(["", "**七、影子测试数据质量**"])
         total = shadow_data_quality.get("total_shadow_samples", 0)
         if total > 0:
             real_ratio = shadow_data_quality.get("real_ratio", 0) * 100
@@ -357,6 +549,18 @@ def render_ga_hourly_summary(
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
+
+    # P2: 报告准确性诊断 (research 00 P2 diagnostics)
+    if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
+        summary = report_accuracy_diagnostics.get("summary") or {}
+        total = report_accuracy_diagnostics.get("total_issues", 0)
+        lines.extend(["", "**十、报告准确性诊断**"])
+        if total == 0:
+            lines.append("- 报告准确性诊断全部通过，未发现不一致")
+        else:
+            for code, count in summary.items():
+                if int(count or 0) > 0:
+                    lines.append(f"- {code}={count}")
     lines.append("")
     lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
     return "\n".join(lines)
@@ -743,6 +947,8 @@ def render_hourly_report_text(
     account_feedback_gate: dict[str, Any] | None = None,
     market_regime_gate: dict[str, Any] | None = None,
     state_consistency: dict[str, Any] | None = None,
+    batch_state: dict[str, Any] | None = None,
+    report_accuracy_diagnostics: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
     state_by_symbol: dict[str, dict[str, Any]] = {}
@@ -760,6 +966,20 @@ def render_hourly_report_text(
         "",
         "**产品分析概览：**",
     ]
+
+    # P0: render legacy summary also surfaces batch completion header if provided.
+    if batch_state:
+        bid = batch_state.get("batch_id") or "-"
+        status = batch_state.get("status") or "-"
+        incomplete = bool(batch_state.get("incomplete"))
+        lines.append(
+            f"- 分析批次：batch_id={bid}；状态={status}"
+            + ("；incomplete" if incomplete else "")
+        )
+        if incomplete:
+            missing = batch_state.get("missing_symbols") or []
+            lines.append(f"  - ⚠ incomplete：missing={missing or []}")
+        lines.append("")
 
     # P2-B: Add risk_off state
     if risk_state:
@@ -967,6 +1187,18 @@ def render_hourly_report_text(
         for job in failed_jobs:
             err = (job.get("error_message") or "")[:120]
             lines.append(f"- #{job['id']} {job['job_type']}：{err}")
+
+    # P2: report accuracy diagnostics (legacy renderer also surfaces them).
+    if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
+        summary = report_accuracy_diagnostics.get("summary") or {}
+        total = report_accuracy_diagnostics.get("total_issues", 0)
+        lines.extend(["", "**报告准确性诊断：**"])
+        if total == 0:
+            lines.append("- 报告准确性诊断全部通过，未发现不一致")
+        else:
+            for code, count in summary.items():
+                if int(count or 0) > 0:
+                    lines.append(f"- {code}={count}")
     lines.append("")
     lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
     return "\n".join(lines)
@@ -992,7 +1224,113 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "risk_check": _safe_json(row.get("risk_check_json"), {}),
         "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
         "trade_plan": trade_plan,
+        # P0 latency fields exposed for render helpers.
+        "analysis_time": int(row.get("analysis_time") or 0),
+        "created_at": row.get("created_at"),
+        "batch_id": row.get("batch_id"),
+        "previous_grade": row.get("previous_grade"),
     }
+
+
+def _opportunity_classifier(row: dict[str, Any]) -> dict[str, Any]:
+    """P0 classify a decision row into executable / observation / no_edge.
+
+    ``executable`` requires grade ∈ {S,A,B}, confidence ≥
+    MIN_CONFIDENCE_FOR_PAPER_ORDER, a complete trade_plan, risk_check.ok
+    truthy, and a decision that authorises a paper order.  Any missing
+    gate demotes to ``observation``; C/D/monitor_only/no_edge fall to
+    ``no_edge`` is left to the caller.
+    """
+    grade = str(row.get("signal_grade") or "D").upper()
+    confidence = float(row.get("confidence") or 0)
+    risk_check = row.get("risk_check") or {}
+    if isinstance(risk_check, str):
+        try:
+            risk_check = json.loads(risk_check)
+        except Exception:
+            risk_check = {}
+    trade_plan = row.get("trade_plan") or {}
+    if isinstance(trade_plan, str):
+        try:
+            trade_plan = json.loads(trade_plan)
+        except Exception:
+            trade_plan = {}
+    decision = str(row.get("decision") or "")
+    blockers: list[str] = []
+
+    if grade not in {"S", "A", "B"}:
+        return {"tier": "no_edge", "blockers": [f"grade={grade}"]}
+
+    if confidence < MIN_CONFIDENCE_FOR_PAPER_ORDER:
+        blockers.append(f"confidence<{MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}")
+    if not trade_plan:
+        blockers.append("missing_trade_plan")
+    if not bool(risk_check.get("ok")):
+        blockers.append("risk_check_failed")
+    if decision not in {"create_paper_order", "trade_plan_available"}:
+        blockers.append(f"decision={decision}")
+
+    if not blockers:
+        return {"tier": "executable", "blockers": []}
+    return {"tier": "observation", "blockers": blockers}
+
+
+def _is_stale_decision(row: dict[str, Any], stale_cutoff_ms: int) -> bool:
+    """A decision is stale when its analysis_time falls before the start of
+    the current 15m analysis window (i.e. it belongs to an older batch).
+    """
+    analysis_time = int(row.get("analysis_time") or 0)
+    if analysis_time <= 0:
+        return True
+    return analysis_time <= stale_cutoff_ms
+
+
+def _format_opportunity_row(
+    row: dict[str, Any],
+    open_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    tier_label: str,
+) -> str:
+    """Render a single opportunity row with full P0 metadata."""
+    symbol = row.get("symbol") or "-"
+    grade = str(row.get("signal_grade") or "D").upper()
+    confidence = float(row.get("confidence") or 0)
+    decision_text = _decision_text(row.get("decision"))
+    analysis_time = int(row.get("analysis_time") or 0)
+    created_at = row.get("created_at")
+    age_min = ""
+    if created_at:
+        try:
+            parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            age_min = f"{int((utc_ms() - int(parsed.timestamp() * 1000)) / 60000)}m"
+        except Exception:
+            age_min = "-"
+    else:
+        age_min = "-"
+    batch_id = row.get("batch_id") or "-"
+    previous_grade = row.get("previous_grade") or "-"
+    delta = grade_delta(previous_grade, grade) if previous_grade and previous_grade != "-" else "-"
+    open_orders = open_by_symbol.get(symbol, [])
+    pos_status = _position_summary(open_orders) if open_orders else "无持仓"
+    blockers = row.get("_blockers") or []
+    blockers_text = "；".join(blockers) if blockers else "全部通过"
+    summary = row.get("final_summary") or "-"
+    if isinstance(summary, str):
+        summary = (summary[:120] + "…") if len(summary) > 120 else summary
+    return (
+        f"- **{symbol}**〔{tier_label}〕{decision_text}｜等级 {grade}（prev={previous_grade}, Δ={delta}）｜"
+        f"置信度 {confidence * 100:.0f}%｜analysis_time={analysis_time}｜age={age_min}｜batch_id={batch_id}｜"
+        f"持仓={pos_status}｜门禁={blockers_text}｜{summary}"
+    )
+
+
+def _distribution_source_label(source_raw: str, duckdb_stats: dict[str, Any] | None) -> str:
+    """P2 phrasing clarification for the distribution source label."""
+    if source_raw == "duckdb" and (duckdb_stats or {}).get("ok"):
+        return "DuckDB 时序"
+    if source_raw in {"in_memory_fallback", "sqlite_fallback"}:
+        return "SQLite 实时等级统计（DuckDB 未启用）"
+    return str(source_raw or "SQLite 实时等级统计（DuckDB 未启用）")
 
 
 def _decision_text(value: Any) -> str:
