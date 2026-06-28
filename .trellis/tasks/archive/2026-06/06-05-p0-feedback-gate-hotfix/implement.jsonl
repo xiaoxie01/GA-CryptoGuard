@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Module conventions for account risk guard, shadow testing, pending order lifecycle, state consistency diagnostics"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer data flow checklist for broker → gate → schema → report changes"}
+{"file": ".trellis/tasks/06-05-p0-feedback-gate-hotfix/prd.md", "reason": "P0 requirements: 7 confirmed defects and acceptance criteria"}
+{"file": ".trellis/tasks/06-05-cryptoguard-strategy-intelligence-upgrade/research/current-system-audit.md", "reason": "System audit confirming defects and what must be preserved"}

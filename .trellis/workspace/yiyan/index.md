@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 23
-- **Last Active**: 2026-06-27
+- **Total Sessions**: 24
+- **Last Active**: 2026-06-28
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~780 | Active |
+| `journal-1.md` | ~813 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 24 | 2026-06-28 | Hourly report accuracy: batch gate, opportunity classification, deterministic text override, grade hysteresis | `3677a6f` | `main` |
 | 23 | 2026-06-27 | Breakeven Stop-Loss Idempotency — 9 Fixes + Production Recovery | `ef2ea8c`, `ebc9899`, `efd3101` | `main` |
 | 22 | 2026-06-22 | Session 22 - Position conflict revalidator for open paper trades | `84cb212` | `main` |
 | 21 | 2026-06-21 | Session 21 - P1/P2 review closure: deterministic PnL, backtest gate, shadow hard gate, evolution evidence | `4b148af`, `9999bbf`, `b24b552`, `fa3a29e`, `4f22e86` | `main` |

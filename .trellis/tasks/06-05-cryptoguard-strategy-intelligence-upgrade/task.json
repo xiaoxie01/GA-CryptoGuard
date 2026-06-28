@@ -1,0 +1,29 @@
+{
+  "id": "cryptoguard-strategy-intelligence-upgrade",
+  "name": "cryptoguard-strategy-intelligence-upgrade",
+  "title": "CryptoGuard Strategy Intelligence Qualitative Upgrade",
+  "description": "Replace level-first trade plans with setup-first evidence-linked reasoning, real-rule historical validation, and causal self-evolution.",
+  "status": "planning",
+  "dev_type": null,
+  "scope": "cross-layer program: analysis, reasoning, risk, paper execution, backtest, evolution, storage, reporting",
+  "package": "crypto_guard",
+  "priority": "P0",
+  "creator": "yiyan",
+  "assignee": "yiyan",
+  "createdAt": "2026-06-05",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-05-p0-feedback-gate-hotfix",
+    "06-15-06-15-sync-upstream-genericagent"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Parent planning task. Implementation must be split into sequential child tasks P0-P6 and must not start before user approval.",
+  "meta": {}
+}

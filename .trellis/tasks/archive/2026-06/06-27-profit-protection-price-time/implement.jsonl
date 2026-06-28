@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "All CryptoGuard contracts: breakeven idempotency, atomic updates, dedupe keys, migration patterns, scheduler rules"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend spec index: database, error handling, quality, logging guidelines"}

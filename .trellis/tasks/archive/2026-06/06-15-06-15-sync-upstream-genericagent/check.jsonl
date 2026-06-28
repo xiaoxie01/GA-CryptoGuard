@@ -1,0 +1,2 @@
+{"file": ".trellis/workflow.md", "reason": "Verify task completion and repository cleanliness according to the project workflow."}
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Confirm the upstream merge did not regress CryptoGuard contracts."}

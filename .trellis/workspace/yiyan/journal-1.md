@@ -778,3 +778,36 @@ Fixed 5-layer idempotency defect causing 72 duplicate stop_loss_adjustment rows 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 24: Hourly report accuracy: batch gate, opportunity classification, deterministic text override, grade hysteresis
+
+**Date**: 2026-06-28
+**Task**: Hourly report accuracy: batch gate, opportunity classification, deterministic text override, grade hysteresis
+**Branch**: `main`
+
+### Summary
+
+Implemented hourly report market accuracy fix: batch completion gate (analysis_batches table + _await_batch_completion), three-tier opportunity classification (executable/observation/no_edge), deterministic summary validator (report_consistency.py strips FORBIDDEN_EXECUTABLE_PHRASES when execution gates fail), grade hysteresis (grade_with_hysteresis + clamp_grade + SA_MAX_COUNTER_EVIDENCE), 10 P2 diagnostic checks in report_diagnostics.py, drawdown sign convention fix, previous_ga_decision_grade exclude_batch_id, skipped-pending batch completion fix. 491 tests pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3677a6f` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

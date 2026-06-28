@@ -1,0 +1,2 @@
+{"file": ".trellis/workflow.md", "reason": "Follow project task and completion workflow while performing the upstream merge."}
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Preserve CryptoGuard architecture and behavioral contracts during the upstream sync."}

@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Verify code follows CryptoGuard conventions"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Verify migration and schema changes follow database guidelines"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify test coverage and quality standards"}

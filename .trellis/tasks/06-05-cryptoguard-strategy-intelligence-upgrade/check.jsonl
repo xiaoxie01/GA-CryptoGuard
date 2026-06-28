@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Review for regressions in GA ownership, closed-candle analysis, evolution state, shadow quality, account risk, and pending lifecycle."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify data contracts survive every layer and validation is not scattered or bypassed."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Verify schema.sql, migrations, repository methods, indexes, transactions, and audit fields stay consistent."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Apply backend review and test expectations."}
+{"file": ".trellis/tasks/06-05-cryptoguard-strategy-intelligence-upgrade/research/current-system-audit.md", "reason": "Check that the implementation resolves the audited root causes rather than only adding more filters."}
+{"file": ".trellis/tasks/archive/2026-06/05-27-ga-cryptoguard-duckdb-skill/research/metrics-and-backtest-guide.md", "reason": "Check that replay evidence is based on real rule execution, costs, no-lookahead, and out-of-sample metrics."}

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "CryptoGuard 模块约定，包含分析周期、评分逻辑、数据库表结构等关键约定"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "数据库操作规范，事务处理、迁移、错误处理等"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误处理模式，确保自进化循环中的错误不会导致状态不一致"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码质量规范，测试要求、命名约定等"}

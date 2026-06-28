@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Quality check against module conventions and forbidden patterns"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify cross-layer contracts after changes"}
+{"file": ".trellis/tasks/06-05-p0-feedback-gate-hotfix/prd.md", "reason": "Verify all 7 acceptance criteria pass"}

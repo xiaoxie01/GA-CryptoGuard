@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "验证实现是否符合 CryptoGuard 约定，特别是数据库表结构和状态流转"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验证测试覆盖、代码质量是否符合规范"}

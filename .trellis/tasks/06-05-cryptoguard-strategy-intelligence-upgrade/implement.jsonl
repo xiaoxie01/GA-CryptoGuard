@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/crypto-guard-conventions.md", "reason": "Preserve existing GA decision, evolution, risk, shadow, notification, pending-order, and diagnostics conventions while changing strategy behavior."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "The upgrade spans analysis, reasoning, risk, paper execution, storage, replay, evolution, and reporting; contracts and boundaries must be mapped before edits."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Schema, migration, repository, audit, and historical artifact changes must remain synchronized."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Use the project backend quality and testing checklist for every child task."}
+{"file": ".trellis/tasks/06-05-cryptoguard-strategy-intelligence-upgrade/research/current-system-audit.md", "reason": "Provides the verified defects, preserved capabilities, and immediate P0 feedback-gate regressions."}
+{"file": ".trellis/tasks/archive/2026-06/05-27-ga-cryptoguard-duckdb-skill/research/strategy-system-audit.md", "reason": "Historical architecture and data-flow baseline for strategy, review, replay, and evolution subsystems."}
+{"file": ".trellis/tasks/archive/2026-06/05-27-ga-cryptoguard-duckdb-skill/research/metrics-and-backtest-guide.md", "reason": "Documents earlier replay limitations, pseudo-R concerns, and the need for real outcome metrics."}
+{"file": ".trellis/tasks/archive/2026-06/05-27-ga-cryptoguard-duckdb-skill/research/improvement-areas.md", "reason": "Records structural strategy and evolution gaps that the new architecture must supersede."}
