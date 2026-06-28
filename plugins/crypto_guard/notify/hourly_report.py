@@ -1282,21 +1282,23 @@ def _format_level(value: Any) -> str:
         return str(value)
 
 
+from plugins.crypto_guard.notify.time_utils import format_event_time_cst as _format_time_utc8_compat
+
+
 def _format_time_utc8(value: Any) -> str:
+    """Format a timestamp to UTC+8 display string.
+
+    Delegates to the shared formatter in notify/time_utils.py.
+    """
     if value in (None, ""):
         return "-"
-    try:
-        if isinstance(value, (int, float)):
-            dt = datetime.fromtimestamp(float(value) / 1000, timezone.utc)
-        else:
-            text = str(value)
-            if text.isdigit():
-                dt = datetime.fromtimestamp(int(text) / 1000, timezone.utc)
-            else:
-                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return (dt.astimezone(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S UTC+8")
-    except Exception:
-        return str(value)
+    result = _format_time_utc8_compat(value)
+    if result == "不可用":
+        try:
+            return str(value)
+        except Exception:
+            return "-"
+    return result
 
 
 def _dedupe(items: list[str]) -> list[str]:

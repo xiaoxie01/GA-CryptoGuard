@@ -597,7 +597,7 @@ revalidate_pending_orders(repo)  # 15 min offset via scheduler
 1. **Late trend stage gate**: `trend_stage` in `{"late", "exhausted"}` blocks trend continuation orders
 2. **Overbought/oversold gate**: RSI >= 75 blocks LONG, RSI <= 25 blocks SHORT
 
-**Why**: 
+**Why**:
 - Late/exhausted trends have high reversal risk — continuation orders get trapped
 - Overbought/oversold RSI indicates exhaustion — chasing moves at extremes leads to poor entries
 
@@ -630,7 +630,7 @@ risk:
 1. **Order flow gate**: `signal == "degraded"` blocks as primary evidence; opposite `supports` blocks
 2. **Chanlun gate**: Opposite `supports` direction blocks trades
 
-**Why**: 
+**Why**:
 - Degraded order flow cannot serve as primary entry confirmation
 - Opposite order_flow/chanlun signals indicate conflicting evidence — entering against them is high-risk
 
@@ -1190,3 +1190,190 @@ Reference execution (2026-06-27): 17 hourly_summary rows restored to `sent`, 1 `
 ---
 
 **Last updated**: 2026-06-27 (P1: Breakeven stop-loss idempotency — atomic conditional UPDATE, pending-only outbox dedupe, marker-guarded one-shot migration, single-scheduler enforcement)
+
+---
+
+## 22. Mark Price Contract
+
+### Convention: All financial actions MUST use fresh Binance mark price, never candle close or entry_price
+
+**What**: The module `paper/mark_price.py` provides the single source of truth for current price in all financial actions (breakeven stop adjustments, profit protection, conflict exits). It fetches from Binance USDⓈ-M Futures `/fapi/v1/premiumIndex` endpoint.
+
+**Why**: Using 1h candle close as "current price" can be up to 60 minutes stale. Using `entry_price` as "current price" is semantically wrong and produces incorrect R-multiple calculations. The mark price from Binance is the fair value used for liquidations and funding rate calculations.
+
+**Signatures**:
+```python
+def fetch_binance_mark_price(symbol: str, *, config, cache: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Fetch live mark price from Binance USDⓈ-M Futures.
+    Returns: {ok, symbol, mark_price, price_time, source: 'binance_mark'}
+    """
+
+def get_mark_price_with_fallback(symbol: str, *, repo, cache: dict[str, Any] | None = None,
+                                  max_cache_age_seconds: float = 90.0) -> dict[str, Any]:
+    """Get mark price with fallback cascade:
+    1. Live Binance fetch (cached per cycle)
+    2. paper_positions last_price (if <= 90s old)
+    3. Error — fail-closed, never use candle close or entry_price
+    Returns: {ok, symbol, mark_price, price_time, source}
+    """
+
+def clear_cycle_cache() -> None:
+    """Clear the module-level mark price cache. Called at start of each
+    update_paper_positions() cycle."""
+```
+
+**Fail-closed behavior**: If mark price is unavailable (API down, network error), the function returns `ok=False` and the caller must set the position to `needs_position_recheck`. Never fall back to candle close or entry_price as a substitute for current price.
+
+**Cache semantics**: Per-cycle caching via a module-level dict + shared dict passed through call chain. Cache is cleared at the start of each `update_paper_positions()` cycle. Within a cycle, the same symbol's mark price is fetched once and reused.
+
+**Module**: `plugins/crypto_guard/paper/mark_price.py`
+
+**Forbidden**:
+```python
+# WRONG: Using candle close as current price
+current_price = float(candle["close"])  # up to 60 min stale
+
+# WRONG: Using entry_price as current price
+current_price = order["entry_price"]  # semantically wrong
+
+# CORRECT: Use mark price with fallback
+result = get_mark_price_with_fallback(symbol, repo=repo, cache=mark_price_cache)
+if not result["ok"]:
+    return {"needs_position_recheck": True, "error": "mark_price_unavailable"}
+current_price = result["mark_price"]
+```
+
+---
+
+## 23. Profit Protection Contract
+
+### Convention: Profit protection evaluates BEFORE routine breakeven, closes on strong reverse signals
+
+**What**: When a paper position has accumulated significant MFE (Maximum Favorable Excursion) and then retraces against a strong S-grade reverse GA signal, the position is closed immediately to protect profits. This is evaluated BEFORE routine breakeven stop adjustments.
+
+**Why**: Without profit protection, profitable positions can give back all gains during reversals. The XRPUSDT order #1 incident lost +1.44R MFE because no mechanism existed to close on reversal signals.
+
+**Six-condition gate** (all must pass):
+1. GA decision is actionable (not `monitor_only`, `no_edge`, `hold_position`)
+2. Signal grade is `S`
+3. Confidence >= 0.85
+4. `mfe_r >= 1.00` (position has accumulated at least 1R of profit)
+5. `current_r >= 0.30` (position is still profitable, not underwater)
+6. `retracement_r >= 0.50` (position has given back at least 0.5R from MFE)
+
+**R-multiple computation**:
+```python
+initial_risk_usdt = trade["initial_risk_usdt"]
+mfe_r = (mfe_price - entry_price) / initial_risk_usdt  # for LONG
+current_r = (mark_price - entry_price) / initial_risk_usdt  # for LONG
+retracement_r = mfe_r - current_r
+```
+
+**Side effects on close**:
+1. `close_paper_trade(repo, trade_id, mark_price, close_reason="strong_conflict_profit_protection")`
+2. `update_paper_order_status(repo, order_id, "closed")`
+3. `backfill_active_evaluation_pnl_r(repo, ga_decision_id, trade_id, pnl_r)`
+4. `upsert_paper_position(repo, order_id, symbol, mark_price, ...)`
+5. `log_paper_trade_event(repo, order_id, "profit_protection", ...)`
+6. `enqueue_job("trade_review", ...)`
+7. `enqueue_job("paper_event_alert", ...)`
+
+**Idempotency**: Uses dedupe key `profit_protection:{trade_id}:{ga_decision_id}`. The same GA decision cannot trigger profit protection on the same trade twice.
+
+**Integration point**: `position_conflict_revalidator.py` — because only the conflict revalidator has access to the GA decision with `signal_grade` and `confidence` fields. The routine breakeven in `update_paper_positions` runs without a GA decision.
+
+**Config** (`trading_mode.yaml`):
+```yaml
+position_conflict:
+  profit_protection:
+    enabled: true
+    min_grade: "S"
+    min_confidence: 0.85
+    min_mfe_r: 1.00
+    min_current_r: 0.30
+    min_retracement_r: 0.50
+    action: "close_full"
+```
+
+**Functions**:
+```python
+# paper_position_updater.py
+def _evaluate_profit_protection(repo, order, trade, ga_decision, config, *, mark_price_cache) -> dict:
+    """Evaluate the 6-condition profit protection gate. Returns {triggered, ...}."""
+
+def _execute_profit_protection_close(repo, order, trade, ga_decision, mark_price, ...) -> dict:
+    """Execute full close with all side effects. Idempotent via dedupe key."""
+
+# position_conflict_revalidator.py
+def _evaluate_profit_protection_inline(repo, order, trade, ga_decision, config, *, mark_price_cache) -> dict:
+    """Bridge function that delegates to _evaluate_profit_protection from paper_position_updater."""
+```
+
+---
+
+## 24. Notification Time Contract
+
+### Convention: All paper trading notifications MUST include UTC+8 event time via shared formatter
+
+**What**: Every paper trading notification (fill, stop adjustment, close, expiry, profit protection, conflict) must contain an explicit UTC+8 event time. The shared formatter `format_event_time_cst` in `notify/time_utils.py` is the single source of truth.
+
+**Why**: Before this contract, notifications had inconsistent time formatting:
+- Some used inline `strftime + (UTC+8)`
+- Some used `datetime.now(timezone(timedelta(hours=8)))` directly
+- Some had no time at all
+- The `hourly_report.py` and `run_ga_workers.py` each had their own `_format_time_utc8` / `_fmt_utc8` implementations
+
+**Shared formatter** (`notify/time_utils.py`):
+```python
+CST = timezone(timedelta(hours=8))
+
+def format_event_time_cst(dt: datetime | str | int | float | None) -> str:
+    """Format to 'YYYY-MM-DD HH:mm:ss (UTC+8)'.
+    - Naive datetimes treated as UTC
+    - String inputs parsed as ISO8601
+    - int/float treated as Unix milliseconds
+    - Returns '不可用' if None or unparseable
+    """
+
+def format_event_time_cst_compact(dt: datetime | str | int | float | None) -> str:
+    """Format to 'YYYY-MM-DD HH:MM (UTC+8)' (no seconds)."""
+
+def format_event_time_cst_for_line(dt: Any) -> str:
+    """Format for a notification detail line: '时间：YYYY-MM-DD HH:mm:ss (UTC+8)'."""
+
+def now_cst_iso() -> str:
+    """Return current UTC+8 time as ISO8601 string."""
+```
+
+**Price labels in notifications**:
+| Event type | Price label | Price source |
+|---|---|---|
+| `paper_order_filled` | 成交价 | `entry_price` |
+| `stop_loss_adjustment` | 当前 Mark Price | `mark_price` |
+| `conflict_exit` / `strong_conflict_profit_protection` | 退出 Mark Price | `exit_price` (mark price) |
+| `stop_loss_hit` / `take_profit_hit` | 退出价 | `exit_price` |
+| Other close events | 退出价 | `exit_price` |
+
+**Forbidden patterns**:
+```python
+# WRONG: Inline strftime + manual UTC+8
+f"时间：{dt.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
+
+# WRONG: Direct CST construction
+now_utc8 = datetime.now(timezone(timedelta(hours=8)))
+
+# WRONG: Using entry_price as generic "价格"
+f"- 价格：{order['entry_price']}"
+
+# CORRECT: Use shared formatter
+from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+event_time = format_event_time_cst(payload.get("event_time"))
+```
+
+**Coverage**: All notification paths in `run_ga_workers.py` (`handle_paper_event_alert`, `handle_paper_drawdown_alert`, auto-create order notification), `hourly_report.py` (`_format_time_utc8`), and `position_conflict_revalidator.py` (`_notify_action`) must use the shared formatter.
+
+**Module**: `plugins/crypto_guard/notify/time_utils.py`
+
+---
+
+**Last updated**: 2026-06-27 (P0: Mark price contract, profit protection contract, notification time contract)

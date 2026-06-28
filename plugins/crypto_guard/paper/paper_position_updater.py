@@ -5,6 +5,7 @@ from typing import Any
 from plugins.crypto_guard.data.binance_rest import fetch_klines, fetch_mark_price
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.paper.execution_quality import equity_snapshot, market_from_price
+from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price, get_mark_price_with_fallback, clear_cycle_cache
 from plugins.crypto_guard.paper.paper_broker import close_trade_if_needed, fill_order_if_triggered
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
@@ -49,6 +50,10 @@ def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, flo
     price_map = prices or {}
     latest_prices: dict[str, float] = {}
     redis = RedisAdapter()
+    # Clear per-cycle mark price cache
+    clear_cycle_cache()
+    # Shared mark price cache for this cycle
+    mark_price_cache: dict[str, dict[str, Any]] = {}
     # Track orders filled in this batch — skip TP/SL check for them (defer to next batch)
     filled_order_ids: set[int] = set()
     for order in repo.list_open_paper_orders():
@@ -242,8 +247,19 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
     except (ValueError, TypeError):
         return None
 
-    # Gate 2: current_r >= threshold — use market.close (not market.price)
-    current_price = float(market.get("close") or 0)
+    # Gate 2: current_r >= threshold — use fresh mark price
+    symbol = order["symbol"]
+    mp_result = get_mark_price_with_fallback(symbol, repo=repo)
+    if mp_result.get("ok"):
+        current_price = float(mp_result["mark_price"])
+        price_source = mp_result.get("price_source", "binance_usdm_mark")
+        price_as_of = mp_result.get("price_as_of", datetime.now(timezone.utc).isoformat())
+        price_age_seconds = mp_result.get("price_age_seconds", -1.0)
+    else:
+        # Fail-closed: do NOT fall back to market.close. Skip the adjustment
+        # so we never move a stop using a stale candle-derived price.
+        LOGGER.info("breakeven: mark price fetch failed for %s, skipping adjustment (fail-closed)", symbol)
+        return None
     if current_price <= 0:
         return None
     initial_risk_usdt = float(trade.get("initial_risk_usdt") or 0)
@@ -270,6 +286,12 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
     changed = repo.update_paper_order_stop_loss(
         order["id"], entry,
         reason=f"统一保本门禁通过（持仓 {holding_minutes:.0f} 分钟，current_r={current_r:.2f}，MFE/R={mfe_r:.2f}）",
+        price_meta={
+            "mark_price": current_price,
+            "price_source": price_source,
+            "price_as_of": price_as_of,
+            "price_age_seconds": price_age_seconds,
+        },
     )
     if not changed:
         # The atomic UPDATE was rejected (order not open, concurrent writer
@@ -282,6 +304,7 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
     # SAME breakeven stop is deduped, but raising the stop to a new
     # (higher) breakeven price gets its own job.
     dedupe_session = f"system:paper:stop_adjust:breakeven:{order['id']}:{round(entry, 8)}"
+    event_time = datetime.now(timezone.utc).isoformat()
     repo.enqueue_job_once(
         "paper_event_alert",
         3,
@@ -294,11 +317,17 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
             "trade_id": trade["id"],
             "entry_price": entry,
             "new_stop_loss": entry,
+            "mark_price": current_price,
+            "price_source": price_source,
+            "price_as_of": price_as_of,
+            "event_time": event_time,
+            "current_r": round(current_r, 4),
+            "mfe_r": round(mfe_r, 4),
             "reason": "统一保本门禁通过",
             "side": order.get("side"),
             "audit": {
                 "open_time": created_at,
-                "action_time": datetime.now(timezone.utc).isoformat(),
+                "action_time": event_time,
                 "holding_minutes": round(holding_minutes, 1) if holding_minutes else None,
                 "current_r": round(current_r, 4),
                 "mfe_r": round(mfe_r, 4),
@@ -307,6 +336,465 @@ def _maybe_adjust_stop_to_breakeven(repo: CryptoGuardRepository, order: dict[str
         },
     )
     return {"ok": True, "stop_loss_adjusted": True, "order_id": order["id"], "new_stop_loss": entry}
+
+
+def _evaluate_profit_protection(
+    repo: CryptoGuardRepository,
+    order: dict[str, Any],
+    trade: dict[str, Any],
+    ga_decision: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    *,
+    mark_price_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Evaluate profit protection rule on a profitable position facing a strong reverse signal.
+
+    Runs BEFORE breakeven adjustment. If triggered, closes the full position
+    using fresh Binance mark price.
+
+    Conditions (ALL must be true):
+    1. ga_decision is actionable (not passive/watch/monitor_only)
+    2. signal_grade == "S"
+    3. confidence >= min_confidence (default 0.85)
+    4. mfe_r >= min_mfe_r (default 1.00)
+    5. current_r >= min_current_r (default 0.30)
+    6. retracement_r = mfe_r - current_r >= min_retracement_r (default 0.50)
+
+    Returns None if profit protection does not trigger, or a result dict if it does.
+    """
+    from datetime import datetime, timezone
+    from plugins.crypto_guard.config.loader import load_config
+
+    if config is None:
+        cfg = load_config().trading_mode.get("position_conflict") or {}
+        pp_cfg = cfg.get("profit_protection") or {}
+    else:
+        pp_cfg = config.get("profit_protection") or {}
+
+    if not pp_cfg.get("enabled", True):
+        return None
+
+    # Condition 1: ga_decision is actionable
+    decision = str(ga_decision.get("decision") or "").lower()
+    if decision in ("opportunity_watch", "monitor_only", "no_edge", ""):
+        return None
+    # Check risk_check
+    risk = ga_decision.get("risk_check_json")
+    if risk:
+        import json as _json
+        if isinstance(risk, str):
+            try:
+                risk = _json.loads(risk)
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        if isinstance(risk, dict) and risk.get("ok") is False:
+            return None
+    # Check has trade_plan
+    trade_plan = ga_decision.get("trade_plan_json")
+    if trade_plan:
+        import json as _json
+        if isinstance(trade_plan, str):
+            try:
+                trade_plan = _json.loads(trade_plan)
+            except (_json.JSONDecodeError, TypeError):
+                trade_plan = None
+    if not trade_plan:
+        return None
+
+    # Condition 2: signal_grade == "S"
+    grade = str(ga_decision.get("signal_grade") or "").upper()
+    min_grade = str(pp_cfg.get("min_grade", "S")).upper()
+    if grade != min_grade:
+        return None
+
+    # Condition 2b: direction verification — profit protection only triggers on
+    # EXPLICIT conflict (opposite signal). Same-direction OR neutral/unknown bias
+    # must NOT trigger. This is a strict bidirectional gate:
+    #   LONG  → require bias == "bearish"; anything else (bullish/neutral/unknown) → no trigger
+    #   SHORT → require bias == "bullish";  anything else (bearish/neutral/unknown) → no trigger
+    side = str(order["side"]).upper()
+    bias = str(ga_decision.get("bias") or ga_decision.get("market_bias") or "neutral").lower()
+    # Parse bias from decision field if not directly available
+    decision_text = str(ga_decision.get("decision") or "").lower()
+    if bias not in ("bullish", "bearish") and decision_text:
+        if "bullish" in decision_text:
+            bias = "bullish"
+        elif "bearish" in decision_text:
+            bias = "bearish"
+        else:
+            bias = "neutral"
+    # Strict bidirectional: only explicit opposite-direction conflict triggers
+    if side == "LONG":
+        if bias != "bearish":
+            return None
+    elif side == "SHORT":
+        if bias != "bullish":
+            return None
+    else:
+        # Unknown side — fail-closed
+        return None
+
+    # Condition 3: confidence >= min_confidence
+    confidence = float(ga_decision.get("confidence") or 0)
+    min_confidence = float(pp_cfg.get("min_confidence", 0.85))
+    if confidence < min_confidence:
+        return None
+
+    # Compute R-multiples using initial_risk_usdt
+    try:
+        entry = float(trade["entry_price"])
+        quantity = float(trade.get("quantity") or order.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if entry <= 0 or quantity <= 0:
+        return None
+
+    initial_risk_usdt = float(trade.get("initial_risk_usdt") or 0)
+    if initial_risk_usdt <= 0:
+        return None  # fail-closed
+
+    side = str(order["side"]).upper()
+
+    # Compute mfe_r from stored max_favorable_excursion
+    mfe_usdt = float(trade.get("max_favorable_excursion") or 0)
+    mfe_r = mfe_usdt / initial_risk_usdt if initial_risk_usdt > 0 else 0.0
+
+    # Condition 4: mfe_r >= min_mfe_r
+    min_mfe_r = float(pp_cfg.get("min_mfe_r", 1.00))
+    if mfe_r < min_mfe_r:
+        return None
+
+    # Get fresh mark price for current_r computation
+    symbol = order["symbol"]
+    mp_result = get_mark_price_with_fallback(symbol, repo=repo, cache=mark_price_cache)
+    if not mp_result.get("ok"):
+        # Fail-closed: log warning and return needs_position_recheck without changing order status
+        LOGGER.warning(
+            "profit_protection: cannot get fresh mark price for %s order_id=%s, marking needs_position_recheck",
+            symbol, order["id"],
+        )
+        return {
+            "ok": False,
+            "action": "needs_position_recheck",
+            "order_id": order["id"],
+            "trade_id": trade["id"],
+            "reason": "mark_price_unavailable",
+            "mark_price_result": mp_result,
+        }
+
+    mark_price = float(mp_result["mark_price"])
+    price_source = mp_result.get("price_source", "unknown")
+    price_as_of = mp_result.get("price_as_of", "")
+    price_age_seconds = float(mp_result.get("price_age_seconds", 0))
+
+    # Compute current_r
+    if side == "LONG":
+        current_r = (mark_price - entry) * quantity / initial_risk_usdt
+    else:
+        current_r = (entry - mark_price) * quantity / initial_risk_usdt
+
+    # Condition 5: current_r >= min_current_r
+    min_current_r = float(pp_cfg.get("min_current_r", 0.30))
+    if current_r < min_current_r:
+        return None
+
+    # Condition 6: retracement_r >= min_retracement_r
+    retracement_r = mfe_r - current_r
+    min_retracement_r = float(pp_cfg.get("min_retracement_r", 0.50))
+    if retracement_r < min_retracement_r:
+        return None
+
+    # All conditions met — execute profit protection close
+    LOGGER.info(
+        "profit_protection triggered: order_id=%s symbol=%s side=%s mfe_r=%.2f current_r=%.2f retracement_r=%.2f grade=%s confidence=%.2f",
+        order["id"], symbol, side, mfe_r, current_r, retracement_r, grade, confidence,
+    )
+
+    return _execute_profit_protection_close(
+        repo, order, trade, ga_decision, mark_price, price_source, price_as_of,
+        price_age_seconds, current_r, mfe_r, retracement_r,
+    )
+
+
+def _execute_profit_protection_close(
+    repo: CryptoGuardRepository,
+    order: dict[str, Any],
+    trade: dict[str, Any],
+    ga_decision: dict[str, Any],
+    mark_price: float,
+    price_source: str,
+    price_as_of: str,
+    price_age_seconds: float,
+    current_r: float,
+    mfe_r: float,
+    retracement_r: float,
+) -> dict[str, Any]:
+    """Execute profit protection close with full side effects.
+
+    Reuses the existing close path: close_paper_trade, update_paper_order_status,
+    backfill_active_evaluation_pnl_r, upsert_paper_position_from_trade,
+    log_paper_trade_event, enqueue trade_review, enqueue paper_event_alert.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    trade_id = int(trade["id"])
+    order_id = int(order["id"])
+    symbol = str(order["symbol"])
+    side = str(order["side"]).upper()
+    ga_decision_id = int(ga_decision.get("id", 0))
+    entry_price = float(trade["entry_price"])
+    quantity = float(trade.get("quantity") or order.get("quantity") or 0)
+
+    # Idempotent: check order is still open
+    current_order = repo.conn.execute(
+        "SELECT status FROM paper_orders WHERE id=?", (order_id,),
+    ).fetchone()
+    if not current_order or current_order["status"] != "open":
+        return {
+            "ok": False,
+            "action": "profit_protection",
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "status": "order_not_open",
+            "reason": f"Order status is {current_order['status'] if current_order else 'missing'}",
+        }
+
+    # Dedupe: check if already closed for this GA decision
+    dedupe_key = f"profit_protection:{trade_id}:{ga_decision_id}"
+    existing = repo.conn.execute(
+        "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
+        (dedupe_key,),
+    ).fetchone()
+    if existing:
+        return {
+            "ok": True,
+            "action": "profit_protection",
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "status": "duplicate",
+            "reason": "Already executed for this GA decision",
+        }
+
+    # Compute PnL
+    if side == "LONG":
+        pnl = (mark_price - entry_price) * quantity
+        pnl_r = (mark_price - entry_price) * quantity / float(trade.get("initial_risk_usdt") or 1)
+    else:
+        pnl = (entry_price - mark_price) * quantity
+        pnl_r = (entry_price - mark_price) * quantity / float(trade.get("initial_risk_usdt") or 1)
+
+    pnl_percent = (pnl / (entry_price * quantity)) * 100 if entry_price * quantity != 0 else 0.0
+
+    # Quality metrics
+    mfe = float(trade.get("max_favorable_excursion") or 0)
+    mae = float(trade.get("max_adverse_excursion") or 0)
+    if side == "LONG":
+        if mark_price < entry_price:
+            mae = max(mae, (entry_price - mark_price) * quantity)
+        else:
+            mfe = max(mfe, (mark_price - entry_price) * quantity)
+    else:
+        if mark_price > entry_price:
+            mae = max(mae, (mark_price - entry_price) * quantity)
+        else:
+            mfe = max(mfe, (entry_price - mark_price) * quantity)
+
+    signal_decay = 0.0
+    created_at = trade.get("created_at")
+    if created_at:
+        try:
+            dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            minutes = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 60.0)
+            signal_decay = min(0.6, minutes / 1440.0)
+        except (ValueError, TypeError):
+            pass
+
+    # Build stop_take_path
+    existing_path = trade.get("stop_take_path_json")
+    if existing_path:
+        try:
+            if isinstance(existing_path, str):
+                path = _json.loads(existing_path)
+            else:
+                path = list(existing_path)
+        except (_json.JSONDecodeError, TypeError):
+            path = []
+    else:
+        path = []
+    path.append({"event": "profit_protection_close", "ts": datetime.now(timezone.utc).isoformat()})
+
+    # Close the trade — atomic guard: only the winner of a concurrent close
+    # proceeds with side effects. If close_paper_trade returns False, a
+    # concurrent writer already closed this trade; bail out without
+    # backfill / order update / position upsert / logs / enqueues / commit.
+    close_reason = "strong_conflict_profit_protection"
+    closed = repo.close_paper_trade(
+        trade_id=trade_id,
+        exit_price=mark_price,
+        close_reason=close_reason,
+        pnl=pnl,
+        pnl_percent=pnl_percent,
+        pnl_r=pnl_r,
+        mfe=mfe,
+        mae=mae,
+        signal_decay_score=signal_decay,
+        stop_take_path=path,
+    )
+    if not closed:
+        return {
+            "ok": True,
+            "action": "profit_protection",
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "status": "already_closed",
+            "reason": "concurrent close",
+        }
+
+    # Backfill real PnL to active evaluations
+    repo.backfill_active_evaluation_pnl_r(trade, pnl_r)
+
+    # Update paper_orders
+    now = datetime.now(timezone.utc).isoformat()
+    repo.update_paper_order_status(order_id, "closed", closed_at=now)
+    repo.conn.execute(
+        "UPDATE paper_orders SET cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
+        (f"profit_protection: GA#{ga_decision_id} strong reverse signal", ga_decision_id, order_id),
+    )
+
+    # Update paper_positions
+    account = repo.ensure_paper_account()
+    repo.upsert_paper_position_from_trade(
+        account_id=int(account["id"]),
+        trade=trade,
+        status="closed",
+        current_price=mark_price,
+        unrealized_pnl=0.0,
+        unrealized_pnl_pct=0.0,
+    )
+
+    # Log close_position event
+    repo.log_paper_trade_event(
+        position_id=trade_id,
+        event_type="close_position",
+        symbol=symbol,
+        side=side,
+        price=mark_price,
+        quantity=quantity,
+        pnl=pnl,
+        pnl_pct=pnl_percent,
+        reason=close_reason,
+        event={
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "pnl_r": round(pnl_r, 4),
+            "ga_decision_id": ga_decision_id,
+            "mark_price": mark_price,
+            "price_source": price_source,
+            "price_as_of": price_as_of,
+            "price_age_seconds": price_age_seconds,
+            "current_r": round(current_r, 4),
+            "mfe_r": round(mfe_r, 4),
+            "retracement_r": round(retracement_r, 4),
+            "dedupe_key": dedupe_key,
+        },
+    )
+
+    # Log profit_protection event
+    repo.log_paper_trade_event(
+        event_type="profit_protection",
+        symbol=symbol,
+        side=side,
+        price=mark_price,
+        quantity=quantity,
+        pnl=pnl,
+        pnl_pct=pnl_percent,
+        reason=f"Profit protection: GA#{ga_decision_id} S-grade reverse signal, MFE={mfe_r:.2f}R current={current_r:.2f}R retracement={retracement_r:.2f}R",
+        event={
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "ga_decision_id": ga_decision_id,
+            "signal_grade": ga_decision.get("signal_grade"),
+            "confidence": ga_decision.get("confidence"),
+            "mark_price": mark_price,
+            "price_source": price_source,
+            "price_as_of": price_as_of,
+            "price_age_seconds": price_age_seconds,
+            "current_r": round(current_r, 4),
+            "mfe_r": round(mfe_r, 4),
+            "retracement_r": round(retracement_r, 4),
+            "close_reason": close_reason,
+            "dedupe_key": dedupe_key,
+        },
+    )
+
+    # Enqueue trade_review
+    repo.enqueue_job("trade_review", 4, "paper_worker", f"system:review:{trade_id}", {"trade_id": trade_id})
+
+    # Enqueue paper_event_alert — use enqueue_job_once to prevent duplicate notifications
+    repo.enqueue_job_once(
+        "paper_event_alert",
+        3,
+        "paper_worker",
+        f"system:paper:profit_protection:{trade_id}:{ga_decision_id}",
+        {
+            "event_type": "close_position",
+            "symbol": symbol,
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "exit_price": mark_price,
+            "close_reason": close_reason,
+            "pnl_r": round(pnl_r, 4),
+            "side": side,
+            "entry_price": entry_price,
+            "stop_loss": order.get("stop_loss"),
+            "mark_price": mark_price,
+            "price_source": price_source,
+            "price_as_of": price_as_of,
+            "price_age_seconds": price_age_seconds,
+            "current_r": round(current_r, 4),
+            "mfe_r": round(mfe_r, 4),
+            "retracement_r": round(retracement_r, 4),
+            "take_profits": _json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "filled_at": order.get("filled_at"),
+            "closed_at": now,
+            "event_time": now,
+            "quantity": quantity,
+            "order_type": order.get("order_type"),
+            "fill_method": order.get("fill_method"),
+            "ga_decision_id": ga_decision_id,
+        },
+    )
+
+    repo.conn.commit()
+
+    LOGGER.info(
+        "profit_protection_close: trade_id=%s symbol=%s side=%s exit_price=%s pnl_r=%.2f ga=%s",
+        trade_id, symbol, side, mark_price, pnl_r, ga_decision_id,
+    )
+
+    return {
+        "ok": True,
+        "action": "profit_protection",
+        "order_id": order_id,
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "entry_price": entry_price,
+        "exit_price": mark_price,
+        "pnl_r": round(pnl_r, 4),
+        "pnl": round(pnl, 4),
+        "mfe_r": round(mfe_r, 4),
+        "current_r": round(current_r, 4),
+        "retracement_r": round(retracement_r, 4),
+        "ga_decision_id": ga_decision_id,
+        "event_time": now,
+        "close_reason": close_reason,
+        "status": "executed",
+    }
 
 
 def _sync_open_positions(repo: CryptoGuardRepository, latest_prices: dict[str, float]) -> None:

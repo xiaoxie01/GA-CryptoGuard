@@ -83,12 +83,12 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                         entry_type = str(plan.get("entry_type") or "limit")
                         status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
                         entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
-                        from datetime import datetime, timezone, timedelta
-                        now_utc8 = datetime.now(timezone(timedelta(hours=8)))
+                        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+                        event_time = format_event_time_cst(datetime.now(timezone.utc))
                         order_text = "\n".join([
                             "**CryptoGuard 已自动创建模拟盘订单**",
                             "",
-                            f"- 时间：{now_utc8.strftime('%Y-%m-%d %H:%M')} (UTC+8)",
+                            f"- 时间：{event_time}",
                             f"- 产品：{decision.get('symbol')}",
                             f"- 方向：{side_cn}",
                             f"- 状态：{status_cn}",
@@ -274,6 +274,7 @@ def _handle_intraday_loss_review(repo: CryptoGuardRepository, payload: dict[str,
     Only pushes a risk alert and optionally evaluates evolution triggers.
     """
     from plugins.crypto_guard.review.evolution_triggers import evaluate_evolution_triggers
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst_for_line
 
     day_utc = payload.get("day_utc", "")
     loss_count = int(payload.get("loss_count") or 0)
@@ -282,12 +283,15 @@ def _handle_intraday_loss_review(repo: CryptoGuardRepository, payload: dict[str,
     # Evaluate evolution triggers (creates/updates trigger, does NOT create candidate)
     evolution = evaluate_evolution_triggers(repo)
 
+    event_time = format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat())
+
     # Build risk alert text
     lines = [
         "**CryptoGuard 盘中风险提醒 · 止损阈值触发**",
         "",
         f"- 日期：{day_utc}",
         f"- 今日止损：{loss_count} 笔",
+        f"- {event_time}",
         f"- 进化状态：{'已触发' if evolution.get('triggered') else '未触发'}",
         "",
         "系统将继续监控，不影响现有模拟盘持仓。",
@@ -487,11 +491,14 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         "timeout": "超时平仓",
         "manual": "手动平仓",
         "conflict_exit": "方向冲突提前退出",
+        "strong_conflict_profit_protection": "利润保护平仓",
     }.get(payload.get("close_reason"), payload.get("close_reason") or "")
     if event_type == "close_position" and payload.get("close_reason") == "conflict_exit":
         event_cn = "提前退出"
     elif event_type == "close_position" and payload.get("close_reason") == "manual":
         event_cn = "手动平仓"
+    elif event_type == "close_position" and payload.get("close_reason") == "strong_conflict_profit_protection":
+        event_cn = "利润保护平仓"
 
     # Calculate USDT P&L from R-multiple
     pnl_r = payload.get("pnl_r")
@@ -514,33 +521,33 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
 
     # Build event-specific details
     detail_lines = []
-    from datetime import datetime, timezone, timedelta
-    utc8 = timezone(timedelta(hours=8))
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst, format_event_time_cst_compact, format_event_time_cst_for_line
 
-    def _fmt_utc8(value: Any) -> str | None:
-        if not value:
-            return None
-        try:
-            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(utc8).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return None
-
+    # Resolve event time: use event's own timestamp first, fall back to current UTC
     event_time = payload.get("event_time") or payload.get("closed_at")
     if event_type == "paper_order_filled":
         event_time = event_time or payload.get("filled_at")
-    now_utc8 = datetime.now(utc8)
-    event_time_text = _fmt_utc8(event_time) or now_utc8.strftime("%Y-%m-%d %H:%M")
-    detail_lines.append(f"- 时间：{event_time_text} (UTC+8)")
+    if event_time:
+        detail_lines.append(format_event_time_cst_for_line(event_time))
+    else:
+        detail_lines.append(format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat()))
+
     if event_type == "stop_loss_adjustment":
         new_stop = payload.get("new_stop_loss")
         adj_reason = payload.get("reason", "")
+        mark_price = payload.get("mark_price")
+        if mark_price:
+            detail_lines.append(f"- 当前 Mark Price：{float(mark_price):.4f}")
         if new_stop:
             detail_lines.append(f"- 新止损：{new_stop}")
         if adj_reason:
             detail_lines.append(f"- 原因：{adj_reason}")
+        current_r = payload.get("current_r")
+        mfe_r = payload.get("mfe_r")
+        if current_r is not None:
+            detail_lines.append(f"- 当前 R：{float(current_r):+.2f}")
+        if mfe_r is not None:
+            detail_lines.append(f"- MFE/R：{float(mfe_r):+.2f}")
     elif event_type in ("take_profit_hit", "stop_loss_hit", "close_position"):
         reason = close_reason_cn
         detail_lines.append(f"- 原因：{reason}")
@@ -550,9 +557,9 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
             detail_lines.append(f"- 入场价：{float(entry_price):.4f}")
         filled_at = payload.get("filled_at")
         if filled_at:
-            filled_cn = _fmt_utc8(filled_at)
-            if filled_cn:
-                detail_lines.append(f"- 入场时间：{filled_cn} (UTC+8)")
+            filled_cn = format_event_time_cst_compact(filled_at)
+            if filled_cn != "不可用":
+                detail_lines.append(f"- 入场时间：{filled_cn}")
             else:
                 detail_lines.append(f"- 入场时间：{filled_at}")
         # TP/SL prices
@@ -563,15 +570,36 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         if take_profits:
             tp_prices = [f"{float(tp.get('price', tp)):.4f}" if isinstance(tp, dict) else f"{float(tp):.4f}" for tp in take_profits]
             detail_lines.append(f"- 止盈价：{', '.join(tp_prices)}")
-        # Exit price
+        # Exit price — show as "退出 Mark Price" for conflict/profit-protection, "退出价" for TP/SL
         exit_price = payload.get("exit_price")
+        close_reason = payload.get("close_reason", "")
         if exit_price:
-            detail_lines.append(f"- 退出价：{float(exit_price):.4f}")
+            if close_reason in ("conflict_exit", "strong_conflict_profit_protection"):
+                detail_lines.append(f"- 退出 Mark Price：{float(exit_price):.4f}")
+            else:
+                detail_lines.append(f"- 退出价：{float(exit_price):.4f}")
+        # Mark price context for close events
+        mark_price = payload.get("mark_price")
+        if mark_price and not exit_price:
+            detail_lines.append(f"- 当前 Mark Price：{float(mark_price):.4f}")
         if pnl_r is not None:
             detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
+        # R-multiples for profit protection / conflict
+        current_r = payload.get("current_r")
+        mfe_r = payload.get("mfe_r")
+        retracement_r = payload.get("retracement_r")
+        if current_r is not None:
+            detail_lines.append(f"- 当前 R：{float(current_r):+.2f}")
+        if mfe_r is not None:
+            detail_lines.append(f"- MFE/R：{float(mfe_r):+.2f}")
+        if retracement_r is not None:
+            detail_lines.append(f"- 回撤 R：{float(retracement_r):+.2f}")
     elif event_type == "paper_order_filled":
         if fill_method_cn:
             detail_lines.append(f"- 成交方式：{fill_method_cn}")
+        entry_price = payload.get("entry_price")
+        if entry_price:
+            detail_lines.append(f"- 成交价：{float(entry_price):.4f}")
         stop_loss = payload.get("stop_loss")
         if stop_loss:
             detail_lines.append(f"- 止损价：{float(stop_loss):.4f}")
@@ -586,16 +614,38 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         if pnl_r is not None:
             detail_lines.append(f"- 盈亏：{float(pnl_r):+.2f}R{pnl_usdt_text}")
 
-    # Price: use exit_price for close events, entry_price for fill events
-    display_price = payload.get("exit_price") or payload.get("entry_price") or "-"
+    # Price: use specific labels — never show a generic "价格" label
+    close_reason = payload.get("close_reason", "")
+    if event_type in ("take_profit_hit", "stop_loss_hit"):
+        price_label = "退出价"
+        display_price = payload.get("exit_price") or "不可用"
+    elif event_type == "close_position":
+        if close_reason in ("conflict_exit", "strong_conflict_profit_protection"):
+            price_label = "退出 Mark Price"
+        else:
+            price_label = "退出价"
+        display_price = payload.get("exit_price") or "不可用"
+    elif event_type == "paper_order_filled":
+        price_label = "成交价"
+        display_price = payload.get("entry_price") or "不可用"
+    elif event_type == "stop_loss_adjustment":
+        price_label = "当前 Mark Price"
+        display_price = payload.get("mark_price") or "不可用"
+    else:
+        # Unknown event_type — skip price line entirely
+        price_label = None
+        display_price = None
+
     lines = [
         f"**CryptoGuard 模拟盘 · {event_cn}**",
         "",
         f"- 产品：{payload.get('symbol', '-')}",
         f"- 方向：{side_cn}",
         f"- 订单：#{payload.get('order_id', '-')}",
-        f"- 价格：{display_price}",
-    ] + detail_lines + [
+    ]
+    if price_label and display_price:
+        lines.append(f"- {price_label}：{display_price}")
+    lines = lines + detail_lines + [
         "",
         "不构成实盘建议，仅用于模拟盘与策略研究。",
     ]
@@ -609,10 +659,17 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
 def handle_paper_drawdown_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     snapshot = payload.get("snapshot") or {}
     target = resolve_report_target(repo, payload)
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst_for_line
+    # Fallback to current UTC time so drawdown always shows a real UTC+8 time
+    # instead of "不可用" when event_time/created_at are missing.
+    event_time = format_event_time_cst_for_line(
+        payload.get("event_time") or payload.get("created_at") or datetime.now(timezone.utc).isoformat()
+    )
     text = "\n".join(
         [
             "**CryptoGuard 模拟盘回撤提醒**",
             "",
+            f"- {event_time}",
             f"- 账户权益：{float(snapshot.get('account_equity') or 0):.2f}",
             f"- 已实现盈亏：{float(snapshot.get('realized_pnl') or 0):.2f}",
             f"- 未实现盈亏：{float(snapshot.get('unrealized_pnl') or 0):.2f}",
@@ -630,18 +687,16 @@ def handle_paper_drawdown_alert(repo: CryptoGuardRepository, payload: dict[str, 
 def _fmt_utc8(ts: str | None) -> str:
     """Format an ISO timestamp to UTC+8 display string.
 
-    Returns the time in 'YYYY-MM-DD HH:MM UTC+8' or '-' if None/unparseable.
+    Delegates to the shared formatter in notify/time_utils.py.
+    Returns the time in 'YYYY-MM-DD HH:MM (UTC+8)' or '-' if None/unparseable.
     """
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst_compact
     if not ts:
         return "-"
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_cn = dt.astimezone(timezone(timedelta(hours=8)))
-        return dt_cn.strftime("%Y-%m-%d %H:%M") + " UTC+8"
-    except (ValueError, TypeError):
+    result = format_event_time_cst_compact(ts)
+    if result == "不可用":
         return str(ts)[:16]
+    return result
 
 
 def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
@@ -878,6 +933,7 @@ def _get_backtest_status(repo: CryptoGuardRepository, candidate_version: str) ->
 def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     """Send immediate notification when evolution is triggered or verdict promotes."""
     import json
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst_for_line
 
     # Cleanup old text-type evolution_review alerts (should be interactive)
     repo.conn.execute(
@@ -908,12 +964,15 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     # Build trigger detail
     detail_lines = [f"**CryptoGuard 自进化触发**", ""]
 
+    event_time = format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat())
+
     if trigger_type == "verdict_promotion":
         # Special handling for verdict promotion
         detail_lines.append(f"- 触发类型：{trigger_type_cn}")
         detail_lines.append(f"- 候选版本：{candidate_version}")
         detail_lines.append(f"- 影子样本数：{sample_count}")
         detail_lines.append(f"- 原因：{reason}")
+        detail_lines.append(f"- {event_time}")
         detail_lines.append("")
         detail_lines.append("候选策略已通过影子测试，等待人工确认升级。")
         detail_lines.append("")
@@ -930,6 +989,7 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
             detail_lines.append(f"- 今日止损：{loss_count} 笔")
         if reason:
             detail_lines.append(f"- 原因：{reason}")
+        detail_lines.append(f"- {event_time}")
         if related_ids:
             ids_str = "/".join(f"#{tid}" for tid in related_ids[:5])
             detail_lines.append(f"- 关联交易：{ids_str}")

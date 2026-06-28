@@ -1073,8 +1073,11 @@ class CryptoGuardRepository:
             (status, filled_at, closed_at, int(order_id)),
         )
 
-    def update_paper_order_stop_loss(self, order_id: int, stop_loss: float, *, reason: str) -> bool:
-        """Atomically update the stop_loss on a paper_order.
+    def update_paper_order_stop_loss(self, order_id: int, stop_loss: float, *, reason: str, price_meta: dict | None = None) -> bool:
+        """Atomically update the stop_loss on a paper_order and sync to trade/position.
+
+        All steps (CAS UPDATE, audit log, trade/position sync) are wrapped in a
+        single SAVEPOINT so they succeed or roll back together.
 
         Returns True if the row was actually changed (and a log was emitted),
         False if the order does not exist, the new stop equals the current
@@ -1088,47 +1091,156 @@ class CryptoGuardRepository:
         if old_stop is not None and abs(float(old_stop) - new_stop) < 1e-8:
             return False
         side = str(row["side"]).lower()
-        if old_stop is None:
-            # NULL-stop initialization branch. Only allowed on open orders.
-            cur = self.conn.execute(
-                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss IS NULL AND status='open'",
+
+        self.conn.execute("SAVEPOINT sp_stop_loss_sync")
+        try:
+            if old_stop is None:
+                cur = self.conn.execute(
+                    "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss IS NULL AND status='open'",
+                    (new_stop, int(order_id)),
+                )
+            elif side == "long":
+                cur = self.conn.execute(
+                    "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
+                    "AND status='open' AND ? >= stop_loss",
+                    (new_stop, int(order_id), float(old_stop), new_stop),
+                )
+            elif side == "short":
+                cur = self.conn.execute(
+                    "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
+                    "AND status='open' AND ? <= stop_loss",
+                    (new_stop, int(order_id), float(old_stop), new_stop),
+                )
+            else:
+                self.conn.execute("ROLLBACK TO sp_stop_loss_sync")
+                self.conn.execute("RELEASE sp_stop_loss_sync")
+                return False
+            if cur.rowcount == 0:
+                self.conn.execute("ROLLBACK TO sp_stop_loss_sync")
+                self.conn.execute("RELEASE sp_stop_loss_sync")
+                return False
+
+            event = {"order_id": int(order_id), "old_stop_loss": old_stop, "new_stop_loss": new_stop}
+            if price_meta:
+                event.update(price_meta)
+            self.log_paper_trade_event(
+                event_type="stop_loss_adjustment",
+                symbol=row["symbol"],
+                side=row["side"],
+                price=new_stop,
+                quantity=row["quantity"],
+                reason=reason,
+                event=event,
+            )
+
+            cur_trade = self.conn.execute(
+                "UPDATE paper_trades SET stop_loss=? WHERE order_id=? AND closed_at IS NULL",
                 (new_stop, int(order_id)),
             )
-        elif side == "long":
-            # LONG: new stop must be >= old stop (move toward breakeven/profit).
-            # Reject lowering the stop (would widen risk) and reject mutating
-            # non-open orders. Comparing in SQL avoids a TOCTOU between the
-            # Python check and the UPDATE.
-            cur = self.conn.execute(
-                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
-                "AND status='open' AND ? >= stop_loss",
-                (new_stop, int(order_id), float(old_stop), new_stop),
-            )
-        elif side == "short":
-            # SHORT: new stop must be <= old stop.
-            cur = self.conn.execute(
-                "UPDATE paper_orders SET stop_loss=? WHERE id=? AND stop_loss=? "
-                "AND status='open' AND ? <= stop_loss",
-                (new_stop, int(order_id), float(old_stop), new_stop),
-            )
-        else:
-            # Unknown side — fail-closed.
+            if cur_trade.rowcount == 0:
+                self.conn.execute("ROLLBACK TO sp_stop_loss_sync")
+                self.conn.execute("RELEASE sp_stop_loss_sync")
+                return False
+            trade_row = self.conn.execute(
+                "SELECT id FROM paper_trades WHERE order_id=? AND closed_at IS NULL LIMIT 1",
+                (int(order_id),),
+            ).fetchone()
+            if trade_row:
+                cur_pos = self.conn.execute(
+                    "UPDATE paper_positions SET stop_loss=? WHERE id=? AND status='open'",
+                    (new_stop, int(trade_row["id"])),
+                )
+                if cur_pos.rowcount == 0:
+                    self.conn.execute("ROLLBACK TO sp_stop_loss_sync")
+                    self.conn.execute("RELEASE sp_stop_loss_sync")
+                    return False
+            self.conn.execute("RELEASE sp_stop_loss_sync")
+        except Exception:
+            self.conn.execute("ROLLBACK TO sp_stop_loss_sync")
+            self.conn.execute("RELEASE sp_stop_loss_sync")
             return False
-        if cur.rowcount == 0:
-            # Concurrent writer already moved the stop, the order is not open,
-            # or the new stop would widen risk — treat as a no-op without
-            # emitting an audit log.
-            return False
-        self.log_paper_trade_event(
-            event_type="stop_loss_adjustment",
-            symbol=row["symbol"],
-            side=row["side"],
-            price=new_stop,
-            quantity=row["quantity"],
-            reason=reason,
-            event={"order_id": int(order_id), "old_stop_loss": old_stop, "new_stop_loss": new_stop},
-        )
         return True
+
+    def update_stop_loss_across_tables(
+        self,
+        trade_id: int,
+        order_id: int,
+        new_stop: float,
+        *,
+        old_stop: float,
+        reason: str,
+        price_meta: dict | None = None,
+    ) -> bool:
+        """Atomic conditional UPDATE of stop_loss across paper_trades, paper_positions,
+        and paper_orders. Uses CAS on paper_trades (compare-and-swap with old_stop).
+        All three table updates are wrapped in a SAVEPOINT so they succeed or roll
+        back together. Requires each table to update exactly the expected number of
+        rows; otherwise rolls back the entire operation.
+
+        Returns True if the paper_trades row was updated (winner of concurrent write),
+        False if the old_stop no longer matches (concurrent writer changed it first),
+        a related row is missing, or any step fails.
+        """
+        self.conn.execute("SAVEPOINT sp_stop_across")
+        try:
+            # 1. CAS on paper_trades — only the winner proceeds
+            cur = self.conn.execute(
+                "UPDATE paper_trades SET stop_loss=? WHERE id=? AND stop_loss=?",
+                (float(new_stop), int(trade_id), float(old_stop)),
+            )
+            if cur.rowcount == 0:
+                self.conn.execute("ROLLBACK TO sp_stop_across")
+                self.conn.execute("RELEASE sp_stop_across")
+                return False
+
+            # 2. Exact update on paper_positions by trade_id (convention: position.id == trade.id)
+            cur_pos = self.conn.execute(
+                "UPDATE paper_positions SET stop_loss=? WHERE id=? AND status='open'",
+                (float(new_stop), int(trade_id)),
+            )
+            if cur_pos.rowcount == 0:
+                self.conn.execute("ROLLBACK TO sp_stop_across")
+                self.conn.execute("RELEASE sp_stop_across")
+                return False
+
+            # 3. CAS on paper_orders (status guard)
+            if order_id:
+                cur_ord = self.conn.execute(
+                    "UPDATE paper_orders SET stop_loss=? WHERE id=? AND status='open'",
+                    (float(new_stop), int(order_id)),
+                )
+                if cur_ord.rowcount == 0:
+                    self.conn.execute("ROLLBACK TO sp_stop_across")
+                    self.conn.execute("RELEASE sp_stop_across")
+                    return False
+
+            # 4. Log the event
+            event = {
+                "trade_id": int(trade_id),
+                "order_id": int(order_id),
+                "old_stop_loss": float(old_stop),
+                "new_stop_loss": float(new_stop),
+                "reason": reason,
+            }
+            if price_meta:
+                event.update(price_meta)
+            trade_row = self.conn.execute("SELECT symbol, side FROM paper_trades WHERE id=?", (int(trade_id),)).fetchone()
+            if trade_row:
+                self.log_paper_trade_event(
+                    event_type="stop_loss_adjustment",
+                    symbol=trade_row["symbol"],
+                    side=trade_row["side"],
+                    price=float(new_stop),
+                    reason=reason,
+                    event=event,
+                )
+
+            self.conn.execute("RELEASE sp_stop_across")
+            return True
+        except Exception:
+            self.conn.execute("ROLLBACK TO sp_stop_across")
+            self.conn.execute("RELEASE sp_stop_across")
+            return False
 
     def create_paper_trade(self, order: dict[str, Any], entry_price: float, *, fill_method: str | None = None) -> int:
         # Guard: one order can only have one open trade
@@ -1220,8 +1332,16 @@ class CryptoGuardRepository:
         exit_efficiency: float | None = None,
         signal_decay_score: float | None = None,
         stop_take_path: list[dict[str, Any]] | None = None,
-    ) -> None:
-        self.conn.execute(
+    ) -> bool:
+        """Atomically close a paper trade.
+
+        Returns True if the row was updated (winner of any concurrent close),
+        False if the trade was already closed (WHERE closed_at IS NULL matched
+        no row). Callers MUST check the return value before executing side
+        effects (logs, enqueues, position upserts) so that only the winner
+        performs them.
+        """
+        cur = self.conn.execute(
             """
             UPDATE paper_trades
             SET exit_price=?, close_reason=?, pnl=?, pnl_percent=?, pnl_r=?,
@@ -1229,7 +1349,7 @@ class CryptoGuardRepository:
                 entry_efficiency=?, exit_efficiency=?, signal_decay_score=?,
                 stop_take_path_json=COALESCE(?, stop_take_path_json),
                 closed_at=CURRENT_TIMESTAMP
-            WHERE id=?
+            WHERE id=? AND closed_at IS NULL
             """,
             (
                 exit_price,
@@ -1246,6 +1366,7 @@ class CryptoGuardRepository:
                 int(trade_id),
             ),
         )
+        return cur.rowcount > 0
 
     def backfill_active_evaluation_pnl_r(self, trade: dict[str, Any], pnl_r: float) -> int:
         """Backfill real pnl_r to active strategy_evaluations (is_shadow=0) using exact ga_decision_id.

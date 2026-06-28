@@ -24,6 +24,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         # Dedup first, then apply schema. The migration is table-guarded so it
         # is a no-op on a fresh DB.
         _apply_stop_loss_adjustment_dedup(conn)
+        _ensure_profit_protection_cutoff_marker(conn)
         with SCHEMA_PATH.open("r", encoding="utf-8") as f:
             conn.executescript(f.read())
         _apply_phase_01_02_migrations(conn)
@@ -1090,6 +1091,30 @@ def _apply_candidate_cap_cleanup(conn: sqlite3.Connection) -> None:
                 (cand["version"],),
             )
 
+    conn.commit()
+
+
+def _ensure_profit_protection_cutoff_marker(conn: sqlite3.Connection) -> None:
+    """Write the profit_protection_mark_price_contract_v1 marker to _migration_state.
+
+    This marker is used by state_consistency._profit_protection_cutoff() to
+    determine the effective cutoff timestamp for profit-protection-era
+    diagnostics checks. Idempotent: no-op if the marker already exists.
+    """
+    # Ensure _migration_state table exists (created by _apply_stop_loss_adjustment_dedup
+    # or schema.sql, but may not exist yet on a fresh DB).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS _migration_state (
+            key TEXT PRIMARY KEY,
+            applied_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("profit_protection_mark_price_contract_v1",),
+    )
     conn.commit()
 
 

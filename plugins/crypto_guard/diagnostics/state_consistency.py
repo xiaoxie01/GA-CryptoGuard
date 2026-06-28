@@ -6,6 +6,9 @@ Detects:
 - Stale shadows (candidates in shadow_testing >7 days with no new samples)
 - Draft limbo (patches in draft >72 hours)
 - Duplicate open trades (same order_id with multiple open paper_trades)
+- Financial action missing mark price (paper_trade_logs with financial actions but no mark_price)
+- Financial action stale price (paper_trade_logs with mark_price older than action time)
+- Paper notification missing event time (alert_outbox paper events without event_time in payload)
 """
 
 from __future__ import annotations
@@ -17,6 +20,28 @@ from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.state_diagnostics")
+
+
+
+def _profit_protection_cutoff(repo: CryptoGuardRepository) -> str | None:
+    """Return the cutoff timestamp for profit-protection-era checks.
+
+    Looks up the applied_at of the profit_protection_mark_price_contract_v1
+    migration marker in _migration_state. Returns None when the marker
+    doesn't exist, meaning the migration hasn't been applied and new-contract
+    diagnostics should be skipped entirely.
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = 'profit_protection_mark_price_contract_v1' "
+            "LIMIT 1"
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        pass
+    return None
 
 
 def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
@@ -55,6 +80,9 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_paper_order_missing_active_eval(repo))
     issues.extend(_check_closed_trade_missing_active_real_pnl(repo))
     issues.extend(_check_shadow_candidate_legacy_only_samples(repo))
+    issues.extend(_check_financial_action_missing_mark_price(repo))
+    issues.extend(_check_financial_action_stale_price(repo))
+    issues.extend(_check_paper_notification_missing_event_time(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -81,6 +109,9 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "paper_order_missing_active_eval": len([i for i in issues if i["type"] == "paper_order_missing_active_eval"]),
         "closed_trade_missing_active_real_pnl": len([i for i in issues if i["type"] == "closed_trade_missing_active_real_pnl"]),
         "shadow_candidate_legacy_only": len([i for i in issues if i["type"] == "shadow_candidate_legacy_only"]),
+        "financial_action_missing_mark_price": len([i for i in issues if i["type"] == "financial_action_missing_mark_price"]),
+        "financial_action_stale_price": len([i for i in issues if i["type"] == "financial_action_stale_price"]),
+        "paper_notification_missing_event_time": len([i for i in issues if i["type"] == "paper_notification_missing_event_time"]),
     }
 
     return {
@@ -1233,5 +1264,192 @@ def _check_shadow_candidate_legacy_only_samples(repo: CryptoGuardRepository) -> 
                     "samples if the service was recently restarted."
                 ),
             })
+
+    return issues
+
+
+def _check_financial_action_missing_mark_price(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: paper_trade_logs with financial actions (breakeven stop adjust, profit protection,
+    conflict exit) that are missing mark_price in their event_json.
+
+    Financial actions that change stop-loss or close positions must record the mark_price
+    used for the decision. Missing mark_price means the action was taken without a
+    verifiable price reference.
+    """
+    issues: list[dict[str, Any]] = []
+    financial_actions = ("stop_loss_adjustment", "profit_protection", "conflict_exit",
+                         "strong_conflict_profit_protection")
+
+    cutoff = _profit_protection_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, position_id, event_type, event_json, created_at
+        FROM paper_trade_logs
+        WHERE event_type IN (?, ?, ?, ?)
+          AND created_at >= ?
+          AND (event_json IS NULL
+               OR json_extract(event_json, '$.mark_price') IS NULL)
+        ORDER BY created_at DESC
+        LIMIT 200
+        """,
+        (*financial_actions, cutoff),
+    ).fetchall()
+
+    for row in rows:
+        issues.append({
+            "type": "financial_action_missing_mark_price",
+            "severity": "warning",
+            "details": {
+                "log_id": row["id"],
+                "position_id": row["position_id"],
+                "event_type": row["event_type"],
+                "created_at": row["created_at"],
+            },
+            "suggested_action": (
+                "Financial actions must include mark_price in event_json. "
+                "Backfill mark_price from paper_positions or Binance API if available."
+            ),
+        })
+
+    return issues
+
+
+def _check_financial_action_stale_price(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: paper_trade_logs with financial actions where the mark_price timestamp
+    (price_as_of) is more than 120 seconds older than the action's created_at.
+
+    A stale price means the action was taken on outdated market data, which can
+    lead to incorrect stop-loss placement or premature profit protection exits.
+    """
+    issues: list[dict[str, Any]] = []
+    financial_actions = ("stop_loss_adjustment", "profit_protection", "conflict_exit",
+                         "strong_conflict_profit_protection")
+
+    cutoff = _profit_protection_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, position_id, event_type, event_json, created_at
+        FROM paper_trade_logs
+        WHERE event_type IN (?, ?, ?, ?)
+          AND created_at >= ?
+          AND event_json IS NOT NULL
+          AND json_extract(event_json, '$.mark_price') IS NOT NULL
+          AND json_extract(event_json, '$.price_as_of') IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 200
+        """,
+        (*financial_actions, cutoff),
+    ).fetchall()
+
+    for row in rows:
+        try:
+            import json
+            event = json.loads(row["event_json"])
+            price_as_of = event.get("price_as_of")
+            created_at = row["created_at"]
+
+            if price_as_of and created_at:
+                price_dt = datetime.fromisoformat(str(price_as_of).replace("Z", "+00:00"))
+                action_dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                if price_dt.tzinfo is None:
+                    price_dt = price_dt.replace(tzinfo=timezone.utc)
+                if action_dt.tzinfo is None:
+                    action_dt = action_dt.replace(tzinfo=timezone.utc)
+
+                age_seconds = (action_dt - price_dt).total_seconds()
+                if age_seconds > 120:
+                    issues.append({
+                        "type": "financial_action_stale_price",
+                        "severity": "warning",
+                        "details": {
+                            "log_id": row["id"],
+                            "position_id": row["position_id"],
+                            "event_type": row["event_type"],
+                            "price_age_seconds": round(age_seconds, 1),
+                            "price_as_of": price_as_of,
+                            "action_at": created_at,
+                        },
+                        "suggested_action": (
+                            f"Price was {age_seconds:.0f}s old when action was taken. "
+                            "Investigate mark_price fetch latency or cache staleness."
+                        ),
+                    })
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+    return issues
+
+
+def _check_paper_notification_missing_event_time(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Check: alert_outbox rows for paper trading events that are missing event_time
+    (UTC+8) in their payload_json.
+
+    All paper trading notifications must include an explicit UTC+8 event time
+    via the shared format_event_time_cst formatter. Missing event_time means
+    the notification was sent without a verifiable timestamp.
+
+    Also checks fallback_text for UTC+8 time patterns — if the fallback text
+    already contains a UTC+8 timestamp, the notification is not flagged.
+    """
+    import re
+    issues: list[dict[str, Any]] = []
+    paper_alert_types = (
+        "paper_order_filled", "paper_order_expired", "stop_loss_adjustment",
+        "stop_loss_hit", "take_profit_hit", "conflict_cancelled",
+        "strong_conflict_profit_protection", "profit_protection",
+        "paper_event_alert",
+    )
+
+    # UTC+8 time pattern: YYYY-MM-DD HH:MM:SS (UTC+8) or YYYY-MM-DD HH:MM (UTC+8)
+    utc8_pattern = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})? \(UTC\+8\)')
+
+    cutoff = _profit_protection_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, alert_type, payload_json, created_at
+        FROM alert_outbox
+        WHERE alert_type IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          AND status = 'sent'
+          AND created_at >= ?
+          AND (payload_json IS NULL
+               OR json_extract(payload_json, '$.event_time') IS NULL)
+        ORDER BY created_at DESC
+        LIMIT 200
+        """,
+        (*paper_alert_types, cutoff),
+    ).fetchall()
+
+    for row in rows:
+        # Check if fallback_text already contains a UTC+8 time
+        payload_json = row["payload_json"]
+        if payload_json:
+            try:
+                import json
+                payload = json.loads(payload_json)
+                fallback = payload.get("fallback_text", "")
+                if fallback and utc8_pattern.search(str(fallback)):
+                    continue  # UTC+8 time found in fallback text, not missing
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        issues.append({
+            "type": "paper_notification_missing_event_time",
+            "severity": "info",
+            "details": {
+                "outbox_id": row["id"],
+                "alert_type": row["alert_type"],
+                "created_at": row["created_at"],
+            },
+            "suggested_action": (
+                "Paper notifications must include event_time (UTC+8) in payload_json. "
+                "Update notification handlers to use format_event_time_cst from notify/time_utils.py."
+            ),
+        })
 
     return issues

@@ -511,7 +511,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         card = json.loads(captured["content"])
         text = card["body"]["elements"][0]["content"]
         self.assertIn("CryptoGuard 模拟盘 · 提前退出", text)
-        self.assertIn("时间：2026-06-23 06:31 (UTC+8)", text)
+        self.assertIn("2026-06-23 06:31:54 (UTC+8)", text)
         self.assertIn("入场时间：2026-06-23 05:39 (UTC+8)", text)
         self.assertNotIn("手动平仓", text)
 
@@ -3981,8 +3981,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
     # --- Test 9: routine breakeven uses market.close ---
 
-    def test_routine_breakeven_uses_market_close(self) -> None:
-        """_maybe_adjust_stop_to_breakeven 使用 market.close（而非 market.price）。"""
+    def test_routine_breakeven_fail_closed_on_mark_failure(self) -> None:
+        """Issue 2: _maybe_adjust_stop_to_breakeven fail-closed (returns None)
+        when get_mark_price_with_fallback returns ok=False — must NOT fall back
+        to market.close anymore.
+        """
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
 
         now = datetime.now(timezone.utc)
@@ -4005,26 +4009,37 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         }
         order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
 
-        # market without "close" → fail-closed
-        market_no_close = {"price": 101.5}
-        result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market_no_close)
-        self.assertIsNone(result, "market without 'close' key must fail-closed")
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback') as mock_mp:
+            # mark price fetch fails → fail-closed (no market.close fallback)
+            mock_mp.return_value = {"ok": False, "error": "stale_price", "price_age_seconds": -1.0}
 
-        # market with "close" → should work
-        market_with_close = {"close": 101.5, "high": 102.0, "low": 99.0}
-        result2 = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market_with_close)
-        self.assertIsNotNone(result2, "market.close=101.5 with all gates met should adjust stop")
-        self.assertTrue(result2.get("stop_loss_adjusted"))
+            # market with close=101.5 would previously trigger adjustment — now must NOT
+            market_with_close = {"close": 101.5, "high": 102.0, "low": 99.0}
+            result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market_with_close)
+            self.assertIsNone(result,
+                "mark fetch failure must fail-closed and NOT fall back to market.close")
+
+            # And market without "close" must also fail-closed
+            market_no_close = {"price": 101.5}
+            result2 = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market_no_close)
+            self.assertIsNone(result2, "market without 'close' key must also fail-closed")
 
     # --- Test 10: MFE/R includes quantity ---
 
     def test_mfe_r_includes_quantity(self) -> None:
         """MFE/R 计算包含 quantity 因子。"""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
 
         now = datetime.now(timezone.utc)
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
         market = {"close": 101.0, "high": 102.0, "low": 99.0}
+
+        def _mp_ok(symbol, *, repo=None, cache=None, **_kw):
+            return {"ok": True, "mark_price": 101.0,
+                    "price_source": "binance_usdm_mark",
+                    "price_as_of": now.isoformat(),
+                    "price_age_seconds": 0.0}
 
         # qty=2, MFE=3, risk=(100-98)*2=4, MFE/R=0.75 → passes
         # Insert a real open long order with stop_loss=98 to back the atomic update.
@@ -4034,6 +4049,17 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'LONG', 'market', 2.0, 100.0, 98.0, 98.0, 'open')"
         )
         oid_q2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 98.0, 4.0)",
+            (oid_q2,),
+        )
+        tid_q2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 'open')",
+            (tid_q2,),
+        )
         self.conn.commit()
         trade_q2 = {
             "id": 101, "symbol": "BTCUSDT", "side": "LONG",
@@ -4043,7 +4069,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "initial_risk_usdt": 4.0,
         }
         order_q2 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q2,)).fetchone())
-        result = _maybe_adjust_stop_to_breakeven(self.repo, order_q2, trade_q2, market)
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+            result = _maybe_adjust_stop_to_breakeven(self.repo, order_q2, trade_q2, market)
         self.assertIsNotNone(result, "qty=2, MFE=3, risk=4, MFE/R=0.75 → should pass gate")
         self.assertTrue(result.get("stop_loss_adjusted"))
 
@@ -4054,6 +4081,17 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'LONG', 'market', 0.5, 100.0, 98.0, 98.0, 'open')"
         )
         oid_q05 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 98.0, 1.0)",
+            (oid_q05,),
+        )
+        tid_q05 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 'open')",
+            (tid_q05,),
+        )
         self.conn.commit()
         trade_q05 = {
             "id": 102, "symbol": "BTCUSDT", "side": "LONG",
@@ -4063,7 +4101,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "initial_risk_usdt": 1.0,
         }
         order_q05 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q05,)).fetchone())
-        result2 = _maybe_adjust_stop_to_breakeven(self.repo, order_q05, trade_q05, market)
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+            result2 = _maybe_adjust_stop_to_breakeven(self.repo, order_q05, trade_q05, market)
         self.assertIsNotNone(result2, "qty=0.5, MFE=3, risk=1, MFE/R=3.0 → should pass")
 
     # --- Test 11: missing created_at fail-closed ---
@@ -4235,6 +4274,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
     def test_trade_70_no_breakeven_at_6min_0206r(self) -> None:
         """验证生产环境 trade #70 在 6 分钟、0.206R 时不会错误收紧止损。"""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import _should_tighten_stop
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
 
@@ -4253,7 +4293,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         }
         market = {"close": 3006.18}
 
-        result_routine = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+        def _mp_ok(symbol, **_kw):
+            return {"ok": True, "mark_price": 3006.18,
+                    "price_source": "binance_usdm_mark",
+                    "price_as_of": now.isoformat(),
+                    "price_age_seconds": 0.0}
+
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+            result_routine = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
         self.assertIsNone(result_routine,
             "Routine breakeven: 6 min holding < 15 min → must NOT tighten")
 
@@ -4270,7 +4317,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         # Even with 30 min holding, MFE/R 0.25 < 0.75 blocks it
         thirty_min_ago2 = (now - timedelta(minutes=30)).isoformat()
         trade2 = {**trade, "created_at": thirty_min_ago2}
-        result_routine2 = _maybe_adjust_stop_to_breakeven(self.repo, order, trade2, market)
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+            result_routine2 = _maybe_adjust_stop_to_breakeven(self.repo, order, trade2, market)
         self.assertIsNone(result_routine2,
             "Routine breakeven: 30 min holding but MFE/R=0.25 < 0.75 → must NOT tighten")
 
@@ -10923,6 +10971,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_short_s_high_confidence_with_decay_exits(self):
         """SHORT open trade + bullish S 0.89 + signal_decay >= 0.70 → conflict_exit."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
         import json
 
@@ -10957,12 +11006,14 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9001)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "15.20", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9001)
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["checked_count"], 1)
-        self.assertEqual(result["conflict_count"], 1)
-        self.assertEqual(result["closed_count"], 1)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["checked_count"], 1)
+            self.assertEqual(result["conflict_count"], 1)
+            self.assertEqual(result["closed_count"], 1)
 
         # Verify trade was actually closed
         trade = self.repo.get_trade(9001)
@@ -11172,6 +11223,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_same_ga_decision_no_duplicate_action(self):
         """Same trade + same GA decision re-run does not duplicate close/adjust/notify."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -11202,14 +11254,16 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        # First run — should close
-        result1 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
-        self.assertEqual(result1["closed_count"], 1)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "15.20", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            # First run — should close
+            result1 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
+            self.assertEqual(result1["closed_count"], 1)
 
-        # Second run — trade is already closed, so checked_count=0 (not in open trades)
-        result2 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
-        self.assertEqual(result2["checked_count"], 0)
-        self.assertEqual(result2["conflict_count"], 0)
+            # Second run — trade is already closed, so checked_count=0 (not in open trades)
+            result2 = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9061)
+            self.assertEqual(result2["checked_count"], 0)
+            self.assertEqual(result2["conflict_count"], 0)
 
     def test_position_conflict_confidence_below_threshold_skipped(self):
         """Conflict exists but confidence below threshold → skipped."""
@@ -11300,6 +11354,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_exit_writes_order_audit_fields(self):
         """conflict_exit writes cancel_reason and invalidated_by_ga_decision_id to paper_orders."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -11330,9 +11385,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9081)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["closed_count"], 1)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "15.20", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9081)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["closed_count"], 1)
 
         # Verify trade closed
         trade = self.repo.get_trade(9081)
@@ -11346,6 +11403,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_missing_price_does_not_close(self):
         """When current_price is unavailable, conflict_exit must NOT close the trade."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -11372,10 +11430,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9091)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["closed_count"], 0)
-        self.assertGreaterEqual(result["recheck_count"], 1)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            # Make live fetch fail so fallback is used (no paper_positions → None)
+            mock_fetch.side_effect = Exception("API unavailable")
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9091)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["closed_count"], 0)
+            self.assertGreaterEqual(result["recheck_count"], 1)
 
         # Verify trade is NOT closed
         trade = self.repo.get_trade(9091)
@@ -11396,6 +11457,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_uses_passed_ga_decision_id_not_latest(self):
         """When ga_decision_id is passed, use it instead of the latest GA decision."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -11436,11 +11498,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        # Pass the OLDER conflicting GA decision id
-        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9101)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["conflict_count"], 1)
-        self.assertEqual(result["closed_count"], 1)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "15.20", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            # Pass the OLDER conflicting GA decision id
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9101)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["conflict_count"], 1)
+            self.assertEqual(result["closed_count"], 1)
 
         trade = self.repo.get_trade(9101)
         self.assertEqual(trade["close_reason"], "conflict_exit")
@@ -11583,6 +11647,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_position_conflict_exit_side_effects(self):
         """conflict_exit must produce all expected side effects: logs, jobs, shadow PnL."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -11624,9 +11689,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9121)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["closed_count"], 1)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            # Mock mark price to return 15.20 (above SHORT entry, adverse for SHORT)
+            # This triggers early exit via condition b (current_r <= -0.30)
+            mock_fetch.return_value = {"markPrice": "15.20", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=9121)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["closed_count"], 1)
 
         # Verify paper_trade_logs has close_position event
         close_log = self.conn.execute(
@@ -11660,7 +11729,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Verify agent_jobs has paper_event_alert with close_reason='conflict_exit'
         alert_job = self.conn.execute(
             "SELECT * FROM agent_jobs WHERE job_type='paper_event_alert' "
-            "AND session_id='system:paper:closed:9121' "
+            "AND session_id='system:paper:conflict_exit:9121:9121' "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(alert_job)
@@ -13441,6 +13510,14 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     # ── shadow_virtual_trade_updater integration tests ──────────────────────
 
+    def _vt_start_ms(self, vt_id: int) -> int:
+        """Return the replay start time (ms) for a shadow VT — guaranteed >= created_at."""
+        from plugins.crypto_guard.paper.shadow_virtual_trade_updater import _iso_to_unix_ms
+        row = self.repo.conn.execute("SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)).fetchone()
+        trade = dict(row)
+        start = _iso_to_unix_ms(trade.get("opened_at") or trade.get("created_at"))
+        return start if start is not None else int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
+
     def _make_shadow_vt(self, **overrides: object) -> int:
         """Helper: create a shadow virtual trade with sensible defaults, return id."""
         from datetime import datetime, timezone
@@ -13487,9 +13564,8 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_pending_stays_pending_no_activation(self):
         """Pending trade with no price touch stays pending."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="pending_entry", entry_type="limit", opened_at=None)
+        now_ms = self._vt_start_ms(vt_id)
         # Mock candle: price never touches entry
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13511,9 +13587,8 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_activation_on_price_touch(self):
         """Limit buy activates when price drops to entry."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="pending_entry", entry_type="limit", entry_price=100.0, opened_at=None)
+        now_ms = self._vt_start_ms(vt_id)
         # Mock candle: low drops below entry
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13535,9 +13610,8 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_sl_hit_closes_at_stop_price(self):
         """SL hit closes at stop_loss price, not mark price."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0)
+        now_ms = self._vt_start_ms(vt_id)
         # Mock candle: low hits SL
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13561,10 +13635,9 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_tp_hit_closes_at_tp_price(self):
         """TP hit closes at actual TP price, not mark price."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0,
                                      take_profit_json=json.dumps([{"price": 110.0}]))
+        now_ms = self._vt_start_ms(vt_id)
         # Mock candle: high hits TP
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13587,10 +13660,9 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_same_candle_sl_tp_ambiguous_path(self):
         """Same candle hits both SL and TP → conservative SL wins with ambiguous_path."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0,
                                      take_profit_json=json.dumps([{"price": 110.0}]))
+        now_ms = self._vt_start_ms(vt_id)
         # Mock candle: wide range hits both SL and TP
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13670,9 +13742,8 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_restart_does_not_overwrite_closed(self):
         """Closed trades are not touched on subsequent update calls."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="closed", close_reason="stop_loss", pnl_r=-1.0)
+        now_ms = self._vt_start_ms(vt_id)
         # Set closed_at
         self.repo.conn.execute(
             "UPDATE shadow_virtual_trades SET closed_at=CURRENT_TIMESTAMP WHERE id=?", (vt_id,)
@@ -13739,7 +13810,6 @@ class PendingOrderManagerTest(unittest.TestCase):
     def test_updater_same_symbol_different_since_time(self):
         """Two trades on same symbol with different since_time get different candles."""
         from datetime import datetime, timezone, timedelta
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         # Trade 1: created 1 hour ago
         old_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         vt1 = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0, opened_at=old_time, ga_decision_id=1001)
@@ -13753,6 +13823,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (recent_time, vt2)
         )
         self.repo.conn.commit()
+        now_ms = self._vt_start_ms(vt2)
 
         call_log: list[tuple[str, int | None]] = []
 
@@ -13776,10 +13847,9 @@ class PendingOrderManagerTest(unittest.TestCase):
         activates a pending_entry also hits TP (but not SL), it's recorded as
         activation_ambiguous_path — we can't determine if TP was before or after entry.
         """
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         vt_id = self._make_shadow_vt(status="pending_entry", entry_type="limit",
                                      entry_price=100.0, stop_loss=95.0, opened_at=None)
+        now_ms = self._vt_start_ms(vt_id)
         # Candle that both activates (low <= 100) AND hits TP (high >= 110)
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13818,7 +13888,6 @@ class PendingOrderManagerTest(unittest.TestCase):
     def test_updater_max_hold_uses_opened_at(self):
         """max_hold_minutes is measured from opened_at, not created_at."""
         from datetime import datetime, timezone, timedelta
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         # Trade was created 100 hours ago (pending for a long time)
         # but opened only 1 hour ago — should NOT be expired
         old_created = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
@@ -13829,6 +13898,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (old_created, vt_id)
         )
         self.repo.conn.commit()
+        now_ms = self._vt_start_ms(vt_id)
 
         def mock_fetcher(symbol: str) -> dict[str, object]:
             return {
@@ -13848,8 +13918,6 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_transaction_rollback_on_error(self):
         """When version save fails inside transaction, patch is rolled back too."""
-        from datetime import datetime, timezone
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         # Create a trade review scenario: patch + version + cap in one transaction
         # We simulate by checking that save_strategy_patch_candidate doesn't auto-commit
         # (no orphan patch if version save fails)
@@ -15335,6 +15403,18 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
         )
         order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
+            (order_id,),
+        )
+        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+            (tid,),
+        )
+        self.conn.commit()
 
         # Count trade_logs before
         before = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
@@ -15640,6 +15720,19 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             )
             conn_a.commit()
             order_id = int(conn_a.execute("SELECT last_insert_rowid()").fetchone()[0])
+            # Insert matching trade and position
+            conn_a.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
+                (order_id,),
+            )
+            tid = int(conn_a.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn_a.execute(
+                "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+                "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+                (tid,),
+            )
+            conn_a.commit()
 
             logs_before = conn_a.execute(
                 "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
@@ -15686,6 +15779,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, NULL, 95.0, 'open', 1)"
         )
         order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 95.0, 5.0)",
+            (order_id,),
+        )
+        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 'open')",
+            (tid,),
+        )
         self.conn.commit()
 
         logs_before = self.conn.execute(
@@ -15725,6 +15829,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
         )
         order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
+            (order_id,),
+        )
+        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+            (tid,),
+        )
         self.conn.commit()
 
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
@@ -15846,6 +15961,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "VALUES ('BTCUSDT', 'SHORT', 'market', 1.0, 100.0, 105.0, 105.0, 'open')"
         )
         order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (?, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 105.0, 5.0)",
+            (order_id,),
+        )
+        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (?, 1, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 'open')",
+            (tid,),
+        )
         self.conn.commit()
         logs_before = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
@@ -16083,6 +16209,1405 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # One of (alpha, dup) — same new_stop — must be marked duplicate.
         dup_count = sum(1 for s in (alpha_sid, dup_sid) if statuses.get(s) == "duplicate")
         self.assertEqual(dup_count, 1, "Exactly one of the same-new_stop pair must be marked duplicate")
+
+    # ── P0: Mark Price Tests ──────────────────────────────────
+
+    def test_mark_price_fetch_binance_mark_price_success(self) -> None:
+        """P0: fetch_binance_mark_price returns ok=True with valid mark_price."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "65000.0", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = fetch_binance_mark_price("BTCUSDT", cache={})
+            self.assertTrue(result["ok"], f"Binance mark price fetch failed: {result}")
+            self.assertIsInstance(result["mark_price"], float)
+            self.assertGreater(result["mark_price"], 0)
+            self.assertEqual(result["price_source"], "binance_usdm_mark")
+
+    def test_mark_price_cycle_cache_reuse(self) -> None:
+        """P0: Same-cycle calls for same symbol reuse cache, not re-fetch."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "65000.0", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            cache: dict[str, Any] = {}
+            result1 = fetch_binance_mark_price("BTCUSDT", cache=cache)
+            self.assertTrue(result1["ok"])
+            result2 = fetch_binance_mark_price("BTCUSDT", cache=cache)
+            self.assertTrue(result2["ok"])
+            self.assertEqual(result1["mark_price"], result2["mark_price"])
+            self.assertEqual(result1["price_as_of"], result2["price_as_of"])
+            # Verify only one API call was made
+            self.assertEqual(mock_fetch.call_count, 1)
+
+    def test_mark_price_cache_clear(self) -> None:
+        """P0: clear_cycle_cache removes module-level cache entries."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import clear_cycle_cache, fetch_binance_mark_price
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "65000.0", "time": now_ms}
+            # Use module-level cache (no explicit cache dict)
+            clear_cycle_cache()
+            fetch_binance_mark_price("BTCUSDT")
+            # After clear, a new fetch should work (module-level cache was cleared)
+            clear_cycle_cache()
+            result = fetch_binance_mark_price("BTCUSDT")
+            self.assertTrue(result["ok"], "Fetch should succeed after cache clear")
+
+    def test_mark_price_get_with_fallback_fail_closed(self) -> None:
+        """P0: get_mark_price_with_fallback returns ok=False when all sources fail."""
+        from plugins.crypto_guard.paper.mark_price import get_mark_price_with_fallback
+
+        result = get_mark_price_with_fallback(
+            "NOSYMBOLZZZ",
+            repo=self.repo,
+            cache={},
+            max_cache_age_seconds=0.001,
+        )
+        self.assertFalse(result["ok"],
+            "Unrecognized symbol must fail-closed, not return stale/fallback price")
+
+    # ── P0: Profit Protection Tests ───────────────────────────
+
+    def test_profit_protection_gate_all_conditions_pass(self) -> None:
+        """P0: Profit protection gate passes when all 6 conditions are met.
+
+        Note: The close execution requires actual DB records (paper_orders, paper_trades).
+        This test verifies the gate logic passes and the function returns a non-None result
+        (meaning the gate was triggered). The close may fail with 'order_not_open' because
+        no real order exists in the test DB.
+        """
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        # mfe_r = 1500/1000 = 1.5, current_r = (51000-50000)*1/1000 = 1.0
+        # retracement_r = 1.5 - 1.0 = 0.5
+        self.assertIsNotNone(result,
+            f"Profit protection gate should pass (non-None result); got None")
+        self.assertEqual(result.get("action"), "profit_protection",
+            f"Result action should be profit_protection; got {result}")
+
+    def test_profit_protection_gate_grade_below_S(self) -> None:
+        """P0: Profit protection does NOT trigger when signal_grade is A (below S)."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "A",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should NOT trigger for A-grade signal; got {result}")
+
+    def test_profit_protection_gate_confidence_below_threshold(self) -> None:
+        """P0: Profit protection does NOT trigger when confidence < 0.85."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.80, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should NOT trigger with confidence < 0.85; got {result}")
+
+    def test_profit_protection_gate_mfe_below_threshold(self) -> None:
+        """P0: Profit protection does NOT trigger when mfe_r < 1.00."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 800.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        # mfe_r = 800/1000 = 0.8 < 1.0
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 50700.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should NOT trigger with mfe_r < 1.0; got {result}")
+
+    def test_profit_protection_gate_current_r_below_threshold(self) -> None:
+        """P0: Profit protection does NOT trigger when current_r < 0.30 (underwater)."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        # mfe was 1500 but current is barely above entry
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        # current_r = (50100-50000)*1/1000 = 0.1 < 0.3
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 50100.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should NOT trigger with current_r < 0.3; got {result}")
+
+    def test_profit_protection_gate_retracement_below_threshold(self) -> None:
+        """P0: Profit protection does NOT trigger when retracement_r < 0.50."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bearish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        # current = 51300, mfe_r=1.5, current_r=1.3, retracement_r=0.2 < 0.5
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51300.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should NOT trigger with retracement_r < 0.5; got {result}")
+
+    def test_profit_protection_gate_ignore_non_actionable_decision(self) -> None:
+        """P0: Profit protection skips when GA decision is monitor_only / no_edge."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        ga_decision = {"decision": "monitor_only", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Profit protection should skip monitor_only decisions; got {result}")
+
+    # ── P1: UTC+8 Time Utils Tests ────────────────────────────
+
+    def test_time_utils_format_event_time_cst_naive_dt(self) -> None:
+        """P1: format_event_time_cst treats naive datetime as UTC."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+
+        dt = datetime(2026, 6, 27, 10, 30, 0)
+        result = format_event_time_cst(dt)
+        self.assertIn("2026-06-27 18:30:00 (UTC+8)", result,
+            f"Naive 10:30 UTC should become 18:30 CST; got {result}")
+
+    def test_time_utils_format_event_time_cst_aware_dt(self) -> None:
+        """P1: format_event_time_cst converts aware datetime to CST."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+
+        dt = datetime(2026, 6, 27, 10, 30, 0, tzinfo=timezone.utc)
+        result = format_event_time_cst(dt)
+        self.assertIn("2026-06-27 18:30:00 (UTC+8)", result)
+
+    def test_time_utils_format_event_time_cst_none(self) -> None:
+        """P1: format_event_time_cst returns 不可用 for None."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+
+        self.assertEqual(format_event_time_cst(None), "不可用")
+
+    def test_time_utils_format_event_time_cst_unix_ms(self) -> None:
+        """P1: format_event_time_cst parses Unix milliseconds."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+
+        # 2026-06-27 10:00:00 UTC = 1782554400000 ms
+        result = format_event_time_cst(1782554400000)
+        self.assertIn("2026-06-27 18:00:00 (UTC+8)", result,
+            f"Unix ms should convert to CST; got {result}")
+
+    def test_time_utils_format_event_time_cst_compact(self) -> None:
+        """P1: format_event_time_cst_compact omits seconds."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst_compact
+
+        dt = datetime(2026, 6, 27, 10, 30, 45, tzinfo=timezone.utc)
+        result = format_event_time_cst_compact(dt)
+        self.assertEqual(result, "2026-06-27 18:30 (UTC+8)",
+            f"Compact format should omit seconds; got {result}")
+
+    # ── P2: State Consistency Diagnostics Tests ───────────────
+
+    def test_state_consistency_financial_action_missing_mark_price(self) -> None:
+        """P2: Detects paper_trade_logs with financial actions missing mark_price."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Insert migration marker so _profit_protection_cutoff returns a value
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+        )
+        event_json_no_price = json.dumps({"position_id": 9999, "event_time": "2026-06-27T10:00:00Z"})
+        self.conn.execute(
+            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json) VALUES (?, ?, ?, ?)",
+            (9999, "BTCUSDT", "profit_protection", event_json_no_price),
+        )
+        self.conn.commit()
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertGreater(result["summary"]["financial_action_missing_mark_price"], 0,
+            "Should detect financial actions without mark_price")
+
+    def test_state_consistency_financial_action_stale_price(self) -> None:
+        """P2: Detects financial actions with stale mark_price (>120s old)."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Insert migration marker so _profit_protection_cutoff returns a value
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+        )
+        stale_price_time = "2026-06-27T08:00:00Z"
+        action_time = "2026-06-27T08:05:00Z"  # 300s later
+        event_json_stale = json.dumps({
+            "position_id": 9999, "mark_price": 50000.0,
+            "price_as_of": stale_price_time, "event_time": action_time,
+        })
+        self.conn.execute(
+            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (9999, "BTCUSDT", "stop_loss_adjustment", event_json_stale, action_time),
+        )
+        self.conn.commit()
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertGreater(result["summary"]["financial_action_stale_price"], 0,
+            "Should detect financial actions with stale mark price")
+
+    def test_state_consistency_paper_notification_missing_event_time(self) -> None:
+        """P2: Detects paper notifications in alert_outbox without event_time."""
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Insert migration marker so _profit_protection_cutoff returns a value
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+        )
+        payload_no_time = json.dumps({"symbol": "BTCUSDT", "order_id": 9999})
+        self.conn.execute(
+            "INSERT INTO alert_outbox(alert_type, payload_json, status) VALUES (?, ?, ?)",
+            ("paper_order_filled", payload_no_time, "sent"),
+        )
+        self.conn.commit()
+
+        result = diagnose_state_consistency(self.repo)
+        self.assertGreater(result["summary"]["paper_notification_missing_event_time"], 0,
+            "Should detect paper notifications without event_time")
+
+    # ── P1: New Issue 11 Tests ──────────────────────────────────
+
+    def test_mark_price_fallback_uses_updated_at(self) -> None:
+        """Issue 2: Fallback reads paper_positions.updated_at, not price_as_of."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import get_mark_price_with_fallback
+
+        # Insert a paper_position with current_price and updated_at
+        self.conn.execute(
+            "INSERT INTO paper_positions(account_id, symbol, side, entry_price, quantity, status, current_price, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "BTCUSDT", "LONG", 64000.0, 1.0, "open", 65000.0, "2026-06-27T10:00:00Z"),
+        )
+        self.conn.commit()
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            # Make live fetch fail so fallback is used
+            mock_fetch.side_effect = Exception("API unavailable")
+            result = get_mark_price_with_fallback(
+                "BTCUSDT",
+                repo=self.repo,
+                cache={},
+                max_cache_age_seconds=999999,
+            )
+            self.assertTrue(result["ok"], f"Fallback should succeed: {result}")
+            self.assertEqual(result["mark_price"], 65000.0)
+            self.assertEqual(result["price_source"], "paper_position_cache")
+            self.assertEqual(result["price_as_of"], "2026-06-27T10:00:00Z")
+
+    def test_mark_price_validates_positive(self) -> None:
+        """Issue 3: mark_price <= 0 is rejected, falls through to except."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "0.0", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = fetch_binance_mark_price("BTCUSDT", cache={})
+            self.assertFalse(result["ok"],
+                f"Zero mark_price should fail-closed; got {result}")
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "-100.0", "time": int(datetime.now(timezone.utc).timestamp() * 1000)}
+            result = fetch_binance_mark_price("BTCUSDT", cache={})
+            self.assertFalse(result["ok"],
+                f"Negative mark_price should fail-closed; got {result}")
+
+    def test_profit_protection_requires_direction_conflict(self) -> None:
+        """Issue 6: LONG+bullish S-grade should NOT trigger profit protection."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 9999, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 9999, "order_id": 9999, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        # LONG + bullish = same direction, should NOT trigger
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.88, "ga_decision_id": 9999,
+                       "market_bias": "bullish",
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"LONG+bullish (same direction) should NOT trigger profit protection; got {result}")
+
+    def test_profit_protection_single_notification(self) -> None:
+        """Issue 7: Profit protection close uses enqueue_job_once, not enqueue_job."""
+        from plugins.crypto_guard.paper.paper_position_updater import _execute_profit_protection_close
+
+        # Set up minimal DB records
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (9999, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt, max_favorable_excursion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (9999, 9999, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0, 1500.0),
+        )
+        self.conn.commit()
+
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=9999").fetchone())
+        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=9999").fetchone())
+        ga_decision = {"id": 9999, "signal_grade": "S", "confidence": 0.88}
+
+        result = _execute_profit_protection_close(
+            self.repo, order, trade, ga_decision,
+            mark_price=51000.0, price_source="binance_usdm_mark",
+            price_as_of="2026-06-27T10:00:00Z", price_age_seconds=0.0,
+            current_r=1.0, mfe_r=1.5, retracement_r=0.5,
+        )
+        self.assertEqual(result.get("status"), "executed",
+            f"Profit protection close should execute; got {result}")
+
+        # Verify only one paper_event_alert job was enqueued
+        jobs = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM agent_jobs WHERE job_type='paper_event_alert' AND session_id LIKE '%profit_protection%'"
+        ).fetchone()
+        self.assertEqual(jobs["cnt"], 1,
+            f"Should have exactly 1 paper_event_alert job; got {jobs['cnt']}")
+
+    def test_close_paper_trade_atomic_guard(self) -> None:
+        """Issue 5: closed_at IS NULL prevents double close."""
+        # Insert a paper_order first (FK constraint)
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (9999, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
+        )
+        # Insert a trade
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (9999, 9999, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0),
+        )
+        self.conn.commit()
+
+        # First close should succeed
+        self.repo.close_paper_trade(
+            trade_id=9999,
+            exit_price=51000.0,
+            close_reason="test_close",
+            pnl=1000.0,
+            pnl_percent=2.0,
+            pnl_r=1.0,
+            mfe=1500.0,
+            mae=0.0,
+        )
+        self.conn.commit()
+
+        # Verify trade is closed
+        trade = self.conn.execute("SELECT closed_at FROM paper_trades WHERE id=9999").fetchone()
+        self.assertIsNotNone(trade["closed_at"], "Trade should be closed after first close")
+
+        # Second close should be a no-op (WHERE closed_at IS NULL prevents it)
+        self.repo.close_paper_trade(
+            trade_id=9999,
+            exit_price=52000.0,
+            close_reason="test_double_close",
+            pnl=2000.0,
+            pnl_percent=4.0,
+            pnl_r=2.0,
+            mfe=1500.0,
+            mae=0.0,
+        )
+        self.conn.commit()
+
+        # Verify exit_price did NOT change (second close was no-op)
+        trade2 = self.conn.execute("SELECT exit_price, close_reason FROM paper_trades WHERE id=9999").fetchone()
+        self.assertEqual(trade2["exit_price"], 51000.0,
+            f"Exit price should remain 51000.0 after atomic guard; got {trade2['exit_price']}")
+        self.assertEqual(trade2["close_reason"], "test_close",
+            f"Close reason should remain 'test_close'; got {trade2['close_reason']}")
+
+    def test_all_notification_types_have_utc8_time(self) -> None:
+        """Issue 9: All paper notification types include UTC+8 time."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+        import re
+
+        # Verify format_event_time_cst produces valid UTC+8 output
+        dt = datetime(2026, 6, 27, 10, 30, 0, tzinfo=timezone.utc)
+        result = format_event_time_cst(dt)
+        self.assertIn("2026-06-27 18:30:00 (UTC+8)", result)
+
+        # Verify format_event_time_cst_for_line includes prefix
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst_for_line
+        line_result = format_event_time_cst_for_line(dt)
+        self.assertIn("时间：2026-06-27 18:30:00 (UTC+8)", line_result)
+
+        # Verify format_event_time_cst_compact omits seconds
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst_compact
+        compact_result = format_event_time_cst_compact(dt)
+        self.assertIn("2026-06-27 18:30 (UTC+8)", compact_result)
+
+        # Verify UTC+8 pattern is consistent
+        utc8_pattern = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})? \(UTC\+8\)')
+        self.assertTrue(utc8_pattern.search(result),
+            f"format_event_time_cst should match UTC+8 pattern; got {result}")
+        self.assertTrue(utc8_pattern.search(compact_result),
+            f"format_event_time_cst_compact should match UTC+8 pattern; got {compact_result}")
+
+    # ── Issue 7c + Issue 1-6 end-to-end tests ─────────────────────────────────
+
+    def _seed_paper_account(self) -> None:
+        """Insert a paper_accounts row (the only precondition the new tests
+        need that CryptoGuardSmokeTest._seed_paper_data normally provides).
+        """
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+        )
+        self.conn.commit()
+
+    # ── Issue 7c + Issue 1-6 end-to-end tests ─────────────────────────────────
+
+    def test_all_paper_event_alert_notifications_have_utc8_time(self) -> None:
+        """Issue 7c: each paper_event_alert notification text contains exactly
+        one ' (UTC+8)' substring across every event_type dispatched via
+        handle_paper_event_alert (not just the formatter).
+        """
+        from plugins.crypto_guard.run_ga_workers import handle_paper_event_alert
+        from unittest.mock import patch
+        import re
+
+        utc8_pattern = re.compile(r' \(UTC\+8\)')
+
+        # Set up a paper_order row so handle_paper_event_alert can look it up.
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, "
+            "quantity, stop_loss, filled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (7001, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0, 49500.0,
+             "2026-06-27T10:00:00Z"),
+        )
+        self.conn.commit()
+
+        # event_time is a fixed UTC ISO timestamp — handler must convert it.
+        event_time = "2026-06-27T10:30:00Z"
+        payloads = {
+            "stop_loss_adjustment": {
+                "event_type": "stop_loss_adjustment", "symbol": "BTCUSDT",
+                "order_id": 7001, "trade_id": 7001, "side": "LONG",
+                "new_stop_loss": 50000.0, "old_stop_loss": 49500.0,
+                "mark_price": 50050.0, "reason": "breakeven",
+                "event_time": event_time,
+            },
+            "close_position": {
+                "event_type": "close_position", "symbol": "BTCUSDT",
+                "order_id": 7001, "trade_id": 7001, "side": "LONG",
+                "exit_price": 50050.0, "close_reason": "take_profit",
+                "pnl_r": 1.2, "entry_price": 50000.0, "stop_loss": 49500.0,
+                "event_time": event_time,
+            },
+            "paper_order_filled": {
+                "event_type": "paper_order_filled", "symbol": "BTCUSDT",
+                "order_id": 7001, "trade_id": 7001, "side": "LONG",
+                "entry_price": 50000.0, "stop_loss": 49500.0,
+                "fill_method": "trigger_touch",
+                "event_time": event_time,
+            },
+            "take_profit_hit": {
+                "event_type": "take_profit_hit", "symbol": "BTCUSDT",
+                "order_id": 7001, "trade_id": 7001, "side": "LONG",
+                "exit_price": 50500.0, "close_reason": "take_profit",
+                "pnl_r": 1.0, "entry_price": 50000.0, "stop_loss": 49500.0,
+                "event_time": event_time,
+            },
+            "stop_loss_hit": {
+                "event_type": "stop_loss_hit", "symbol": "BTCUSDT",
+                "order_id": 7001, "trade_id": 7001, "side": "LONG",
+                "exit_price": 49500.0, "close_reason": "stop_loss",
+                "pnl_r": -1.0, "entry_price": 50000.0, "stop_loss": 49500.0,
+                "event_time": event_time,
+            },
+        }
+
+        old_receive_id = os.environ.get("CRYPTO_GUARD_FEISHU_RECEIVE_ID")
+        os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = "test_chat_id"
+        captured_texts: dict[str, str] = {}
+
+        def fake_send(receive_id: str, content: str, **kwargs: object) -> bool:
+            # Newer alert_outbox / card path stores the text inside a JSON card.
+            try:
+                card = json.loads(content)
+                text = card["body"]["elements"][0]["content"]
+            except (ValueError, KeyError, TypeError, IndexError):
+                text = content
+            return True
+
+        # The render path saves alerts to alert_outbox (and may attempt to send
+        # them). We intercept send_markdown_alert to capture the rendered text.
+        from plugins.crypto_guard.notify.alert_delivery import send_markdown_alert as real_send
+
+        captured: dict[str, list[str]] = {}
+
+        def capture_send(repo, send_message, *, receive_id, receive_id_type, text, alert_type, priority, symbol=None, dedupe_key=None):
+            captured.setdefault(alert_type, []).append(text)
+            return {"sent": True, "queued": False}
+
+        try:
+            with patch("plugins.crypto_guard.run_ga_workers.send_markdown_alert", side_effect=capture_send):
+                for event_type, payload in payloads.items():
+                    handle_paper_event_alert(self.repo, payload, send_message=fake_send)
+        finally:
+            if old_receive_id is None:
+                os.environ.pop("CRYPTO_GUARD_FEISHU_RECEIVE_ID", None)
+            else:
+                os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = old_receive_id
+
+        # Each dispatched text must contain exactly one " (UTC+8)" substring.
+        for event_type in payloads:
+            self.assertIn(event_type, captured, f"event_type {event_type} not dispatched")
+            for text in captured[event_type]:
+                matches = utc8_pattern.findall(text)
+                self.assertEqual(len(matches), 1,
+                    f"event_type={event_type} text must contain exactly one ' (UTC+8)'; "
+                    f"found {len(matches)} in: {text!r}")
+
+    def test_handle_paper_drawdown_alert_has_current_time(self) -> None:
+        """Issue 7a: drawdown payload without event_time still shows current UTC+8
+        time (not "不可用")."""
+        from plugins.crypto_guard.run_ga_workers import handle_paper_drawdown_alert
+        from unittest.mock import patch
+
+        captured: list[str] = []
+
+        def capture_send(repo, send_message, *, receive_id, receive_id_type, text, alert_type, priority, symbol=None, dedupe_key=None):
+            captured.append(text)
+            return {"sent": True, "queued": False}
+
+        old_receive_id = os.environ.get("CRYPTO_GUARD_FEISHU_RECEIVE_ID")
+        os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = "test_chat_id"
+        try:
+            with patch("plugins.crypto_guard.run_ga_workers.send_markdown_alert", side_effect=capture_send):
+                handle_paper_drawdown_alert(
+                    self.repo,
+                    {"snapshot": {"account_equity": 9500.0, "realized_pnl": -100.0,
+                                    "unrealized_pnl": -400.0, "drawdown_percent": 5.0}},
+                    send_message=lambda *a, **kw: True,
+                )
+        finally:
+            if old_receive_id is None:
+                os.environ.pop("CRYPTO_GUARD_FEISHU_RECEIVE_ID", None)
+            else:
+                os.environ["CRYPTO_GUARD_FEISHU_RECEIVE_ID"] = old_receive_id
+
+        self.assertTrue(captured, "drawdown alert should render a text block")
+        text = captured[0]
+        self.assertIn("时间：", text)
+        # 4-digit year evidence that the time is real and current.
+        import re
+        self.assertRegex(text, r"时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC\+8\)")
+        self.assertNotIn("不可用", text)
+
+    def test_mark_price_rejects_stale_binance_time(self) -> None:
+        """Issue 1: stale Binance time (>90s) returns ok=False with
+        error='stale_binance_time' — fail-closed, not cached as success.
+        NOTE: This test was updated from the old behavior (ok=True with warning)
+        to the new fail-closed behavior (ok=False)."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price
+
+        two_min_ago_ms = int((datetime.now(timezone.utc) - timedelta(minutes=2)).timestamp() * 1000)
+        cache: dict = {}
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "65000.0", "time": two_min_ago_ms}
+            result = fetch_binance_mark_price("BTCUSDT", cache=cache)
+        self.assertFalse(result["ok"],
+            f"Stale Binance time (>90s) must return ok=False; got {result}")
+        self.assertEqual(result["error"], "stale_binance_time",
+            f"Error must be 'stale_binance_time'; got {result}")
+        self.assertGreater(result["price_age_seconds"], 0,
+            f"price_age_seconds must be positive for a 2-min-old server time; got {result}")
+        self.assertNotIn("BTCUSDT", cache,
+            "Stale-time response must not be cached as a success")
+
+    def test_mark_price_rejects_future_binance_time(self) -> None:
+        """Issue 1: future Binance time (>10s drift) returns ok=False with
+        error mentioning 'future' — and is NOT cached as success."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.mark_price import fetch_binance_mark_price
+
+        future_ms = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp() * 1000)
+        cache: dict = {}
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "65000.0", "time": future_ms}
+            result = fetch_binance_mark_price("BTCUSDT", cache=cache)
+        self.assertFalse(result["ok"],
+            f"Future Binance time must be rejected; got {result}")
+        self.assertIn("future", str(result.get("error", "")).lower(),
+            f"Error must mention 'future'; got {result}")
+        self.assertNotIn("BTCUSDT", cache,
+            "Future-time response must not be cached as a success")
+
+    def test_routine_breakeven_skips_when_mark_fails(self) -> None:
+        """Issue 8 (test 3): _maybe_adjust_stop_to_breakeven returns None and
+        writes no stop_loss_adjustment log when mark price fetch fails."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
+
+        self._seed_paper_account()
+        now = datetime.now(timezone.utc)
+        thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
+        self.conn.execute(
+            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+            "initial_stop_loss, status) "
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open')"
+        )
+        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        trade = {
+            "id": 8001, "symbol": "BTCUSDT", "side": "LONG",
+            "entry_price": 100.0, "quantity": 1.0,
+            "created_at": thirty_min_ago,
+            "max_favorable_excursion": 1.5,
+            "initial_risk_usdt": 2.0,
+        }
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback') as mock_mp:
+            mock_mp.return_value = {"ok": False, "error": "stale_price", "price_age_seconds": -1.0}
+            result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, {"close": 101.5})
+        self.assertIsNone(result, "breakeven must skip (None) when mark fetch fails")
+
+        # No stop_loss_adjustment log should have been written for trade 8001.
+        log = self.conn.execute(
+            "SELECT id FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' AND position_id=8001"
+        ).fetchone()
+        self.assertIsNone(log, "No stop_loss_adjustment log should be written on mark fetch failure")
+
+    def test_conflict_exit_includes_quote_metadata(self) -> None:
+        """Issue 8 (test 4): conflict_exit log event_json contains
+        mark_price / price_source / price_as_of / price_age_seconds."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._seed_paper_account()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (8002, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (8002, 8002, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status, updated_at) VALUES (8002, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
+        )
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
+            "VALUES (8002, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}', '{\"entry\":14.00,\"stop\":13.50}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        from plugins.crypto_guard.paper.mark_price import fetch_mark_price
+        fake_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.return_value = {"markPrice": "15.20", "time": fake_time_ms}
+            run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=8002)
+
+        log = self.conn.execute(
+            "SELECT event_json FROM paper_trade_logs "
+            "WHERE event_type='conflict_exit' AND json_extract(event_json, '$.trade_id')=8002 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log, "conflict_exit log must be written")
+        ev = json.loads(log["event_json"])
+        self.assertIn("mark_price", ev, "conflict_exit log must include mark_price")
+        self.assertIn("price_source", ev, "conflict_exit log must include price_source")
+        self.assertIn("price_as_of", ev, "conflict_exit log must include price_as_of")
+        self.assertIn("price_age_seconds", ev, "conflict_exit log must include price_age_seconds")
+
+    def test_stop_adjusted_includes_quote_metadata(self) -> None:
+        """Issue 8 (test 5): stop_loss_adjustment log event_json contains
+        mark_price / price_source / price_as_of / price_age_seconds."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        created_long_ago = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+        self._seed_paper_account()
+        # SHORT trade in profit (current < entry), stop above entry (15.00 > 14.50).
+        # Tighten stop toward entry on conflict.
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (8003, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            (created_long_ago,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (8003, 8003, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.0, 1.0, 0.0, ?)",
+            (created_long_ago,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
+            "quantity, stop_loss, status, updated_at) VALUES (8003, 1, 'LINKUSDT', 'SHORT', 14.50, 14.20, 1, 15.00, 'open', ?)",
+            (now_iso,),
+        )
+        # Conflicting bullish A-grade decisions (A avoids the S-only _should_early_exit
+        # gate, while A/B still counts toward reverse_confirmations for tighten).
+        # Insert 2 bullish A-grade decisions to satisfy reverse_confirmations >= 2.
+        for gid in (8031, 8032):
+            self.conn.execute(
+                "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+                "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+                "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
+                "VALUES (?, 'LINKUSDT', ?, ?, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
+                "'[]', '[]', '[]', '{\"ok\":true}', '[]', 'bullish A signal', '{}', '{\"entry\":14.00,\"stop\":13.50}')",
+                (gid, gid * 1000, now_iso),
+            )
+        self.conn.commit()
+
+        fake_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            # Live mark 14.20 — but live fetch direct returns this; fallback to
+            # paper_positions current_price also gives 14.20. Either way current_r >= 0.50
+            # so tighten gate 3 passes and stop moves below entry toward breakeven.
+            mock_fetch.return_value = {"markPrice": "14.20", "time": fake_time_ms}
+            # Use the latest GA decision so two consecutive bullish confirmations are seen.
+            run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=8032)
+
+        log = self.conn.execute(
+            "SELECT event_json FROM paper_trade_logs "
+            "WHERE event_type='stop_loss_adjustment' AND json_extract(event_json, '$.trade_id')=8003 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log, "stop_loss_adjustment log must be written")
+        ev = json.loads(log["event_json"])
+        self.assertIn("mark_price", ev, "stop_loss_adjustment log must include mark_price")
+        self.assertIn("price_source", ev, "stop_loss_adjustment log must include price_source")
+        self.assertIn("price_as_of", ev, "stop_loss_adjustment log must include price_as_of")
+        self.assertIn("price_age_seconds", ev, "stop_loss_adjustment log must include price_age_seconds")
+
+    def test_profit_protection_recheck_on_mark_failure(self) -> None:
+        """Issue 8 (test 6): when mark fetch fails and profit protection
+        requests needs_position_recheck, the inline wrapper writes a
+        paper_trade_logs needs_position_recheck entry and enqueues a
+        paper_event_alert job."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        created_long_ago = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+        self._seed_paper_account()
+        # LONG trade far underwater but MFE high so profit protection progresses
+        # past grade/confidence/mfe gates, then fails on mark fetch.
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
+            "VALUES (8004, 'LINKUSDT', 'LONG', 'market', 'open', 14.50, 14.00, 1, ?)",
+            (created_long_ago,),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
+            "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
+            "VALUES (8004, 8004, 'LINKUSDT', 'LONG', 14.50, 14.00, 1, 0.5, 14.00, 0.0, 1.5, 0.0, ?)",
+            (created_long_ago,),
+        )
+        # Bullish-S bias that conflicts with LONG via bias=bearish.
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
+            "VALUES (8004, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.90, 'bearish', 'enter_short', "
+            "'[]', '[]', '[]', '{\"ok\":true}', '[]', 'bearish S signal', '{}', '{\"entry\":13.00,\"stop\":13.50}')",
+            (now_iso,),
+        )
+        self.conn.commit()
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price') as mock_fetch:
+            mock_fetch.side_effect = Exception("API unavailable")
+            # No paper_positions row → fallback also fails → ok=False for mark fetch.
+            result = run_position_conflict_revalidation(self.repo, symbol="LINKUSDT", ga_decision_id=8004)
+
+        # Profit protection flow should have produced a recheck (paper_trade_logs +
+        # agent_jobs paper_event_alert enqueued by _execute_recheck_mark's caller).
+        log = self.conn.execute(
+            "SELECT event_json FROM paper_trade_logs "
+            "WHERE event_type='needs_position_recheck' AND position_id=8004 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log,
+            "needs_position_recheck log must be written when mark fetch fails for profit protection")
+        ev = json.loads(log["event_json"])
+        self.assertIn("mark_price_unavailable_for_profit_protection",
+            ev.get("reason", ""),
+            "recheck reason must indicate profit-protection mark unavailability")
+
+    def test_close_paper_race_only_one_winner_side_effects(self) -> None:
+        """Issue 8 (test 7): close_paper_trade returns False for the second
+        concurrent close, AND profit_protection_close skips side effects when
+        it loses the race.
+        """
+        from plugins.crypto_guard.paper.paper_position_updater import _execute_profit_protection_close
+
+        self._seed_paper_account()
+        # Pre-create order + trade.
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (8005, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, "
+            "initial_risk_usdt, max_favorable_excursion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (8005, 8005, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0, 1500.0),
+        )
+        self.conn.commit()
+
+        # Pre-close the trade to simulate a concurrent winner.
+        self.assertTrue(self.repo.close_paper_trade(
+            trade_id=8005, exit_price=50900.0, close_reason="tp",
+            pnl=900.0, pnl_percent=1.8, pnl_r=0.9, mfe=1500.0, mae=0.0,
+        ))
+        self.conn.commit()
+
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=8005").fetchone())
+        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=8005").fetchone())
+        ga_decision = {"id": 8005, "signal_grade": "S", "confidence": 0.90}
+
+        # Calling _execute_profit_protection_close now must observe already_closed
+        # and skip every side effect.
+        result = _execute_profit_protection_close(
+            self.repo, order, trade, ga_decision,
+            mark_price=51000.0, price_source="binance_usdm_mark",
+            price_as_of="2026-06-27T10:00:00Z", price_age_seconds=0.0,
+            current_r=1.0, mfe_r=1.5, retracement_r=0.5,
+        )
+        self.assertEqual(result.get("status"), "already_closed",
+            f"Loser of close race must report already_closed; got {result}")
+        self.assertEqual(result.get("action"), "profit_protection")
+        self.assertEqual(result.get("reason"), "concurrent close")
+
+        # No profit_protection log, no close_position log for trade 8005.
+        logs = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM paper_trade_logs "
+            "WHERE json_extract(event_json, '$.trade_id')=8005 "
+            "AND event_type IN ('profit_protection', 'close_position')"
+        ).fetchone()
+        self.assertEqual(logs["cnt"], 0,
+            "Loser side must not write close/profit_protection logs")
+        # No paper_event_alert job for this trade's profit protection (race).
+        jobs = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM agent_jobs WHERE job_type='paper_event_alert' "
+            "AND session_id LIKE '%profit_protection:8005%'"
+        ).fetchone()
+        self.assertEqual(jobs["cnt"], 0,
+            "Loser side must not enqueue a paper_event_alert job")
+
+        # The unaltered exit_price stays from the winner.
+        trade2 = self.conn.execute("SELECT exit_price, close_reason FROM paper_trades WHERE id=8005").fetchone()
+        self.assertEqual(float(trade2["exit_price"]), 50900.0)
+        self.assertEqual(trade2["close_reason"], "tp")
+
+    def test_profit_protection_neutral_bias_does_not_trigger(self) -> None:
+        """Issue 8 (test 8): neutral/unknown bias never triggers profit
+        protection under the strict bidirectional direction gate."""
+        from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config().trading_mode
+        order = {"id": 8006, "symbol": "BTCUSDT", "side": "LONG", "status": "open",
+                 "entry_price": 50000.0, "quantity": 1.0}
+        trade = {"id": 8006, "order_id": 8006, "entry_price": 50000.0,
+                 "initial_risk_usdt": 1000.0, "max_favorable_excursion": 1500.0,
+                 "quantity": 1.0}
+        # No market_bias, decision text without bullish/bearish → neutral.
+        ga_decision = {"decision": "create_paper_order", "signal_grade": "S",
+                       "confidence": 0.90, "ga_decision_id": 8006,
+                       "trade_plan_json": json.dumps({"side": "LONG", "entry_price": 50000.0}),
+                       "risk_check_json": json.dumps({"ok": True})}
+        mark_price_cache = {"BTCUSDT": {"ok": True, "mark_price": 51000.0,
+            "price_source": "binance_usdm_mark", "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 0.0}}
+        result = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result,
+            f"Neutral bias must NOT trigger profit protection; got {result}")
+
+        # Same for explicit neutral market_bias.
+        ga_decision2 = {**ga_decision, "market_bias": "neutral"}
+        result2 = _evaluate_profit_protection(
+            self.repo, order, trade, ga_decision2, cfg, mark_price_cache=mark_price_cache
+        )
+        self.assertIsNone(result2,
+            f"Explicit neutral market_bias must NOT trigger profit protection; got {result2}")
+
+    # ── Issue 2: paper_broker concurrent close guard ────────────
+
+    def test_close_paper_race_paper_broker_safe(self) -> None:
+        """Issue 2: close_trade_if_needed returns closed=False and skips
+        side effects when the trade was already closed concurrently."""
+        from plugins.crypto_guard.paper.paper_broker import close_trade_if_needed
+
+        self._seed_paper_account()
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8881, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8881, 8881, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.commit()
+
+        # Pre-close the trade (simulating concurrent writer)
+        self.repo.close_paper_trade(
+            trade_id=8881,
+            exit_price=99.0,
+            close_reason="concurrent_close",
+            pnl=-1.0,
+            pnl_percent=-1.0,
+            pnl_r=-0.5,
+            mfe=0.0,
+            mae=1.0,
+        )
+        self.conn.commit()
+
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=8881").fetchone())
+        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=8881").fetchone())
+        market = {"close": 95.0, "high": 96.0, "low": 94.0, "open": 96.0}
+
+        # Count side-effect markers before
+        log_count_before = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE event_type='close_position'"
+        ).fetchone()["cnt"]
+
+        result = close_trade_if_needed(self.repo, order, trade, market)
+        self.assertFalse(result.get("closed", True),
+            f"close_trade_if_needed must return closed=False on concurrent close; got {result}")
+        self.assertEqual(result.get("skip_reason"), "concurrent_close",
+            f"skip_reason must be 'concurrent_close'; got {result}")
+
+        # Verify no duplicate side effects (log count unchanged)
+        log_count_after = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE event_type='close_position'"
+        ).fetchone()["cnt"]
+        self.assertEqual(log_count_before, log_count_after,
+            "No new close_position log should be created on concurrent close")
+
+    # ── Issue 3: Conflict stop tighten atomic CAS ──────────────
+
+    def test_conflict_stop_tighten_atomic_cas(self) -> None:
+        """Issue 3: update_stop_loss_across_tables uses CAS — concurrent
+        change returns False."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8882, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8882, 8882, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (8882, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 'open')",
+        )
+        self.conn.commit()
+
+        # Simulate concurrent writer changing stop_loss to 99.0
+        self.conn.execute("UPDATE paper_trades SET stop_loss=99.0 WHERE id=8882")
+        self.conn.commit()
+
+        # CAS with old_stop=98.0 should fail (actual is 99.0)
+        result = self.repo.update_stop_loss_across_tables(
+            trade_id=8882, order_id=8882, new_stop=100.0,
+            old_stop=98.0, reason="test_cas",
+        )
+        self.assertFalse(result, "CAS must fail when old_stop doesn't match current stop_loss")
+
+        # Verify with correct old_stop succeeds
+        result2 = self.repo.update_stop_loss_across_tables(
+            trade_id=8882, order_id=8882, new_stop=100.0,
+            old_stop=99.0, reason="test_cas_correct",
+        )
+        self.assertTrue(result2, "CAS must succeed when old_stop matches")
+
+        # Verify all three tables were updated
+        trade_sl = self.conn.execute("SELECT stop_loss FROM paper_trades WHERE id=8882").fetchone()["stop_loss"]
+        order_sl = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=8882").fetchone()["stop_loss"]
+        pos_sl = self.conn.execute("SELECT stop_loss FROM paper_positions WHERE id=8882").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(trade_sl), 100.0)
+        self.assertAlmostEqual(float(order_sl), 100.0)
+        self.assertAlmostEqual(float(pos_sl), 100.0)
+
+    def test_conflict_stop_tighten_missing_position_rolls_back(self) -> None:
+        """update_stop_loss_across_tables rolls back when paper_positions row
+        is missing (rowcount==0 on position update)."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8883, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8883, 8883, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        # No paper_positions row!
+        self.conn.commit()
+
+        result = self.repo.update_stop_loss_across_tables(
+            trade_id=8883, order_id=8883, new_stop=100.0,
+            old_stop=98.0, reason="test_missing_pos",
+        )
+        self.assertFalse(result, "Must fail when position row is missing")
+
+        # Verify trade stop was NOT changed (rolled back)
+        trade_sl = self.conn.execute("SELECT stop_loss FROM paper_trades WHERE id=8883").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(trade_sl), 98.0, msg="Trade stop must be rolled back on missing position")
+
+    def test_conflict_stop_tighten_closed_order_rolls_back(self) -> None:
+        """update_stop_loss_across_tables rolls back when paper_orders is not open."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8884, 'BTCUSDT', 'LONG', 'market', 'filled', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8884, 8884, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (8884, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 'open')",
+        )
+        self.conn.commit()
+
+        result = self.repo.update_stop_loss_across_tables(
+            trade_id=8884, order_id=8884, new_stop=100.0,
+            old_stop=98.0, reason="test_closed_order",
+        )
+        self.assertFalse(result, "Must fail when order is not open")
+
+        # Verify trade and position stop were NOT changed (rolled back)
+        trade_sl = self.conn.execute("SELECT stop_loss FROM paper_trades WHERE id=8884").fetchone()["stop_loss"]
+        pos_sl = self.conn.execute("SELECT stop_loss FROM paper_positions WHERE id=8884").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(trade_sl), 98.0, msg="Trade stop must be rolled back")
+        self.assertAlmostEqual(float(pos_sl), 98.0, msg="Position stop must be rolled back")
+
+    def test_conflict_stop_tighten_no_order_id_ok(self) -> None:
+        """update_stop_loss_across_tables succeeds when order_id=0 (no order to update)."""
+        # Create a placeholder order (FK constraint requires it), but mark it filled
+        # so the order update step is skipped (order_id=0 means "no order to update").
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (9985, 'BTCUSDT', 'LONG', 'market', 'filled', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8885, 9985, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (8885, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 'open')",
+        )
+        self.conn.commit()
+
+        # order_id=0 means "skip order update" — only trade + position need to succeed
+        result = self.repo.update_stop_loss_across_tables(
+            trade_id=8885, order_id=0, new_stop=100.0,
+            old_stop=98.0, reason="test_no_order",
+        )
+        self.assertTrue(result, "Should succeed with trade + position, no order")
+
+        trade_sl = self.conn.execute("SELECT stop_loss FROM paper_trades WHERE id=8885").fetchone()["stop_loss"]
+        pos_sl = self.conn.execute("SELECT stop_loss FROM paper_positions WHERE id=8885").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(trade_sl), 100.0)
+        self.assertAlmostEqual(float(pos_sl), 100.0)
+
+    # ── Issue 4: Conflict actions single notification ───────────
+
+    def test_conflict_actions_single_notification(self) -> None:
+        """Issue 4: conflict_exit/stop_adjusted only have paper_event_alert,
+        not _notify_action (which would double-send)."""
+        from unittest.mock import patch, MagicMock
+        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+
+        # Set up GA decision with S-grade bearish signal
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
+            "signal_grade, confidence, market_bias, decision, skill_result_refs_json, "
+            "evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
+            "VALUES (8890, 'BTCUSDT', 1700000000000, '2026-06-27T10:00:00Z', 'scheduled', "
+            "'S', 0.90, 'bearish', 'create_paper_order', '[]', '[]', '[]', '{\"ok\":true}', "
+            "'[\"create_paper_order\"]', 'test', '{}', '{\"side\":\"SHORT\"}')"
+        )
+        # Set up an open LONG trade
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss, ga_decision_id) "
+            "VALUES (8890, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0, 8890)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8890, 8890, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.commit()
+
+        mock_send = MagicMock()
+
+        with patch('plugins.crypto_guard.paper.position_conflict_revalidator.get_mark_price_with_fallback') as mock_mp, \
+             patch('plugins.crypto_guard.paper.position_conflict_revalidator._notify_action') as mock_notify:
+            mock_mp.return_value = {
+                "ok": True, "mark_price": 95.0,
+                "price_source": "binance_usdm_mark",
+                "price_as_of": "2026-06-27T10:00:00Z",
+                "price_age_seconds": 0.0,
+            }
+            result = run_position_conflict_revalidation(
+                self.repo, ga_decision_id=8890, send_message=mock_send,
+            )
+
+        # Verify _notify_action was NOT called for conflict_exit
+        # (conflict_exit already enqueues paper_event_alert)
+        for call_args in mock_notify.call_args_list:
+            action = call_args[0][1]  # second positional arg
+            action_type = action.get("action", "")
+            self.assertNotIn(action_type, ("conflict_exit", "stop_adjusted", "profit_protection"),
+                f"_notify_action should NOT be called for {action_type} (has its own notification path)")
+
+    # ── Issue 5: Routine breakeven log includes price_meta ──────
+
+    def test_routine_breakeven_log_includes_price_meta(self) -> None:
+        """Issue 5: stop_loss_adjustment log event_json contains
+        mark_price/price_source/price_as_of/price_age_seconds from price_meta."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8883, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8883, 8883, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
+            "VALUES (8883, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 'open')",
+        )
+        self.conn.commit()
+
+        price_meta = {
+            "mark_price": 105.0,
+            "price_source": "binance_usdm_mark",
+            "price_as_of": "2026-06-27T10:00:00Z",
+            "price_age_seconds": 1.5,
+        }
+        changed = self.repo.update_paper_order_stop_loss(
+            8883, 100.0,
+            reason="test_price_meta",
+            price_meta=price_meta,
+        )
+        self.assertTrue(changed, "Stop loss update should succeed")
+
+        log = self.conn.execute(
+            "SELECT event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(log, "A stop_loss_adjustment log should exist")
+        event = json.loads(log["event_json"])
+        self.assertIn("mark_price", event, "event_json must contain mark_price")
+        self.assertAlmostEqual(event["mark_price"], 105.0)
+        self.assertEqual(event["price_source"], "binance_usdm_mark")
+        self.assertEqual(event["price_as_of"], "2026-06-27T10:00:00Z")
+        self.assertAlmostEqual(event["price_age_seconds"], 1.5)
+
+    def test_breakeven_missing_trade_rolls_back(self) -> None:
+        """update_paper_order_stop_loss rolls back when paper_trades row missing."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8886, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        # No paper_trades or paper_positions row
+        self.conn.commit()
+
+        result = self.repo.update_paper_order_stop_loss(
+            8886, 100.0, reason="test_missing_trade",
+        )
+        self.assertFalse(result, "Must fail when trade row is missing")
+
+        # Verify order stop was NOT changed (rolled back)
+        order_sl = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=8886").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(order_sl), 98.0, msg="Order stop must be rolled back on missing trade")
+
+    def test_breakeven_missing_position_rolls_back(self) -> None:
+        """update_paper_order_stop_loss rolls back when paper_positions row missing."""
+        self.conn.execute(
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity, stop_loss, initial_stop_loss) "
+            "VALUES (8887, 'BTCUSDT', 'LONG', 'market', 'open', 100.0, 1.0, 98.0, 98.0)",
+        )
+        self.conn.execute(
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+            "VALUES (8887, 8887, 'BTCUSDT', 'LONG', 100.0, 1.0, 98.0, 98.0, 2.0)",
+        )
+        # No paper_positions row
+        self.conn.commit()
+
+        result = self.repo.update_paper_order_stop_loss(
+            8887, 100.0, reason="test_missing_position",
+        )
+        self.assertFalse(result, "Must fail when position row is missing")
+
+        # Verify order and trade stop were NOT changed (rolled back)
+        order_sl = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=8887").fetchone()["stop_loss"]
+        trade_sl = self.conn.execute("SELECT stop_loss FROM paper_trades WHERE id=8887").fetchone()["stop_loss"]
+        self.assertAlmostEqual(float(order_sl), 98.0, msg="Order stop must be rolled back")
+        self.assertAlmostEqual(float(trade_sl), 98.0, msg="Trade stop must be rolled back")
+
+    # ── Issue 7: UTC formatter timestamp unit compatibility ────
+
+    def test_time_utils_identify_seconds_vs_millis(self) -> None:
+        """Issue 7: auto-detect seconds vs milliseconds for int/float timestamps,
+        unknown types return '不可用'."""
+        from plugins.crypto_guard.notify.time_utils import format_event_time_cst, format_event_time_cst_compact
+
+        # Seconds-level timestamp: 1782554400 = 2026-06-27 10:00:00 UTC
+        result_s = format_event_time_cst(1782554400)
+        self.assertIn("2026-06-27 18:00:00 (UTC+8)", result_s,
+            f"Second-level int should convert to CST; got {result_s}")
+
+        # Milliseconds-level timestamp: 1782554400000
+        result_ms = format_event_time_cst(1782554400000)
+        self.assertIn("2026-06-27 18:00:00 (UTC+8)", result_ms,
+            f"Millisecond-level int should convert to CST; got {result_ms}")
+
+        # String seconds
+        result_str_s = format_event_time_cst("1782554400")
+        self.assertIn("2026-06-27 18:00:00 (UTC+8)", result_str_s,
+            f"Second-level string should convert to CST; got {result_str_s}")
+
+        # Unknown type (bool) returns "不可用"
+        result_bool = format_event_time_cst(True)
+        self.assertEqual(result_bool, "不可用",
+            f"Unknown type should return '不可用'; got {result_bool}")
+
+        # Compact version also handles seconds
+        result_compact = format_event_time_cst_compact(1782554400)
+        self.assertIn("2026-06-27 18:00 (UTC+8)", result_compact,
+            f"Compact format should handle seconds; got {result_compact}")
+
+        # Compact unknown type
+        result_compact_bool = format_event_time_cst_compact(True)
+        self.assertEqual(result_compact_bool, "不可用",
+            f"Compact unknown type should return '不可用'; got {result_compact_bool}")
 
 
 if __name__ == "__main__":

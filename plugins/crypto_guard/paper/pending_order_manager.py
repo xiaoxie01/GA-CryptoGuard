@@ -225,10 +225,13 @@ def notify_order_cancelled(
     """
     from plugins.crypto_guard.notify.alert_delivery import send_markdown_alert
     from plugins.crypto_guard.notify.hourly_report import resolve_report_target
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst
 
     side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(order.get("side") or "").upper(), order.get("side") or "-")
     status = str(order.get("status") or "").lower()
     alert_type = "paper_order_expired" if status == "expired" else "conflict_cancelled"
+
+    event_time = format_event_time_cst(datetime.now(timezone.utc).isoformat())
 
     lines = [
         "**模拟盘挂单已取消**",
@@ -236,6 +239,7 @@ def notify_order_cancelled(
         f"- 产品：{order.get('symbol', '-')}",
         f"- 方向：{side_cn}",
         f"- 订单：#{order.get('id', '-')}",
+        f"- 时间：{event_time}",
         f"- 原因：{reason}",
         "",
         "不构成实盘建议，仅用于模拟盘与策略研究。",

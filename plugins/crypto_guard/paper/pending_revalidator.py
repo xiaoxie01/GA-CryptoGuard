@@ -264,6 +264,7 @@ def _notify_action(
 
     from plugins.crypto_guard.notify.alert_delivery import send_markdown_alert
     from plugins.crypto_guard.notify.hourly_report import resolve_report_target
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst
 
     order_id = action.get("order_id", "-")
     symbol = action.get("symbol", "-")
@@ -273,12 +274,15 @@ def _notify_action(
     reason = action.get("reason", "")
     alert_type = "paper_order_expired" if act == "cancel" else "conflict_cancelled"
 
+    event_time = format_event_time_cst(datetime.now(timezone.utc).isoformat())
+
     lines = [
         "**模拟盘挂单复核**",
         "",
         f"- 产品：{symbol}",
         f"- 方向：{side_cn}",
         f"- 订单：#{order_id}",
+        f"- 时间：{event_time}",
         f"- 动作：{'取消' if act == 'cancel' else '转观察'}",
         f"- 原因：{reason}",
         "",

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.paper.mark_price import get_mark_price_with_fallback, clear_cycle_cache
+from plugins.crypto_guard.notify.time_utils import format_event_time_cst, format_event_time_cst_compact
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.position_conflict")
@@ -63,6 +65,10 @@ def run_position_conflict_revalidation(
     stop_adjusted_count = 0
     recheck_count = 0
     skipped_count = 0
+
+    # Per-cycle mark price cache
+    clear_cycle_cache()
+    mark_price_cache: dict[str, dict[str, Any]] = {}
 
     for trade in open_trades:
         trade = dict(trade)
@@ -129,8 +135,21 @@ def run_position_conflict_revalidation(
 
         conflict_count += 1
 
-        # Get current price once for all downstream checks
-        current_price = _get_current_price_for_trade(repo, trade_id, trade_symbol)
+        # Get current price once for all downstream checks — retain full quote
+        # metadata (mark_price/price_source/price_as_of/price_age_seconds) so
+        # it can be threaded into conflict action logs and notifications.
+        mp_result = get_mark_price_with_fallback(trade_symbol, repo=repo, cache=mark_price_cache)
+        if mp_result.get("ok"):
+            current_price = float(mp_result["mark_price"])
+            price_meta = {
+                "mark_price": float(mp_result["mark_price"]),
+                "price_source": mp_result.get("price_source", "binance_usdm_mark"),
+                "price_as_of": mp_result.get("price_as_of"),
+                "price_age_seconds": mp_result.get("price_age_seconds"),
+            }
+        else:
+            current_price = None
+            price_meta = None
 
         # ── Pre-gate: passive decisions must not adjust position ──
         is_passive = _is_passive_decision(latest_decision)
@@ -139,7 +158,7 @@ def run_position_conflict_revalidation(
             grade = str(latest_decision.get("signal_grade") or "").upper()
             current_r = _compute_current_r_for_trade(trade, current_price)
             if grade == "S" and current_r is not None and current_r <= early_exit_min_adverse_r:
-                action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price)
+                action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price, price_meta=price_meta)
                 if action.get("status") == "executed":
                     closed_count += 1
             else:
@@ -147,7 +166,24 @@ def run_position_conflict_revalidation(
                 recheck_count += 1
             actions.append(action)
             if notify_actions:
-                _notify_action(repo, action, send_message)
+                action_type = action.get("action", "")
+                if action_type not in ("conflict_exit", "stop_adjusted", "profit_protection"):
+                    _notify_action(repo, action, send_message)
+            continue
+
+        # --- P0: Profit Protection (runs BEFORE early exit / tighten) ---
+        profit_protection_result = _evaluate_profit_protection_inline(
+            repo, trade, latest_decision, ga_dec_id,
+            mark_price_cache=mark_price_cache,
+        )
+        if profit_protection_result is not None:
+            if profit_protection_result.get("status") == "executed":
+                closed_count += 1
+            elif profit_protection_result.get("status") in ("needs_position_recheck", "marked"):
+                recheck_count += 1
+            actions.append(profit_protection_result)
+            if notify_actions and profit_protection_result.get("action") != "profit_protection":
+                _notify_action(repo, profit_protection_result, send_message)
             continue
 
         # --- P0: Strong conflict early exit ---
@@ -157,7 +193,7 @@ def run_position_conflict_revalidation(
             signal_decay_exit_threshold=signal_decay_exit_threshold,
             strong_confirmations=strong_confirmations,
         ):
-            action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price)
+            action = _execute_early_exit(repo, trade, latest_decision, ga_dec_id, current_price, price_meta=price_meta)
             if action.get("status") == "executed":
                 closed_count += 1
             elif action.get("status") in ("already_closed", "duplicate"):
@@ -174,7 +210,7 @@ def run_position_conflict_revalidation(
             min_mfe_r_for_breakeven=min_mfe_r_for_breakeven,
             reverse_confirmations_for_tighten=reverse_confirmations_for_tighten,
         ):
-            action = _execute_stop_tighten(repo, trade, latest_decision, ga_dec_id, current_price)
+            action = _execute_stop_tighten(repo, trade, latest_decision, ga_dec_id, current_price, price_meta=price_meta)
             if action.get("status") == "executed":
                 stop_adjusted_count += 1
             elif action.get("status") == "duplicate":
@@ -188,7 +224,9 @@ def run_position_conflict_revalidation(
 
         actions.append(action)
         if notify_actions:
-            _notify_action(repo, action, send_message)
+            action_type = action.get("action", "")
+            if action_type not in ("conflict_exit", "stop_adjusted", "profit_protection"):
+                _notify_action(repo, action, send_message)
 
     return {
         "ok": True,
@@ -422,45 +460,6 @@ def _should_tighten_stop(
 # ---------------------------------------------------------------------------
 
 
-def _get_current_price_for_trade(
-    repo: CryptoGuardRepository,
-    trade_id: int,
-    symbol: str,
-) -> float | None:
-    """Get the most recent current price for a trade's symbol.
-
-    Priority: paper_positions.current_price (if fresh) > recent klines_1h.close
-    Requires the price source to be fresh (within 15 min).
-    """
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    freshness_cutoff_ms = now_ms - 15 * 60 * 1000  # 15 minutes ago
-
-    # Priority 1: paper_positions.current_price (must be fresh within 15 min)
-    # Use SQLite strftime to handle format differences between CURRENT_TIMESTAMP
-    # ('YYYY-MM-DD HH:MM:SS') and ISO 8601 strings alike.
-    pos_row = repo.conn.execute(
-        """SELECT current_price, updated_at FROM paper_positions WHERE id=?
-           AND updated_at IS NOT NULL
-           AND CAST(strftime('%s', updated_at) AS INTEGER) >= ?""",
-        (trade_id, freshness_cutoff_ms // 1000),
-    ).fetchone()
-    if pos_row and pos_row["current_price"] is not None:
-        return float(pos_row["current_price"])
-
-    # Priority 2: recent klines_1h close (must be within 15 min)
-    try:
-        kline_row = repo.conn.execute(
-            "SELECT close FROM klines_1h WHERE symbol=? AND close_time >= ? ORDER BY close_time DESC LIMIT 1",
-            (symbol, freshness_cutoff_ms),
-        ).fetchone()
-        if kline_row and kline_row["close"] is not None:
-            return float(kline_row["close"])
-    except Exception:
-        pass
-
-    return None
-
-
 def _compute_current_r_for_trade(
     trade: dict[str, Any],
     current_price: float | None,
@@ -560,6 +559,78 @@ def _compute_signal_decay_for_trade(
     return max(0.0, min(1.0, time_decay + performance_decay))
 
 
+def _evaluate_profit_protection_inline(
+    repo: CryptoGuardRepository,
+    trade: dict[str, Any],
+    ga_decision: dict[str, Any],
+    ga_decision_id: int,
+    *,
+    mark_price_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Inline profit protection evaluation for the conflict revalidator path.
+
+    Called BEFORE early exit and stop tighten. Evaluates whether a profitable
+    position with high MFE should be closed due to a strong reverse S-grade signal.
+
+    Returns an action dict if profit protection triggers, None if it doesn't.
+    """
+    from plugins.crypto_guard.paper.paper_position_updater import _evaluate_profit_protection, _execute_profit_protection_close
+
+    # Get the order for profit protection evaluation
+    order_id = trade.get("order_id")
+    if not order_id:
+        return None
+
+    order = repo.conn.execute(
+        "SELECT * FROM paper_orders WHERE id=?",
+        (int(order_id),),
+    ).fetchone()
+    if not order or order["status"] != "open":
+        return None
+
+    order_dict = dict(order)
+
+    # Use the shared _evaluate_profit_protection from paper_position_updater
+    result = _evaluate_profit_protection(
+        repo, order_dict, trade, ga_decision,
+        mark_price_cache=mark_price_cache,
+    )
+
+    if result is None:
+        return None
+
+    if result.get("action") == "needs_position_recheck":
+        # Close the loop: route the recheck through the standard
+        # _execute_recheck_mark path so it writes paper_trade_logs, enqueues
+        # paper_event_alert, and is countable by the main loop's recheck_count.
+        return _execute_recheck_mark(
+            repo, trade, ga_decision, ga_decision_id, None,
+            reason="mark_price_unavailable_for_profit_protection",
+        )
+
+    # Build action dict in the conflict revalidator format
+    return {
+        "action": "profit_protection",
+        "trade_id": int(trade["id"]),
+        "symbol": str(trade["symbol"]),
+        "side": result.get("side", str(trade.get("side", ""))),
+        "entry_price": result.get("entry_price"),
+        "exit_price": result.get("exit_price"),
+        "pnl_r": result.get("pnl_r"),
+        "pnl": result.get("pnl"),
+        "mfe_r": result.get("mfe_r"),
+        "current_r": result.get("current_r"),
+        "retracement_r": result.get("retracement_r"),
+        "signal_grade": ga_decision.get("signal_grade"),
+        "market_bias": ga_decision.get("market_bias"),
+        "ga_decision_id": ga_decision_id,
+        "event_time": result.get("event_time"),
+        "exit_time": result.get("event_time"),
+        "reason": f"利润保护：+{result.get('mfe_r', 0):.2f}R MFE 回撤至 +{result.get('current_r', 0):.2f}R",
+        "status": result.get("status", "executed"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Action executors
 # ---------------------------------------------------------------------------
@@ -571,8 +642,15 @@ def _execute_early_exit(
     latest_decision: dict[str, Any],
     ga_decision_id: int,
     current_price: float | None,
+    *,
+    price_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Close the paper trade due to strong conflict signal."""
+    """Close the paper trade due to strong conflict signal.
+
+    ``price_meta`` carries fresh quote metadata (mark_price, price_source,
+    price_as_of, price_age_seconds) so it can be merged into the close log
+    and the notification payload. None when the mark fetch failed upstream.
+    """
     trade_id = int(trade["id"])
     trade_symbol = str(trade["symbol"])
     order_id = trade.get("order_id")
@@ -643,9 +721,12 @@ def _execute_early_exit(
     signal_decay = _compute_signal_decay_for_trade(trade, current_price)
     stop_take_path = _build_stop_take_path(trade, "conflict_exit")
 
-    # Close the trade
+    # Close the trade — atomic guard: only the winner of a concurrent close
+    # proceeds with side effects. If close_paper_trade returns False, another
+    # writer already closed this trade; bail out without backfill / order
+    # update / position upsert / logs / enqueues / commit.
     now = datetime.now(timezone.utc).isoformat()
-    repo.close_paper_trade(
+    closed = repo.close_paper_trade(
         trade_id=trade_id,
         exit_price=current_price,
         close_reason="conflict_exit",
@@ -657,6 +738,13 @@ def _execute_early_exit(
         signal_decay_score=signal_decay,
         stop_take_path=stop_take_path,
     )
+    if not closed:
+        return {
+            "action": "conflict_exit",
+            "trade_id": trade_id,
+            "status": "already_closed",
+            "reason": "concurrent close",
+        }
 
     # Backfill real PnL to active evaluations.
     # Shadow evaluations get PnL exclusively from their independent virtual_trade lifecycle.
@@ -685,6 +773,23 @@ def _execute_early_exit(
     _record_action(repo, dedupe_key, trade_id, trade_symbol)
 
     # Log conflict_exit event
+    event_payload = {
+        "trade_id": trade_id,
+        "ga_decision_id": ga_decision_id,
+        "signal_grade": latest_decision.get("signal_grade"),
+        "market_bias": latest_decision.get("market_bias"),
+        "confidence": latest_decision.get("confidence"),
+        "pnl_r": round(pnl_r, 4),
+        "close_reason": "conflict_exit",
+        "dedupe_key": dedupe_key,
+    }
+    if price_meta:
+        event_payload.update({
+            "mark_price": price_meta.get("mark_price"),
+            "price_source": price_meta.get("price_source"),
+            "price_as_of": price_meta.get("price_as_of"),
+            "price_age_seconds": price_meta.get("price_age_seconds"),
+        })
     repo.log_paper_trade_event(
         event_type="conflict_exit",
         symbol=trade_symbol,
@@ -694,16 +799,7 @@ def _execute_early_exit(
         pnl=pnl,
         pnl_pct=pnl_percent,
         reason=f"Position conflict: GA#{ga_decision_id} {latest_decision.get('signal_grade')} {latest_decision.get('market_bias')} vs {pos_side}",
-        event={
-            "trade_id": trade_id,
-            "ga_decision_id": ga_decision_id,
-            "signal_grade": latest_decision.get("signal_grade"),
-            "market_bias": latest_decision.get("market_bias"),
-            "confidence": latest_decision.get("confidence"),
-            "pnl_r": round(pnl_r, 4),
-            "close_reason": "conflict_exit",
-            "dedupe_key": dedupe_key,
-        },
+        event=event_payload,
     )
 
     # Log standard close_position event (side effect paper_broker does)
@@ -724,30 +820,38 @@ def _execute_early_exit(
     repo.enqueue_job("trade_review", 4, "position_conflict", f"system:review:{trade_id}", {"trade_id": trade_id})
 
     # Enqueue paper_event_alert job (side effect paper_broker does)
-    repo.enqueue_job(
+    alert_payload = {
+        "event_type": "close_position",
+        "symbol": trade_symbol,
+        "order_id": order_id,
+        "trade_id": trade_id,
+        "exit_price": current_price,
+        "close_reason": "conflict_exit",
+        "pnl_r": pnl_r,
+        "side": pos_side,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profits": json.loads(trade.get("take_profit_json") or "[]") if trade.get("take_profit_json") else [],
+        "filled_at": (order_row["filled_at"] if order_row and order_row["filled_at"] else trade.get("created_at")),
+        "closed_at": now,
+        "event_time": now,
+        "quantity": quantity,
+        "order_type": (order_row["order_type"] if order_row and order_row["order_type"] else trade.get("fill_method") or "market"),
+        "fill_method": (order_row["fill_method"] if order_row and order_row["fill_method"] else trade.get("fill_method")),
+    }
+    if price_meta:
+        alert_payload.update({
+            "mark_price": price_meta.get("mark_price"),
+            "price_source": price_meta.get("price_source"),
+            "price_as_of": price_meta.get("price_as_of"),
+            "price_age_seconds": price_meta.get("price_age_seconds"),
+        })
+    repo.enqueue_job_once(
         "paper_event_alert",
         3,
         "position_conflict",
-        f"system:paper:closed:{trade_id}",
-        {
-            "event_type": "close_position",
-            "symbol": trade_symbol,
-            "order_id": order_id,
-            "trade_id": trade_id,
-            "exit_price": current_price,
-            "close_reason": "conflict_exit",
-            "pnl_r": pnl_r,
-            "side": pos_side,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profits": json.loads(trade.get("take_profit_json") or "[]") if trade.get("take_profit_json") else [],
-            "filled_at": (order_row["filled_at"] if order_row and order_row["filled_at"] else trade.get("created_at")),
-            "closed_at": now,
-            "event_time": now,
-            "quantity": quantity,
-            "order_type": (order_row["order_type"] if order_row and order_row["order_type"] else trade.get("fill_method") or "market"),
-            "fill_method": (order_row["fill_method"] if order_row and order_row["fill_method"] else trade.get("fill_method")),
-        },
+        f"system:paper:conflict_exit:{trade_id}:{ga_decision_id}",
+        alert_payload,
     )
 
     repo.conn.commit()
@@ -782,8 +886,15 @@ def _execute_stop_tighten(
     latest_decision: dict[str, Any],
     ga_decision_id: int,
     current_price: float | None,
+    *,
+    price_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Tighten stop loss on conflict — move to breakeven if profitable."""
+    """Tighten stop loss on conflict — move to breakeven if profitable.
+
+    ``price_meta`` carries fresh quote metadata (mark_price, price_source,
+    price_as_of, price_age_seconds) so it can be merged into the adjustment
+    log. None when the mark fetch failed upstream.
+    """
     trade_id = int(trade["id"])
     trade_symbol = str(trade["symbol"])
     order_id = trade.get("order_id")
@@ -817,25 +928,9 @@ def _execute_stop_tighten(
             tighten_reason = f"止损收紧: {old_stop} → {new_stop} (保本)"
 
     if new_stop != old_stop:
-        # Update paper_trades
-        repo.conn.execute(
-            "UPDATE paper_trades SET stop_loss=? WHERE id=?",
-            (new_stop, trade_id),
-        )
-        # Update paper_positions
-        repo.conn.execute(
-            "UPDATE paper_positions SET stop_loss=? WHERE id=?",
-            (new_stop, trade_id),
-        )
-        # Update paper_orders
-        if order_id:
-            repo.conn.execute(
-                "UPDATE paper_orders SET stop_loss=? WHERE id=?",
-                (new_stop, int(order_id)),
-            )
-
         # Compute audit info
-        from datetime import datetime, timezone as tz_utc
+        from datetime import datetime, timezone
+        tz_utc = timezone.utc
         open_time = trade.get("created_at")
         holding_minutes = None
         if open_time:
@@ -852,32 +947,74 @@ def _execute_stop_tighten(
 
         mfe_r = _compute_mfe_r_for_trade(trade, current_price)
 
-        repo.log_paper_trade_event(
-            event_type="stop_loss_adjustment",
-            symbol=trade_symbol,
-            side=pos_side,
-            price=new_stop,
-            quantity=trade.get("quantity"),
+        # Build enriched price_meta with audit details for the atomic log
+        enriched_meta = dict(price_meta) if price_meta else {}
+        enriched_meta.update({
+            "ga_decision_id": ga_decision_id,
+            "trigger": "position_conflict",
+            "dedupe_key": dedupe_key,
+            "audit": {
+                "open_time": open_time,
+                "action_time": datetime.now(tz_utc).isoformat(),
+                "holding_minutes": holding_minutes,
+                "current_r": round(current_r, 4) if current_r is not None else None,
+                "mfe_r": round(mfe_r, 4) if mfe_r is not None else None,
+                "decision_executable": True,
+                "gate_result": "all_passed",
+            },
+        })
+
+        # Atomic stop tighten: use CAS across all three tables
+        updated = repo.update_stop_loss_across_tables(
+            trade_id, int(order_id) if order_id else 0, new_stop,
+            old_stop=old_stop,
             reason=f"Position conflict stop tighten: GA#{ga_decision_id}",
-            event={
+            price_meta=enriched_meta,
+        )
+        if not updated:
+            return {
+                "action": "stop_adjusted",
                 "trade_id": trade_id,
-                "ga_decision_id": ga_decision_id,
+                "symbol": trade_symbol,
+                "side": pos_side,
                 "old_stop_loss": old_stop,
                 "new_stop_loss": new_stop,
-                "trigger": "position_conflict",
-                "dedupe_key": dedupe_key,
-                "audit": {
-                    "open_time": open_time,
-                    "action_time": datetime.now(tz_utc).isoformat(),
-                    "holding_minutes": holding_minutes,
-                    "current_r": round(current_r, 4) if current_r is not None else None,
-                    "mfe_r": round(mfe_r, 4) if mfe_r is not None else None,
-                    "decision_executable": True,
-                    "gate_result": "all_passed",
-                },
-            },
-        )
+                "status": "duplicate",
+                "reason": "Concurrent writer changed stop_loss first",
+            }
         repo.conn.commit()
+
+        # Enqueue paper_event_alert so notifications carry quote metadata
+        alert_payload = {
+            "event_type": "stop_loss_adjustment",
+            "symbol": trade_symbol,
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "new_stop_loss": new_stop,
+            "old_stop_loss": old_stop,
+            "side": pos_side,
+            "entry_price": entry_price,
+            "current_r": round(current_r, 4) if current_r is not None else None,
+            "mfe_r": round(mfe_r, 4) if mfe_r is not None else None,
+            "reason": tighten_reason,
+            "event_time": datetime.now(tz_utc).isoformat(),
+            "trigger": "position_conflict",
+            "ga_decision_id": ga_decision_id,
+        }
+        if price_meta:
+            alert_payload.update({
+                "mark_price": price_meta.get("mark_price"),
+                "price_source": price_meta.get("price_source"),
+                "price_as_of": price_meta.get("price_as_of"),
+                "price_age_seconds": price_meta.get("price_age_seconds"),
+            })
+        repo.enqueue_job_once(
+            "paper_event_alert",
+            3,
+            "position_conflict",
+            f"system:paper:stop_adjust:{trade_id}:{ga_decision_id}",
+            alert_payload,
+        )
 
         LOGGER.info(
             "stop_adjusted: trade_id=%s symbol=%s old=%s new=%s r=%.2f ga=%s",
@@ -1065,17 +1202,18 @@ def _build_stop_take_path(
 
 
 def _format_utc8_timestamp(value: Any) -> str | None:
+    """Format a timestamp to UTC+8 display string (compact, no seconds).
+
+    Delegates to the shared formatter in notify/time_utils.py.
+    Returns None if the value is None/unparseable, so callers can
+    conditionally include the time line.
+    """
     if not value:
         return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).astimezone(
-            timezone(timedelta(hours=8))
-        ).strftime("%Y-%m-%d %H:%M")
-    except Exception:
+    result = format_event_time_cst_compact(value)
+    if result == "不可用":
         return None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1238,7 @@ def _notify_action(
         ("conflict_exit", "executed"),
         ("stop_adjusted", "executed"),
         ("needs_position_recheck", "marked"),
+        ("profit_protection", "executed"),
     }
     if (action_type, status) not in allowed:
         return {"ok": True, "sent": False, "queued": False, "reason": f"not_notifiable:{action_type}:{status}"}
@@ -1119,7 +1258,7 @@ def _notify_action(
             "",
             f"- 产品：{symbol}",
             f"- 方向：{side_cn}",
-            f"- 时间：{event_time} (UTC+8)" if event_time else "",
+            f"- 时间：{event_time}" if event_time else "",
             f"- 退出价格：{exit_price}",
             f"- 盈亏 R：{pnl_r}",
             f"- 触发信号：GA#{ga_id} {grade}级",
@@ -1128,15 +1267,41 @@ def _notify_action(
             "不构成实盘建议，仅用于模拟盘与策略研究。",
         ]
         alert_type = "close_position"
+    elif action_type == "profit_protection":
+        exit_price = action.get("exit_price", "-")
+        pnl_r = action.get("pnl_r", 0)
+        ga_id = action.get("ga_decision_id", "?")
+        grade = action.get("signal_grade", "?")
+        mfe_r = action.get("mfe_r", 0)
+        current_r = action.get("current_r", 0)
+        retracement_r = action.get("retracement_r", 0)
+        event_time = _format_utc8_timestamp(action.get("event_time") or action.get("exit_time"))
+        lines = [
+            "**模拟盘利润保护 - 已平仓锁定利润**",
+            "",
+            f"- 产品：{symbol}",
+            f"- 方向：{side_cn}",
+            f"- 时间：{event_time}" if event_time else "",
+            f"- 退出价格：{exit_price}",
+            f"- 盈亏 R：{pnl_r}",
+            f"- MFE：+{mfe_r:.2f}R → 当前：+{current_r:.2f}R（回撤 {retracement_r:.2f}R）",
+            f"- 触发信号：GA#{ga_id} {grade}级强反向",
+            f"- 原因：{action.get('reason', '利润保护')}",
+            "",
+            "不构成实盘建议，仅用于模拟盘与策略研究。",
+        ]
+        alert_type = "close_position"
     elif action_type == "stop_adjusted":
         old_stop = action.get("old_stop_loss", "-")
         new_stop = action.get("new_stop_loss", "-")
         grade = action.get("signal_grade", "?")
+        event_time = _format_utc8_timestamp(action.get("event_time") or datetime.now(timezone.utc).isoformat())
         lines = [
             "**模拟盘持仓冲突 - 已收紧止损**",
             "",
             f"- 产品：{symbol}",
             f"- 方向：{side_cn}",
+            f"- 时间：{event_time}",
             f"- 旧止损：{old_stop}",
             f"- 新止损：{new_stop}",
             f"- 当前 R：{action.get('current_r', '-')}",
@@ -1149,11 +1314,13 @@ def _notify_action(
     elif action_type == "needs_position_recheck":
         grade = action.get("signal_grade", "?")
         current_r = action.get("current_r", "-")
+        event_time = _format_utc8_timestamp(datetime.now(timezone.utc).isoformat())
         lines = [
             "**模拟盘持仓冲突 - 进入复核**",
             "",
             f"- 产品：{symbol}",
             f"- 方向：{side_cn}",
+            f"- 时间：{event_time}",
             f"- 当前 R：{current_r}",
             f"- 触发信号：{grade}级",
             f"- 原因：{action.get('reason', '方向冲突进入复核队列')}",

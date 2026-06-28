@@ -187,3 +187,12 @@ position_conflict:
   min_current_r_for_breakeven: 0.50
   min_mfe_r_for_breakeven: 0.75
   reverse_confirmations_for_tighten: 2
+  # P0: Profit protection — close profitable positions on strong reverse signals
+  profit_protection:
+    enabled: true
+    min_grade: "S"
+    min_confidence: 0.85
+    min_mfe_r: 1.00
+    min_current_r: 0.30
+    min_retracement_r: 0.50
+    action: "close_full"

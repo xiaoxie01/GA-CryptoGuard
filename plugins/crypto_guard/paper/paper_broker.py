@@ -544,7 +544,7 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
     stop_take_path = quality["stop_take_path"]
     if exit_result.get("hit"):
         stop_take_path.append({"event": "exit_hit", "reason": close_reason, "exit_price": exit_price, "details": exit_result["hit"]})
-    repo.close_paper_trade(
+    closed = repo.close_paper_trade(
         trade["id"],
         exit_price=exit_price,
         close_reason=close_reason,
@@ -558,6 +558,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         signal_decay_score=quality["signal_decay_score"],
         stop_take_path=stop_take_path,
     )
+    if not closed:
+        return {"ok": True, "closed": False, "skip_reason": "concurrent_close"}
     closed_at = utc_iso()
     repo.update_paper_order_status(order["id"], "closed", closed_at=closed_at)
     # Backfill real pnl_r to active strategy_evaluations for this trade.
