@@ -877,3 +877,36 @@ Fixed 12 review issues: P0-1 replace polling with re-enqueue (no worker blocking
 ### Next Steps
 
 - None - task complete
+
+
+## Session 27: BTC#9 Trade Gate Final Seal — R3→R13 + Production Migration
+
+**Date**: 2026-07-02
+**Task**: BTC#9 Trade Gate Final Seal — R3→R13 + Production Migration
+**Branch**: `main`
+
+### Summary
+
+Completed 11 rounds of strict final-review fixes (R3-R13) for BTC#9 'down-pullback LONG false trigger' defect chain. Each round closed specific execution-path holes: R7 snapshot-path coverage, R8 generation-end symbol sync, R9 schema contract, R10 snapshot-authoritative analysis_time, R11 strict-positive-int parser, R12 single-source-of-truth consolidation, R13 docstring accuracy. After R13 approval, executed production migration sequence: stop services → VACUUM INTO backup (642.3 MB) → initialize_database() (0.3s) → Schema Health OK + State Consistency 0 issues + row counts unchanged (ga_decisions=1490, paper_orders=9, paper_trades=4) → restart hub.pyw. btc9_trade_gate_contract_v1 marker written, paper_trade_logs.dedupe_key column + unique partial index added, 6 BTC#9 diagnostic checks all pass on production data. 785 tests passing.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1092646b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
