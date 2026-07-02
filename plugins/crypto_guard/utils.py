@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 
 INTERVAL_MS = {
@@ -31,6 +32,27 @@ def latest_closed_close_time_ms(interval: str, now_ms: int | None = None) -> int
     now = utc_ms() if now_ms is None else int(now_ms)
     current_open = math.floor(now / span) * span
     return current_open - 1
+
+
+def _strict_positive_int_ms(value: Any) -> int | None:
+    """R11/R12: strict positive integer parser — rejects float/bool/NaN/Infinity/string/None/non-positive.
+
+    Only accepts a real int (not a bool subclass) that is > 0. All other
+    types return None so callers can fail-closed.
+
+    Key constraint: ``isinstance(True, int) is True`` in Python, so the
+    bool check MUST come before the int check.
+
+    R12: single source of truth — risk_engine, ga_judge, llm_agent_judge
+    all import this function from here to prevent contract drift.
+    """
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, int):
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 def latest_closed_open_time_ms(interval: str, now_ms: int | None = None) -> int:

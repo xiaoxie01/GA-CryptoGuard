@@ -216,11 +216,27 @@ def _create_watch_from_order(repo: CryptoGuardRepository, order: dict[str, Any],
         LOGGER.debug("create_watch_from_order failed: %s", e)
 
 
-def _latest_ga_decision(repo: CryptoGuardRepository, symbol: str) -> dict[str, Any] | None:
-    row = repo.conn.execute(
-        "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=? ORDER BY analysis_time_utc DESC LIMIT 1",
-        (symbol,),
-    ).fetchone()
+def _latest_ga_decision(repo: CryptoGuardRepository, symbol: str, *, max_analysis_time: int | None = None) -> dict[str, Any] | None:
+    """Get latest GA decision for a symbol.
+
+    BTC#9 fix: When max_analysis_time is provided, only return decisions
+    with analysis_time <= max_analysis_time. This prevents future-function
+    leakage in historical backfill — a candle at time T should not see
+    GA decisions published after T.
+
+    When max_analysis_time is None (live non-replay path), no upper bound
+    is applied (backward-compatible).
+    """
+    if max_analysis_time is not None:
+        row = repo.conn.execute(
+            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=? AND analysis_time <= ? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+            (symbol, int(max_analysis_time)),
+        ).fetchone()
+    else:
+        row = repo.conn.execute(
+            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
     return dict(row) if row else None
 
 

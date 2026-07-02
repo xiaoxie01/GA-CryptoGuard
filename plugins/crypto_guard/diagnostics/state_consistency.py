@@ -44,6 +44,26 @@ def _profit_protection_cutoff(repo: CryptoGuardRepository) -> str | None:
     return None
 
 
+def _btc9_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
+    """Section 七: Return the cutoff timestamp for BTC#9 regression-chain checks.
+
+    Uses the independent btc9_trade_gate_contract_v1 marker (NOT the R4 marker).
+    Returns None if the marker is absent, meaning BTC#9 diagnostics should be
+    skipped (no contract yet).
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = 'btc9_trade_gate_contract_v1' "
+            "LIMIT 1"
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        pass
+    return None
+
+
 def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Run all state consistency checks.
 
@@ -83,6 +103,16 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_financial_action_missing_mark_price(repo))
     issues.extend(_check_financial_action_stale_price(repo))
     issues.extend(_check_paper_notification_missing_event_time(repo))
+    # Section 九: Schema health is an integral part of state consistency
+    issues.extend(_check_schema_health_as_issues(repo))
+    # BTC#9 fix: 6 类新诊断
+    issues.extend(_check_btc9_contract_marker_missing(repo))
+    issues.extend(_check_fallback_llm_failed_created_paper_order(repo))
+    issues.extend(_check_missing_entry_confirmation_paper_order(repo))
+    issues.extend(_check_htf_support_reason_inconsistent(repo))
+    issues.extend(_check_chop_regime_boosted(repo))
+    issues.extend(_check_fill_without_ga_revalidation(repo))
+    issues.extend(_check_invalid_condition_equals_stop_loss(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -112,13 +142,22 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "financial_action_missing_mark_price": len([i for i in issues if i["type"] == "financial_action_missing_mark_price"]),
         "financial_action_stale_price": len([i for i in issues if i["type"] == "financial_action_stale_price"]),
         "paper_notification_missing_event_time": len([i for i in issues if i["type"] == "paper_notification_missing_event_time"]),
+        "btc9_contract_marker_missing": len([i for i in issues if i["type"] == "btc9_contract_marker_missing"]),
     }
 
+    # Section 八: Separate counts for error/warning/legacy_info
+    error_issues = [i for i in issues if i.get("severity") == "error"]
+    warning_issues = [i for i in issues if i.get("severity") == "warning"]
+    legacy_issues = [i for i in issues if i.get("severity") == "legacy_info"]
+
     return {
-        "ok": len(issues) == 0,
+        "ok": len(error_issues) == 0,
         "issues": issues,
         "summary": summary,
         "total_issues": len(issues),
+        "error_count": len(error_issues),
+        "warning_count": len(warning_issues),
+        "legacy_info_count": len(legacy_issues),
     }
 
 
@@ -1451,5 +1490,568 @@ def _check_paper_notification_missing_event_time(repo: CryptoGuardRepository) ->
                 "Update notification handlers to use format_event_time_cst from notify/time_utils.py."
             ),
         })
+
+    return issues
+
+
+def _check_btc9_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Section 九: Emit error when the btc9_trade_gate_contract_v1 marker is absent.
+
+    The BTC#9 contract marker is independent from the R4 marker. When the
+    schema and code for BTC#9 exist but the marker is missing, it means
+    initialize_database() has not been run (or failed before the marker
+    step). Diagnostics must not silently skip all BTC#9 checks and report
+    healthy — they must emit an explicit error.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = 'btc9_trade_gate_contract_v1' "
+            "LIMIT 1"
+        ).fetchone()
+        if not row or not row["applied_at"]:
+            issues.append({
+                "type": "btc9_contract_marker_missing",
+                "severity": "error",
+                "details": {
+                    "marker_key": "btc9_trade_gate_contract_v1",
+                    "issue": "marker_absent",
+                },
+                "suggested_action": (
+                    "BTC#9 contract marker 缺失。运行 initialize_database() 部署 marker。"
+                    "marker 缺失时所有 BTC#9 诊断被跳过，可能导致假绿。"
+                ),
+            })
+    except Exception:
+        # _migration_state table itself may not exist
+        issues.append({
+            "type": "btc9_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": "btc9_trade_gate_contract_v1",
+                "issue": "migration_state_table_missing",
+            },
+            "suggested_action": (
+                "_migration_state 表不存在或查询失败。"
+                "运行 initialize_database() 创建表并写入 BTC#9 marker。"
+            ),
+        })
+    return issues
+
+
+def _check_fallback_llm_failed_created_paper_order(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: LLM failed/disabled 的 GA decision 不应关联到非取消的 paper_order。
+
+    Section 八: Uses BTC#9 marker cutoff in SQL WHERE clause.
+    - Pre-marker data: severity=legacy_info (historical, not actionable)
+    - Post-marker data: severity=error (contract violation)
+    - Uses aggregate COUNT to detect truncation by LIMIT.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    # Aggregate count to detect truncation by LIMIT
+    total_count_row = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM paper_orders po
+        JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+        WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
+                                'expired', 'risk_off_cancelled', 'cancelled')
+          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+        """,
+        (cutoff,),
+    ).fetchone()
+    total_matching = int(total_count_row["cnt"]) if total_count_row else 0
+
+    rows = repo.conn.execute(
+        """
+        SELECT po.id AS order_id, po.symbol, po.side, po.status, po.ga_decision_id,
+               gd.raw_decision_json, gd.analysis_time_utc
+        FROM paper_orders po
+        JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+        WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
+                                'expired', 'risk_off_cancelled', 'cancelled')
+          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+        ORDER BY po.id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for row in rows:
+        try:
+            raw = json.loads(row["raw_decision_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        llm_status = str(raw.get("llm_status") or "ok").lower()
+        if llm_status not in {"failed", "disabled"}:
+            continue
+        issues.append({
+            "type": "fallback_llm_failed_created_paper_order",
+            "severity": "error",
+            "details": {
+                "order_id": row["order_id"],
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "status": row["status"],
+                "ga_decision_id": row["ga_decision_id"],
+                "llm_status": llm_status,
+            },
+            "suggested_action": (
+                "LLM failed/disabled 的 GA decision 必须降级为 opportunity_watch，"
+                "不应创建模拟盘订单。检查 risk_engine.apply_risk_to_decision 的 fallback 降级逻辑。"
+            ),
+        })
+    # If aggregate count exceeds LIMIT, emit a truncation warning so diagnostics
+    # do not falsely declare all-healthy due to LIMIT truncation.
+    if total_matching > 500:
+        issues.append({
+            "type": "fallback_llm_failed_created_paper_order",
+            "severity": "warning",
+            "details": {
+                "truncated": True,
+                "total_matching": total_matching,
+                "limit": 500,
+            },
+            "suggested_action": (
+                "诊断因 LIMIT 500 截断，可能遗漏部分违规订单。"
+                "请扩大分页或使用 aggregate COUNT 进行全库审计。"
+            ),
+        })
+    return issues
+
+
+def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: 缺少 entry_trigger_confirmation 的 trade_plan 不应创建非取消订单。
+
+    Section 八: Uses BTC#9 marker cutoff in SQL WHERE clause.
+    R3-E: Provenance-aware — calls the same _validate_entry_confirmation used
+    by the execution gate, passing snapshot/module_analysis_results loaded
+    from the persisted snapshot_id. A structurally valid but fabricated
+    confirmation is now reported when no matching real event exists.
+
+    Reports by reason category:
+    - missing confirmation
+    - malformed confirmation
+    - confirmation event not found
+    - event not closed
+    - future event
+    - field mismatch
+
+    Uses aggregate COUNT to detect truncation by LIMIT. Emits
+    diagnostic_truncated warning when total > 500.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    # Aggregate count to detect truncation by LIMIT
+    total_count_row = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM paper_orders po
+        JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+        WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
+                                'expired', 'risk_off_cancelled', 'cancelled')
+          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+        """,
+        (cutoff,),
+    ).fetchone()
+    total_matching = int(total_count_row["cnt"]) if total_count_row else 0
+
+    rows = repo.conn.execute(
+        """
+        SELECT po.id AS order_id, po.symbol, po.side, po.status, po.ga_decision_id,
+               gd.trade_plan_json, gd.analysis_time_utc, gd.analysis_time,
+               gd.snapshot_id
+        FROM paper_orders po
+        JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+        WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
+                                'expired', 'risk_off_cancelled', 'cancelled')
+          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+        ORDER BY po.id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    from plugins.crypto_guard.risk.risk_engine import _validate_entry_confirmation
+    for row in rows:
+        plan_json = row["trade_plan_json"] or "{}"
+        try:
+            plan = json.loads(plan_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        ec = plan.get("entry_trigger_confirmation")
+        side = str(row["side"] or "").upper()
+        analysis_time_ms = int(row["analysis_time"] or 0)
+
+        # R3-E: Load persisted module_analysis_results by snapshot_id for
+        # provenance-aware validation — same path as the execution gate.
+        snapshot_id = row["snapshot_id"]
+        module_analysis_results: dict[str, Any] | None = None
+        provenance_load_error: str | None = None
+        if snapshot_id:
+            try:
+                mod_rows = repo.conn.execute(
+                    "SELECT module, result_json FROM module_analysis_results "
+                    "WHERE snapshot_id=?",
+                    (int(snapshot_id),),
+                ).fetchall()
+                if mod_rows:
+                    module_analysis_results = {}
+                    for mr in mod_rows:
+                        mod_key = mr["module"]
+                        try:
+                            module_analysis_results[mod_key] = json.loads(mr["result_json"] or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            module_analysis_results[mod_key] = {}
+                else:
+                    # snapshot_id present but no module_analysis_results rows
+                    provenance_load_error = "no_module_analysis_results_for_snapshot"
+            except Exception as e:
+                provenance_load_error = f"module_analysis_results_query_failed: {e}"
+        else:
+            provenance_load_error = "missing_snapshot_id"
+
+        # Use the unified provenance-aware validator: when
+        # module_analysis_results is available, the confirmation must
+        # match a real persisted event. Fabricated objects are rejected.
+        # R4-D3: pass repo so the validator can also verify deterministic_rule
+        # sources against persisted events.
+        valid, reason = _validate_entry_confirmation(
+            ec, side, analysis_time_ms,
+            module_analysis_results=module_analysis_results,
+            repo=repo,
+        )
+        if not valid:
+            # Categorize by reason for diagnostic clarity
+            reason_str = str(reason or "")
+            if "provenance_unavailable" in reason_str:
+                category = "provenance_unavailable"
+            elif "必须是对象" in reason_str or "不是字符串" in reason_str:
+                category = "malformed_confirmation"
+            elif "not_found" in reason_str or "not_found_in_real_events" in reason_str:
+                category = "confirmation_event_not_found"
+            elif "future" in reason_str or "晚于" in reason_str:
+                category = "future_event"
+            elif "不匹配" in reason_str or "mismatch" in reason_str:
+                category = "field_mismatch"
+            elif ec is None:
+                category = "missing_confirmation"
+            else:
+                category = "malformed_confirmation"
+
+            issues.append({
+                "type": "missing_entry_confirmation_paper_order",
+                "severity": "error",
+                "details": {
+                    "order_id": row["order_id"],
+                    "symbol": row["symbol"],
+                    "side": row["side"],
+                    "status": row["status"],
+                    "entry_trigger_confirmation": ec,
+                    "validation_reason": reason,
+                    "category": category,
+                    "snapshot_id": snapshot_id,
+                    "provenance_load_error": provenance_load_error,
+                },
+                "suggested_action": (
+                    "缺少有效入场确认（entry_trigger_confirmation 必须为结构化对象且通过"
+                    "_validate_entry_confirmation provenance-aware 验证）禁止直接开仓。"
+                    f"category={category}。"
+                    "检查 risk_engine.validate_trade_plan 的 require_entry_confirmation_for_paper_order 门禁。"
+                ),
+            })
+    # If aggregate count exceeds LIMIT, emit a diagnostic_truncated warning
+    # so diagnostics do not falsely declare all-healthy due to LIMIT truncation.
+    if total_matching > 500:
+        issues.append({
+            "type": "diagnostic_truncated",
+            "severity": "warning",
+            "details": {
+                "check": "missing_entry_confirmation_paper_order",
+                "truncated": True,
+                "total_matching": total_matching,
+                "limit": 500,
+            },
+            "suggested_action": (
+                "诊断因 LIMIT 500 截断，可能遗漏部分违规订单。"
+                "请扩大分页或使用 aggregate COUNT 进行全库审计。"
+            ),
+        })
+    return issues
+
+
+def _check_htf_support_reason_inconsistent(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: risk_check.htf_support.ok=True 时 reason 不得包含「不支持」。"""
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, risk_check_json, analysis_time_utc
+        FROM ga_decisions
+        WHERE risk_check_json IS NOT NULL
+          AND datetime(analysis_time_utc) >= datetime(?)
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for row in rows:
+        try:
+            risk_check = json.loads(row["risk_check_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        htf = (risk_check.get("metrics") or {}).get("htf_support") or {}
+        ok = bool(htf.get("ok"))
+        reason = str(htf.get("reason") or "")
+        if ok and "不支持" in reason:
+            issues.append({
+                "type": "htf_support_reason_inconsistent",
+                "severity": "error",
+                "details": {
+                    "ga_decision_id": row["id"],
+                    "symbol": row["symbol"],
+                    "htf_ok": ok,
+                    "htf_reason": reason,
+                },
+                "suggested_action": (
+                    "htf_support.ok=True 时 reason 必须为正面/空文本。"
+                    "检查 risk_engine._htf_support 的 reason 赋值逻辑。"
+                ),
+            })
+    return issues
+
+
+def _check_chop_regime_boosted(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: market_phase=chop/transition/unknown 时不应有正向 confidence_adjustment。
+
+    Section 八: Detects abnormal boosts for all non-aligned phases:
+    - chop: sideways, no directional boost
+    - transition: uncertain, no directional boost
+    - unknown: regime unclear, no directional boost
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, market_regime_gate_json, analysis_time_utc
+        FROM ga_decisions
+        WHERE market_regime_gate_json IS NOT NULL
+          AND datetime(analysis_time_utc) >= datetime(?)
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    # Phases that should never receive a positive confidence_adjustment
+    abnormal_phases = {"chop", "transition", "unknown"}
+    for row in rows:
+        raw = row["market_regime_gate_json"] or "{}"
+        # Safely parse JSON; default to {} on any failure or non-dict result
+        try:
+            regime_gate = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(regime_gate, dict):
+            continue
+        adjustments = regime_gate.get("adjustments") or {}
+        if not isinstance(adjustments, dict):
+            continue
+        market_phase = str(adjustments.get("market_phase") or "normal").lower()
+        conf_adj = float(adjustments.get("confidence_adjustment") or 0)
+        if market_phase in abnormal_phases and conf_adj > 0:
+            issues.append({
+                "type": "chop_regime_boosted",
+                "severity": "error",
+                "details": {
+                    "ga_decision_id": row["id"],
+                    "symbol": row["symbol"],
+                    "market_phase": market_phase,
+                    "confidence_adjustment": conf_adj,
+                },
+                "suggested_action": (
+                    f"market_phase={market_phase} 不应提供 confidence boost。"
+                    "检查 risk_engine.apply_regime_gate aligned 分支的抑制逻辑。"
+                ),
+            })
+    return issues
+
+
+def _check_fill_without_ga_revalidation(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: 事后审计 — limit_range_touch 成交时刻最新 GA 已转冲突。"""
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT po.id AS order_id, po.symbol, po.side, po.filled_at, po.ga_decision_id
+        FROM paper_orders po
+        WHERE po.fill_method = 'limit_range_touch'
+          AND po.filled_at IS NOT NULL
+          AND datetime(replace(replace(po.filled_at, 'T', ' '), 'Z', '')) >= datetime(?)
+        ORDER BY po.id DESC
+        LIMIT 200
+        """,
+        (cutoff,),
+    ).fetchall()
+    for row in rows:
+        filled_at_norm = str(row["filled_at"]).replace("T", " ").replace("Z", "")
+        ga = repo.conn.execute(
+            "SELECT id, market_bias, signal_grade FROM ga_decisions "
+            "WHERE symbol=? AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) <= datetime(?) "
+            "ORDER BY analysis_time DESC LIMIT 1",
+            (row["symbol"], filled_at_norm),
+        ).fetchone()
+        if not ga:
+            continue
+        bias = str(ga["market_bias"] or "neutral").lower()
+        grade = str(ga["signal_grade"] or "D").upper()
+        side = str(row["side"] or "").upper()
+        conflict = (
+            (side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"})
+            or (side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"})
+        )
+        if conflict:
+            issues.append({
+                "type": "fill_without_ga_revalidation",
+                "severity": "error",
+                "details": {
+                    "order_id": row["order_id"],
+                    "symbol": row["symbol"],
+                    "side": side,
+                    "filled_at": row["filled_at"],
+                    "conflict_ga_decision_id": ga["id"],
+                    "conflict_bias": bias,
+                    "conflict_grade": grade,
+                },
+                "suggested_action": (
+                    "fill 前必须复核最新 GA，方向冲突时取消订单。"
+                    "检查 paper_broker._revalidate_pending_before_fill 的调用。"
+                ),
+            })
+    return issues
+
+
+def _check_invalid_condition_equals_stop_loss(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """BTC#9 fix: trade_plan.invalid_condition 解析价不应等于 stop_loss。"""
+    import json
+    import re
+    issues: list[dict[str, Any]] = []
+    cutoff = _btc9_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT po.id AS order_id, po.symbol, po.side, po.status, po.ga_decision_id,
+               gd.trade_plan_json
+        FROM paper_orders po
+        JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+        WHERE gd.trade_plan_json IS NOT NULL
+          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+        ORDER BY po.id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for row in rows:
+        try:
+            plan = json.loads(row["trade_plan_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        stop = plan.get("stop_loss")
+        invalid_cond = plan.get("invalid_condition")
+        if stop is None or not isinstance(invalid_cond, str):
+            continue
+        try:
+            stop_f = float(stop)
+        except (TypeError, ValueError):
+            continue
+        # BTC#9 fix: invalid_condition 文本可能包含非价格数字（如 "15m"），
+        # 取最后一个数字作为失效价
+        all_matches = re.findall(r"[-+]?\d+(?:\.\d+)?", invalid_cond)
+        if not all_matches:
+            continue
+        try:
+            invalid_price = float(all_matches[-1])
+        except (TypeError, ValueError):
+            continue
+        if abs(invalid_price - stop_f) < 1e-9:
+            issues.append({
+                "type": "invalid_condition_equals_stop_loss",
+                "severity": "warning",
+                "details": {
+                    "order_id": row["order_id"],
+                    "symbol": row["symbol"],
+                    "side": row["side"],
+                    "stop_loss": stop_f,
+                    "invalid_condition": invalid_cond,
+                    "parsed_invalid_price": invalid_price,
+                },
+                "suggested_action": (
+                    "invalid_condition 价与 stop_loss 同价，缺少失效缓冲层。"
+                    "检查 ga_judge._build_trade_plan 的 invalid_condition_price 计算。"
+                ),
+            })
+    return issues
+
+
+def _check_schema_health_as_issues(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Section 九: Delegates to check_schema_health(conn=repo.conn) and
+    converts any failures into state_consistency issues.
+
+    Schema health is an integral part of state consistency — missing columns,
+    missing indexes, or incorrect CHECK constraints are state consistency
+    errors.
+    """
+    from plugins.crypto_guard.storage.migrations import check_schema_health
+
+    try:
+        health = check_schema_health(conn=repo.conn)
+    except Exception as e:
+        return [{
+            "type": "schema_health_check_failed",
+            "severity": "error",
+            "details": {"exception": str(e)},
+            "suggested_action": "check_schema_health() raised an exception. Check the database connection and schema integrity.",
+        }]
+
+    issues: list[dict[str, Any]] = []
+
+    if not health.get("ok"):
+        for col in (health.get("missing_columns") or []):
+            issues.append({
+                "type": "schema_health_missing_column",
+                "severity": "error",
+                "details": {"column": col},
+                "suggested_action": "Run initialize_database() to apply migrations.",
+            })
+
+        for idx in (health.get("missing_indexes") or []):
+            issues.append({
+                "type": "schema_health_missing_index",
+                "severity": "error",
+                "details": {"index": idx},
+                "suggested_action": "Run initialize_database() to rebuild indexes.",
+            })
+
+        for con in (health.get("constraint_errors") or []):
+            issues.append({
+                "type": "schema_health_constraint_error",
+                "severity": "error",
+                "details": {"constraint": con},
+                "suggested_action": "Check migrations for missed schema updates.",
+            })
 
     return issues

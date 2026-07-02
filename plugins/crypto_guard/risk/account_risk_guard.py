@@ -11,7 +11,7 @@ Recovery: wait 24h + last 10 avg_r > 0 + loss_count <= 4
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
@@ -35,6 +35,12 @@ DEFAULTS = {
         "ETHUSDT_LONG": 48,
         "BNBUSDT_SHORT": 48,
     },
+    # FS-2: combo avg-R blocking on a healthy account is OPT-IN.
+    # Default False preserves the established healthy-account behavior.
+    # When False, a negative symbol-side avgR alone does NOT block a
+    # healthy account. Cooldown / negative avgR still block during
+    # ordinary risk_off and during recovery.
+    "block_healthy_account_on_negative_combo_avg_r": False,
 }
 
 
@@ -47,9 +53,10 @@ def _load_account_risk_config() -> dict[str, Any]:
 
 
 class AccountRiskGuard:
-    def __init__(self, repo: CryptoGuardRepository):
+    def __init__(self, repo: CryptoGuardRepository, *, now_provider: Callable[[], datetime] | None = None):
         self.repo = repo
         self._config = _load_account_risk_config()
+        self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
     @property
     def drawdown_threshold(self) -> float:
@@ -71,6 +78,15 @@ class AccountRiskGuard:
     def cooldown_symbols(self) -> dict[str, int]:
         raw = self._config.get("cooldown_symbols", {})
         return {str(k): int(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    @property
+    def block_healthy_on_negative_combo_avg_r(self) -> bool:
+        """FS-2: opt-in flag. Default False — a negative symbol-side avgR
+        alone must NOT permanently block a healthy account."""
+        return bool(self._config.get(
+            "block_healthy_account_on_negative_combo_avg_r",
+            DEFAULTS["block_healthy_account_on_negative_combo_avg_r"],
+        ))
 
     def check(self, *, symbol: str, side: str) -> dict[str, Any]:
         account = self._get_account()
@@ -100,43 +116,8 @@ class AccountRiskGuard:
         elif daily_pause_active:
             pause_reason = daily_pause_reason
 
-        # Recovery check for exit
-        if not hard_risk_off and not daily_pause_active:
-            if risk_off:
-                # In risk_off but not hard — check if recovery conditions met
-                if recovery_eligible:
-                    return _ok_result(drawdown_pct=drawdown_pct)
-                else:
-                    recovery_reason = recovery.get("reason")
-                    if not recovery_reason:
-                        recovery_reason = (
-                            f"avg_r={recovery.get('avg_r', 0):.3f}, "
-                            f"亏损{recovery.get('loss_count', 0)}笔"
-                        )
-                    return {
-                        "ok": True,
-                        "risk_off": True,
-                        "hard_risk_off": False,
-                        "daily_loss_pause": False,
-                        "pause_active": False,
-                        "pause_reason": f"账户回撤 {drawdown_pct:.2f}% 处于 risk_off，恢复条件未满足（{recovery_reason}）",
-                        "drawdown_pct": drawdown_pct,
-                        "effective_risk_percent": self.risk_off_risk_percent,
-                        "blocked": False,
-                        "blocked_reason": None,
-                        "cooldown_active": False,
-                        "cooldown_until": None,
-                        "recovery_eligible": False,
-                        "recovery_status": recovery,
-                        "daily_pause_status": daily_pause,
-                    }
-            else:
-                return _ok_result(drawdown_pct=drawdown_pct)
-
-        # We are in risk_off territory (at minimum)
-        risk_off_reason = f"账户回撤 {drawdown_pct:.2f}% 超过阈值 {self.drawdown_threshold}%"
-
-        # Symbol+side cooldown
+        # ALWAYS compute cooldown and combo_avg_r — they are needed even in
+        # risk_off (non-hard) mode to block specific symbol+side combos.
         combo_key = f"{symbol}_{side}".upper()
         cooldown_hours = self.cooldown_symbols.get(combo_key, 0)
         cooldown_active = False
@@ -147,7 +128,7 @@ class AccountRiskGuard:
         if cooldown_hours > 0:
             last_loss_time = self._last_loss_time_for_combo(symbol, side)
             if last_loss_time:
-                now = datetime.now(timezone.utc)
+                now = self._now_provider()
                 cooldown_end = last_loss_time + timedelta(hours=cooldown_hours)
                 if now < cooldown_end:
                     cooldown_active = True
@@ -155,11 +136,98 @@ class AccountRiskGuard:
                     blocked = True
                     blocked_reason = f"{combo_key} 冷却中（{cooldown_hours}h），上次亏损: {last_loss_time.strftime('%m-%d %H:%M')} UTC"
 
-        # Symbol+side negative avg_r
         combo_avg_r = self._combo_avg_r(symbol, side, lookback=20)
-        if combo_avg_r is not None and combo_avg_r < 0 and not blocked:
-            blocked = True
-            blocked_reason = f"{combo_key} 历史 avg_r={combo_avg_r:.3f} < 0，禁止开仓"
+        # FS-2: combo avg-R blocking on a healthy account is opt-in.
+        # When neither risk_off nor pause is active, a negative avgR alone
+        # does NOT block unless block_healthy_on_negative_combo_avg_r=True.
+        # During risk_off (non-hard) and during recovery, negative avgR
+        # remains blocking.
+        combo_avg_r_block_eligible = (
+            combo_avg_r is not None and combo_avg_r < 0 and not blocked
+        )
+        healthy_path = (not risk_off) and (not pause_active)
+        if combo_avg_r_block_eligible:
+            if healthy_path and not self.block_healthy_on_negative_combo_avg_r:
+                # FS-2: preserve established healthy-account behavior.
+                # Negative avgR alone is informational on a healthy account.
+                pass
+            else:
+                blocked = True
+                blocked_reason = f"{combo_key} 历史 avg_r={combo_avg_r:.3f} < 0，禁止开仓"
+
+        # Early return: not in any risk-off territory — but still honor combo
+        # cooldown blocks (and negative avgR if opt-in).
+        if healthy_path:
+            if blocked:
+                return {
+                    "ok": True,
+                    "risk_off": False,
+                    "hard_risk_off": False,
+                    "daily_loss_pause": False,
+                    "pause_active": False,
+                    "pause_reason": None,
+                    "drawdown_pct": drawdown_pct,
+                    "effective_risk_percent": None,
+                    "blocked": True,
+                    "blocked_reason": blocked_reason,
+                    "cooldown_active": cooldown_active,
+                    "cooldown_until": cooldown_until,
+                    "recovery_eligible": False,
+                    "recovery_status": {},
+                    "daily_pause_status": daily_pause,
+                }
+            return _ok_result(drawdown_pct=drawdown_pct)
+
+        # In risk_off but not hard/pause — check recovery
+        if not hard_risk_off and not daily_pause_active:
+            if recovery_eligible:
+                # Recovery lifts the risk_off tier, but combo cooldown /
+                # negative avg_r blocks MUST still be honored.
+                if blocked:
+                    return {
+                        "ok": True,
+                        "risk_off": False,
+                        "hard_risk_off": False,
+                        "daily_loss_pause": False,
+                        "pause_active": False,
+                        "pause_reason": None,
+                        "drawdown_pct": drawdown_pct,
+                        "effective_risk_percent": None,
+                        "blocked": True,
+                        "blocked_reason": blocked_reason,
+                        "cooldown_active": cooldown_active,
+                        "cooldown_until": cooldown_until,
+                        "recovery_eligible": True,
+                        "recovery_status": recovery,
+                        "daily_pause_status": daily_pause,
+                    }
+                return _ok_result(drawdown_pct=drawdown_pct)
+            recovery_reason = recovery.get("reason")
+            if not recovery_reason:
+                recovery_reason = (
+                    f"avg_r={recovery.get('avg_r', 0):.3f}, "
+                    f"亏损{recovery.get('loss_count', 0)}笔"
+                )
+            return {
+                "ok": True,
+                "risk_off": True,
+                "hard_risk_off": False,
+                "daily_loss_pause": False,
+                "pause_active": False,
+                "pause_reason": f"账户回撤 {drawdown_pct:.2f}% 处于 risk_off，恢复条件未满足（{recovery_reason}）",
+                "drawdown_pct": drawdown_pct,
+                "effective_risk_percent": self.risk_off_risk_percent,
+                "blocked": blocked,
+                "blocked_reason": blocked_reason,
+                "cooldown_active": cooldown_active,
+                "cooldown_until": cooldown_until,
+                "recovery_eligible": False,
+                "recovery_status": recovery,
+                "daily_pause_status": daily_pause,
+            }
+
+        # We are in hard_risk_off or daily_loss_pause territory
+        risk_off_reason = f"账户回撤 {drawdown_pct:.2f}% 超过阈值 {self.drawdown_threshold}%"
 
         result = {
             "ok": True,
@@ -200,7 +268,7 @@ class AccountRiskGuard:
         """
         # "Today" in user-facing risk alerts follows UTC+8, matching Feishu reports.
         utc8 = timezone(timedelta(hours=8))
-        now_local = datetime.now(timezone.utc).astimezone(utc8)
+        now_local = self._now_provider().astimezone(utc8)
         today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         today_start_iso = today_start.isoformat()
 
@@ -304,7 +372,7 @@ class AccountRiskGuard:
                 last_loss_dt = datetime.fromisoformat(str(last_loss["closed_at"]).replace("Z", "+00:00"))
                 if last_loss_dt.tzinfo is None:
                     last_loss_dt = last_loss_dt.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) - last_loss_dt < timedelta(hours=wait_hours):
+                if self._now_provider() - last_loss_dt < timedelta(hours=wait_hours):
                     return {"eligible": False, "reason": f"距离上次亏损不足 {wait_hours}h", "sample_count": 0}
             except (ValueError, TypeError):
                 pass

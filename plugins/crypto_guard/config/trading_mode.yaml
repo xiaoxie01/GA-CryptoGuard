@@ -27,6 +27,28 @@ risk:
   allow_manual_bypass: false
   min_sl_distance_pct: 0.8  # 止损距离至少占入场价的0.8%
   min_tp_distance_pct: 1.0  # 第一止盈距离至少占入场价的1.0%
+  # BTC#9 fix: LLM failed/disabled fallback 不得直接创建模拟盘订单
+  fallback_llm_failed_blocks_paper_order: true
+  # BTC#9 fix: 缺少 entry_trigger_confirmation 不得直接创建模拟盘订单
+  require_entry_confirmation_for_paper_order: true
+  # BTC#9 fix: invalid_condition 价与 stop_loss 之间最小缓冲（比例 0-1，0.3=30% 从 stop 向 entry）
+  invalid_condition_buffer_ratio: 0.3
+  # BTC#9 P2-1: HTF weak structure fail-closed — 多周期结构偏弱需更强入场确认
+  require_stronger_confirmation_for_weak_structure: true
+
+# BTC#9 fix: pending 订单 fill 前复核最新 GA + K 线健康
+pending_order_revalidation:
+  enabled: true
+  require_healthy_kline_for_limit: true
+  unhealthy_kline_wick_ratio: 2.0  # (high-low) > ratio * abs(close-open) 视为插针
+  # BTC#9 P0-2: structured candle confirmation for limit orders (per-candle close validation)
+  require_structured_candle_confirmation: true
+  require_close_hold_entry_zone: true
+  max_adverse_penetration_r: 0.5  # (entry-close)/(entry-stop) must be <= 0.5 for fill
+  max_candles_per_batch: 1500  # max candles to process per cycle for downtime recovery (R3-G: 3+ pages)
+  # C5: paged backfill — per-page fetch size and max pages per batch
+  max_candles_per_page: 500
+  max_pages_per_batch: 10
 
 account_risk:
   drawdown_risk_off_threshold: -2.5   # %

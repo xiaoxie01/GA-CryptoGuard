@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timedelta, timezone
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
@@ -10,7 +11,7 @@ from plugins.crypto_guard.scheduler.job_runner import run_scheduled_job
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.storage.sqlite_db import connect_db
-from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
 
 LOGGER = get_logger("crypto_guard.scheduler")
 
@@ -73,7 +74,6 @@ def run_job(job_name: str) -> dict:
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
         if job_name == "daily_review":
-            from datetime import datetime, timezone, timedelta
             yesterday_utc = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
             scheduled_time = latest_closed_close_time_ms("1d", now)
             result = run_scheduled_job(repo, job_name=job_name, scheduled_time=scheduled_time, task_fn=lambda: {"ok": True, "queued": repo.enqueue_job_once("daily_review", 7, "scheduler", f"system:scheduled:daily:{yesterday_utc}", {"day_utc": yesterday_utc})})
@@ -81,6 +81,10 @@ def run_job(job_name: str) -> dict:
             return result
         if job_name == "hourly_feishu_report":
             scheduled_time = latest_closed_close_time_ms("1h", now)
+            # FR-2: compute expected_batch_id and report_hour_utc at scheduler time
+            cutoff_ms = latest_closed_close_time_ms("15m", now)
+            expected_batch_id = f"15m:{cutoff_ms}"
+            report_hour_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             result = run_scheduled_job(
                 repo,
                 job_name=job_name,
@@ -92,7 +96,12 @@ def run_job(job_name: str) -> dict:
                         3,
                         "scheduler",
                         f"system:scheduled:hourly_report:{scheduled_time}",
-                        {"scheduled_time": scheduled_time},
+                        {
+                            "scheduled_time": scheduled_time,
+                            "expected_batch_id": expected_batch_id,
+                            "report_hour_utc": report_hour_utc,
+                            "expected_analysis_time": cutoff_ms,
+                        },
                     ),
                 },
             )

@@ -1427,7 +1427,7 @@ class CryptoGuardRepository:
             self.conn.execute("RELEASE sp_stop_across")
             return False
 
-    def create_paper_trade(self, order: dict[str, Any], entry_price: float, *, fill_method: str | None = None) -> int:
+    def create_paper_trade(self, order: dict[str, Any], entry_price: float, *, fill_method: str | None = None, event_time: int | None = None, allow_wall_clock: bool = False) -> int:
         # Guard: one order can only have one open trade
         existing = self.conn.execute(
             "SELECT id FROM paper_trades WHERE order_id=? AND closed_at IS NULL LIMIT 1",
@@ -1440,15 +1440,30 @@ class CryptoGuardRepository:
         if signal_id:
             signal = self.get_signal(int(signal_id))
             market_snapshot_id = signal.get("market_snapshot_id") or signal.get("snapshot_id") if signal else None
+        # BTC#9 R3-B fix: use event_time (candle.close_time) for all timestamps
+        # to eliminate historical backfill time-travel. Fail-closed unless
+        # allow_wall_clock=True is explicitly passed.
+        if event_time is not None and int(event_time) > 0:
+            from plugins.crypto_guard.utils import iso_utc_from_ms
+            ts_iso = iso_utc_from_ms(int(event_time))
+        elif allow_wall_clock:
+            ts_iso = utc_iso()
+        else:
+            # R3-B: truly fail-closed — no trade, no side effects
+            raise ValueError(
+                "create_paper_trade requires event_time (candle close_time ms) "
+                "for replay fills; pass allow_wall_clock=True for explicit live mode"
+            )
         self.conn.execute(
             """
             INSERT INTO paper_trades(
                 order_id, signal_id, market_snapshot_id, symbol, side, entry_price, stop_loss,
                 initial_stop_loss, initial_risk_usdt,
                 take_profit_json, quantity, max_favorable_excursion, max_adverse_excursion,
-                entry_efficiency, exit_efficiency, signal_decay_score, stop_take_path_json, fill_method
+                entry_efficiency, exit_efficiency, signal_decay_score, stop_take_path_json, fill_method,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, ?, ?, ?)
             """,
             (
                 order["id"],
@@ -1462,8 +1477,9 @@ class CryptoGuardRepository:
                 _compute_initial_risk_usdt(order, entry_price),
                 order.get("take_profit_json"),
                 order.get("quantity"),
-                json.dumps([{"event": "filled", "entry_price": entry_price, "ts": utc_iso()}], ensure_ascii=False),
+                json.dumps([{"event": "filled", "entry_price": entry_price, "ts": ts_iso}], ensure_ascii=False),
                 fill_method or order.get("fill_method"),
+                ts_iso,
             ),
         )
         trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -1473,6 +1489,8 @@ class CryptoGuardRepository:
             trade={**order, "id": trade_id, "entry_price": entry_price, "current_price": entry_price},
             status="open",
             current_price=float(entry_price),
+            event_time=event_time,
+            allow_wall_clock=allow_wall_clock,
         )
         self.log_paper_trade_event(
             position_id=position_id,
@@ -1483,6 +1501,7 @@ class CryptoGuardRepository:
             quantity=order.get("quantity"),
             reason=fill_method or order.get("fill_method") or "filled",
             event={"order_id": order["id"], "trade_id": trade_id, "fill_method": fill_method or order.get("fill_method")},
+            event_time=event_time,
         )
         return trade_id
 
@@ -1517,6 +1536,8 @@ class CryptoGuardRepository:
         exit_efficiency: float | None = None,
         signal_decay_score: float | None = None,
         stop_take_path: list[dict[str, Any]] | None = None,
+        event_time: int | None = None,
+        allow_wall_clock: bool = False,
     ) -> bool:
         """Atomically close a paper trade.
 
@@ -1525,7 +1546,23 @@ class CryptoGuardRepository:
         no row). Callers MUST check the return value before executing side
         effects (logs, enqueues, position upserts) so that only the winner
         performs them.
+
+        BTC#9 R3-B: event_time (candle close_time ms) is used for closed_at.
+        When allow_wall_clock=True, falls back to utc_iso() for live mode.
+        When neither event_time nor allow_wall_clock is provided, raises
+        ValueError (fail-closed).
         """
+        # R3-B: determine closed_at timestamp
+        if event_time is not None and int(event_time) > 0:
+            from plugins.crypto_guard.utils import iso_utc_from_ms
+            closed_at_iso = iso_utc_from_ms(int(event_time))
+        elif allow_wall_clock:
+            closed_at_iso = utc_iso()
+        else:
+            raise ValueError(
+                "close_paper_trade requires event_time (candle close_time ms) "
+                "for replay closes; pass allow_wall_clock=True for explicit live mode"
+            )
         cur = self.conn.execute(
             """
             UPDATE paper_trades
@@ -1533,7 +1570,7 @@ class CryptoGuardRepository:
                 max_favorable_excursion=?, max_adverse_excursion=?,
                 entry_efficiency=?, exit_efficiency=?, signal_decay_score=?,
                 stop_take_path_json=COALESCE(?, stop_take_path_json),
-                closed_at=CURRENT_TIMESTAMP
+                closed_at=?
             WHERE id=? AND closed_at IS NULL
             """,
             (
@@ -1548,6 +1585,7 @@ class CryptoGuardRepository:
                 exit_efficiency,
                 signal_decay_score,
                 json.dumps(stop_take_path, ensure_ascii=False) if stop_take_path is not None else None,
+                closed_at_iso,
                 int(trade_id),
             ),
         )
@@ -1951,7 +1989,22 @@ class CryptoGuardRepository:
         current_price: float | None = None,
         unrealized_pnl: float = 0.0,
         unrealized_pnl_pct: float = 0.0,
+        event_time: int | None = None,
+        allow_wall_clock: bool = False,
     ) -> int:
+        # R3-B: determine timestamp for opened_at/updated_at/closed_at
+        if event_time is not None and int(event_time) > 0:
+            from plugins.crypto_guard.utils import iso_utc_from_ms
+            ts_iso = iso_utc_from_ms(int(event_time))
+        elif allow_wall_clock:
+            ts_iso = utc_iso()
+        else:
+            # Fail-closed for replay; live callers must pass allow_wall_clock=True
+            # For position upserts that happen during fill/close, event_time is mandatory
+            raise ValueError(
+                "upsert_paper_position_from_trade requires event_time "
+                "for replay; pass allow_wall_clock=True for live mode"
+            )
         position_id = int(trade.get("id") or 0)
         row = self.conn.execute("SELECT id FROM paper_positions WHERE id=?", (position_id,)).fetchone() if position_id else None
         if row:
@@ -1960,8 +2013,8 @@ class CryptoGuardRepository:
                 UPDATE paper_positions
                 SET current_price=?, stop_loss=?, take_profit_json=?, unrealized_pnl=?, unrealized_pnl_pct=?,
                     max_favorable_excursion=?, max_adverse_excursion=?, status=?,
-                    closed_at=CASE WHEN ?!='open' THEN CURRENT_TIMESTAMP ELSE closed_at END,
-                    updated_at=CURRENT_TIMESTAMP
+                    closed_at=CASE WHEN ?!='open' THEN ? ELSE closed_at END,
+                    updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -1974,6 +2027,8 @@ class CryptoGuardRepository:
                     float(trade.get("max_adverse_excursion") or 0),
                     status,
                     status,
+                    ts_iso,
+                    ts_iso,
                     position_id,
                 ),
             )
@@ -1982,9 +2037,10 @@ class CryptoGuardRepository:
             """
             INSERT INTO paper_positions(
                 id, account_id, symbol, side, entry_price, current_price, quantity, stop_loss, take_profit_json,
-                unrealized_pnl, unrealized_pnl_pct, max_favorable_excursion, max_adverse_excursion, status, updated_at
+                unrealized_pnl, unrealized_pnl_pct, max_favorable_excursion, max_adverse_excursion, status,
+                opened_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id or None,
@@ -2001,6 +2057,8 @@ class CryptoGuardRepository:
                 float(trade.get("max_favorable_excursion") or 0),
                 float(trade.get("max_adverse_excursion") or 0),
                 status,
+                ts_iso,
+                ts_iso,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -2018,11 +2076,22 @@ class CryptoGuardRepository:
         reason: str | None = None,
         event: dict[str, Any] | None = None,
         position_id: int | None = None,
+        event_time: int | None = None,
+        dedupe_key: str | None = None,
     ) -> int:
+        # BTC#9 fix: use event_time (ms) for the event log timestamp when provided;
+        # fall back to utc_iso() for live non-replay paths.
+        if event_time is not None and int(event_time) > 0:
+            from plugins.crypto_guard.utils import iso_utc_from_ms
+            ts_iso = iso_utc_from_ms(int(event_time))
+        else:
+            ts_iso = utc_iso()
+        event_payload = dict(event or {})
+        event_payload.setdefault("ts", ts_iso)
         self.conn.execute(
             """
-            INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, price, quantity, pnl, pnl_pct, reason, event_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, price, quantity, pnl, pnl_pct, reason, event_json, dedupe_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id,
@@ -2034,7 +2103,9 @@ class CryptoGuardRepository:
                 pnl,
                 pnl_pct,
                 reason,
-                json.dumps(event or {}, ensure_ascii=False),
+                json.dumps(event_payload, ensure_ascii=False),
+                dedupe_key,
+                ts_iso,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])

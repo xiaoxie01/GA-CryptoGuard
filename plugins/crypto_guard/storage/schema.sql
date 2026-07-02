@@ -296,6 +296,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     fill_method TEXT,
     source TEXT DEFAULT 'signal_compat',
     risk_check_passed INTEGER DEFAULT 0,
+    last_processed_candle_time INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     filled_at TEXT,
     closed_at TEXT,
@@ -367,6 +368,7 @@ CREATE TABLE IF NOT EXISTS paper_trade_logs (
     pnl_pct REAL,
     reason TEXT,
     event_json TEXT,
+    dedupe_key TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_paper_trade_logs_symbol_time ON paper_trade_logs(symbol, created_at);

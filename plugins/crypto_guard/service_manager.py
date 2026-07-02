@@ -120,6 +120,14 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
     jobs: list[str] = []
     minute = now.minute
     hour = now.hour
+    # P0 (R4): analyze_market_15m must be dispatched before hourly_feishu_report
+    # so the analysis batch exists when the report checks for it.
+    if minute in {1, 16, 31, 46}:
+        jobs.append("fetch_15m_klines")
+    if minute % 5 == 1:
+        jobs.append("fetch_5m_klines")
+    if minute in {1, 16, 31, 46}:
+        jobs.append("analyze_market_15m")
     if minute in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
         jobs.append("hourly_feishu_report")
     jobs.append("alert_outbox_retry")
@@ -129,12 +137,6 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
             jobs.append("fetch_4h_klines")
         if hour == 0:
             jobs.append("fetch_1d_klines")
-    if minute in {1, 16, 31, 46}:
-        jobs.append("fetch_15m_klines")
-    if minute % 5 == 1:
-        jobs.append("fetch_5m_klines")
-    if minute in {1, 16, 31, 46}:
-        jobs.append("analyze_market_15m")
     if minute in {3, 18, 33, 48}:
         jobs.append("update_opportunity_watches")
     if minute % 3 == 0:

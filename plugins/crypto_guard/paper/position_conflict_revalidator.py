@@ -737,6 +737,7 @@ def _execute_early_exit(
         mae=mae,
         signal_decay_score=signal_decay,
         stop_take_path=stop_take_path,
+        allow_wall_clock=True,
     )
     if not closed:
         return {
@@ -767,6 +768,7 @@ def _execute_early_exit(
         current_price=current_price,
         unrealized_pnl=0.0,
         unrealized_pnl_pct=0.0,
+        allow_wall_clock=True,
     )
 
     # Record action

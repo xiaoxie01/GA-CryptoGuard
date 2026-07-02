@@ -251,7 +251,20 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         return result
     if job_type == "hourly_feishu_report":
         retry_count = int(payload.get("retry_count") or 0)
-        report = build_hourly_report(repo, retry_count=retry_count)
+        expected_batch_id = payload.get("expected_batch_id")
+        report_hour_utc = payload.get("report_hour_utc")
+        expected_analysis_time = payload.get("expected_analysis_time")
+        receive_id = payload.get("receive_id")
+        receive_id_type = payload.get("receive_id_type")
+        report = build_hourly_report(
+            repo,
+            retry_count=retry_count,
+            expected_batch_id=expected_batch_id,
+            report_hour_utc=report_hour_utc,
+            expected_analysis_time=expected_analysis_time if expected_analysis_time is not None else None,
+            receive_id=receive_id,
+            receive_id_type=receive_id_type,
+        )
         if report.get("error") == "batch_incomplete_requeued":
             LOGGER.info("hourly_feishu_report requeued retry=%s batch=%s", report.get("retry_count"), report.get("batch_id"))
             return report
@@ -568,9 +581,9 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
     if event_type == "paper_order_filled":
         event_time = event_time or payload.get("filled_at")
     if event_time:
-        detail_lines.append(format_event_time_cst_for_line(event_time))
+        detail_lines.append(f"- {format_event_time_cst_for_line(event_time)}")
     else:
-        detail_lines.append(format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat()))
+        detail_lines.append(f"- {format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat())}")
 
     if event_type == "stop_loss_adjustment":
         new_stop = payload.get("new_stop_loss")
@@ -637,9 +650,6 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
     elif event_type == "paper_order_filled":
         if fill_method_cn:
             detail_lines.append(f"- 成交方式：{fill_method_cn}")
-        entry_price = payload.get("entry_price")
-        if entry_price:
-            detail_lines.append(f"- 成交价：{float(entry_price):.4f}")
         stop_loss = payload.get("stop_loss")
         if stop_loss:
             detail_lines.append(f"- 止损价：{float(stop_loss):.4f}")
@@ -667,7 +677,8 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         display_price = payload.get("exit_price") or "不可用"
     elif event_type == "paper_order_filled":
         price_label = "成交价"
-        display_price = payload.get("entry_price") or "不可用"
+        entry_price = payload.get("entry_price")
+        display_price = f"{float(entry_price):.4f}" if entry_price is not None else "不可用"
     elif event_type == "stop_loss_adjustment":
         price_label = "当前 Mark Price"
         display_price = payload.get("mark_price") or "不可用"

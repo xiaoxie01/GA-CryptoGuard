@@ -93,7 +93,7 @@ def execute_market_skills(
         "closed_candles": len(candles),
         "previous_analysis_state_id": (previous_analysis_state or {}).get("id"),
     }
-    modules["price_action"] = _run_skill(repo, "price_action", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_price_action(candles, analysis_time_utc=analysis_time_utc))
+    modules["price_action"] = _run_skill(repo, "price_action", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_price_action(candles, analysis_time_utc=analysis_time_utc, timeframe=timeframe))
     modules["momentum"] = _run_skill(repo, "momentum", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_momentum(candles, analysis_time_utc=analysis_time_utc))
     modules["trend_stage"] = _run_skill(
         repo,

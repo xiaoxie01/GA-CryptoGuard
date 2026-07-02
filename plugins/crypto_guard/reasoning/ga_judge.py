@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision, validate_json
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
+from plugins.crypto_guard.utils import _strict_positive_int_ms
 
 
 def _get_min_risk_distance(entry: float) -> float:
@@ -15,6 +17,65 @@ def _get_min_risk_distance(entry: float) -> float:
     return entry * min_sl_pct
 
 
+def _invalid_condition_buffer_pct() -> float:
+    """BTC#9 fix: invalid_condition 与 stop_loss 之间的最小缓冲（比例 0-1）。
+
+    Returns a ratio where:
+    - 0.0 = same as stop_loss (no buffer)
+    - 0.3 = 30% from stop toward entry
+    - 1.0 = at entry price
+
+    Config key: risk.invalid_condition_buffer_ratio (default 0.3).
+
+    R3-F: NaN/non-finite config values fail closed (returns default 0.3).
+    """
+    cfg = load_config().trading_mode
+    risk_cfg = cfg.get("risk", {})
+    raw = risk_cfg.get("invalid_condition_buffer_ratio", 0.3)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.3
+    if not math.isfinite(val):
+        return 0.3
+    return val
+
+
+def _invalid_condition_price(invalid: float, side: str, entry: float | None = None) -> float | None:
+    """Calculate invalid_condition_price with correct ordering.
+
+    LONG:  stop_loss < invalid_condition_price < entry_price
+          invalid_condition_price = invalid + (entry - invalid) * buffer_ratio
+
+    SHORT: entry_price < invalid_condition_price < stop_loss
+           invalid_condition_price = invalid - (invalid - entry) * buffer_ratio
+
+    invalid_condition = structural invalidation (early fail)
+    stop_loss = hard risk protection (last resort)
+
+    BTC#9 fix: entry is required — if missing, return None (fail-closed).
+    The old percentage-based fallback produced wrong-direction values.
+
+    R3-F: NaN/Infinity/non-finite values for invalid or entry fail closed.
+    """
+    if entry is None or entry <= 0 or entry == invalid:
+        return None
+    if not math.isfinite(invalid) or not math.isfinite(entry):
+        return None
+
+    buffer_ratio = _invalid_condition_buffer_pct()
+    buffer_ratio = min(max(buffer_ratio, 0.1), 0.5)  # clamp 10%-50%
+
+    if side == "LONG":
+        # invalid_condition_price = invalid + (entry - invalid) * buffer_ratio
+        # Moves from stop_loss toward entry
+        return invalid + (entry - invalid) * buffer_ratio
+    else:
+        # invalid_condition_price = invalid - (invalid - entry) * buffer_ratio
+        # Moves from stop_loss toward entry
+        return invalid - (invalid - entry) * buffer_ratio
+
+
 def _match_price_precision(price: float, reference: float) -> float:
     """Round price to match reference price's decimal precision."""
     ref_str = f"{reference:.10f}".rstrip("0")
@@ -23,6 +84,152 @@ def _match_price_precision(price: float, reference: float) -> float:
     else:
         decimals = 0
     return round(price, decimals)
+
+
+def _extract_structured_entry_confirmation(
+    snapshot: dict[str, Any],
+    side: str,
+    entry: float,
+) -> dict[str, Any] | None:
+    """Extract structured entry_trigger_confirmation from PA/SMC module structure_events.
+
+    BTC#9 fix: traverses real ``price_action.structure_events`` and
+    ``smc.structure_events`` lists. Forbids defaulting
+    timeframe/closed/direction — missing fields reject the event.
+
+    Selection criteria (newest valid first):
+    - direction matches trade side (LONG→bullish, SHORT→bearish)
+    - closed must be strictly True (identity check, R4-D5)
+    - candle_close_time <= snapshot.analysis_time_utc (no future leak)
+    - price > 0 and finite
+
+    Returns None if no structured event is available (deterministic plans
+    that can't source real confirmation won't have one — blocked by
+    require_ec gate and downgraded to opportunity_watch).
+
+    R9-1: symbol is mandatory — sourced from snapshot.symbol. If snapshot
+    lacks symbol, return None (fail-closed). This aligns the generation
+    end with R8's symbol-mandatory shape check contract.
+    """
+    import math
+
+    snap_symbol = str(snapshot.get("symbol") or "")
+    if not snap_symbol:
+        return None
+
+    modules = snapshot.get("modules") or {}
+    # R11-5: snapshot.analysis_time_utc must be strict positive int
+    analysis_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
+    if analysis_time is None:
+        return None
+
+    # Collect candidate events from both PA and SMC modules
+    candidates: list[dict[str, Any]] = []
+
+    for module_key in ("price_action", "smc"):
+        module_data = modules.get(module_key) or {}
+        events = module_data.get("structure_events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            candidates.append({**event, "_source": module_key})
+
+    # Also check SMC events under a different key for compatibility
+    smc = modules.get("smc") or {}
+    smc_events = smc.get("structure_events")
+    if isinstance(smc_events, list):
+        for event in smc_events:
+            if not isinstance(event, dict):
+                continue
+            if "_source" not in event:
+                candidates.append({**event, "_source": "smc"})
+
+    if not candidates:
+        return None
+
+    expected_dir = "bullish" if side == "LONG" else "bearish"
+
+    # Filter and validate events
+    valid_events: list[tuple[int, dict[str, Any]]] = []
+    for event in candidates:
+        # Parse event_type
+        raw_event_type = str(event.get("event") or event.get("type") or "").upper()
+        for prefix, canonical in [("BULLISH_BOS", "BOS"), ("BEARISH_BOS", "BOS"),
+                                   ("BULLISH_CHOCH", "CHOCH"), ("BEARISH_CHOCH", "CHOCH"),
+                                   ("BOS", "BOS"), ("CHOCH", "CHOCH"),
+                                   ("RECLAIM", "RECLAIM"), ("BREAKOUT_RETEST", "BREAKOUT_RETEST")]:
+            if raw_event_type == prefix:
+                raw_event_type = canonical
+                break
+        if raw_event_type not in {"BOS", "CHOCH", "RECLAIM", "BREAKOUT_RETEST"}:
+            continue
+
+        # Direction: must be explicitly present, no defaulting
+        direction = str(event.get("direction") or "").lower()
+        if direction not in {"bullish", "bearish"}:
+            # Try to derive from the raw event name only if it contains explicit direction
+            raw_name = str(event.get("event") or event.get("type") or "").lower()
+            if "bullish" in raw_name:
+                direction = "bullish"
+            elif "bearish" in raw_name:
+                direction = "bearish"
+            else:
+                # No explicit direction — reject this event
+                continue
+
+        if direction != expected_dir:
+            continue
+
+        # Timeframe: must be explicitly present and valid, no defaulting
+        timeframe = str(event.get("timeframe") or "")
+        if timeframe not in {"1m", "5m", "15m", "1h", "4h"}:
+            continue
+
+        # candle_close_time: R11-5 must be strict positive int
+        close_time = _strict_positive_int_ms(event.get("candle_close_time") or event.get("close_time"))
+        if close_time is None:
+            continue
+
+        # No future leak (R10-4: analysis_time is guaranteed positive here)
+        if close_time > analysis_time:
+            continue
+
+        # Price: must be finite positive
+        price = event.get("price") or event.get("close")
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(price) or price <= 0:
+            continue
+
+        # R4-D5: closed must be strictly True — reject None, False, "false" string, etc.
+        # Previously: `if closed is not None and not bool(closed)` which accepted
+        # closed=None (missing) and closed="false" (bool("false")==True in Python).
+        closed = event.get("closed")
+        if closed is not True:
+            continue
+
+        source = event.get("_source", "price_action")
+        valid_events.append((close_time, {
+            "type": "closed_candle_confirmation",
+            "timeframe": timeframe,
+            "event_type": raw_event_type,
+            "direction": direction,
+            "candle_close_time": close_time,
+            "price": price,
+            "source": source,
+            "symbol": snap_symbol,
+        }))
+
+    if not valid_events:
+        return None
+
+    # Sort by close_time descending (newest valid first)
+    valid_events.sort(key=lambda x: x[0], reverse=True)
+    return valid_events[0][1]
 
 
 def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | None:
@@ -143,6 +350,12 @@ def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | N
     invalid = _match_price_precision(invalid, entry)
 
     if side == "LONG":
+        raw_icp = _invalid_condition_price(float(invalid), "LONG", entry)
+        if raw_icp is None:
+            return None
+        invalid_cond_price = _match_price_precision(raw_icp, entry)
+        # Try to extract structured entry_trigger_confirmation from PA module
+        entry_confirm = _extract_structured_entry_confirmation(snapshot, side, entry)
         return {
             "side": "LONG",
             "entry_type": entry_type,
@@ -154,10 +367,16 @@ def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | N
                 {"price": float(_match_price_precision(entry + risk * 2.5, entry)), "ratio": 0.5},
             ],
             "risk_percent": 0.5,
-            "invalid_condition": f"15m 收盘跌破 {invalid}",
+            "invalid_condition": f"15m 收盘跌破 {invalid_cond_price}",
+            "entry_trigger_confirmation": entry_confirm,
             "reason": "结构偏多，等待回踩确认；仅用于模拟盘",
         }
     else:
+        raw_icp = _invalid_condition_price(float(invalid), "SHORT", entry)
+        if raw_icp is None:
+            return None
+        invalid_cond_price = _match_price_precision(raw_icp, entry)
+        entry_confirm = _extract_structured_entry_confirmation(snapshot, side, entry)
         return {
             "side": "SHORT",
             "entry_type": entry_type,
@@ -169,7 +388,8 @@ def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | N
                 {"price": float(_match_price_precision(entry - risk * 2.5, entry)), "ratio": 0.5},
             ],
             "risk_percent": 0.5,
-            "invalid_condition": f"15m 收盘站回 {invalid}",
+            "invalid_condition": f"15m 收盘站回 {invalid_cond_price}",
+            "entry_trigger_confirmation": entry_confirm,
             "reason": "结构偏空，等待反抽确认；仅用于模拟盘",
         }
 

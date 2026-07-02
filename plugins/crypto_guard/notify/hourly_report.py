@@ -14,9 +14,13 @@ from plugins.crypto_guard.notify.report_consistency import (
     FORBIDDEN_EXECUTABLE_PHRASES, contains_forbidden_phrase, rewrite_inconsistent_summary,
 )
 from plugins.crypto_guard.strategy.grade_config import (
-    MIN_CONFIDENCE_FOR_PAPER_ORDER, grade_delta,
+    MIN_CONFIDENCE_FOR_PAPER_ORDER,
 )
 from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
+
+from plugins.crypto_guard.logging_utils import get_logger
+
+LOGGER = get_logger("crypto_guard.hourly_report")
 
 
 def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -32,9 +36,10 @@ def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] |
     return repo.latest_feishu_target()
 
 
-def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0) -> dict[str, Any]:
-    # Check schema health first
-    schema = check_schema_health()
+def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, expected_batch_id: str | None = None, report_hour_utc: str | None = None, expected_analysis_time: int | None = None, receive_id: str | None = None, receive_id_type: str | None = None) -> dict[str, Any]:
+    # Check schema health first — pass repo.conn so a repo DB missing columns
+    # is detected even when the default DB is healthy.
+    schema = check_schema_health(conn=repo.conn)
     if not schema["ok"]:
         return {
             "ok": False,
@@ -46,38 +51,80 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0) ->
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     active_symbols = repo.active_analysis_symbols()
 
-    # P0 batch-completion gate (research 01/02): use the current 15m
-    # analysis batch as the report cutoff.  P0-1 (Round 3): no longer
-    # polls — takes a single snapshot. If the batch is still incomplete
-    # and we haven't exhausted retries, re-enqueue the report job with
-    # a delay so the worker is freed immediately.
-    MAX_HOURLY_REPORT_RETRIES = 12
-    POLL_INTERVAL_SECONDS = 30
+    # P2 (R4): config-driven retry budget
+    gate_cfg = _hourly_report_gate_config()
+    retry_budget = _compute_retry_budget(gate_cfg)
+    max_retries = retry_budget["max_retries"]
+    # FR-3 (P1 fix): use the normalized poll_interval from _compute_retry_budget
+    # so invalid/missing config values don't crash with ValueError here.
+    poll_interval = retry_budget["poll_interval_seconds"]
 
-    batch_state = _await_batch_completion(repo, primary_interval="15m")
-    if batch_state["incomplete"] and retry_count < MAX_HOURLY_REPORT_RETRIES:
+    batch_state = _await_batch_completion(
+        repo, primary_interval="15m",
+        expected_batch_id=expected_batch_id,
+        expected_analysis_time=expected_analysis_time,
+    )
+
+    # FR-2: carry the immutable expected_batch_id from the scheduler/parent job
+    if expected_batch_id is None:
+        expected_batch_id = batch_state.get("batch_id")
+    if expected_analysis_time is None:
+        expected_analysis_time = batch_state.get("analysis_time")
+    if report_hour_utc is None:
+        report_hour_utc = now
+
+    # Determine if we need a degraded report (FR-1)
+    use_degraded = _should_use_degraded_report(batch_state)
+
+    if batch_state["incomplete"] and retry_count < max_retries:
         # Re-enqueue self with delay; worker is freed immediately.
         from datetime import timedelta as _td
-        scheduled_at = (datetime.now(timezone.utc) + _td(seconds=POLL_INTERVAL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        repo.enqueue_job(
+        scheduled_at = (datetime.now(timezone.utc) + _td(seconds=poll_interval)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # FR-2: identity chain — pin to the original expected batch and hour
+        session_id = f"hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{retry_count + 1}"
+        retry_payload: dict[str, Any] = {
+            "retry_count": retry_count + 1,
+            "expected_batch_id": expected_batch_id,
+            "report_hour_utc": report_hour_utc,
+            "expected_analysis_time": expected_analysis_time,
+        }
+        if receive_id:
+            retry_payload["receive_id"] = receive_id
+            retry_payload["receive_id_type"] = receive_id_type or "chat_id"
+        repo.enqueue_job_once(
             "hourly_feishu_report",
             priority=3,
             source="hourly_report_requeue",
-            session_id=f"hourly_report_requeue:{batch_state.get('batch_id', 'none')}:{retry_count + 1}",
-            payload={"retry_count": retry_count + 1},
+            session_id=session_id,
+            payload=retry_payload,
             scheduled_at=scheduled_at,
         )
         return {
             "ok": False,
             "error": "batch_incomplete_requeued",
             "retry_count": retry_count + 1,
-            "batch_id": batch_state.get("batch_id"),
+            "batch_id": expected_batch_id,
             "generated_at_utc": now,
         }
 
+    # FR-1: degraded report path — no historical signals/analysis_states/ga_decisions
+    if use_degraded:
+        return _render_degraded_report(repo, now, batch_state, report_hour_utc, expected_batch_id)
+
+    # Normal report: batch completed with at least one symbol
     min_analysis_time = batch_state["min_analysis_time"]
     batches_reported = batch_state.get("batch_id")
+    # FR-1: only render ga_decisions whose batch_id matches the expected batch
     ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time, batch_id=batches_reported)
+
+    # FR-1 (P0 fix): if the batch shows completed symbols but the exact
+    # batch_id filter returns zero decisions, the decisions are stale or
+    # missing. Rendering the legacy text path would surface unfiltered
+    # signals/analysis_states from previous cycles — fall back to degraded.
+    if not ga_decisions:
+        degraded_state = {**batch_state, "status": "absent", "completed_count": 0}
+        return _render_degraded_report(repo, now, degraded_state, report_hour_utc, expected_batch_id)
+
     signals = repo.latest_signals_by_symbol(limit=80)
     states = repo.latest_analysis_states(limit=120)
     open_orders = repo.list_open_paper_orders()
@@ -130,7 +177,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0) ->
     }
 
 
-def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: str = "15m") -> dict[str, Any]:
+def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: str = "15m", expected_batch_id: str | None = None, expected_analysis_time: int | None = None) -> dict[str, Any]:
     """Take a single snapshot of the current analysis batch for the hourly report.
 
     P0-1 (Round 3): No longer polls or sleeps. Returns instantly with the
@@ -138,35 +185,38 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
     re-enqueue the hourly_feishu_report job with a delay instead of blocking
     the worker.
 
-    Returns a dict describing the batch state for renderer/diagnostics use.
+    FR-2: If expected_batch_id is provided (from retry chain), use it instead
+    of computing a new one. This ensures a retry crossing a 15-minute boundary
+    still inspects the original expected batch.
+
+    FR-2 (P0 fix): If expected_analysis_time is provided, pin cutoff_ms and
+    min_analysis_time to it. Without this, a retry crossing a 15-minute
+    boundary would recompute cutoff_ms from utc_ms() at retry time, shifting
+    min_analysis_time forward and filtering out the original batch's decisions.
     """
     cfg = _hourly_report_gate_config()
-    env_timeout = os.environ.get("HOURLY_REPORT_BATCH_GATE_TIMEOUT")
-    timeout_seconds = int(env_timeout) if env_timeout else int(cfg.get("timeout_seconds", 300))
+    # FR-3 (P1 fix): use normalized values from _compute_retry_budget so
+    # invalid/missing config doesn't crash with ValueError here.
+    retry_budget = _compute_retry_budget(cfg)
+    timeout_seconds = retry_budget["timeout_seconds"]
 
-    cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
+    # FR-2: pin cutoff_ms to expected_analysis_time when provided so a retry
+    # crossing a 15-minute boundary still inspects the original batch window.
+    # Without this, min_analysis_time would shift forward and filter out the
+    # original batch's decisions.
+    if expected_analysis_time is not None:
+        cutoff_ms = int(expected_analysis_time)
+    else:
+        cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
     span = INTERVAL_MS[primary_interval]
-    expected_batch_id = f"{primary_interval}:{cutoff_ms}"
+    if expected_batch_id is None:
+        expected_batch_id = f"{primary_interval}:{cutoff_ms}"
 
     def _snapshot() -> dict[str, Any] | None:
-        batch = repo.get_analysis_batch(expected_batch_id)
-        if batch:
-            return batch
-        # fall back to the most recent running/finished batch within cutoff window
-        row = repo.conn.execute(
-            """
-            SELECT batch_id, primary_interval, analysis_time, status,
-                   enabled_symbols_json
-            FROM analysis_batches
-            WHERE primary_interval=? AND analysis_time >= ?
-            ORDER BY analysis_time DESC, id DESC LIMIT 1
-            """,
-            (primary_interval, cutoff_ms - span),
-        ).fetchone()
-        if not row:
-            return None
-        # Use get_analysis_batch for consistent batch_symbol_status data
-        return repo.get_analysis_batch(row["batch_id"])
+        # P0 (R4): NEVER fall back to a previous batch. If the expected
+        # batch_id is absent, the analysis hasn't started yet — return None
+        # so the caller re-enqueues with delay instead of rendering stale data.
+        return repo.get_analysis_batch(expected_batch_id)
 
     snapshot = _snapshot()
     missing: list[str] = []
@@ -187,21 +237,10 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
         completed_count = len(completed_syms)
         missing = sorted(set(enabled_symbols) - set(completed_syms) - set(failed))
 
-    incomplete = bool(missing or pending_symbols)
-    # P1-9 (Round 3): when falling back to a previous batch, use that
-    # batch's analysis_time for min_analysis_time rather than the current
-    # slot's time, so decisions from the fallback batch are actually found.
-    fallback_batch = snapshot
+    incomplete = bool(missing or pending_symbols) or snapshot is None
+    # P0 (R4): no fallback adoption — use the expected batch's timestamps.
     effective_batch_id = expected_batch_id
     effective_min_time = cutoff_ms - span + 1
-    if fallback_batch is not None:
-        fb_batch_id = fallback_batch.get("batch_id")
-        if fb_batch_id and fb_batch_id != expected_batch_id:
-            # Falling back to a previous batch: use its own timestamps
-            effective_batch_id = fb_batch_id
-            fb_analysis_time = int(fallback_batch.get("analysis_time") or 0)
-            if fb_analysis_time > 0:
-                effective_min_time = fb_analysis_time - span + 1
 
     return {
         "batch_id": effective_batch_id,
@@ -225,15 +264,201 @@ def _hourly_report_gate_config() -> dict[str, Any]:
     """Load batch-gate config from scheduler.yaml (no exception noise)."""
     try:
         from plugins.crypto_guard.config.loader import load_config
-        report_cfg = (load_config().scheduler or {}).get("hourly_report") or {}
+        scheduler = load_config().scheduler or {}
+        jobs = scheduler.get("jobs") or {}
+        report_cfg = jobs.get("hourly_feishu_report") or {}
         return report_cfg.get("batch_gate") or {}
     except Exception:
         return {}
 
 
-def _short_sleep(seconds: float) -> None:
-    import time as _time
-    _time.sleep(max(0.0, float(seconds)))
+def _compute_retry_budget(gate_cfg: dict[str, Any]) -> dict[str, Any]:
+    """FR-3: Compute max_retries from timeout_seconds / poll_interval_seconds.
+
+    max_retries = ceil(timeout_seconds / poll_interval_seconds).
+    Removes max_retries from configuration — derived entirely at runtime.
+    """
+    from math import ceil
+    timeout_raw = gate_cfg.get("timeout_seconds", 300)
+    interval_raw = gate_cfg.get("poll_interval_seconds", 30)
+
+    # Validate and coerce
+    try:
+        timeout_seconds = int(timeout_raw)
+    except (ValueError, TypeError):
+        LOGGER.warning("FR-3: invalid timeout_seconds=%r, falling back to 300", timeout_raw)
+        timeout_seconds = 300
+    try:
+        poll_interval_seconds = int(interval_raw)
+    except (ValueError, TypeError):
+        LOGGER.warning("FR-3: invalid poll_interval_seconds=%r, falling back to 30", interval_raw)
+        poll_interval_seconds = 30
+
+    if timeout_seconds < 0:
+        LOGGER.warning("FR-3: negative timeout_seconds=%d, falling back to 300", timeout_seconds)
+        timeout_seconds = 300
+    if poll_interval_seconds <= 0:
+        LOGGER.warning("FR-3: non-positive poll_interval_seconds=%d, falling back to 30", poll_interval_seconds)
+        poll_interval_seconds = 30
+
+    # timeout_seconds == 0 → immediate degraded report, no retries
+    if timeout_seconds == 0:
+        return {"max_retries": 0, "timeout_seconds": 0, "poll_interval_seconds": poll_interval_seconds}
+
+    max_retries = ceil(timeout_seconds / poll_interval_seconds)
+    return {"max_retries": max_retries, "timeout_seconds": timeout_seconds, "poll_interval_seconds": poll_interval_seconds}
+
+
+def _should_use_degraded_report(batch_state: dict[str, Any]) -> bool:
+    """FR-1: Determine if the hourly report must use the degraded path.
+
+    Degraded when: batch absent, batch failed, or zero completed symbols.
+    NOT degraded for partial-failed batches (those still render completed symbols).
+    """
+    status = batch_state.get("status", "absent")
+    completed_count = batch_state.get("completed_count", 0)
+    # absent → never started, failed → all symbols failed, zero completed → nothing to show
+    if status == "absent":
+        return True
+    if status == "failed":
+        return True
+    if completed_count == 0 and status in ("success", "partial_failed", "running"):
+        return True
+    return False
+
+
+def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: dict[str, Any], report_hour_utc: str, expected_batch_id: str | None) -> dict[str, Any]:
+    """FR-1: Render a deterministic degraded report when the expected batch is
+    absent, failed, or has zero completed symbols.
+
+    Contains system, queue, account, position, and risk state but MUST NOT
+    contain historical opportunities, C/D classifications, legacy signals,
+    analysis_states, or LLM market commentary.
+    """
+    active_symbols = repo.active_analysis_symbols()
+    open_orders = repo.list_open_paper_orders()
+    equity = repo.latest_equity_snapshot()
+    failed_jobs = repo.recent_failed_jobs(limit=5)
+    queue_counts = {
+        "pending_user": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority <= 2"),
+        "pending_background": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority > 2"),
+        "running": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='running'"),
+    }
+    risk_state = _fetch_risk_state(repo)
+    state_consistency = _fetch_state_consistency(repo)
+    report_accuracy_diagnostics = run_for_report(repo, batch_id=expected_batch_id)
+
+    # Build degraded text
+    lines: list[str] = [
+        "**CryptoGuard 每小时简报（降级模式）**",
+        f"北京时间：{_format_time_utc8(now)}",
+        f"UTC 时间：{now}",
+        "",
+        "⚠ 当前行情分析不可用，本报告未采用历史信号代替",
+        "",
+        "**零、分析批次状态**",
+        f"- {_batch_status_label(batch_state.get('status'))} · "
+        f"完成 {batch_state.get('completed_count', 0)}/{batch_state.get('total_count', 0)} 个品种",
+    ]
+    failed_syms = batch_state.get("failed_symbols") or []
+    if failed_syms:
+        lines.append(f"- 分析失败：{', '.join(failed_syms)}")
+
+    lines.extend(["", "**一、系统状态**"])
+    waiting = queue_counts.get("pending_user", 0) + queue_counts.get("pending_background", 0)
+    lines.append(
+        f"- 调度正常 · 等待任务 {waiting} 个 · "
+        f"正在执行 {queue_counts.get('running', 0)} 个 · 最近失败 {len(failed_jobs)} 个"
+    )
+
+    if risk_state:
+        risk_status = []
+        if risk_state.get("risk_off"):
+            risk_status.append("risk_off")
+        if risk_state.get("hard_risk_off"):
+            risk_status.append("hard_risk_off")
+        if risk_state.get("daily_loss_pause"):
+            risk_status.append("daily_loss_pause")
+        if risk_status:
+            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+        else:
+            lines.append("- 风险状态：正常")
+
+    lines.extend(["", "**二、模拟盘摘要**"])
+    if equity:
+        snap = _safe_json(equity.get("snapshot_json"), {}) or equity
+        dd_value = float(snap.get("drawdown_percent") or 0)
+        dd_display = abs(dd_value)
+        lines.append(
+            f"- 权益 {float(equity.get('account_equity') or 0):.2f} USDT · "
+            f"浮动盈亏 {float(equity.get('unrealized_pnl') or 0):+.2f} · "
+            f"已实现 {float(equity.get('realized_pnl') or 0):+.2f} · "
+            f"回撤 {dd_display:.2f}%"
+        )
+    else:
+        lines.append("- 暂无净值快照")
+    lines.append(f"- 当前持仓/挂单：{len(open_orders)}")
+
+    # Risk events
+    lines.extend(["", "**三、风险事件**"])
+    if failed_jobs:
+        for job in failed_jobs[:5]:
+            lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
+    else:
+        lines.append("- 暂无新的失败任务或风险事件")
+
+    # State consistency diagnostics
+    if state_consistency and not state_consistency.get("error"):
+        summary = state_consistency.get("summary", {})
+        total = state_consistency.get("total_issues", 0)
+        lines.extend(["", "**状态一致性诊断**"])
+        if total > 0:
+            lines.append(f"- 发现问题 {total} 个")
+        else:
+            lines.append("- 全部正常，未发现状态不一致")
+
+    # Report accuracy diagnostics
+    if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
+        diag_summary = report_accuracy_diagnostics.get("summary") or {}
+        diag_total = report_accuracy_diagnostics.get("total_issues", 0)
+        lines.extend(["", "**报告准确性诊断**"])
+        if diag_total == 0:
+            lines.append("- 报告准确性诊断全部通过")
+        else:
+            for code, count in diag_summary.items():
+                if int(count or 0) > 0:
+                    lines.append(f"- {code}={count}")
+
+    lines.append("")
+    lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
+
+    return {
+        "ok": True,
+        "degraded": True,
+        "generated_at_utc": now,
+        "active_symbols": active_symbols,
+        "latest_signals": [],
+        "analysis_states": [],
+        "ga_decisions": [],
+        "active_watches": [],
+        "open_orders": open_orders,
+        "equity_snapshot": equity,
+        "failed_jobs": failed_jobs,
+        "queue_counts": queue_counts,
+        "duckdb_stats": {},
+        "risk_state": risk_state,
+        "shadow_data_quality": {},
+        "feedback_patterns": {},
+        "long_short_performance": {},
+        "account_feedback_gate": {},
+        "market_regime_gate": {},
+        "state_consistency": state_consistency,
+        "report_accuracy_diagnostics": report_accuracy_diagnostics,
+        "batch": batch_state,
+        "agent_brief": {},
+        "text": "\n".join(lines),
+    }
 
 
 def _json_list(raw: Any) -> list[str]:
@@ -298,13 +523,12 @@ def render_ga_hourly_summary(
     high_grade = executable + observation  # legacy alias for position conflict logic
     lines: list[str] = [
         "**GA CryptoGuard 每小时摘要**",
-        f"北京时间（UTC+8）：{_format_time_utc8(generated_at_utc)}",
+        f"北京时间：{_format_time_utc8(generated_at_utc)}",
         f"UTC 时间：{generated_at_utc}",
         "",
     ]
     # P0: report batch completion / incompleteness header.
     if batch_state:
-        bid = batch_state.get("batch_id") or "-"
         status = batch_state.get("status") or "-"
         incomplete = bool(batch_state.get("incomplete"))
         enabled_syms = batch_state.get("enabled_symbols") or []
@@ -316,26 +540,30 @@ def render_ga_hourly_summary(
         failed_syms = batch_state.get("failed_symbols") or []
         if isinstance(failed_syms, str):
             failed_syms = _json_list(failed_syms)
-        lines.append("**零、分析批次状态**")
+        completed_count = int(batch_state.get("completed_count") or len(completed_syms))
+        total_count = int(batch_state.get("total_count") or len(enabled_syms))
+        analysis_time = batch_state.get("analysis_time")
+        lines.append("**分析批次**")
         lines.append(
-            f"- batch_id={bid}；状态={status}；"
-            f"enabled={len(enabled_syms)}；completed={len(completed_syms)}；failed={len(failed_syms)}"
+            f"- {_batch_status_label(status, incomplete)}"
+            f" · 完成 {completed_count}/{total_count} 个品种"
+            f" · 数据截至 {_format_time_utc8(analysis_time)}"
         )
         if failed_syms:
-            lines.append("- 失败 symbols：" + ", ".join(failed_syms))
+            lines.append("- 分析失败：" + "、".join(failed_syms))
         if incomplete:
             missing = batch_state.get("missing_symbols") or []
             still_running = batch_state.get("still_running") or []
-            lines.append(
-                f"- ⚠ 本报告 incomplete：missing={missing or []}；still_running={still_running or []}"
-            )
+            pending = _dedupe([str(x) for x in list(missing) + list(still_running)])
+            lines.append("- 尚未完成：" + ("、".join(pending) if pending else "部分品种仍在分析"))
         lines.append("")
 
     lines.extend([
         "**一、系统状态**",
-        f"- scheduler：运行中；队列 user={queue_counts.get('pending_user', 0)} background={queue_counts.get('pending_background', 0)} running={queue_counts.get('running', 0)}",
-        "- market data：Binance USDⓈ-M 期货公共 K 线（SQLite 热数据）；Redis/Parquet/DuckDB 状态见 /status",
-        f"- 任务队列：最近失败任务 {len(failed_jobs)}",
+        f"- 调度正常 · 等待任务 {queue_counts.get('pending_user', 0) + queue_counts.get('pending_background', 0)} 个"
+        f" · 正在执行 {queue_counts.get('running', 0)} 个"
+        f" · 最近失败 {len(failed_jobs)} 个",
+        "- 行情数据：Binance U本位合约公共行情 · SQLite",
     ])
 
     # P2-B: Add risk_off state
@@ -350,7 +578,12 @@ def render_ga_hourly_summary(
         if risk_status:
             # P2-14: drawdown display as non-negative amplitude
             dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
-            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+            labels = {
+                "risk_off": "风险收缩",
+                "hard_risk_off": "暂停开仓",
+                "daily_loss_pause": "当日亏损暂停",
+            }
+            lines.append(f"- 风险状态：**{'、'.join(labels.get(x, x) for x in risk_status)}**（回撤 {dd_pct:.1f}%）")
         else:
             lines.append("- 风险状态：正常")
 
@@ -360,19 +593,17 @@ def render_ga_hourly_summary(
         dd_value = float(snap.get("drawdown_percent") or 0)
         dd_display = abs(dd_value)  # P1: external amplitude is non-negative
         lines.append(
-            f"- equity={float(equity_snapshot.get('account_equity') or 0):.2f}；"
-            f"unrealized={float(equity_snapshot.get('unrealized_pnl') or 0):.2f}；"
-            f"realized={float(equity_snapshot.get('realized_pnl') or 0):.2f}；"
-            f"回撤={dd_display:.2f}%"
+            f"- 权益 {float(equity_snapshot.get('account_equity') or 0):.2f} USDT"
+            f" · 浮动盈亏 {float(equity_snapshot.get('unrealized_pnl') or 0):+.2f}"
+            f" · 已实现 {float(equity_snapshot.get('realized_pnl') or 0):+.2f}"
+            f" · 回撤 {dd_display:.2f}%"
             + ("（账号权益低于初始）" if dd_value < 0 else "（未回撤）" if dd_value >= 0 else "")
         )
-        lines.append(
-            f"- decision_source=ga_decisions；distribution_source={((duckdb_stats or {}).get('source') or 'sqlite_fresh')}；"
-            f"market_data_source=Binance USDⓈ-M futures；fallback={'no' if (duckdb_stats or {}).get('ok') else 'duckdb_unavailable'}"
-        )
+        analytics_source = "DuckDB 时序统计" if (duckdb_stats or {}).get("ok") else "SQLite 实时统计"
+        lines.append(f"- 决策来源：GA 决策 · 统计来源：{analytics_source}")
     else:
         lines.append("- 暂无净值快照")
-    lines.append(f"- open/pending orders：{len(open_orders)}")
+    lines.append(f"- 当前持仓/挂单：{len(open_orders)} 个")
 
     # P2-B: Add LONG vs SHORT performance
     if long_short_performance and not long_short_performance.get("error"):
@@ -415,7 +646,7 @@ def render_ga_hourly_summary(
     source_raw = (duckdb_stats or {}).get("source") or "in_memory_fallback"
     # P2 语法澄清 (research 09): describe the fallback honestly
     source_label = _distribution_source_label(source_raw, duckdb_stats)
-    lines.append("- 等级分布：" + "，".join(f"{k}={v}" for k, v in distribution.items()) + f"（{source_label}）")
+    lines.append("- 等级分布：" + " · ".join(f"{k} {v}" for k, v in distribution.items()) + f"（{source_label}）")
     if no_edge:
         symbols = ", ".join(row["symbol"] for row in no_edge[:30])
         lines.append(f"- C/D：{symbols}")
@@ -565,15 +796,17 @@ def render_ga_hourly_summary(
 
     # P2: 报告准确性诊断 (research 00 P2 diagnostics)
     if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
-        summary = report_accuracy_diagnostics.get("summary") or {}
-        total = report_accuracy_diagnostics.get("total_issues", 0)
         lines.extend(["", "**十、报告准确性诊断**"])
-        if total == 0:
-            lines.append("- 报告准确性诊断全部通过，未发现不一致")
+        errors = int(report_accuracy_diagnostics.get("error_count") or 0)
+        warnings = int(report_accuracy_diagnostics.get("warning_count") or 0)
+        legacy = int(report_accuracy_diagnostics.get("legacy_info_count") or 0)
+        if errors == 0 and warnings == 0:
+            suffix = f"；另有历史审计记录 {legacy} 条（不影响当前运行）" if legacy else ""
+            lines.append(f"- 当前检查通过，未发现新的不一致{suffix}")
         else:
-            for code, count in summary.items():
-                if int(count or 0) > 0:
-                    lines.append(f"- {code}={count}")
+            lines.append(f"- 当前异常 {errors} 项 · 提醒 {warnings} 项")
+            if legacy:
+                lines.append(f"- 历史审计记录 {legacy} 条（不计入当前异常）")
     lines.append("")
     lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
     return "\n".join(lines)
@@ -974,7 +1207,7 @@ def render_hourly_report_text(
         orders_by_symbol.setdefault(order["symbol"], []).append(order)
     lines = [
         "**CryptoGuard 每小时简报**",
-        f"北京时间（UTC+8）：{_format_time_utc8(generated_at_utc)}",
+        f"北京时间：{_format_time_utc8(generated_at_utc)}",
         f"UTC 时间：{generated_at_utc}",
         "",
         "**产品分析概览：**",
@@ -982,16 +1215,14 @@ def render_hourly_report_text(
 
     # P0: render legacy summary also surfaces batch completion header if provided.
     if batch_state:
-        bid = batch_state.get("batch_id") or "-"
-        status = batch_state.get("status") or "-"
         incomplete = bool(batch_state.get("incomplete"))
         lines.append(
-            f"- 分析批次：batch_id={bid}；状态={status}"
-            + ("；incomplete" if incomplete else "")
+            f"- 分析批次：{_batch_status_label(batch_state.get('status'), incomplete)} · "
+            f"完成 {batch_state.get('completed_count', 0)}/{batch_state.get('total_count', 0)} 个品种"
         )
         if incomplete:
             missing = batch_state.get("missing_symbols") or []
-            lines.append(f"  - ⚠ incomplete：missing={missing or []}")
+            lines.append(f"  - 尚未完成：{', '.join(missing) if missing else '等待分析结果'}")
         lines.append("")
 
     # P2-B: Add risk_off state
@@ -1312,17 +1543,20 @@ def _format_opportunity_row(
     *,
     tier_label: str,
 ) -> str:
-    """Render a single opportunity row with full P0 metadata."""
+    """Render a concise user-facing opportunity row.
+
+    Full batch IDs, millisecond timestamps, grade deltas and raw gate keys
+    remain available in the structured report payload for audit purposes.
+    """
     symbol = row.get("symbol") or "-"
     grade = str(row.get("signal_grade") or "D").upper()
     confidence = float(row.get("confidence") or 0)
-    decision_text = _decision_text(row.get("decision"))
     analysis_time = int(row.get("analysis_time") or 0)
     created_at = row.get("created_at")
     # P2-13: age based on analysis_time (market time), not created_at (DB insert time)
     age_min = ""
     if analysis_time > 0:
-        age_min = f"{int((utc_ms() - analysis_time) / 60000)}m"
+        age_min = f"{max(0, int((utc_ms() - analysis_time) / 60000))}m"
     elif created_at:
         try:
             parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
@@ -1331,21 +1565,92 @@ def _format_opportunity_row(
             age_min = "-"
     else:
         age_min = "-"
-    batch_id = row.get("batch_id") or "-"
-    previous_grade = row.get("previous_grade") or "-"
-    delta = grade_delta(previous_grade, grade) if previous_grade and previous_grade != "-" else "-"
     open_orders = open_by_symbol.get(symbol, [])
     pos_status = _position_summary(open_orders) if open_orders else "无持仓"
     blockers = row.get("_blockers") or []
-    blockers_text = "；".join(blockers) if blockers else "全部通过"
-    summary = row.get("final_summary") or "-"
-    if isinstance(summary, str):
-        summary = (summary[:120] + "…") if len(summary) > 120 else summary
+    bias = _market_bias_label(row.get("market_bias"))
+    stage = _trend_stage_label(row.get("trend_stage"))
+    age_text = _age_label(age_min)
+    status_text = "可执行" if tier_label == "可执行" else "继续观察"
+    details = [bias, stage, pos_status, age_text]
+    details_text = " · ".join(x for x in details if x)
+    reason = _humanize_gate_blockers(blockers, row)
     return (
-        f"- **{symbol}**〔{tier_label}〕{decision_text}｜等级 {grade}（prev={previous_grade}, Δ={delta}）｜"
-        f"置信度 {confidence * 100:.0f}%｜analysis_time={analysis_time}｜age={age_min}｜batch_id={batch_id}｜"
-        f"持仓={pos_status}｜门禁={blockers_text}｜{summary}"
+        f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
+        f"  {details_text}\n"
+        f"  {'条件：' if tier_label == '可执行' else '原因：'}{reason}"
     )
+
+
+def _batch_status_label(status: Any, incomplete: bool = False) -> str:
+    if incomplete:
+        return "分析进行中"
+    return {
+        "success": "分析完成",
+        "partial_failed": "部分完成",
+        "failed": "分析失败",
+        "absent": "等待分析",
+        "running": "分析进行中",
+    }.get(str(status or ""), "状态未知")
+
+
+def _humanize_gate_blockers(blockers: list[Any], row: dict[str, Any]) -> str:
+    labels: list[str] = []
+    blocker_strings = [str(x) for x in blockers]
+    if any(x == "missing_trade_plan" for x in blocker_strings):
+        labels.append("交易计划尚未形成")
+    if any(x.startswith("confidence<") for x in blocker_strings):
+        labels.append(f"置信度未达到 {MIN_CONFIDENCE_FOR_PAPER_ORDER * 100:.0f}%")
+    if "stale_decision" in blocker_strings:
+        labels.append("分析结果已过期")
+    if any(x == "risk_check_failed" for x in blocker_strings):
+        risk = row.get("risk_check") or {}
+        reasons = risk.get("reasons") if isinstance(risk, dict) else []
+        meaningful = [
+            str(reason) for reason in (reasons or [])
+            if "缺少完整 trade_plan" not in str(reason)
+        ]
+        if meaningful:
+            labels.append("风控未通过：" + "；".join(meaningful[:2]))
+        elif "交易计划尚未形成" not in labels:
+            labels.append("风控条件未通过")
+    if any(x.startswith("decision=") for x in blocker_strings) and not labels:
+        labels.append("当前决策仅用于观察")
+    if not blocker_strings:
+        plan = row.get("trade_plan") or {}
+        entry_type = str(plan.get("entry_type") or "")
+        return {
+            "limit": "等待限价触发并持续满足风控",
+            "trigger": "等待突破触发并持续满足风控",
+            "market": "执行门禁已通过",
+        }.get(entry_type, "执行门禁已通过")
+    return "；".join(_dedupe(labels)) or "当前条件不足，继续观察"
+
+
+def _market_bias_label(value: Any) -> str:
+    return {
+        "bullish": "方向偏多",
+        "bearish": "方向偏空",
+        "neutral": "方向中性",
+        "mixed": "方向分歧",
+    }.get(str(value or "").lower(), "")
+
+
+def _trend_stage_label(value: Any) -> str:
+    return {
+        "early": "趋势初期",
+        "middle": "趋势中段",
+        "late": "趋势后段",
+        "range": "震荡区间",
+        "transition": "方向转换中",
+        "unknown": "阶段不明",
+    }.get(str(value or "").lower(), "")
+
+
+def _age_label(age: str) -> str:
+    if age.endswith("m"):
+        return f"{age[:-1]} 分钟前"
+    return ""
 
 
 def _distribution_source_label(source_raw: str, duckdb_stats: dict[str, Any] | None) -> str:

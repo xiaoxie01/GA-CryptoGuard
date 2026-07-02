@@ -94,9 +94,9 @@ def rewrite_inconsistent_summary(text: str, decision: dict[str, Any]) -> str:
       - Generate deterministic summary: "[观察] {symbol} {grade}级；{gate_blockers}"
       - The report renderer prefers rendered_summary over final_summary
     The blacklist-based cleanup on final_summary is kept as a secondary defense.
+
+    P2 (R4): Always produce deterministic output even when text is empty.
     """
-    if not text:
-        return text
     if execution_eligible(decision):
         return text
     # P1-8 (Round 3): Generate a deterministic rendered_summary
@@ -123,20 +123,27 @@ def rewrite_inconsistent_summary(text: str, decision: dict[str, Any]) -> str:
 
 
 def _gate_blockers(decision: dict[str, Any]) -> str:
+    """P2 (R4): Covers ALL gate types — grade, decision, plan, risk, confidence."""
     blockers: list[str] = []
+    from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+    grade = str(decision.get("signal_grade") or "").upper()
+    if grade not in {"S", "A", "B"}:
+        blockers.append(f"信号等级 {grade or '?'} ∉ S/A/B")
     plan = decision.get("trade_plan")
     has_plan = is_valid_trade_plan(plan)
-    risk = decision.get("risk_check") or {}
-    risk_ok = bool(risk.get("ok")) if isinstance(risk, dict) else False
-    confidence = float(decision.get("confidence") or 0)
     if not has_plan:
         blockers.append("缺 trade_plan")
+    risk = decision.get("risk_check") or {}
+    risk_ok = bool(risk.get("ok")) if isinstance(risk, dict) else False
     if not risk_ok:
         reasons = (risk.get("reasons") if isinstance(risk, dict) else None) or []
         blockers.append("风控未通过" + ("：" + "；".join(str(r) for r in reasons[:2]) if reasons else ""))
-    from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+    confidence = float(decision.get("confidence") or 0)
     if confidence < MIN_CONFIDENCE_FOR_PAPER_ORDER:
         blockers.append(f"置信度 {confidence:.2f} < {MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}")
+    decision_name = str(decision.get("decision") or "")
+    if decision_name not in {"create_paper_order", "trade_plan_available"}:
+        blockers.append(f"决策类型 {decision_name or '?'} ∉ create_paper_order/trade_plan_available")
     return "，".join(blockers)
 
 

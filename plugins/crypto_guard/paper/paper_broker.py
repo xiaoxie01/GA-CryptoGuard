@@ -401,6 +401,15 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
 
 
 def _ensure_ga_decision_for_legacy_signal(repo: CryptoGuardRepository, signal: dict[str, Any], trade_plan: dict[str, Any], risk: dict[str, Any]) -> int:
+    # R11-4: preserve analysis_time_utc from the original signal's ga_decision_json
+    # so subsequent reads of ga_decision_json can satisfy the strict-positive-int contract.
+    _legacy_analysis_time: Any = None
+    try:
+        _orig_decision = json.loads(signal.get("ga_decision_json") or "{}") if signal.get("ga_decision_json") else {}
+        if isinstance(_orig_decision, dict):
+            _legacy_analysis_time = _orig_decision.get("analysis_time_utc")
+    except (json.JSONDecodeError, TypeError):
+        pass
     legacy = {
         "symbol": signal["symbol"],
         "decision": signal.get("decision") or "trade_plan_available",
@@ -410,6 +419,7 @@ def _ensure_ga_decision_for_legacy_signal(repo: CryptoGuardRepository, signal: d
         "market_bias": signal.get("direction") or "neutral",
         "trend_stage": signal.get("trend_stage") or "unknown",
         "has_trade_plan": True,
+        "analysis_time_utc": _legacy_analysis_time,
         "trade_plan": trade_plan,
         "risk_check": risk,
         "evidence": [],
@@ -457,7 +467,356 @@ def _check_account_risk(repo: CryptoGuardRepository, symbol: str, side: str) -> 
     return guard.check(symbol=symbol, side=side)
 
 
-def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], price: float | dict[str, Any]) -> dict[str, Any]:
+def _is_unhealthy_pullback_bar(market: dict[str, Any], side: str, wick_ratio: float = 2.0) -> bool:
+    """BTC#9 fix: 判断当前 K 线是否为「阴线插针」式不健康回踩。
+
+    判定条件（同时满足）：
+    1. 实体反向：LONG 时 close < open（阴线）；SHORT 时 close > open（阳线）
+    2. 影线过长：(high - low) > wick_ratio * abs(close - open)
+       即整根 K 线长度远超实体，说明上下影插针、方向未确认。
+
+    十字星（close == open）不视为不健康：实体为零代表方向未定，但非反向，
+    交由后续 GA 复核与触发条件把关。
+
+    Args:
+        market: 含 open/high/low/close 的 dict
+        side: "LONG" 或 "SHORT"
+        wick_ratio: 影线/实体倍数阈值，默认 2.0
+    """
+    try:
+        open_p = float(market.get("open") or 0)
+        high = float(market.get("high") or 0)
+        low = float(market.get("low") or 0)
+        close = float(market.get("close") or 0)
+    except (TypeError, ValueError):
+        return False
+    if open_p <= 0 or high <= 0 or low <= 0 or close <= 0:
+        return False
+    body = abs(close - open_p)
+    if body <= 0:
+        # 十字星：实体为零，方向未定但非反向，不视为不健康
+        return False
+    full_range = high - low
+    side_u = str(side or "").upper()
+    body_adverse = (side_u == "LONG" and close < open_p) or (side_u == "SHORT" and close > open_p)
+    return body_adverse and full_range > wick_ratio * body
+
+
+def _validate_limit_fill_candle(market: dict, order: dict, prev_close: float = None) -> tuple[bool, str]:
+    """Validate a closed candle for limit order fill. Returns (pass, reason).
+
+    BTC#9 Phase C Section 5: entry reclaim is mandatory. A purely
+    bullish/bearish candle that does NOT close back through entry is
+    insufficient — price has not reclaimed the entry zone.
+
+    LONG limit fill requires ALL of:
+    - low <= entry <= high (candle traded through entry)
+    - close >= entry (reclaims entry zone) OR structured reclaim event
+      present in market["reclaim_event"]
+    - NOT (close < open AND prev_close and close < prev_close) (adverse
+      momentum)
+    - candle is closed (close_time < now — enforced by caller)
+
+    SHORT limit fill requires ALL of:
+    - low <= entry <= high (candle traded through entry)
+    - close <= entry (reclaims entry zone from above) OR structured
+      reclaim event present in market["reclaim_event"]
+    - NOT (close > open AND prev_close and close > prev_close) (adverse
+      momentum)
+
+    Missing fields / unparseable -> fail-closed.
+    """
+    try:
+        open_p = float(market.get("open") or 0)
+        close = float(market.get("close") or 0)
+    except (TypeError, ValueError):
+        return False, "candle_failed_entry_zone_reclaim"
+
+    try:
+        entry = float(order.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return False, "candle_failed_entry_zone_reclaim"
+
+    if open_p <= 0 or close <= 0 or entry <= 0:
+        return False, "candle_failed_entry_zone_reclaim"
+
+    # Require high/low for entry-zone touch verification
+    try:
+        high = float(market.get("high") or 0)
+        low = float(market.get("low") or 0)
+    except (TypeError, ValueError):
+        return False, "candle_failed_entry_zone_reclaim"
+    if high <= 0 or low <= 0:
+        return False, "candle_failed_entry_zone_reclaim"
+
+    side = str(order.get("side") or "").upper()
+
+    # Structured reclaim event (optional): caller may attach a real
+    # module_analysis_results / snapshot event proving reclaim.
+    reclaim_event = market.get("reclaim_event")
+
+    if side == "LONG":
+        # Gate 1: candle must have traded through entry (low <= entry <= high)
+        if not (low <= entry <= high):
+            return False, "candle_failed_entry_zone_reclaim"
+
+        # Gate 2: close must reclaim above entry, OR a structured reclaim
+        # event must be present. Pure bullishness is NOT a substitute.
+        reclaimed = close >= entry
+        if not reclaimed and not reclaim_event:
+            return False, "candle_failed_entry_zone_reclaim"
+
+        # Gate 3: adverse momentum — bearish candle closing below prev close
+        if close < open_p and prev_close is not None and close < prev_close:
+            return False, "adverse_momentum_candle"
+
+        return True, "ok"
+
+    elif side == "SHORT":
+        # Gate 1: candle must have traded through entry (low <= entry <= high)
+        if not (low <= entry <= high):
+            return False, "candle_failed_entry_zone_reclaim"
+
+        # Gate 2: close must reclaim below entry, OR structured reclaim event
+        reclaimed = close <= entry
+        if not reclaimed and not reclaim_event:
+            return False, "candle_failed_entry_zone_reclaim"
+
+        # Gate 3: adverse momentum — bullish candle closing above prev close
+        if close > open_p and prev_close is not None and close > prev_close:
+            return False, "adverse_momentum_candle"
+
+        return True, "ok"
+
+    return False, "candle_failed_entry_zone_reclaim"
+
+
+def _close_holds_entry_zone(market: dict[str, Any], order: dict[str, Any], max_penetration_r: float = 0.5) -> bool:
+    """DEPRECATED: Replaced by _validate_limit_fill_candle.
+
+    Kept for backward compatibility only. New code should use _validate_limit_fill_candle.
+    """
+    from plugins.crypto_guard.paper.paper_broker import _validate_limit_fill_candle as _v
+    return _v(market, order)[0]
+
+
+def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str, Any], market: dict[str, Any], *, event_time: int | None = None) -> dict[str, Any]:
+    """BTC#9 fix: fill 前复核最新 GA + K 线健康。
+
+    返回 dict：
+    - {"proceed": True} 继续成交
+    - {"proceed": False, "skip_reason": "ga_conflict_cancelled"} 取消订单
+    - {"proceed": False, "skip_reason": "unhealthy_kline"} 保持 pending
+    - {"proceed": False, "skip_reason": "close_penetrated_entry_zone"} 保持 pending
+    - {"proceed": False, "skip_reason": "missing_event_time"} 缺少事件时间（fail-closed）
+
+    BTC#9 fix: event_time (candle.close_time) is used as the upper bound
+    for GA recheck. For limit orders, missing event_time is fail-closed.
+
+    开关关闭时直接 proceed。
+    """
+    from plugins.crypto_guard.config.loader import load_config
+    cfg = load_config().trading_mode
+    rev_cfg = cfg.get("pending_order_revalidation", {})
+    if not rev_cfg.get("enabled", True):
+        return {"proceed": True}
+
+    side = str(order.get("side") or "").upper()
+    symbol = order.get("symbol") or ""
+
+    # BTC#9 fix: limit orders require event_time for GA recheck upper bound
+    order_type = str(order.get("order_type") or "").lower()
+    if order_type == "limit" and event_time is None:
+        return {"proceed": False, "skip_reason": "missing_event_time"}
+
+    # 1. 复核最新 GA：方向冲突则取消
+    # Section 五: GA recheck must be fail-closed — exceptions return ga_recheck_unavailable
+    # Section 六 (C2): write idempotent audit log before returning ga_recheck_unavailable
+    def _log_ga_recheck_unavailable(detail: str, latest_ga: dict | None = None) -> None:
+        """C2: idempotent audit log for ga_recheck_unavailable events."""
+        try:
+            dedupe_key = f"ga_recheck_unavailable:{order['id']}:{event_time or 0}"
+            existing = repo.conn.execute(
+                "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
+                (dedupe_key,),
+            ).fetchone()
+            if existing:
+                return
+            latest_ga_id = latest_ga.get("id") if latest_ga else None
+            latest_bias = str(latest_ga.get("market_bias") or "").lower() if latest_ga else None
+            latest_grade = str(latest_ga.get("signal_grade") or "").upper() if latest_ga else None
+            repo.log_paper_trade_event(
+                position_id=None,
+                event_type="pending_order_ga_recheck_unavailable",
+                symbol=symbol,
+                side=side,
+                price=0.0,
+                quantity=order.get("quantity"),
+                pnl=0.0,
+                pnl_pct=0.0,
+                reason=f"GA recheck unavailable: {detail}",
+                event={
+                    "order_id": order["id"],
+                    "order_side": side,
+                    "latest_ga_decision_id": latest_ga_id,
+                    "latest_bias": latest_bias,
+                    "latest_grade": latest_grade,
+                    "event_time": event_time,
+                    "detail": detail,
+                    "dedupe_key": dedupe_key,
+                },
+            )
+        except Exception:
+            # Audit log failure must not mask the original ga_recheck_unavailable
+            pass
+
+    try:
+        from plugins.crypto_guard.paper.pending_revalidator import _latest_ga_decision
+        latest_ga = _latest_ga_decision(repo, symbol, max_analysis_time=event_time)
+    except Exception:
+        _log_ga_recheck_unavailable("exception during _latest_ga_decision")
+        return {"proceed": False, "skip_reason": "ga_recheck_unavailable"}
+    if latest_ga is None:
+        _log_ga_recheck_unavailable("no GA decision found", latest_ga=None)
+        return {"proceed": False, "skip_reason": "ga_recheck_unavailable"}
+    if latest_ga:
+        # BTC#9 P1-1 fix: time-pinned GA recheck — only cancel if latest GA is NEWER than order's baseline.
+        # R3-D: baseline = order's GA analysis_time if ga_decision_id exists, else order.created_at (ms).
+        # R3-D: all SQL reads must be inside exception boundary; baseline read failure
+        # returns ga_recheck_baseline_unavailable (distinct from ga_recheck_unavailable).
+        order_ga_id = order.get("ga_decision_id")
+        baseline_time: int | None = None
+        try:
+            if order_ga_id:
+                order_ga_row = repo.conn.execute(
+                    "SELECT analysis_time FROM ga_decisions WHERE id=?", (int(order_ga_id),)
+                ).fetchone()
+                if order_ga_row and order_ga_row["analysis_time"]:
+                    baseline_time = int(order_ga_row["analysis_time"])
+            else:
+                # R3-D: no ga_decision_id — use order.created_at as baseline
+                raw_created = order.get("created_at")
+                if raw_created:
+                    text = str(raw_created).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(text)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    baseline_time = int(dt.timestamp() * 1000)
+        except Exception:
+            _log_ga_recheck_unavailable("exception during baseline time resolution", latest_ga)
+            return {"proceed": False, "skip_reason": "ga_recheck_baseline_unavailable"}
+
+        if baseline_time is None:
+            _log_ga_recheck_unavailable("baseline time unresolvable (no ga_decision_id and no created_at)", latest_ga)
+            return {"proceed": False, "skip_reason": "ga_recheck_baseline_unavailable"}
+
+        # Also fetch latest GA's analysis_time (not returned by _latest_ga_decision)
+        # R3-D: this read must also be inside the exception boundary
+        latest_ga_analysis_time = None
+        try:
+            if latest_ga.get("id"):
+                latest_row = repo.conn.execute(
+                    "SELECT analysis_time FROM ga_decisions WHERE id=?", (int(latest_ga["id"]),)
+                ).fetchone()
+                if latest_row and latest_row["analysis_time"]:
+                    latest_ga_analysis_time = int(latest_row["analysis_time"])
+        except Exception:
+            _log_ga_recheck_unavailable("exception during latest GA analysis_time read", latest_ga)
+            return {"proceed": False, "skip_reason": "ga_recheck_unavailable"}
+
+        if latest_ga_analysis_time is not None and latest_ga_analysis_time <= baseline_time:
+            # Latest GA predates or equals the order's baseline — don't cancel
+            pass
+        else:
+            # Only proceed with cancel if latest GA is definitely newer than baseline
+            # and within the event_time upper bound (already enforced by _latest_ga_decision).
+            bias = str(latest_ga.get("market_bias") or "neutral").lower()
+            grade = str(latest_ga.get("signal_grade") or "D").upper()
+            conflict = (
+                (side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"})
+                or (side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"})
+            )
+            if conflict:
+                # R3-D: historical conflict cancellation must use candle event_time for cancelled_at,
+                # not wall-clock utc_iso(). For live mode (event_time None), fall back to utc_iso().
+                if event_time is not None and int(event_time) > 0:
+                    from plugins.crypto_guard.utils import iso_utc_from_ms
+                    cancel_ts_iso = iso_utc_from_ms(int(event_time))
+                else:
+                    cancel_ts_iso = utc_iso()
+                reason = f"fill 前复核：方向冲突 {side} vs GA#{latest_ga['id']} bias={bias} grade={grade}"
+                # Section 六: SAVEPOINT/CAS — update first, then audit log on success
+                repo.conn.execute("SAVEPOINT btc9_conflict_cancel")
+                try:
+                    cur = repo.conn.execute(
+                        "UPDATE paper_orders SET status='revalidator_cancelled', cancelled_at=?, cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=? AND status IN ('pending', 'needs_recheck')",
+                        (cancel_ts_iso, reason, latest_ga["id"], order["id"]),
+                    )
+                    if cur.rowcount == 0:
+                        # Race lost — another worker already changed the order
+                        repo.conn.execute("ROLLBACK TO SAVEPOINT btc9_conflict_cancel")
+                        repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
+                        return {"proceed": False, "skip_reason": "cancel_race_lost", "ga_decision_id": latest_ga["id"]}
+                    # C3: Audit log — position_id=None for pending orders (no trade yet).
+                    # event_json enriched with order_id / original_ga_decision_id /
+                    # invalidated_by_ga_decision_id / order_side / latest_bias /
+                    # latest_grade / event_time / dedupe_key for full traceability.
+                    conflict_dedupe_key = f"conflict_cancel:{order['id']}:{latest_ga['id']}"
+                    repo.log_paper_trade_event(
+                        position_id=None,
+                        event_type="pending_order_invalidated_by_new_ga_decision",
+                        symbol=symbol,
+                        side=side,
+                        price=0.0,
+                        quantity=order.get("quantity"),
+                        pnl=0.0,
+                        pnl_pct=0.0,
+                        reason=reason,
+                        event={
+                            "order_id": order["id"],
+                            "original_ga_decision_id": order.get("ga_decision_id"),
+                            "invalidated_by_ga_decision_id": latest_ga["id"],
+                            "order_side": side,
+                            "latest_bias": bias,
+                            "latest_grade": grade,
+                            "event_time": event_time,
+                            "reason": reason,
+                            "dedupe_key": conflict_dedupe_key,
+                        },
+                        event_time=event_time if (event_time is not None and int(event_time) > 0) else None,
+                    )
+                    repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
+                    repo.conn.commit()
+                except Exception:
+                    repo.conn.execute("ROLLBACK TO SAVEPOINT btc9_conflict_cancel")
+                    repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
+                    _log_ga_recheck_unavailable("exception during conflict cancel", latest_ga)
+                    return {"proceed": False, "skip_reason": "ga_recheck_unavailable"}
+                return {"proceed": False, "skip_reason": "ga_conflict_cancelled", "ga_decision_id": latest_ga["id"]}
+
+    # 2. limit 订单 K 线健康检查
+    order_type = str(order.get("order_type") or "").lower()
+    if order_type == "limit":
+        if rev_cfg.get("require_healthy_kline_for_limit", True):
+            wick_ratio = float(rev_cfg.get("unhealthy_kline_wick_ratio", 2.0))
+            if _is_unhealthy_pullback_bar(market, side, wick_ratio=wick_ratio):
+                return {"proceed": False, "skip_reason": "unhealthy_kline"}
+
+        # BTC#9 P0-2: structured candle confirmation for limit orders
+        if rev_cfg.get("require_structured_candle_confirmation", True):
+            # Use prev_close from market if available (for per-candle processing),
+            # otherwise default to open price as best approximation
+            prev_close = float(market.get("prev_close") or market.get("open") or 0)
+            if prev_close <= 0:
+                prev_close = None
+            pass_candle, candle_reason = _validate_limit_fill_candle(market, order, prev_close=prev_close)
+            if not pass_candle:
+                return {"proceed": False, "skip_reason": candle_reason}
+
+    return {"proceed": True}
+
+
+def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], price: float | dict[str, Any], *, event_time: int | None = None) -> dict[str, Any]:
     market = price if isinstance(price, dict) else market_from_price(order["symbol"], float(price))
     last_price = float(market["close"])
     high = float(market["high"])
@@ -470,6 +829,17 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     # Calculate position size based on risk
     stop = float(order.get("stop_loss") or 0)
     risk_pct = float(order.get("risk_percent") or 0.5)
+    # BTC#9 fix: convert event_time to ISO once for all downstream timestamps
+    # event_time is candle.close_time in ms; if missing, fall back to utc_iso()
+    if event_time is not None and int(event_time) > 0:
+        from plugins.crypto_guard.utils import iso_utc_from_ms
+        fill_ts_iso = iso_utc_from_ms(int(event_time))
+        fill_event_time = int(event_time)
+        fill_allow_wall = False
+    else:
+        fill_ts_iso = utc_iso()
+        fill_event_time = None
+        fill_allow_wall = True  # live mode: explicit wall-clock fallback
     if order_type == "market":
         should_fill = True
         open_price = float(market.get("open", last_price))
@@ -486,6 +856,10 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
         fill_method = "trigger_touch" if should_fill else fill_method
     if not should_fill:
         return {"ok": True, "filled": False}
+    # BTC#9 fix: fill 前复核最新 GA + K 线健康
+    rev = _revalidate_pending_before_fill(repo, order, market, event_time=event_time)
+    if not rev.get("proceed"):
+        return {"ok": True, "filled": False, "skip_reason": rev.get("skip_reason")}
     # Size AFTER fill price is determined (slippage applied for market orders)
     sizing = compute_position_size(float(entry_price), stop, risk_percent=risk_pct)
     if sizing is not None:
@@ -495,8 +869,8 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     if existing_trade:
         return {"ok": True, "filled": False, "existing_trade_id": existing_trade["id"],
                 "reason": "order already has an open trade"}
-    trade_id = repo.create_paper_trade(order, float(entry_price), fill_method=fill_method)
-    repo.update_paper_order_status(order["id"], "open", filled_at=utc_iso())
+    trade_id = repo.create_paper_trade(order, float(entry_price), fill_method=fill_method, event_time=fill_event_time, allow_wall_clock=fill_allow_wall)
+    repo.update_paper_order_status(order["id"], "open", filled_at=fill_ts_iso)
     repo.enqueue_job(
         "paper_event_alert",
         3,
@@ -512,7 +886,8 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
             "side": order.get("side"),
             "stop_loss": order.get("stop_loss"),
             "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
-            "filled_at": utc_iso(),
+            "filled_at": fill_ts_iso,
+            "event_time": fill_event_time,
             "quantity": order.get("quantity"),
             "order_type": order.get("order_type"),
         },
@@ -520,7 +895,7 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     return {"ok": True, "filled": True, "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method}
 
 
-def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], trade: dict[str, Any], price: float | dict[str, Any]) -> dict[str, Any]:
+def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], trade: dict[str, Any], price: float | dict[str, Any], *, event_time: int | None = None) -> dict[str, Any]:
     market = price if isinstance(price, dict) else market_from_price(order["symbol"], float(price))
     path_metrics = update_trade_path_metrics(trade, market)
     repo.update_paper_trade_quality(
@@ -534,6 +909,10 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
     trade["max_adverse_excursion"] = path_metrics["max_adverse_excursion"]
     trade["stop_take_path_json"] = json.dumps(path_metrics["stop_take_path"], ensure_ascii=False)
 
+    # BTC#9 Phase B: evaluate_exit handles same-candle SL+TP ambiguity with
+    # conservative SL priority (see execution_quality.py lines 78-81). When both
+    # SL and TP are hit on the same candle, the trade closes at stop_loss with
+    # {"ambiguous_intrabar": True} recorded in the path.
     exit_result = evaluate_exit(order, trade, market)
     if not exit_result["should_close"]:
         return {"ok": True, "closed": False, "mfe": path_metrics["max_favorable_excursion"], "mae": path_metrics["max_adverse_excursion"]}
@@ -544,6 +923,16 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
     stop_take_path = quality["stop_take_path"]
     if exit_result.get("hit"):
         stop_take_path.append({"event": "exit_hit", "reason": close_reason, "exit_price": exit_price, "details": exit_result["hit"]})
+    # R3-B: determine close timestamp from event_time
+    if event_time is not None and int(event_time) > 0:
+        from plugins.crypto_guard.utils import iso_utc_from_ms
+        close_ts_iso = iso_utc_from_ms(int(event_time))
+        close_event_time = int(event_time)
+        close_allow_wall = False
+    else:
+        close_ts_iso = utc_iso()
+        close_event_time = None
+        close_allow_wall = True
     closed = repo.close_paper_trade(
         trade["id"],
         exit_price=exit_price,
@@ -557,11 +946,12 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         exit_efficiency=quality["exit_efficiency"],
         signal_decay_score=quality["signal_decay_score"],
         stop_take_path=stop_take_path,
+        event_time=close_event_time,
+        allow_wall_clock=close_allow_wall,
     )
     if not closed:
         return {"ok": True, "closed": False, "skip_reason": "concurrent_close"}
-    closed_at = utc_iso()
-    repo.update_paper_order_status(order["id"], "closed", closed_at=closed_at)
+    repo.update_paper_order_status(order["id"], "closed", closed_at=close_ts_iso)
     # Backfill real pnl_r to active strategy_evaluations for this trade.
     # Shadow evaluations get PnL exclusively from their independent virtual_trade lifecycle.
     repo.backfill_active_evaluation_pnl_r(trade, quality["pnl_r"])
@@ -572,6 +962,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         current_price=exit_price,
         unrealized_pnl=0.0,
         unrealized_pnl_pct=0.0,
+        event_time=close_event_time,
+        allow_wall_clock=close_allow_wall,
     )
     repo.log_paper_trade_event(
         position_id=int(trade["id"]),
@@ -584,6 +976,7 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
         pnl_pct=quality["pnl_percent"],
         reason=close_reason,
         event={"order_id": order["id"], "trade_id": trade["id"], "pnl_r": quality["pnl_r"]},
+        event_time=close_event_time,
     )
     repo.enqueue_job("trade_review", 4, "paper_worker", f"system:review:{trade['id']}", {"trade_id": trade["id"]})
     event_type = "take_profit_hit" if close_reason == "take_profit" else "stop_loss_hit" if close_reason == "stop_loss" else "close_position"
@@ -605,8 +998,8 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
             "stop_loss": order.get("stop_loss"),
             "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
             "filled_at": order.get("filled_at"),
-            "closed_at": closed_at,
-            "event_time": closed_at,
+            "closed_at": close_ts_iso,
+            "event_time": close_ts_iso,
             "quantity": trade.get("quantity"),
             "order_type": order.get("order_type"),
         },

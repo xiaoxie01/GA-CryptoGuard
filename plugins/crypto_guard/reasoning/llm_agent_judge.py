@@ -9,6 +9,7 @@ from plugins.crypto_guard.reasoning.decision_schema import validate_json
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
+from plugins.crypto_guard.utils import _strict_positive_int_ms
 
 
 SYSTEM_PROMPT = """你是 GA CryptoGuard 的市场研究 Agent。
@@ -122,6 +123,9 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             "C/D 级不得 create_paper_order，decision 应为 monitor_only 或 no_edge",
             f"反向证据存在不等于不能交易；只要 RR>={min_rr} 且止损明确，A/S 级仍应给出 trade_plan",
             "counter_evidence 至少 1 条",
+            "entry_trigger_confirmation 必须是结构化对象（type/timeframe/event_type/direction/candle_close_time/price/source/symbol），不得使用裸字符串",
+            "entry_trigger_confirmation 必须与 schema 完全匹配，字段不可省略；无法提供时设为 null",
+            "entry_trigger_confirmation.symbol 必须等于顶层 decision.symbol — 禁止跨 symbol 匹配",
         ],
         "market_snapshot": _compact_snapshot(snapshot),
         "pre_score": scoring,
@@ -296,7 +300,11 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     decision = dict(fallback)
     decision.update(candidate)
     decision["symbol"] = snapshot["symbol"]
-    decision["analysis_time_utc"] = int(snapshot.get("analysis_time_utc") or 0)
+    # R11-6: snapshot.analysis_time_utc must be a strict positive int, else fail-closed
+    _snap_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
+    if _snap_time is None:
+        raise ValueError("snapshot.analysis_time_utc 缺失或非严格正整数，拒绝产出 decision")
+    decision["analysis_time_utc"] = _snap_time
     decision.setdefault("strategy_name", fallback.get("strategy_name", "llm_agent_sop"))
     decision.setdefault("strategy_version", fallback.get("strategy_version", "1.0"))
     decision["analysis_source"] = "llm_agent"
@@ -340,6 +348,15 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         decision["has_trade_plan"] = False
     if not decision.get("has_trade_plan"):
         decision["trade_plan"] = None
+    # BTC#9: LLM failed/disabled must NOT fake entry_trigger_confirmation
+    trade_plan = decision.get("trade_plan")
+    if isinstance(trade_plan, dict):
+        ec = trade_plan.get("entry_trigger_confirmation")
+        if isinstance(ec, str):
+            decision["trade_plan"]["entry_trigger_confirmation"] = None
+            notes = list(decision.get("risk_notes") or [])
+            notes.append("LLM 输出裸字符串 entry_trigger_confirmation，已清空为 null（需结构化对象）。")
+            decision["risk_notes"] = notes
     if decision.get("decision") == "trade_plan_available":
         decision["has_trade_plan"] = bool(decision.get("trade_plan"))
     watch = decision.get("opportunity_watch")

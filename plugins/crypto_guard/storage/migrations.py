@@ -32,6 +32,17 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_hourly_report_accuracy_migration(conn)
         with SCHEMA_PATH.open("r", encoding="utf-8") as f:
             conn.executescript(f.read())
+        # R5-D1: Run dedupe_key migration AFTER executescript. schema.sql no
+        # longer creates the partial unique index on paper_trade_logs(dedupe_key)
+        # — the migration function owns the index. On old production DBs that
+        # lack the dedupe_key column, executescript's CREATE INDEX would crash
+        # with OperationalError("no such column: dedupe_key"). By removing the
+        # index DDL from schema.sql and keeping it here (after executescript
+        # which may have CREATE TABLE IF NOT EXISTS), _add_column runs safely
+        # on existing tables, and CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
+        # On fresh DBs: executescript creates the table with dedupe_key column
+        # (from CREATE TABLE DDL), then this migration creates the index.
+        _apply_paper_trade_logs_dedupe_key_migration(conn)
         _apply_phase_01_02_migrations(conn)
         _seed_symbols(conn, cfg.symbols)
         _seed_strategies(conn, cfg.strategies)
@@ -47,6 +58,20 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _apply_legacy_fuzzy_migration(conn)
         _apply_phase_shadow_vt_v2_migration(conn)
         _apply_candidate_cap_cleanup(conn)
+        # FS-5: R4 contract marker is the LAST step. Only write it after ALL
+        # schema, seed, and migration steps succeed AND schema health passes.
+        # If any prior step raised, the exception propagates and the marker
+        # is never written — diagnostics will not falsely believe the R4
+        # contract is deployed. The marker and any uncommitted work from this
+        # initialization are committed atomically together.
+        health = check_schema_health(conn=conn)
+        if not health["ok"]:
+            raise RuntimeError(
+                f"schema health check failed after migrations: {health.get('missing_columns')}"
+            )
+        _ensure_hourly_report_accuracy_r4_contract_marker(conn)
+        _ensure_btc9_trade_gate_contract_marker(conn)
+        conn.commit()
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
         conn.close()
@@ -402,6 +427,7 @@ def _apply_ga_master_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "paper_orders", "ga_decision_id", "INTEGER")
     _add_column(conn, "paper_orders", "source", "TEXT DEFAULT 'signal_compat'")
     _add_column(conn, "paper_orders", "risk_check_passed", "INTEGER DEFAULT 0")
+    _add_column(conn, "paper_orders", "last_processed_candle_time", "INTEGER")
     _add_column(conn, "opportunity_watches", "ga_decision_id", "INTEGER")
     _add_column(conn, "opportunity_watches", "created_by_user_action", "INTEGER DEFAULT 0")
     _add_column(conn, "opportunity_watches", "source_button_action", "TEXT")
@@ -1372,6 +1398,69 @@ def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
     )
     # One-shot migration: populate batch_symbol_status from existing JSON columns
     _migrate_batch_json_to_symbol_status(conn)
+    # P1 (R4): rebuild batch_symbol_status with CHECK constraint if it was
+    # created without one (CREATE TABLE IF NOT EXISTS silently skips on existing).
+    _ensure_batch_symbol_status_check_constraint(conn)
+
+
+def _ensure_hourly_report_accuracy_r4_contract_marker(conn: sqlite3.Connection) -> None:
+    """FS-5: Write the hourly_report_accuracy_r4_contract_v1 marker.
+
+    The marker is written ONCE — the first time the R4 migration runs to
+    completion with all postconditions satisfied. Its ``applied_at``
+    timestamp is the cutoff between legacy audit findings (pre-marker) and
+    current R4 runtime errors (post-marker).
+
+    Idempotent: INSERT OR IGNORE means repeated migration runs do not
+    refresh the timestamp.
+    """
+    # Ensure _migration_state table exists (created by _apply_stop_loss_adjustment_dedup
+    # on older DBs; safe to re-assert here).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS _migration_state (
+            key TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("hourly_report_accuracy_r4_contract_v1",),
+    )
+
+
+def _apply_paper_trade_logs_dedupe_key_migration(conn: sqlite3.Connection) -> None:
+    """R4-D4: Add dedupe_key column and UNIQUE partial index to paper_trade_logs.
+
+    Enables idempotent audit logging via direct INSERT with IntegrityError catch,
+    eliminating the SELECT-then-INSERT race window in _log_retryable_skip_audit.
+    The partial unique index only applies when dedupe_key IS NOT NULL, so
+    non-deduplicated log rows are unaffected.
+    """
+    _add_column(conn, "paper_trade_logs", "dedupe_key", "TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trade_logs_dedupe_key "
+        "ON paper_trade_logs(dedupe_key) WHERE dedupe_key IS NOT NULL"
+    )
+
+
+def _ensure_btc9_trade_gate_contract_marker(conn: sqlite3.Connection) -> None:
+    """Section 七: Write the btc9_trade_gate_contract_v1 marker.
+
+    Independent of the R4 marker — BTC#9 diagnostics use this cutoff, not the
+    R4 contract boundary. INSERT OR IGNORE ensures idempotency.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migration_state ("
+        "  key TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("btc9_trade_gate_contract_v1",),
+    )
 
 
 def _migrate_batch_json_to_symbol_status(conn: sqlite3.Connection) -> None:
@@ -1414,6 +1503,139 @@ def _json_list_from_raw(raw: Any) -> list[str]:
         return []
 
 
+def _ensure_batch_symbol_status_check_constraint(conn: sqlite3.Connection) -> None:
+    """FR-4: Atomic rebuild of batch_symbol_status to add exact CHECK constraint.
+
+    On old DBs where CREATE TABLE IF NOT EXISTS silently skipped the CHECK,
+    the constraint is missing. This migration detects the absence and rebuilds
+    the table atomically using SAVEPOINT.
+
+    Rules:
+    - Never use SELECT * — explicit column list.
+    - Preserve valid statuses: pending, completed, failed.
+    - Invalid legacy values normalized to 'pending' with auditable migration finding.
+    - Business-row count before and after must match.
+    - Handle residual temporary table safely.
+    - Rebuild required indexes.
+    - Validate postconditions before releasing SAVEPOINT.
+    - Repeated execution is a no-op.
+    - Schema-health check verifies the exact status constraint, not merely CHECK.
+    """
+    import re as _re
+
+    # Check if the exact CHECK constraint exists
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
+    ).fetchone()
+    if not table_sql_row:
+        return  # table doesn't exist yet — will be created with correct schema
+    table_sql = table_sql_row["sql"] or ""
+
+    # FR-4: verify the EXACT constraint pattern, not just any CHECK token
+    # Accept: CHECK(status IN ('pending', 'completed', 'failed'))
+    # with optional whitespace variations
+    exact_check_pattern = _re.compile(
+        r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
+        _re.IGNORECASE,
+    )
+    if exact_check_pattern.search(table_sql):
+        return  # already has the correct constraint — no-op
+
+    # Handle residual temporary table from a previous failed migration
+    conn.execute("DROP TABLE IF EXISTS _batch_symbol_status_new")
+
+    # Count rows before migration
+    count_before = int(conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0])
+
+    # Use SAVEPOINT for atomic rollback on failure
+    conn.execute("SAVEPOINT batch_symbol_status_rebuild")
+    try:
+        # Create new table with exact constraint
+        conn.execute(
+            """
+            CREATE TABLE _batch_symbol_status_new (
+                batch_id  TEXT NOT NULL,
+                symbol    TEXT NOT NULL,
+                status    TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
+                updated_at TEXT,
+                PRIMARY KEY (batch_id, symbol)
+            )
+            """
+        )
+
+        # Copy data with explicit columns — normalize invalid statuses
+        # First: copy valid rows as-is
+        conn.execute(
+            """
+            INSERT INTO _batch_symbol_status_new (batch_id, symbol, status, updated_at)
+            SELECT batch_id, symbol, status, updated_at
+            FROM batch_symbol_status
+            WHERE status IN ('pending', 'completed', 'failed')
+            """
+        )
+
+        # Second: find and normalize invalid statuses, recording audit findings
+        invalid_rows = conn.execute(
+            """
+            SELECT batch_id, symbol, status
+            FROM batch_symbol_status
+            WHERE status NOT IN ('pending', 'completed', 'failed')
+            """
+        ).fetchall()
+
+        if invalid_rows:
+            for row in invalid_rows:
+                # Record auditable migration finding in _migration_state
+                # Schema: key TEXT, applied_at TEXT
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO _migration_state (key, applied_at)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        f"batch_symbol_status_normalize:{row['batch_id']}:{row['symbol']}:original_status={row['status']}:normalized_to=pending",
+                    ),
+                )
+            # Insert normalized rows
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO _batch_symbol_status_new (batch_id, symbol, status, updated_at)
+                SELECT batch_id, symbol, 'pending', updated_at
+                FROM batch_symbol_status
+                WHERE status NOT IN ('pending', 'completed', 'failed')
+                """
+            )
+
+        # Swap tables
+        conn.execute("DROP TABLE batch_symbol_status")
+        conn.execute("ALTER TABLE _batch_symbol_status_new RENAME TO batch_symbol_status")
+
+        # Rebuild indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_symbol_status_batch ON batch_symbol_status(batch_id)"
+        )
+
+        # Validate postconditions
+        count_after = int(conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0])
+        if count_after != count_before:
+            raise RuntimeError(
+                f"FR-4: row count mismatch after migration: before={count_before}, after={count_after}"
+            )
+
+        # Verify the constraint is now present
+        new_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
+        ).fetchone()
+        if not new_sql_row or not exact_check_pattern.search(new_sql_row["sql"] or ""):
+            raise RuntimeError("FR-4: CHECK constraint not found after migration rebuild")
+
+        conn.execute("RELEASE batch_symbol_status_rebuild")
+    except Exception:
+        conn.execute("ROLLBACK TO batch_symbol_status_rebuild")
+        conn.execute("RELEASE batch_symbol_status_rebuild")
+        raise
+
+
 def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Check production schema health - verify all required columns exist.
 
@@ -1443,8 +1665,9 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "opportunity_watches": ["dedupe_key"],
         "paper_positions": ["updated_at"],
         "strategy_evaluations": ["ga_decision_id", "paper_trade_id", "outcome_source", "shadow_virtual_trade_id"],
-        "paper_orders": ["initial_stop_loss"],
+        "paper_orders": ["initial_stop_loss", "last_processed_candle_time"],
         "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
+        "paper_trade_logs": ["dedupe_key"],
         "shadow_virtual_trades": ["strategy_name", "status", "entry_type", "opened_at", "expires_at", "last_processed_candle_time"],
     }
 
@@ -1455,6 +1678,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "idx_shadow_vt_unique",
         "idx_strategy_evals_shadow_unique",
         "idx_alert_outbox_dedupe_unique",
+        "idx_paper_trade_logs_dedupe_key",
     ]
 
     # Required tables
@@ -1500,6 +1724,64 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
             ).fetchone()
             if not tbl_exists:
                 missing.append({"table": tbl_name, "column": "(table)"})
+
+        # FR-4: check exact CHECK constraint on batch_symbol_status.status
+        # Must match CHECK(status IN ('pending', 'completed', 'failed')) exactly,
+        # not just any CHECK token (which could be a different constraint).
+        import re as _re
+        bss_sql = _conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
+        ).fetchone()
+        exact_check_pattern = _re.compile(
+            r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
+            _re.IGNORECASE,
+        )
+        if bss_sql and not exact_check_pattern.search(bss_sql["sql"] or ""):
+            missing.append({"table": "batch_symbol_status", "column": "CHECK(status IN ('pending','completed','failed'))"})
+
+        # R5-D4/R6-D3: verify the dedupe_key index is a PARTIAL unique index with
+        # WHERE dedupe_key IS NOT NULL. A non-partial unique index would
+        # reject multiple NULL dedupe_key rows (breaking non-deduplicated logs).
+        # R6-D3: also verify via PRAGMA index_info that the indexed column is
+        # actually "dedupe_key" — the SQL text check alone could be fooled by
+        # an index that mentions "dedupe_key" in the WHERE clause but indexes
+        # a different column.
+        import re as _re2
+        dedupe_idx_sql = _conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_paper_trade_logs_dedupe_key'"
+        ).fetchone()
+        if dedupe_idx_sql:
+            idx_sql_lower = (dedupe_idx_sql["sql"] or "").lower()
+            if "unique" not in idx_sql_lower:
+                missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key UNIQUE"})
+            if "dedupe_key is not null" not in idx_sql_lower:
+                missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key WHERE dedupe_key IS NOT NULL"})
+            # R6-D3: verify the indexed column is actually "dedupe_key"
+            # R7-D3: the index must be EXACTLY ["dedupe_key"] — a composite index
+            # that includes dedupe_key plus other columns would pass the old
+            # membership check ("dedupe_key" not in indexed_cols) but should fail.
+            # Also fail-closed if PRAGMA index_info itself raises.
+            try:
+                idx_info_rows = _conn.execute(
+                    "PRAGMA index_info('idx_paper_trade_logs_dedupe_key')"
+                ).fetchall()
+                if not idx_info_rows:
+                    missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key column=dedupe_key (index has no columns)"})
+                else:
+                    indexed_cols = [str(r["name"]) for r in idx_info_rows if r["name"]]
+                    # R7-D3: exact list equality — index must be solely on dedupe_key
+                    if indexed_cols != ["dedupe_key"]:
+                        missing.append({
+                            "table": "paper_trade_logs",
+                            "column": f"idx_paper_trade_logs_dedupe_key column=dedupe_key (indexed columns: {','.join(indexed_cols) or 'none'})",
+                        })
+            except Exception as exc:
+                # R7-D3: fail-closed — if PRAGMA index_info fails, report it as
+                # a missing health item rather than silently passing.
+                missing.append({
+                    "table": "paper_trade_logs",
+                    "column": f"idx_paper_trade_logs_dedupe_key column=dedupe_key (PRAGMA index_info failed: {exc})",
+                })
 
         return {
             "ok": len(missing) == 0,

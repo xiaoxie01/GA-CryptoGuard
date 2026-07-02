@@ -16,33 +16,164 @@ from plugins.crypto_guard.utils import utc_ms
 LOGGER = get_logger("crypto_guard.paper")
 
 
-def _fetch_last_candle_market(symbol: str, mark_price: float) -> dict[str, Any]:
-    """Fetch recent 1m candles OHLC for accurate stop loss/take profit checks.
+def _log_retryable_skip_audit(
+    repo: CryptoGuardRepository,
+    order: dict[str, Any],
+    candle_close_time: int,
+    skip_reason: str,
+    fill_result: dict[str, Any],
+) -> None:
+    """R3-C: Write ONE idempotent audit record per (order_id, candle_close_time, skip_reason).
 
-    Uses the widest high/low across last 5 candles (including current) to detect
-    intrabar price touches that mark price alone would miss.
-    Falls back to mark_price-based market if candle fetch fails.
+    R4-D4: Uses direct INSERT with UNIQUE constraint on dedupe_key column
+    instead of SELECT-then-INSERT race window. When a duplicate INSERT is
+    attempted, sqlite3.IntegrityError is caught and silently ignored —
+    the row already exists from a concurrent/earlier call.
+    Audit log failure must not mask the original skip_reason.
+    """
+    import sqlite3
+
+    try:
+        dedupe_key = f"retryable_skip:{order['id']}:{candle_close_time}:{skip_reason}"
+        repo.log_paper_trade_event(
+            position_id=None,
+            event_type="pending_order_retryable_skip",
+            symbol=order.get("symbol", ""),
+            side=order.get("side", ""),
+            price=0.0,
+            quantity=order.get("quantity"),
+            pnl=0.0,
+            pnl_pct=0.0,
+            reason=f"Retryable skip: {skip_reason} at candle close_time={candle_close_time}",
+            event={
+                "order_id": order["id"],
+                "candle_close_time": candle_close_time,
+                "skip_reason": skip_reason,
+                "ga_decision_id": fill_result.get("ga_decision_id"),
+                "dedupe_key": dedupe_key,
+            },
+            event_time=candle_close_time if candle_close_time > 0 else None,
+            dedupe_key=dedupe_key,
+        )
+    except sqlite3.IntegrityError:
+        # R4-D4: UNIQUE constraint on dedupe_key — row already exists, idempotent.
+        return
+    except Exception:
+        # Audit log failure must not mask the original skip_reason
+        pass
+
+
+def _dedupe_and_validate_monotonic(
+    candles: list[dict[str, Any]],
+    cursor_close_time: int | None = None,
+) -> list[dict[str, Any]]:
+    """R4-D2: Deduplicate candles by close_time and enforce strict-monotonic ordering.
+
+    Page-boundary fetches can return overlapping candles (same close_time appearing
+    as the last of page N and the first of page N+1). This helper:
+    1. Deduplicates by close_time, keeping the first occurrence.
+    2. Validates strict-monotonic close_time ordering. If a candle with a
+       close_time <= a previously seen close_time is encountered (non-duplicate
+       out-of-order), it is dropped and a warning is logged.
+    3. R5-D2: Detects gaps in the candle sequence. If the gap between consecutive
+       candles exceeds EXPECTED_INTERVAL_MS (60000ms for 1m candles), the result
+       is truncated at the last safe candle (before the gap). The gap candle and
+       all subsequent candles are excluded — the caller must not process past a
+       gap because missing candles may contain fill/SL/TP events.
+    4. R6-D1: When cursor_close_time is provided, the FIRST candle is checked
+       against the cursor for gap detection. This closes the hole where the
+       first returned candle was far ahead of the cursor (missing candles
+       between cursor and first result). The prior code initialized
+       last_close_time=0, so the gap check (which requires last_close_time > 0)
+       was skipped for the first candle.
+    5. R6-D1: Invalid candles (close_time <= 0, out-of-order, duplicate) now
+       STOP processing instead of being skipped. The previous `continue`
+       behavior silently dropped bad candles and kept processing subsequent
+       candles, which could hide data-integrity issues and process candles
+       after a corrupted one. Now we `break` to preserve the cursor at the
+       last safe position.
+    Returns a new list of unique, strictly-monotonic, gap-free candles.
+    """
+    EXPECTED_INTERVAL_MS = 60000  # 1-minute candles
+    if not candles:
+        return []
+    seen: set[int] = set()
+    result: list[dict[str, Any]] = []
+    last_close_time = cursor_close_time or 0
+    for c in candles:
+        ct = int(c.get("close_time", 0))
+        if ct <= 0:
+            LOGGER.warning("R6-D1: stopping at candle with invalid close_time=%s", ct)
+            break
+        if ct in seen:
+            # Duplicate — skip (expected at page boundaries)
+            continue
+        if ct <= last_close_time:
+            # Out-of-order or equal (non-duplicate) — stop and warn
+            LOGGER.warning(
+                "R6-D1: stopping at out-of-order candle close_time=%s (last=%s)", ct, last_close_time,
+            )
+            break
+        # R5-D2 / R6-D1: Gap detection — if the gap exceeds the expected interval,
+        # truncate at the last safe candle. Do not process past a gap.
+        # When cursor_close_time is provided, this also checks the first candle
+        # against the cursor (closing the first-candle gap hole).
+        if last_close_time > 0 and (ct - last_close_time) > EXPECTED_INTERVAL_MS:
+            LOGGER.warning(
+                "R5-D2/R6-D1: gap detected: last_close_time=%s next_close_time=%s "
+                "gap=%sms (expected=%sms). Truncating at last safe candle.",
+                last_close_time, ct, ct - last_close_time, EXPECTED_INTERVAL_MS,
+            )
+            break
+        seen.add(ct)
+        last_close_time = ct
+        result.append(c)
+    return result
+
+
+def _fetch_unprocessed_closed_candles(
+    symbol: str,
+    start_time: int | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Fetch 1m closed candles from Binance REST API.
+
+    BTC#9 Phase C Section 11: returns a result dict instead of swallowing
+    exceptions into an empty list. Callers must distinguish network_error
+    from no-data.
+
+    Returns:
+        {"ok": True, "error": None, "candles": [...]} on success.
+        {"ok": False, "error": "network_error", "candles": []} on exception.
+        {"ok": False, "error": "invalid_data", "candles": []} on bad data.
+
+    Returns ONLY fully closed candles (close_time < now). The current
+    unclosed candle is NEVER returned. Candles are sorted by open_time
+    ascending. On network failure: candles list is empty (never fallback
+    to fake candle).
+
+    Args:
+        symbol: Trading symbol (e.g. "BTCUSDT")
+        start_time: Unix millis start time for candle fetch (candles with
+                    close_time > start_time). If None, fetches most recent.
+        limit: Max candles to fetch (default 500).
     """
     try:
-        candles = fetch_klines(symbol, "1m", limit=5)
-        if candles:
-            # Use the widest range across all recent candles
-            high = max(float(c["high"]) for c in candles)
-            low = min(float(c["low"]) for c in candles)
-            last = candles[-1]
-            return {
-                "symbol": symbol,
-                "open_time": last.get("open_time"),
-                "close_time": last.get("close_time"),
-                "open": float(last["open"]),
-                "high": high,
-                "low": low,
-                "close": mark_price,  # use mark price as current close
-                "source": "1m_candle_range_with_mark",
-            }
+        candles = fetch_klines(symbol, "1m", start_time=start_time, limit=int(limit))
     except Exception as exc:
-        LOGGER.debug("fetch last candle failed for %s: %s", symbol, exc)
-    return market_from_price(symbol, mark_price)
+        LOGGER.warning("fetch unprocessed closed candles failed for %s: %s", symbol, exc)
+        return {"ok": False, "error": "network_error", "candles": []}
+
+    try:
+        # Filter to ONLY fully closed candles
+        now_ms = utc_ms()
+        closed = [c for c in candles if int(c.get("close_time", 0)) < now_ms]
+        # Sort by open_time ascending
+        closed.sort(key=lambda c: int(c.get("open_time", 0)))
+        return {"ok": True, "error": None, "candles": closed}
+    except Exception as exc:
+        LOGGER.warning("parse closed candles failed for %s: %s", symbol, exc)
+        return {"ok": False, "error": "invalid_data", "candles": []}
 
 
 def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, float | dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -56,34 +187,272 @@ def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, flo
     mark_price_cache: dict[str, dict[str, Any]] = {}
     # Track orders filled in this batch — skip TP/SL check for them (defer to next batch)
     filled_order_ids: set[int] = set()
+    # Load config for max_candles_per_batch
+    from plugins.crypto_guard.config.loader import load_config as _load_config
+    rev_cfg = _load_config().trading_mode.get("pending_order_revalidation", {})
+    max_candles_per_batch = int(rev_cfg.get("max_candles_per_batch", 500))
+    # C5: paged backfill config — per-page size and max pages per batch
+    max_candles_per_page = int(rev_cfg.get("max_candles_per_page", 500))
+    max_pages_per_batch = int(rev_cfg.get("max_pages_per_batch", 10))
+
     for order in repo.list_open_paper_orders():
         LOGGER.info("paper update order_id=%s symbol=%s status=%s", order.get("id"), order.get("symbol"), order.get("status"))
         symbol = order["symbol"]
         market_or_price = price_map.get(symbol)
-        if market_or_price is None:
-            mark_price = float(fetch_mark_price(symbol)["markPrice"])
-            candle_market = _fetch_last_candle_market(symbol, mark_price)
-            market = candle_market
-        else:
-            market = market_or_price if isinstance(market_or_price, dict) else market_from_price(symbol, float(market_or_price))
-        latest_prices[symbol] = float(market["close"])
-        redis.set_latest_price(order["symbol"], float(market["close"]))
+
         if order["status"] == "pending":
-            fill_result = fill_order_if_triggered(repo, order, market)
-            results.append(fill_result)
-            if fill_result.get("filled"):
-                filled_order_ids.add(order["id"])
+            # Per-candle 1m closed candle processing for pending orders
+            created_at_ms = None
+            if order.get("created_at"):
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    text = str(order["created_at"]).replace("Z", "+00:00")
+                    dt = _dt.fromisoformat(text)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    created_at_ms = int(dt.timestamp() * 1000)
+                except Exception:
+                    pass
+
+            cursor = order.get("last_processed_candle_time")
+            if cursor:
+                start_time = cursor
+            elif created_at_ms:
+                start_time = created_at_ms
+            else:
+                start_time = None
+
+            # C4: _fetch_unprocessed_closed_candles returns a result dict.
+            # C5: paged backfill — fetch multiple pages until exhausted,
+            # config cap, error, or order closed/filled.
+            page = 0
+            all_candles: list[dict[str, Any]] = []
+            page_start_time = start_time
+            fetch_error: str | None = None
+            while page < max_pages_per_batch:
+                result = _fetch_unprocessed_closed_candles(
+                    symbol, start_time=page_start_time, limit=max_candles_per_page,
+                )
+                if not result.get("ok"):
+                    fetch_error = result.get("error", "unknown")
+                    # If we already have candles from prior pages, process them.
+                    # Otherwise skip this cycle preserving the cursor.
+                    if not all_candles:
+                        results.append({"ok": True, "filled": False, "order_id": order["id"],
+                                       "skip_reason": f"candle_fetch_{fetch_error}"})
+                        break
+                    else:
+                        break
+                page_candles = result.get("candles") or []
+                if not page_candles:
+                    break  # No more data
+                all_candles.extend(page_candles)
+                page += 1
+                # C5: next page startTime must be strictly > last close_time
+                last_page_close = int(page_candles[-1].get("close_time", 0))
+                if last_page_close <= 0:
+                    break
+                page_start_time = last_page_close + 1
+                # Stop if we've reached the batch cap
+                if len(all_candles) >= max_candles_per_batch:
+                    break
+
+            # R4-D2/R6-D1: deduplicate page-boundary candles and enforce strict-monotonic close_time.
+            # R6-D1: pass cursor_close_time so the first candle is checked against the
+            # cursor for gap detection. Without this, a gap between the cursor and
+            # the first returned candle would go undetected.
+            cursor_close_time = 0
+            if cursor:
+                try:
+                    cursor_close_time = int(cursor)
+                except (TypeError, ValueError):
+                    cursor_close_time = 0
+            all_candles = _dedupe_and_validate_monotonic(
+                all_candles,
+                cursor_close_time=cursor_close_time if cursor_close_time > 0 else None,
+            )
+
+            # On first-page error with no candles, skip to next order
+            if fetch_error and not all_candles:
+                continue
+
+            candles = all_candles
+            if not candles:
+                # No candles to process — use mark_price for equity tracking only
+                if market_or_price is None:
+                    try:
+                        mark_price = float(fetch_mark_price(symbol)["markPrice"])
+                    except Exception:
+                        mark_price = 0.0
+                else:
+                    mark_price = float(market_or_price) if not isinstance(market_or_price, dict) else float(market_or_price.get("close", 0))
+                latest_prices[symbol] = mark_price if mark_price > 0 else latest_prices.get(symbol, 0.0)
+                redis.set_latest_price(symbol, latest_prices[symbol])
+                continue
+
+            # Process each candle sequentially.
+            #
+            # BTC#9 Phase B (Section 2): After a pending order is filled on
+            # candle N, we must NOT break out of the loop. Instead we continue
+            # processing remaining closed candles through the normal open-order
+            # path (path metrics / SL/TP). The fill candle itself is conservative
+            # — only the trade is created, SL/TP is deferred to the next candle
+            # via filled_order_ids. Mark-price-dependent breakeven / profit
+            # protection are skipped in historical replay (no mark price for
+            # past times).
+            last_candle_time = None
+            prev_candle_close = None
+            order_became_open = False  # track transition within this loop
+
+            # R3-C: retryable skip_reasons — preserve cursor, stop processing later candles.
+            # These represent transient failures where the fill opportunity was not consumed;
+            # the next run must re-encounter the same candle.
+            _RETRYABLE_SKIP_REASONS = frozenset({
+                "ga_recheck_unavailable",
+                "ga_recheck_baseline_unavailable",
+                "cancel_race_lost",
+                "missing_event_time",
+            })
+
+            for candle in candles:
+                # Build single-candle market dict with prev_close from previous candle
+                single_market = {
+                    "symbol": symbol,
+                    "open_time": candle.get("open_time"),
+                    "close_time": candle.get("close_time"),
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "prev_close": prev_candle_close,
+                    "source": "1m_closed_candle",
+                }
+                candle_event_time = int(candle.get("close_time", 0))
+                candle_close_time = candle_event_time
+
+                if not order_became_open:
+                    # --- Pending path: try to fill ---
+                    fill_result = fill_order_if_triggered(
+                        repo, order, single_market, event_time=candle_event_time,
+                    )
+                    results.append(fill_result)
+
+                    # R3-C: classify result — retryable skip_reasons must preserve cursor
+                    # and stop processing later candles. The fill opportunity was not
+                    # consumed; the next run must re-encounter this candle.
+                    skip_reason = fill_result.get("skip_reason")
+                    if skip_reason in _RETRYABLE_SKIP_REASONS:
+                        # Write ONE idempotent audit record per (order_id, candle_close_time, skip_reason)
+                        _log_retryable_skip_audit(
+                            repo, order, candle_close_time, skip_reason, fill_result,
+                        )
+                        # Do NOT advance cursor — break immediately
+                        break
+
+                    last_candle_time = candle_close_time
+                    prev_candle_close = float(candle["close"])
+
+                    if fill_result.get("filled"):
+                        filled_order_ids.add(order["id"])
+                        # Update cursor to the candle that triggered the fill
+                        repo.conn.execute(
+                            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+                            (last_candle_time, order["id"]),
+                        )
+                        # Order is now open — transition to open-order path
+                        # for subsequent candles. Do NOT evaluate SL/TP on
+                        # this same candle (conservative rule).
+                        order_became_open = True
+                        # Refresh order dict to reflect new status
+                        order = dict(repo.conn.execute(
+                            "SELECT * FROM paper_orders WHERE id=?", (order["id"],),
+                        ).fetchone())
+                    continue
+
+                # --- Open path (post-fill): evaluate SL/TP on this candle ---
+                # Skip if this order was just filled in this batch (already
+                # handled above — filled_order_ids prevents same-candle SL/TP).
+                # For post-fill candles, order["id"] is in filled_order_ids but
+                # we must still process SL/TP. The filled_order_ids check in the
+                # main `open` branch (line ~172) handles orders that were filled
+                # in a PREVIOUS batch. Here, within the same candle loop, we
+                # explicitly evaluate SL/TP for candles after the fill candle.
+                trade = repo.get_open_trade_for_order(order["id"])
+                if trade:
+                    close_result = close_trade_if_needed(
+                        repo, order, trade, single_market,
+                        event_time=candle_event_time,
+                    )
+                    results.append(close_result)
+                    if close_result.get("closed"):
+                        # Trade closed on this candle — advance cursor and stop
+                        last_candle_time = candle_close_time
+                        repo.conn.execute(
+                            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+                            (last_candle_time, order["id"]),
+                        )
+                        prev_candle_close = float(candle["close"])
+                        break  # Trade closed, no more processing needed
+                    # Not closed: advance cursor to this candle
+                    last_candle_time = candle_close_time
+                    repo.conn.execute(
+                        "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+                        (last_candle_time, order["id"]),
+                    )
+                else:
+                    # No open trade (shouldn't happen, but handle gracefully)
+                    last_candle_time = candle_close_time
+                    repo.conn.execute(
+                        "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+                        (last_candle_time, order["id"]),
+                    )
+                prev_candle_close = float(candle["close"])
+
+            # After processing all candles, advance cursor for non-fill, non-close cases
+            if last_candle_time is not None and not order_became_open:
+                repo.conn.execute(
+                    "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+                    (last_candle_time, order["id"]),
+                )
+
+            # Use the last candle's close as the latest price for equity tracking
+            if last_candle_time is not None:
+                last_candle_close = candles[-1]["close"]
+                latest_prices[symbol] = float(last_candle_close)
+                redis.set_latest_price(symbol, latest_prices[symbol])
+            else:
+                if market_or_price is None:
+                    try:
+                        mark_price = float(fetch_mark_price(symbol)["markPrice"])
+                    except Exception:
+                        mark_price = 0.0
+                else:
+                    mark_price = float(market_or_price) if not isinstance(market_or_price, dict) else float(market_or_price.get("close", 0))
+                latest_prices[symbol] = mark_price if mark_price > 0 else latest_prices.get(symbol, 0.0)
+                redis.set_latest_price(symbol, latest_prices[symbol])
         elif order["status"] == "open":
             # Skip TP/SL check for orders just filled in this batch
             if order["id"] in filled_order_ids:
                 continue
+            if market_or_price is None:
+                try:
+                    mark_price = float(fetch_mark_price(symbol)["markPrice"])
+                except Exception:
+                    mark_price = 0.0
+                market = market_from_price(symbol, mark_price)
+            else:
+                market = market_or_price if isinstance(market_or_price, dict) else market_from_price(symbol, float(market_or_price))
+            latest_prices[symbol] = float(market["close"])
+            redis.set_latest_price(symbol, latest_prices[symbol])
             trade = repo.get_open_trade_for_order(order["id"])
             if trade:
-                close_result = close_trade_if_needed(repo, order, trade, market)
+                close_result = close_trade_if_needed(repo, order, trade, market)  # live mode: no event_time, wall-clock fallback
                 results.append(close_result)
                 adjustment = None if close_result.get("closed") else _maybe_adjust_stop_to_breakeven(repo, order, trade, market)
                 if adjustment:
                     results.append(adjustment)
+
+    repo.conn.commit()
     snapshot = equity_snapshot(
         ts=utc_ms(),
         closed_realized_pnl=repo.sum_closed_realized_pnl(),
@@ -643,6 +1012,7 @@ def _execute_profit_protection_close(
         mae=mae,
         signal_decay_score=signal_decay,
         stop_take_path=path,
+        allow_wall_clock=True,
     )
     if not closed:
         return {
@@ -674,6 +1044,7 @@ def _execute_profit_protection_close(
         current_price=mark_price,
         unrealized_pnl=0.0,
         unrealized_pnl_pct=0.0,
+        allow_wall_clock=True,
     )
 
     # Log close_position event
@@ -814,6 +1185,7 @@ def _sync_open_positions(repo: CryptoGuardRepository, latest_prices: dict[str, f
             current_price=price,
             unrealized_pnl=pnl,
             unrealized_pnl_pct=pnl_pct,
+            allow_wall_clock=True,
         )
 
 

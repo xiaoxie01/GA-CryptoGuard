@@ -40,6 +40,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     Returns the standard state-consistency shape (ok / issues / summary /
     total_issues) so it can be merged into diagnose_state_consistency output
     or rendered standalone in the hourly report.
+
+    FS-5: Issues are classified into three buckets:
+      - ``error``: current R4-runtime violations (post-marker)
+      - ``warning``: current R4-runtime warnings (post-marker)
+      - ``legacy_info``: pre-marker audit findings preserved for traceability
+
+    ``ok`` is True iff ``error_count == 0``. Warnings and legacy_info remain
+    visible and must be explained, but do not fail the diagnostic.
     """
     issues: list[dict[str, Any]] = []
     issues.extend(_check_hourly_report_incomplete_batch(repo, batch_id))
@@ -53,6 +61,24 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_invalid_liquidity_sweep_semantics(repo))
     issues.extend(_check_negative_drawdown_display(repo))
 
+    # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
+    # R4 contract version timestamp written by the migration once the R4
+    # postconditions (schema health, batch_symbol_status CHECK, etc.) hold.
+    marker_ts = _get_r4_contract_marker_ts(repo)
+    if marker_ts is not None:
+        for issue in issues:
+            decision_id = (issue.get("details") or {}).get("decision_id")
+            if decision_id is None:
+                continue
+            decision_ts = _get_decision_created_ts(repo, decision_id)
+            if decision_ts is not None and decision_ts < marker_ts:
+                # Pre-marker decision — demote to legacy_info, preserve visibility.
+                issue["severity"] = "legacy_info"
+
+    error_count = sum(1 for i in issues if i["severity"] == "error")
+    warning_count = sum(1 for i in issues if i["severity"] == "warning")
+    legacy_info_count = sum(1 for i in issues if i["severity"] == "legacy_info")
+
     summary = {
         HOURLY_REPORT_INCOMPLETE_BATCH: _count(issues, HOURLY_REPORT_INCOMPLETE_BATCH),
         HOURLY_REPORT_STALE_DECISION: _count(issues, HOURLY_REPORT_STALE_DECISION),
@@ -64,13 +90,56 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         DIRECTION_FLIP_NO_CLOSED_CANDLE: _count(issues, DIRECTION_FLIP_NO_CLOSED_CANDLE),
         INVALID_LIQUIDITY_SWEEP: _count(issues, INVALID_LIQUIDITY_SWEEP),
         NEGATIVE_DRAWDOWN_DISPLAY: _count(issues, NEGATIVE_DRAWDOWN_DISPLAY),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "legacy_info_count": legacy_info_count,
     }
     return {
-        "ok": len(issues) == 0,
+        "ok": error_count == 0,
         "issues": issues,
         "summary": summary,
         "total_issues": len(issues),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "legacy_info_count": legacy_info_count,
     }
+
+
+# FS-5: R4 contract marker key in _migration_state. The marker is written
+# only after the R4 migration postconditions succeed (schema health OK,
+# batch_symbol_status CHECK constraint present, etc.). Decisions created
+# before this marker are legacy audit findings, not current R4 errors.
+R4_CONTRACT_MARKER_KEY = "hourly_report_accuracy_r4_contract_v1"
+
+
+def _get_r4_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
+    """Return the R4 contract marker's applied_at timestamp, or None."""
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=?",
+            (R4_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        return None
+    return None
+
+
+def _get_decision_created_ts(repo: CryptoGuardRepository, decision_id: int | None) -> str | None:
+    """Return the created_at timestamp for a ga_decisions row, or None."""
+    if decision_id is None:
+        return None
+    try:
+        row = repo.conn.execute(
+            "SELECT created_at FROM ga_decisions WHERE id=?",
+            (int(decision_id),),
+        ).fetchone()
+        if row and row["created_at"]:
+            return str(row["created_at"])
+    except Exception:
+        return None
+    return None
 
 
 def run_for_report(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
@@ -254,13 +323,27 @@ def _check_executable_opportunity_risk_rejected(repo: CryptoGuardRepository) -> 
 
 
 def _check_opportunity_below_confidence(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """FS-5 #4: Only warn when structured state claims executable eligibility.
+
+    A non-executable ``opportunity_watch`` decision (one whose ``decision`` is
+    NOT ``create_paper_order`` / ``trade_plan_available``) is expected to be
+    below the execution confidence threshold — that is the very reason it is
+    classified as watch-only rather than executable. Warning on those rows
+    produces noise that obscures real executable-threshold failures.
+
+    Only warn when:
+      - ``signal_grade IN ('S','A','B')`` AND
+      - ``decision IN ('create_paper_order', 'trade_plan_available')`` AND
+      - ``confidence < MIN_CONFIDENCE_FOR_PAPER_ORDER``
+    """
     from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
     issues: list[dict[str, Any]] = []
     rows = repo.conn.execute(
         """
-        SELECT id, symbol, signal_grade, confidence
+        SELECT id, symbol, signal_grade, confidence, decision
         FROM ga_decisions
         WHERE signal_grade IN ('S','A','B')
+          AND decision IN ('create_paper_order', 'trade_plan_available')
         ORDER BY id DESC LIMIT 120
         """
     ).fetchall()
@@ -273,6 +356,7 @@ def _check_opportunity_below_confidence(repo: CryptoGuardRepository) -> list[dic
                     "decision_id": int(r["id"]), "symbol": r["symbol"],
                     "grade": r["signal_grade"], "confidence": conf,
                     "threshold": MIN_CONFIDENCE_FOR_PAPER_ORDER,
+                    "decision": r["decision"],
                 },
                 f"置信度 {conf:.2f} 低于 min_confidence {MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}；不进入可执行",
             ))
@@ -356,19 +440,23 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
     """Flag symbol-level direction flips that lack a closed candle
     breakthrough evidence.
 
-    P1-11c: also checks counter_evidence and evidence (BOS/CHoCH) for
-    confirmation, not just counter_evidence.
-
-    P1-6 (Round 3): market_bias flip is the TRIGGER (the flip happened)
-    but NOT the CONFIRMATION (the flip was structurally justified).
-    Only closed-candle tokens and BOS/CHoCH events count as confirmation.
+    FR-5: Uses structured evidence from the snapshot's module results.
+    A valid confirmation requires an event dict with:
+      - matching symbol and snapshot
+      - event_type in the canonical structural-break set
+      - supported non-empty timeframe
+      - strict closed status
+      - parseable event/close time (seconds, milliseconds, or ISO UTC)
+      - event_time after previous decision and not after current decision
+      - direction matching the new side
+    Text evidence is NEVER accepted.
     """
     issues: list[dict[str, Any]] = []
     cutoff_ms = int((datetime.now(timezone.utc).timestamp() - 4 * 3600) * 1000)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, analysis_time, market_bias, counter_evidence_json,
-               trade_plan_json, evidence_json
+               trade_plan_json, evidence_json, snapshot_id
         FROM ga_decisions
         WHERE analysis_time >= ?
         ORDER BY symbol, analysis_time ASC
@@ -383,24 +471,17 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
             "counter": _safe_json(r["counter_evidence_json"]) or [],
             "side": (_safe_json(r["trade_plan_json"]) or {}).get("side"),
             "evidence": _safe_json(r["evidence_json"]) or [],
+            "snapshot_id": r["snapshot_id"],
+            "symbol": r["symbol"],
         })
     for symbol, seq in by_symbol.items():
         for prev, cur in zip(seq, seq[1:]):
             prev_side = prev.get("side") or _bias_side(prev.get("bias"))
             cur_side = cur.get("side") or _bias_side(cur.get("bias"))
             if prev_side and cur_side and prev_side != cur_side:
-                # P1-11c: check multiple confirmation sources
-                # P1-6 (Round 3): market_bias flip is NOT confirmation.
-                # Only closed-candle tokens and BOS/CHoCH events count.
-                merged_counter = " ".join(str(x) for x in (cur["counter"] or []))
-                merged_evidence = " ".join(str(x) for x in (cur["evidence"] or []))
-                combined = merged_counter + " " + merged_evidence
-                structural_confirmation = any(
-                    token in combined
-                    for token in ("收盘突破", "收盘跌破", "收盘站上", "收盘站回",
-                                  "closed candle", "closed_candle",
-                                  "BOS", "CHoCH", "Break of Structure",
-                                  "Change of Character")
+                # FR-5: structured evidence from snapshot's module results
+                structural_confirmation = _has_structured_confirmation(
+                    repo, cur, cur_side, prev_ts=prev.get("ts", 0),
                 )
                 if not structural_confirmation:
                     issues.append(_issue(
@@ -412,6 +493,292 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
                         "方向翻转必须以已收盘 K 线突破作为证据；缺突破证据时记录诊断",
                     ))
     return issues
+
+
+# Canonical structural-break event types for direction flip confirmation.
+# All upper-case — comparison uses .upper() on the event_type value.
+_STRUCTURAL_BREAK_TYPES = frozenset({
+    "BOS", "BREAK_OF_STRUCTURE",
+    "CHOCH", "CHANGE_OF_CHARACTER",
+    "BREAKOUT", "BREAKDOWN",
+})
+
+# Supported timeframes for structured evidence
+_SUPPORTED_TIMEFRAMES = frozenset({
+    "1m", "5m", "15m", "1h", "4h", "1d",
+})
+
+
+def _has_structured_confirmation(
+    repo: CryptoGuardRepository, cur: dict[str, Any], new_side: str, *, prev_ts: int = 0,
+) -> bool:
+    """FR-5: Check for structured event confirmation of a direction flip.
+
+    Text evidence is NEVER accepted. A valid confirmation must come from
+    structured events associated with the decision's snapshot/module result
+    in the database. Inline evidence from ga_decisions.evidence_json /
+    counter_evidence_json is NOT trusted — it could be fabricated by the LLM.
+
+    Every accepted event must have:
+    - matching symbol and snapshot (looked up from module_analysis_results)
+    - event_type in the canonical structural-break set
+    - supported non-empty timeframe (from module_analysis_results.timeframe)
+    - strict closed status (snapshot events are by definition closed)
+    - required parseable event/close time (from module_analysis_results.analysis_time)
+    - event_time after previous decision and not after current decision
+    - direction matching the new side
+    """
+    snapshot_id = cur.get("snapshot_id")
+    symbol = cur.get("symbol")
+    analysis_time = cur.get("ts", 0)
+
+    # FR-5 (P1 fix): ONLY events looked up from the snapshot's module results
+    # are accepted. Inline evidence from cur["evidence"]/cur["counter"] is
+    # explicitly rejected — it lives in ga_decisions JSON columns that the
+    # LLM could populate with arbitrary dicts.
+    events = _lookup_snapshot_events(repo, snapshot_id, symbol)
+
+    for event in events:
+        # Must have a structural-break event_type (mapped from production shape)
+        event_type = event.get("event_type", "")
+        if not event_type:
+            continue
+        if str(event_type).upper() not in _STRUCTURAL_BREAK_TYPES:
+            continue
+
+        # FR-5: must have supported non-empty timeframe
+        timeframe = str(event.get("timeframe", "")).lower().strip()
+        if not timeframe or timeframe not in _SUPPORTED_TIMEFRAMES:
+            continue
+
+        # FR-5: strict closed status — snapshot events are by definition on
+        # closed candles; explicit closed=False rejects, otherwise accepted.
+        closed = event.get("closed", True)
+        if closed is not True and str(closed).lower().strip() not in {"true", "1", "yes"}:
+            continue
+
+        # FR-5: required parseable event/close time
+        event_time = _parse_event_time(event)
+        if event_time is None:
+            continue
+
+        # FR-5: event_time must be after previous decision and not after current
+        event_time_ms = int(event_time)
+        if prev_ts > 0 and event_time_ms <= prev_ts:
+            continue
+        if analysis_time > 0 and event_time_ms > analysis_time:
+            continue
+
+        # FR-5: direction must match new side
+        direction = str(event.get("direction", "")).lower().strip()
+        side_lower = new_side.lower()
+        direction_match = (
+            (side_lower == "long" and direction in {"bullish", "long", "up", "多"})
+            or (side_lower == "short" and direction in {"bearish", "short", "down", "空"})
+        )
+        if direction_match:
+            return True
+
+    return False
+
+
+# Production modules that emit structural-break events. The legacy
+# `smc_orderflow` module has 0 rows in production — real modules are
+# `price_action` (with `structure_events` list) and `smc`.
+_SNAPSHOT_EVENT_MODULES: tuple[str, ...] = ("price_action", "smc", "smc_orderflow")
+
+# Map production event names to canonical structural-break types.
+# Production `price_action.structure_events[].event` uses names like
+# `bullish_bos`, `bearish_choch`. The `type` field is `BOS`/`CHoCH`/`none`.
+_EVENT_NAME_TO_TYPE: dict[str, str] = {
+    "bullish_bos": "BOS",
+    "bearish_bos": "BOS",
+    "bullish_choch": "CHOCH",
+    "bearish_choch": "CHOCH",
+    "bullish_breakout": "BREAKOUT",
+    "bearish_breakout": "BREAKOUT",
+    "bullish_breakdown": "BREAKDOWN",
+    "bearish_breakdown": "BREAKDOWN",
+}
+
+
+def _normalize_snapshot_event(raw: dict[str, Any], *, timeframe: str, analysis_time: int) -> dict[str, Any] | None:
+    """FS-1 / FR-5: Map a production-shape event dict to the canonical shape.
+
+    Production `price_action.structure_events` rows emitted by
+    ``price_action_engine._structure_events()`` look like:
+        {"event": "bullish_bos", "type": "BOS", "event_type": "BOS",
+         "direction": "bullish", "timeframe": "1h",
+         "reference_high": 6.267, "reference_low": 5.957, "close": 6.308,
+         "close_time": <source candle close_time>, "closed": True}
+
+    Canonical shape required by ``_has_structured_confirmation``:
+        {"event_type": "BOS", "timeframe": "1h", "closed": True,
+         "time": <close_time_ms>, "direction": "bullish"}
+
+    FS-1: The event time MUST come from the source event's ``close_time``
+    (the actual candle close time written by ``price_action_engine``). The
+    module row's ``analysis_time`` MUST NOT be used as an event-time
+    fallback — module analysis time is when the analyzer ran, not when the
+    candle closed. Repeated analysis of the same higher-timeframe candle
+    therefore retains the same event time.
+
+    FS-1: The ``closed`` flag MUST come from the source event. It MUST NOT
+    be invented as ``True`` when the source event does not prove it.
+    """
+    event_name = str(raw.get("event", "")).lower().strip()
+    # Direct event_type field wins if present
+    direct_type = raw.get("event_type")
+    if direct_type:
+        event_type = str(direct_type).upper()
+    elif event_name in _EVENT_NAME_TO_TYPE:
+        event_type = _EVENT_NAME_TO_TYPE[event_name]
+    else:
+        # Fall back to the `type` field (BOS / CHoCH / none)
+        type_field = str(raw.get("type", "")).upper().strip()
+        if not type_field or type_field == "NONE":
+            return None
+        event_type = type_field
+
+    # Derive direction from event_name prefix or explicit direction field
+    direction = ""
+    if event_name.startswith("bullish") or event_name.startswith("bos_bull") or event_name.startswith("choch_bull"):
+        direction = "bullish"
+    elif event_name.startswith("bearish") or event_name.startswith("bos_bear") or event_name.startswith("choch_bear"):
+        direction = "bearish"
+    elif raw.get("direction"):
+        direction = str(raw.get("direction")).lower().strip()
+
+    # FS-1: event time MUST come from the source event. NEVER fall back to
+    # module analysis_time — that is when the analyzer ran, not when the
+    # candle closed.
+    event_time = raw.get("close_time")
+    if event_time is None:
+        event_time = raw.get("time")
+    if event_time is None:
+        event_time = raw.get("event_time")
+    if event_time is None:
+        # FS-1: no real event time — reject instead of substituting analysis_time
+        return None
+
+    # FS-1: closed flag MUST come from the source event. NEVER invent True.
+    closed_raw = raw.get("closed")
+    if closed_raw is None:
+        # Source event did not prove closed status — reject.
+        return None
+    if closed_raw is True or str(closed_raw).lower().strip() in {"true", "1", "yes"}:
+        closed = True
+    else:
+        # Explicit closed=False — reject.
+        return None
+
+    return {
+        "event_type": event_type,
+        "timeframe": timeframe,
+        "closed": closed,
+        "time": event_time,
+        "direction": direction,
+    }
+
+
+def _lookup_snapshot_events(
+    repo: CryptoGuardRepository, snapshot_id: int | None, symbol: str,
+) -> list[dict[str, Any]]:
+    """FR-5: Look up structured events from the snapshot's module results.
+
+    Production modules with structural-break events:
+    - `price_action`: result_json.structure_events (list of dicts)
+    - `smc`: result_json.events / structure_breaks (list of dicts)
+    - `smc_orderflow`: legacy module (0 rows in production as of 2026-06-29)
+
+    Each returned event is normalized to the canonical shape with event_type,
+    timeframe, closed, time, direction fields populated from the module row.
+    """
+    if snapshot_id is None:
+        return []
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT module, timeframe, analysis_time, result_json
+            FROM module_analysis_results
+            WHERE snapshot_id=? AND symbol=? AND module IN (?, ?, ?)
+            ORDER BY timeframe
+            """,
+            (int(snapshot_id), symbol, *_SNAPSHOT_EVENT_MODULES),
+        ).fetchall()
+    except Exception:
+        return []
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        result = _safe_json(row["result_json"]) or {}
+        if not isinstance(result, dict):
+            continue
+        timeframe = str(row["timeframe"] or "").lower().strip()
+        analysis_time = int(row["analysis_time"] or 0)
+        # price_action: structure_events list; smc: events/structure_breaks
+        items: list[Any] = []
+        for key in ("structure_events", "events", "structure_breaks", "breakouts", "breakdowns"):
+            v = result.get(key)
+            if isinstance(v, list):
+                items.extend(v)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalize_snapshot_event(item, timeframe=timeframe, analysis_time=analysis_time)
+            if normalized is not None:
+                events.append(normalized)
+    return events
+
+
+def _parse_event_time(event: dict[str, Any]) -> int | None:
+    """FR-5: Parse event time from seconds, milliseconds, or ISO UTC.
+
+    Returns milliseconds since epoch, or None if unparseable.
+    Threshold: values < 1e12 are seconds, >= 1e12 are milliseconds.
+    """
+    # Try multiple time field names
+    for field in ("event_time", "close_time", "time", "timestamp", "candle_close_time"):
+        raw = event.get(field)
+        if raw is None:
+            continue
+
+        # Integer/float: distinguish seconds from milliseconds
+        if isinstance(raw, (int, float)):
+            val = int(raw)
+            if val <= 0:
+                continue
+            if val < 1_000_000_000_000:
+                # Seconds — convert to milliseconds
+                return val * 1000
+            else:
+                # Already milliseconds
+                return val
+
+        # String: try ISO UTC format
+        if isinstance(raw, str):
+            raw_str = raw.strip()
+            if not raw_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except (ValueError, TypeError):
+                # Try as numeric string
+                try:
+                    val = int(float(raw_str))
+                    if val <= 0:
+                        continue
+                    if val < 1_000_000_000_000:
+                        return val * 1000
+                    else:
+                        return val
+                except (ValueError, TypeError):
+                    continue
+
+    return None
 
 
 def _check_invalid_liquidity_sweep_semantics(repo: CryptoGuardRepository) -> list[dict[str, Any]]:

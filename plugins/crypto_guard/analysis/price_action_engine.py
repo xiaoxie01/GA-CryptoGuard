@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 
-def analyze_price_action(candles: list[dict[str, Any]], *, analysis_time_utc: int) -> dict[str, Any]:
+def analyze_price_action(
+    candles: list[dict[str, Any]],
+    *,
+    analysis_time_utc: int,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
     if len(candles) < 8:
         return {
             "module": "price_action",
@@ -114,6 +119,9 @@ def analyze_price_action(candles: list[dict[str, Any]], *, analysis_time_utc: in
 
     confidence = 0.68 if structure in ("bullish", "bearish") else 0.55 if structure == "transition" else 0.45
     invalid_level = last_low if structure == "bullish" else last_high if structure == "bearish" else None
+    # FS-1: pass the latest closed candle's close_time so structure_events
+    # carry the real candle close time, not the module analysis_time.
+    source_close_time = candles[-1].get("close_time") if candles else None
     return {
         "module": "price_action",
         "market_structure": structure,
@@ -126,7 +134,11 @@ def analyze_price_action(candles: list[dict[str, Any]], *, analysis_time_utc: in
         "swing_highs": highs,
         "swing_lows": lows,
         "swing_labels": swing_labels,
-        "structure_events": _structure_events(last_event, previous_high, previous_low, close),
+        "structure_events": _structure_events(
+            last_event, previous_high, previous_low, close,
+            source_close_time=source_close_time,
+            timeframe=timeframe,
+        ),
         "range": {"high": last_high, "low": last_low, "width_pct": range_width_pct},
         "explanation": explain_structure(last_event, structure, invalid_level),
         "confidence": confidence,
@@ -181,7 +193,30 @@ def _range_width_pct(highs: list[dict[str, Any]], lows: list[dict[str, Any]], cl
     return abs(float(highs[-1]["price"]) - float(lows[-1]["price"])) / float(close)
 
 
-def _structure_events(last_event: str, previous_high: float, previous_low: float, close: float) -> list[dict[str, Any]]:
+def _structure_events(
+    last_event: str,
+    previous_high: float,
+    previous_low: float,
+    close: float,
+    *,
+    source_close_time: Any = None,
+    timeframe: str | None = None,
+) -> list[dict[str, Any]]:
+    """Emit structured events for the latest candle.
+
+    FS-1: each real structural-break event carries:
+      - ``event_type``: canonical type (BOS / CHoCH / fake_breakout / retest / none)
+      - ``direction``: ``bullish`` / ``bearish`` / ``""`` (empty for non-directional)
+      - ``timeframe``: caller-supplied timeframe, or empty string
+      - ``close_time``: actual source candle close time (from candles[-1])
+      - ``closed``: ``True`` (these events are by definition on closed candles)
+
+    For ``none`` / non-break events, ``event_type`` is ``"none"`` and the
+    event is still emitted so callers can inspect the last candle's context.
+    A missing ``source_close_time`` produces ``close_time=None`` and the
+    diagnostic normalizer MUST reject such events (no fallback to module
+    analysis_time).
+    """
     event_type = "none"
     if "bos" in last_event:
         event_type = "BOS"
@@ -191,4 +226,22 @@ def _structure_events(last_event: str, previous_high: float, previous_low: float
         event_type = "fake_breakout"
     elif "retest" in last_event:
         event_type = "retest"
-    return [{"event": last_event, "type": event_type, "reference_high": previous_high, "reference_low": previous_low, "close": close}]
+
+    direction = ""
+    if last_event.startswith("bullish"):
+        direction = "bullish"
+    elif last_event.startswith("bearish"):
+        direction = "bearish"
+
+    return [{
+        "event": last_event,
+        "type": event_type,
+        "event_type": event_type,
+        "direction": direction,
+        "timeframe": timeframe or "",
+        "reference_high": previous_high,
+        "reference_low": previous_low,
+        "close": close,
+        "close_time": source_close_time,
+        "closed": True,
+    }]

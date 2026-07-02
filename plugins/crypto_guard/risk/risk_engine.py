@@ -6,6 +6,7 @@ from typing import Any
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES, score_market_regime
 from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
+from plugins.crypto_guard.utils import _strict_positive_int_ms
 
 
 def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -13,6 +14,29 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
     risk = validate_trade_plan(result, snapshot)
     result["risk_check"] = risk
     result["manual_bypass_allowed"] = False
+
+    # BTC#9 fix: LLM failed/disabled fallback 不得直接创建模拟盘订单
+    cfg = load_config().trading_mode
+    risk_cfg = cfg.get("risk", {})
+    block_fallback = bool(risk_cfg.get("fallback_llm_failed_blocks_paper_order", True))
+    llm_status = str(result.get("llm_status") or "").lower()
+    fallback_blocked = block_fallback and llm_status in {"failed", "disabled"}
+    if fallback_blocked and result.get("has_trade_plan") and result.get("trade_plan"):
+        result["has_trade_plan"] = False
+        result["decision"] = "monitor_only"
+        # BTC#9 P2-2: audit fields for fallback downgrade
+        result["fallback_trade_plan_blocked"] = True
+        result["fallback_block_reason"] = f"llm_status={llm_status}, fallback_llm_failed_blocks_paper_order=true"
+        result["original_decision"] = "trade_plan_available"
+        result["downgraded_decision"] = "monitor_only"
+        notes = list(result.get("risk_notes") or [])
+        notes.append(f"LLM 状态为 {llm_status}，降级为 opportunity_watch，不创建模拟盘订单")
+        result["risk_notes"] = notes
+        # 让 risk_check 也反映降级
+        risk = dict(risk)
+        risk["ok"] = False
+        risk["reasons"] = list(risk.get("reasons") or []) + [f"llm_status={llm_status} 降级，禁止开仓"]
+        result["risk_check"] = risk
 
     if result.get("has_trade_plan") and result.get("trade_plan") and not risk["ok"]:
         result["has_trade_plan"] = False
@@ -22,6 +46,9 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
         result["risk_notes"] = notes
 
     result["suggested_actions"] = suggested_actions(result, risk)
+    # 二次保险：即使 suggested_actions 误含 create_paper_order 也过滤掉
+    if fallback_blocked and "create_paper_order" in result["suggested_actions"]:
+        result["suggested_actions"] = [a for a in result["suggested_actions"] if a != "create_paper_order"]
     if "create_opportunity_watch" in result["suggested_actions"] and not result.get("opportunity_watch"):
         result["opportunity_watch"] = default_watch_from_decision(result, risk)
     return result
@@ -48,10 +75,63 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
     if missing:
         reasons.append("trade_plan 字段不完整：" + ",".join(missing))
 
+    # Extract side early — needed by entry_trigger_confirmation validation
+    side = str(plan.get("side") or "").upper()
+
     # P0-D: Check entry_trigger_confirmation quality
-    # Auto/template confirmations indicate watch_only, not hard block
+    # BTC#9 fix: 结构化 closed_candle_confirmation 必须通过 _validate_entry_confirmation
+    # 裸字符串确认（"x", "manual_close_above_60300", "5m 突破确认"）一律拒绝
     entry_confirmation = plan.get("entry_trigger_confirmation")
-    metrics["has_entry_confirmation"] = bool(entry_confirmation and str(entry_confirmation).strip() not in ("", "auto", "template"))
+    require_ec = bool(risk_cfg.get("require_entry_confirmation_for_paper_order", True))
+    # R11-2: snapshot.analysis_time_utc 必须是严格正整数（int，非 bool/float/字符串）
+    snap_analysis_time = _strict_positive_int_ms((snapshot or {}).get("analysis_time_utc"))
+    if snap_analysis_time is None:
+        return {
+            "ok": False,
+            "reasons": ["snapshot.analysis_time_utc 缺失或非严格正整数，禁止开仓（无法校验未来函数）"],
+            "metrics": metrics,
+        }
+
+    # R11-4: decision.analysis_time_utc 必须存在且为严格正整数，并与 snapshot 完全一致
+    decision_time = _strict_positive_int_ms(decision.get("analysis_time_utc"))
+    if decision_time is None:
+        return {
+            "ok": False,
+            "reasons": ["decision.analysis_time_utc 缺失或非严格正整数，禁止开仓"],
+            "metrics": metrics,
+        }
+    if decision_time != snap_analysis_time:
+        return {
+            "ok": False,
+            "reasons": [f"analysis_time_mismatch: decision={decision_time} vs snapshot={snap_analysis_time}"],
+            "metrics": metrics,
+        }
+
+    analysis_time = snap_analysis_time
+
+    if entry_confirmation is None:
+        metrics["has_entry_confirmation"] = False
+        if require_ec:
+            reasons.append("缺少入场确认（entry_trigger_confirmation 为空），禁止直接开仓")
+    elif isinstance(entry_confirmation, str):
+        metrics["has_entry_confirmation"] = False
+        reasons.append(
+            "裸字符串确认已废弃，需结构化 closed_candle_confirmation，"
+            f"收到: {entry_confirmation!r}"
+        )
+    elif isinstance(entry_confirmation, dict):
+        valid_ec, ec_reason = _validate_entry_confirmation(
+            entry_confirmation, side, analysis_time,
+            snapshot=snapshot,
+        )
+        metrics["has_entry_confirmation"] = valid_ec
+        metrics["entry_confirmation_validation"] = ec_reason
+        if not valid_ec:
+            reasons.append(f"entry_trigger_confirmation 无效: {ec_reason}")
+    else:
+        metrics["has_entry_confirmation"] = False
+        if require_ec:
+            reasons.append(f"entry_trigger_confirmation 类型无效: {type(entry_confirmation).__name__}")
 
     rr = _risk_reward(plan)
     metrics["rr"] = rr
@@ -63,11 +143,27 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
     if confidence < min_conf:
         reasons.append(f"置信度 {confidence:.2f} 低于 {min_conf:.2f}")
 
-    side = str(plan.get("side") or "").upper()
     htf = _htf_support(side, snapshot)
     metrics["htf_support"] = htf
     if not htf["ok"]:
-        reasons.append(htf["reason"])
+        # BTC#9 P2-1: weak structure 在有有效 entry_confirmation 时可豁免
+        # 豁免必须: (1) reason 包含"结构偏弱" (2) entry_confirmation 是通过 _validate_entry_confirmation 的有效对象
+        if "结构偏弱" in str(htf.get("reason") or ""):
+            entry_confirmation = plan.get("entry_trigger_confirmation")
+            if isinstance(entry_confirmation, dict):
+                valid_ec, _ = _validate_entry_confirmation(
+                    entry_confirmation, side, analysis_time,
+                    snapshot=snapshot,
+                )
+                if valid_ec:
+                    metrics["htf_support"] = dict(htf, ok=True, reason="")
+                    metrics["weak_structure_confirmation_exemption"] = True
+                else:
+                    reasons.append(htf["reason"])
+            else:
+                reasons.append(htf["reason"])
+        else:
+            reasons.append(htf["reason"])
 
     alignment = _structure_momentum_alignment(side, snapshot)
     metrics["structure_momentum_alignment"] = alignment
@@ -90,6 +186,31 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
             min_sl_pct = float(risk_cfg.get("min_sl_distance_pct", 0.8))
             if sl_pct < min_sl_pct:
                 reasons.append(f"止损距离 {sl_pct:.3f}% 低于最小要求 {min_sl_pct}%，交易空间不足")
+
+        # BTC#9 fix: invalid_condition 与 stop_loss 必须保持缓冲 + 正确顺序
+        invalid_cond = plan.get("invalid_condition")
+        invalid_cond_price = _parse_invalid_condition_price(invalid_cond)
+        if stop and invalid_cond_price is not None:
+            dist_pct = abs(invalid_cond_price - stop) / stop * 100 if stop != 0 else 0.0
+            min_dist_pct = 0.1  # minimum 0.1% buffer
+            if dist_pct < min_dist_pct:
+                reasons.append(
+                    f"invalid_condition 价 {invalid_cond_price:.4f} 与 stop_loss {stop:.4f} "
+                    f"距离 {dist_pct:.4f}% 低于最小缓冲 {min_dist_pct}%，缺少失效缓冲层"
+                )
+            # BTC#9 fix: 验证严格的顺序 (strict <, not <=)
+            if side == "LONG":
+                if not (stop < invalid_cond_price < entry):
+                    reasons.append(
+                        "invalid_condition 不在 stop_loss 和 entry 之间 (LONG, strict): "
+                        f"stop={stop:.4f}, invalid_cond={invalid_cond_price:.4f}, entry={entry:.4f}"
+                    )
+            elif side == "SHORT":
+                if not (entry < invalid_cond_price < stop):
+                    reasons.append(
+                        "invalid_condition 不在 entry 和 stop_loss 之间 (SHORT, strict): "
+                        f"entry={entry:.4f}, invalid_cond={invalid_cond_price:.4f}, stop={stop:.4f}"
+                    )
 
         tps = plan.get("take_profits") or []
         if tps:
@@ -248,6 +369,605 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+_STRUCTURED_EVENT_TYPES = {"BOS", "CHOCH", "RECLAIM", "BREAKOUT_RETEST"}
+_STRUCTURED_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h"}
+_STRUCTURED_SOURCES = {"price_action", "smc", "deterministic_rule"}
+
+
+def _validate_entry_confirmation_shape(
+    confirmation: Any,
+    trade_side: str,
+    analysis_time_ms: int = 0,
+) -> tuple[bool, str]:
+    """Shape-only validation for structured entry confirmation.
+
+    This helper CANNOT grant order eligibility on its own. It validates
+    the structural fields but does NOT verify that the confirmation
+    references a real event in persisted module output.
+
+    Production risk paths must use _validate_entry_confirmation() with
+    snapshot/repo/module_analysis_results for provenance-aware validation.
+    """
+    import math
+
+    if not isinstance(confirmation, dict):
+        return False, "entry_trigger_confirmation 必须是对象，不是字符串"
+
+    if confirmation.get("type") != "closed_candle_confirmation":
+        return False, f"type 必须为 closed_candle_confirmation，收到 {confirmation.get('type')!r}"
+
+    timeframe = str(confirmation.get("timeframe") or "")
+    if timeframe not in _STRUCTURED_TIMEFRAMES:
+        return False, f"timeframe {timeframe!r} 不在支持集合 {sorted(_STRUCTURED_TIMEFRAMES)}"
+
+    event_type = str(confirmation.get("event_type") or "")
+    if event_type not in _STRUCTURED_EVENT_TYPES:
+        return False, f"event_type {event_type!r} 不在支持集合 {sorted(_STRUCTURED_EVENT_TYPES)}"
+
+    direction = str(confirmation.get("direction") or "").lower()
+    expected_dir = "bullish" if trade_side == "LONG" else "bearish"
+    if direction != expected_dir:
+        return False, f"direction={direction!r} 与 trade_side={trade_side} 不匹配（期望 {expected_dir}）"
+
+    close_time = _strict_positive_int_ms(confirmation.get("candle_close_time"))
+    if close_time is None:
+        return False, f"candle_close_time 必须是严格正整数，收到 {confirmation.get('candle_close_time')!r}"
+
+    # R10-2: analysis_time_ms <= 0 时 fail-closed — 不允许跳过未来函数校验
+    if analysis_time_ms <= 0:
+        return False, "analysis_time_ms 缺失或非正整数，无法校验未来函数"
+    if close_time > analysis_time_ms:
+        return False, (
+            f"candle_close_time={close_time} 晚于 analysis_time={analysis_time_ms}，"
+            f"存在未来函数泄漏风险"
+        )
+
+    # Price: must be finite positive (reject NaN/Infinity/0/negative)
+    price = confirmation.get("price", 0)
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return False, f"price 无法转换为数值，收到 {price!r}"
+    if not math.isfinite(price) or price <= 0:
+        return False, f"price 必须为有限正数，收到 {price}"
+
+    source = str(confirmation.get("source") or "")
+    if source not in _STRUCTURED_SOURCES:
+        return False, f"source {source!r} 不在支持集合 {sorted(_STRUCTURED_SOURCES)}"
+
+    # R8-1: symbol is MANDATORY — without it, cross-symbol matching
+    # cannot be prevented in the snapshot or DB fallback path.
+    symbol = str(confirmation.get("symbol") or "")
+    if not symbol:
+        return False, "symbol 字段必填（禁止跨 symbol 匹配）"
+
+    # R3-A: deterministic_rule must reference a persisted rule/event ID
+    if source == "deterministic_rule":
+        rule_id = confirmation.get("rule_id") or confirmation.get("event_id")
+        if not rule_id:
+            return False, (
+                "source=deterministic_rule 必须包含 rule_id 或 event_id "
+                "以追溯确定性规则输出，缺少该字段"
+            )
+
+    return True, ""
+
+
+def _validate_entry_confirmation(
+    confirmation: Any,
+    trade_side: str,
+    analysis_time_ms: int = 0,
+    *,
+    repo: Any = None,
+    snapshot: dict[str, Any] | None = None,
+    module_analysis_results: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate structured entry confirmation. Returns (valid, reason).
+
+    BTC#9 R3-A fix: When snapshot/repo/module_analysis_results are provided,
+    verification goes beyond shape validation — the confirmation must
+    reference a REAL event in the module output. LLM self-reported fields
+    are not trusted.
+
+    Shape-only validation (backward-compatible) runs when snapshot/repo/
+    module_analysis_results are all None. This shape-only path CANNOT
+    grant order eligibility in production risk paths — it is kept for
+    diagnostics and backward compatibility only.
+
+    Fail if:
+    - Not a dict
+    - Missing required fields
+    - type != "closed_candle_confirmation"
+    - timeframe not in supported set
+    - event_type not in supported set
+    - direction mismatches trade_side (LONG requires bullish, SHORT requires bearish)
+    - candle_close_time > analysis_time (event after analysis = future leak)
+    - candle_close_time <= 0 or price <= 0
+    - price is NaN/Infinity/0/negative
+    - source not in supported set
+    - source="deterministic_rule" without rule_id/event_id
+    - confirmation does not match any real event in module_analysis_results/snapshot
+
+    Returns (True, "") only when ALL checks pass.
+    """
+    # Step 1: shape validation (shared with _validate_entry_confirmation_shape)
+    valid_shape, shape_reason = _validate_entry_confirmation_shape(
+        confirmation, trade_side, analysis_time_ms,
+    )
+    if not valid_shape:
+        return False, shape_reason
+
+    # Step 2: provenance-aware verification (when real-source data is available)
+    if repo is not None or snapshot is not None or module_analysis_results is not None:
+        real_match = _find_matching_real_event(
+            confirmation, trade_side, analysis_time_ms,
+            snapshot=snapshot,
+            module_analysis_results=module_analysis_results,
+            repo=repo,
+        )
+        if not real_match:
+            return False, "confirmation_event_not_found_in_real_events"
+    else:
+        # R4-D3: When ALL provenance sources are None, we cannot verify the
+        # confirmation against real persisted events. Shape-only validation
+        # is insufficient to grant order eligibility — LLM self-reported
+        # fields are untrusted. Fail-closed.
+        return False, "provenance_unavailable"
+
+    return True, ""
+
+
+def _find_matching_real_event(
+    confirmation: dict[str, Any],
+    trade_side: str,
+    analysis_time_ms: int,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    module_analysis_results: dict[str, Any] | None = None,
+    repo: Any = None,
+) -> bool:
+    """Check if the confirmation references a real event in module output.
+
+    Matches by: source/module, timeframe, event_type, direction,
+    candle_close_time, price (within 0.01%), closed=True.
+
+    R4-D6: When repo is provided and source="deterministic_rule", verify
+    the rule_id against persisted deterministic events in the database.
+    """
+    import math
+
+    conf_source = str(confirmation.get("source") or "")
+    conf_timeframe = str(confirmation.get("timeframe") or "")
+    conf_event_type = str(confirmation.get("event_type") or "").upper()
+    conf_direction = str(confirmation.get("direction") or "").lower()
+    # R11-4: conf_close_time must be strict positive int
+    conf_close_time = _strict_positive_int_ms(confirmation.get("candle_close_time"))
+    if conf_close_time is None:
+        return False
+    try:
+        conf_price = float(confirmation.get("price") or 0)
+    except (TypeError, ValueError):
+        return False
+
+    # R8-2: snapshot symbol must match confirmation symbol — no cross-symbol matching.
+    conf_symbol = str(confirmation.get("symbol") or "")
+    if snapshot and isinstance(snapshot, dict):
+        snap_symbol = str(snapshot.get("symbol") or "")
+        if not snap_symbol:
+            return False  # snapshot 自身缺 symbol — fail-closed
+        if not conf_symbol or conf_symbol != snap_symbol:
+            return False
+
+    # Build candidate list from snapshot modules
+    candidates: list[dict[str, Any]] = []
+
+    if snapshot and isinstance(snapshot, dict):
+        modules = snapshot.get("modules") or {}
+        for module_key in ("price_action", "smc"):
+            module_data = modules.get(module_key) or {}
+            events = module_data.get("structure_events")
+            if isinstance(events, list):
+                for event in events:
+                    if isinstance(event, dict):
+                        candidates.append({**event, "_module": module_key})
+
+    # Also check module_analysis_results if provided
+    if module_analysis_results and isinstance(module_analysis_results, dict):
+        for module_key, module_data in module_analysis_results.items():
+            if not isinstance(module_data, dict):
+                continue
+            events = module_data.get("structure_events")
+            if isinstance(events, list):
+                for event in events:
+                    if isinstance(event, dict):
+                        candidates.append({**event, "_module": module_key})
+
+    if not candidates:
+        # R4-D6: Even without in-memory candidates, deterministic_rule source
+        # can be verified against persisted DB events via repo.
+        if conf_source == "deterministic_rule" and repo is not None:
+            if _verify_deterministic_rule_id(confirmation, repo, analysis_time_ms):
+                return True
+        return False
+
+    for event in candidates:
+        # Match source/module
+        event_module = event.get("_module") or event.get("source") or ""
+        if conf_source and conf_source != "deterministic_rule":
+            if conf_source != event_module and conf_source != event.get("source"):
+                continue
+
+        # Match timeframe (no defaulting)
+        event_timeframe = str(event.get("timeframe") or "")
+        if event_timeframe != conf_timeframe:
+            continue
+
+        # Match event_type
+        raw_event_type = str(event.get("event") or event.get("type") or "").upper()
+        for prefix, canonical in [("BULLISH_BOS", "BOS"), ("BEARISH_BOS", "BOS"),
+                                   ("BULLISH_CHOCH", "CHOCH"), ("BEARISH_CHOCH", "CHOCH"),
+                                   ("BULLISH_RECLAIM", "RECLAIM"), ("BEARISH_RECLAIM", "RECLAIM"),
+                                   ("BOS", "BOS"), ("CHOCH", "CHOCH"),
+                                   ("RECLAIM", "RECLAIM"), ("BREAKOUT_RETEST", "BREAKOUT_RETEST")]:
+            if raw_event_type == prefix:
+                raw_event_type = canonical
+                break
+        if raw_event_type != conf_event_type:
+            continue
+
+        # Match direction (no defaulting, no trusting LLM self-report)
+        event_direction = str(event.get("direction") or "").lower()
+        if event_direction not in {"bullish", "bearish"}:
+            raw_name = str(event.get("event") or event.get("type") or "").lower()
+            if "bullish" in raw_name:
+                event_direction = "bullish"
+            elif "bearish" in raw_name:
+                event_direction = "bearish"
+            else:
+                continue
+        if event_direction != conf_direction:
+            continue
+
+        # Match candle_close_time (R11-4: strict positive int parser)
+        event_close_time = _strict_positive_int_ms(event.get("candle_close_time") or event.get("close_time"))
+        if event_close_time is None:
+            continue
+        if event_close_time != conf_close_time:
+            continue
+
+        # Match price within 0.01%
+        event_price = event.get("price") or event.get("close")
+        try:
+            event_price = float(event_price)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(event_price) or event_price <= 0:
+            continue
+        if conf_price > 0 and event_price > 0:
+            price_diff_pct = abs(event_price - conf_price) / event_price * 100
+            if price_diff_pct > 0.01:
+                continue
+
+        # R8-3: closed must be strictly True (identity check), consistent with
+        # the DB fallback path (R7-D2). String "true" is no longer accepted.
+        closed = event.get("closed")
+        if closed is not True:
+            continue
+
+        # R4-D6: For deterministic_rule source, verify rule_id matches a field
+        # in the persisted event (rule_id, event_id, or id).
+        if conf_source == "deterministic_rule":
+            conf_rule_id = str(confirmation.get("rule_id") or confirmation.get("event_id") or "")
+            event_rule_id = str(
+                event.get("rule_id") or event.get("event_id") or event.get("id") or ""
+            )
+            if not conf_rule_id or not event_rule_id or conf_rule_id != event_rule_id:
+                continue
+
+        return True
+
+    # R4-D6: If no in-memory candidate matched, but repo is available and
+    # source is deterministic_rule, verify the rule_id against persisted DB data.
+    if conf_source == "deterministic_rule" and repo is not None:
+        if _verify_deterministic_rule_id(confirmation, repo, analysis_time_ms):
+            return True
+
+    return False
+
+
+def _verify_deterministic_rule_id(
+    confirmation: dict[str, Any],
+    repo: Any,
+    analysis_time_ms: int = 0,
+) -> bool:
+    """R5-D3/R6-D2: Verify that a deterministic_rule confirmation's rule_id references
+    a real persisted event in the database, with FULL field matching.
+
+    R4-D6 originally only checked if rule_id existed ANYWHERE in
+    module_analysis_results.result_json or feishu_events.event_id — no
+    symbol/direction/price/closed/time matching. An unrelated feishu_events
+    row with the same event_id would pass verification.
+
+    R5-D3 tightened to require symbol, direction, close_time, price, closed.
+
+    R6-D2 closes 5 remaining holes:
+    1. timeframe: now checked exactly (was missing entirely)
+    2. event_type: now checked canonically (was missing entirely)
+    3. direction: now MANDATORY — both confirmation and event must have a
+       valid direction that matches (was short-circuited: if either was
+       empty, the check was skipped)
+    4. analysis_time: no more 60s future leak tolerance — the upper bound
+       is exact (was `analysis_time_upper + 60000`)
+    5. feishu payload: all fields required — missing direction/price/timeframe/
+       event_type now FAIL instead of defaulting to ok=True
+
+    ALL of the following must match:
+    - symbol (exact)
+    - timeframe (exact)
+    - event_type (canonical match, e.g. BULLISH_BOS → BOS)
+    - direction (exact, MANDATORY — both sides must have valid value)
+    - candle_close_time (within +/-60000ms of confirmation's value)
+    - price (finite, positive, within 0.01% of confirmation's price)
+    - closed=True
+    - event_time <= analysis_time (no future leak, exact upper bound)
+
+    For feishu_events, the payload_json must contain ALL of:
+    symbol, direction, candle_close_time, price, timeframe, event_type
+    matching the confirmation.
+
+    Returns True only if a fully matching persisted record is found.
+    """
+    import json
+    import math
+
+    rule_id = str(confirmation.get("rule_id") or confirmation.get("event_id") or "")
+    if not rule_id:
+        return False
+
+    conf_symbol = str(confirmation.get("symbol") or "")
+    # R11-4: conf_close_time must be a strict positive int
+    conf_close_time = _strict_positive_int_ms(confirmation.get("candle_close_time"))
+    if conf_close_time is None:
+        return False
+    conf_direction = str(confirmation.get("direction") or "").lower()
+    try:
+        conf_price = float(confirmation.get("price") or 0)
+    except (TypeError, ValueError):
+        conf_price = 0.0
+    conf_event_type = str(confirmation.get("event_type") or "").upper()
+    conf_timeframe = str(confirmation.get("timeframe") or "")
+
+    # R7-D1: conf_symbol and conf_close_time are MANDATORY — without them
+    # the DB query would either scan all rows (global fallback) or match
+    # the wrong symbol. Fail closed instead.
+    # (R11-4: conf_close_time is already a strict positive int or None here.)
+    if not conf_symbol:
+        return False
+
+    # R7-D2: analysis_time_ms is MANDATORY — without a real analysis_time
+    # there is no sound upper bound. The old fallback
+    # (conf_close_time + 60000) allowed future events to leak through.
+    if analysis_time_ms <= 0:
+        return False
+    analysis_time_upper = analysis_time_ms
+
+    # R6-D2 hole 3: direction is MANDATORY — reject if confirmation has no direction
+    if conf_direction not in {"bullish", "bearish"}:
+        return False
+    # R6-D2 hole 2: event_type is MANDATORY
+    if not conf_event_type:
+        return False
+    # R6-D2 hole 1: timeframe is MANDATORY
+    if not conf_timeframe:
+        return False
+
+    # Canonical event_type mapping (same as _find_matching_real_event)
+    _EVENT_TYPE_CANONICAL = [
+        ("BULLISH_BOS", "BOS"), ("BEARISH_BOS", "BOS"),
+        ("BULLISH_CHOCH", "CHOCH"), ("BEARISH_CHOCH", "CHOCH"),
+        ("BULLISH_RECLAIM", "RECLAIM"), ("BEARISH_RECLAIM", "RECLAIM"),
+        ("BOS", "BOS"), ("CHOCH", "CHOCH"),
+        ("RECLAIM", "RECLAIM"), ("BREAKOUT_RETEST", "BREAKOUT_RETEST"),
+    ]
+
+    def _canonical_event_type(raw: str) -> str:
+        raw_upper = raw.upper()
+        for prefix, canonical in _EVENT_TYPE_CANONICAL:
+            if raw_upper == prefix:
+                return canonical
+        return raw_upper
+
+    conf_event_type_canonical = _canonical_event_type(conf_event_type)
+
+    # 1. Check module_analysis_results for matching rule_id in structure_events
+    #    with FULL field matching
+    try:
+        # R7-D1: conf_symbol and conf_close_time are mandatory (checked above),
+        # so the global fallback branch is removed. Query is always scoped.
+        mod_rows = repo.conn.execute(
+            "SELECT result_json, analysis_time, timeframe FROM module_analysis_results "
+            "WHERE symbol=? AND analysis_time >= ? "
+            "ORDER BY analysis_time DESC LIMIT 50",
+            (conf_symbol, conf_close_time - 86400000),  # 24h lookback
+        ).fetchall()
+        for row in mod_rows:
+            # R6-D2 hole 4: event_time (analysis_time) must not be after the upper bound.
+            # No 60s tolerance — the upper bound is exact.
+            row_analysis_time = int(row["analysis_time"] or 0)
+            if row_analysis_time > analysis_time_upper:
+                continue
+            try:
+                result = json.loads(row["result_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            events = result.get("structure_events") if isinstance(result, dict) else None
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_rid = str(event.get("rule_id") or event.get("event_id") or event.get("id") or "")
+                if not event_rid or event_rid != rule_id:
+                    continue
+                # R6-D2 hole 1: Match timeframe (exact)
+                # Prefer event-level timeframe, fall back to row-level timeframe
+                event_timeframe = str(event.get("timeframe") or row["timeframe"] or "")
+                if event_timeframe != conf_timeframe:
+                    continue
+                # R6-D2 hole 2: Match event_type (canonical)
+                raw_event_type = str(event.get("event") or event.get("type") or event.get("event_type") or "").upper()
+                event_type_canonical = _canonical_event_type(raw_event_type)
+                if event_type_canonical != conf_event_type_canonical:
+                    continue
+                # R6-D2 hole 3: Match direction — MANDATORY, no short-circuit
+                # Both confirmation and event must have a valid direction that matches.
+                event_direction = str(event.get("direction") or "").lower()
+                if event_direction not in {"bullish", "bearish"}:
+                    raw_name = str(event.get("event") or event.get("type") or "").lower()
+                    if "bullish" in raw_name:
+                        event_direction = "bullish"
+                    elif "bearish" in raw_name:
+                        event_direction = "bearish"
+                    else:
+                        # Missing direction — reject (not skip)
+                        continue
+                if event_direction != conf_direction:
+                    continue
+                # R7-D2: candle_close_time must match EXACTLY (was ±60000ms)
+                # R11-4: strict positive int parser
+                event_ct = _strict_positive_int_ms(event.get("candle_close_time") or event.get("close_time"))
+                if event_ct is None:
+                    continue
+                if event_ct != conf_close_time:
+                    continue
+                # Match price (finite, positive, within 0.01%)
+                event_price = event.get("price") or event.get("close")
+                try:
+                    event_price = float(event_price)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(event_price) or event_price <= 0:
+                    continue
+                if conf_price > 0 and event_price > 0:
+                    price_diff_pct = abs(event_price - conf_price) / event_price * 100
+                    if price_diff_pct > 0.01:
+                        continue
+                # R7-D2: closed must be exactly True (strict identity check)
+                closed = event.get("closed")
+                if closed is not True:
+                    continue
+                # All fields match — verified
+                return True
+    except Exception:
+        pass
+
+    # 2. Check feishu_events for matching event_id with structured trading payload
+    #    R6-D2 hole 5: ALL fields required — missing fields FAIL (not default-True)
+    #    R7-D2: closed must be strictly True, close_time must match EXACTLY,
+    #    and event close_time must not be after analysis_time_upper (no future leak).
+    try:
+        fe_row = repo.conn.execute(
+            "SELECT event_id, payload_json FROM feishu_events WHERE event_id=? LIMIT 1",
+            (rule_id,),
+        ).fetchone()
+        if fe_row:
+            try:
+                payload = json.loads(fe_row["payload_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            # R6-D2 hole 5: ALL fields must be present AND match.
+            # No default-True — missing fields mean rejection.
+            payload_symbol = str(payload.get("symbol") or "")
+            if payload_symbol != conf_symbol:
+                pass  # symbol mismatch or missing — reject
+            else:
+                # R6-D2 hole 1: timeframe must be present and match
+                payload_timeframe = str(payload.get("timeframe") or "")
+                if payload_timeframe != conf_timeframe:
+                    pass  # timeframe mismatch or missing — reject
+                else:
+                    # R6-D2 hole 2: event_type must be present and match canonically
+                    payload_event_type_raw = str(payload.get("event_type") or payload.get("event") or payload.get("type") or "").upper()
+                    payload_event_type_canonical = _canonical_event_type(payload_event_type_raw)
+                    if payload_event_type_canonical != conf_event_type_canonical:
+                        pass  # event_type mismatch or missing — reject
+                    else:
+                        # R6-D2 hole 3: direction must be present and match — MANDATORY
+                        payload_direction = str(payload.get("direction") or "").lower()
+                        if payload_direction not in {"bullish", "bearish"}:
+                            pass  # missing or invalid direction — reject
+                        elif payload_direction != conf_direction:
+                            pass  # direction mismatch — reject
+                        else:
+                            # candle_close_time must be present and match EXACTLY
+                            # R11-4: strict positive int parser
+                            payload_ct = _strict_positive_int_ms(payload.get("candle_close_time") or payload.get("close_time"))
+                            if payload_ct is None:
+                                pass  # missing or invalid close_time — reject
+                            elif payload_ct != conf_close_time:
+                                pass  # R7-D2: exact match (was ±60000ms)
+                            elif payload_ct > analysis_time_upper:
+                                pass  # R7-D2: future event — reject
+                            else:
+                                # price must be present, finite, positive, within 0.01%
+                                payload_price = payload.get("price") or payload.get("close")
+                                try:
+                                    payload_price = float(payload_price)
+                                except (TypeError, ValueError):
+                                    payload_price = 0.0
+                                if payload_price <= 0 or not math.isfinite(payload_price):
+                                    pass  # missing or invalid price — reject
+                                else:
+                                    price_diff_pct = abs(payload_price - conf_price) / payload_price * 100
+                                    if price_diff_pct > 0.01:
+                                        pass  # price mismatch — reject
+                                    else:
+                                        # R7-D2: closed must be exactly True (strict identity)
+                                        payload_closed = payload.get("closed")
+                                        if payload_closed is not True:
+                                            pass  # closed missing or not strictly True — reject
+                                        else:
+                                            # All fields match — verified
+                                            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _parse_invalid_condition_price(invalid_condition: Any) -> float | None:
+    """BTC#9 fix: 从 invalid_condition 文本中解析失效价位。
+
+    兼容格式：
+    - "15m 收盘跌破 59750.2"
+    - "15m 收盘站回 60250.5"
+    - 纯数字字符串/数值
+
+    解析失败返回 None（兼容 LLM 自由文本，不报错）。
+    """
+    if invalid_condition is None:
+        return None
+    if isinstance(invalid_condition, (int, float)):
+        try:
+            return float(invalid_condition)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(invalid_condition, str):
+        return None
+    import re
+    # BTC#9 fix: invalid_condition 文本可能包含非价格数字（如 "15m"），
+    # 取最后一个数字作为失效价
+    all_matches = re.findall(r"[-+]?\d+(?:\.\d+)?", invalid_condition)
+    if not all_matches:
+        return None
+    try:
+        return float(all_matches[-1])
+    except (TypeError, ValueError):
+        return None
+
+
 def _entry_price(plan: dict[str, Any]) -> float | None:
     value = plan.get("entry_price")
     if value is None:
@@ -289,13 +1009,42 @@ def _htf_support(side: str, snapshot: dict[str, Any]) -> dict[str, Any]:
     htf_structure = str(direction.get("market_structure") or "unknown")
     trend_structure = str(trend_1h.get("market_structure") or "unknown")
     setup_structure = str(setup_15m.get("market_structure") or "unknown")
+
+    cfg = load_config().trading_mode
+    risk_cfg = cfg.get("risk", {})
+    require_stronger = bool(risk_cfg.get("require_stronger_confirmation_for_weak_structure", True))
+
     # 4H 允许 transition 和 range（区间不提供方向偏置但也不阻断），1H/15M 允许 range
     if side == "LONG":
         ok = htf_structure in {"bullish", "transition", "range"} and trend_structure in {"bullish", "range", "transition"} and setup_structure in {"bullish", "range", "transition"}
-        reason = f"高周期不支持做多：4H={htf_structure}, 1H={trend_structure}, 15M={setup_structure}"
+        reason = "" if ok else f"高周期不支持做多：4H={htf_structure}, 1H={trend_structure}, 15M={setup_structure}"
+        # BTC#9 P2-1: weak structure fail-closed — multiple TFs with range/transition need stronger confirmation
+        if ok and require_stronger:
+            weak_tfs = []
+            if htf_structure in {"range", "transition"}:
+                weak_tfs.append("4H")
+            if trend_structure in {"range", "transition"}:
+                weak_tfs.append("1H")
+            if setup_structure in {"range", "transition"}:
+                weak_tfs.append("15M")
+            if len(weak_tfs) >= 2:
+                ok = False
+                reason = f"多周期结构偏弱（{','.join(weak_tfs)}），需更强入场确认"
     elif side == "SHORT":
         ok = htf_structure in {"bearish", "transition", "range"} and trend_structure in {"bearish", "range", "transition"} and setup_structure in {"bearish", "range", "transition"}
-        reason = f"高周期不支持做空：4H={htf_structure}, 1H={trend_structure}, 15M={setup_structure}"
+        reason = "" if ok else f"高周期不支持做空：4H={htf_structure}, 1H={trend_structure}, 15M={setup_structure}"
+        # BTC#9 P2-1: weak structure fail-closed
+        if ok and require_stronger:
+            weak_tfs = []
+            if htf_structure in {"range", "transition"}:
+                weak_tfs.append("4H")
+            if trend_structure in {"range", "transition"}:
+                weak_tfs.append("1H")
+            if setup_structure in {"range", "transition"}:
+                weak_tfs.append("15M")
+            if len(weak_tfs) >= 2:
+                ok = False
+                reason = f"多周期结构偏弱（{','.join(weak_tfs)}），需更强入场确认"
     else:
         ok = False
         reason = "trade_plan 缺少 LONG/SHORT 方向"
@@ -470,8 +1219,24 @@ def apply_regime_gate(
         }
 
     if alignment != "counter_regime":
+        # BTC#9 fix: chop/transition/unknown market_phase 不提供 confidence boost
+        # 只有 risk_on/rebound (for LONG) 或 risk_off/selloff (for SHORT) 才能 boost
+        market_phase = str(regime.get("market_phase") or "normal")
+        boost_suppressed = False
+        boost_suppress_reason: str | None = None
+
         if alignment == "aligned":
-            effective_delta = max(0.0, min(0.05, support_score * regime_weight))
+            # Only explicit regimes can boost: risk_on/rebound (LONG aligned) or risk_off/selloff (SHORT aligned)
+            boost_eligible_phases = {"risk_on", "rebound", "risk_off", "selloff"}
+            if market_phase in boost_eligible_phases:
+                effective_delta = max(0.0, min(0.05, support_score * regime_weight))
+            elif market_phase in {"chop", "transition", "unknown"}:
+                effective_delta = 0.0
+                boost_suppressed = True
+                boost_suppress_reason = f"market_phase={market_phase} 不提供信心加成"
+            else:
+                # "normal" or any other phase — current behavior (can add small boost)
+                effective_delta = max(0.0, min(0.05, support_score * regime_weight))
         elif alignment == "independent_trend":
             effective_delta = 0.0
         else:
@@ -542,6 +1307,7 @@ def apply_regime_gate(
                 "effective_confidence_after_regime": confidence,
                 "support_score": round(support_score, 4),
                 "support_score_side": support_side,
+                "confidence_boost_suppressed_reason": boost_suppress_reason,
             },
         }
 

@@ -54,6 +54,9 @@ jobs:
       include_symbols: true
       include_paper_positions: true
       include_queue_status: true
+    batch_gate:
+      poll_interval_seconds: 30
+      timeout_seconds: 300
 
   alert_outbox_retry:
     cron: "* * * * *"

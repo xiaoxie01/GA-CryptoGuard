@@ -1384,11 +1384,20 @@ event_time = format_event_time_cst(payload.get("event_time"))
 
 > **Trigger**: Production hourly report contained stale decisions, misclassified executable opportunities, and LLM summary text that contradicted structured execution state.
 
-### Contract 25.1: Batch completion gate — report MUST wait for all symbols
+### Contract 25.1: Batch completion gate — report MUST wait for all symbols, degraded on failure
 
-**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol's status is tracked atomically in `batch_symbol_status` (independent detail table, not JSON columns). The report renderer takes a single snapshot; if the batch is incomplete, the hourly report job is re-enqueued with a 30-second delay (up to 12 retries = 6 minutes max). After max retries, the report renders with `incomplete=true`. **The worker never polls or sleeps** — it returns instantly and re-enqueues.
+**What**: The scheduler registers an `analysis_batches` row with `batch_id = f"{primary_interval}:{analysis_time}"` at enqueue time. Each symbol's status is tracked atomically in `batch_symbol_status` (independent detail table, not JSON columns). The report renderer takes a single snapshot; if the batch is incomplete, the hourly report job is re-enqueued with a 30-second delay. **The worker never polls or sleeps** — it returns instantly and re-enqueues.
 
-**Why**: Without a batch gate, the report could render mid-cycle — some symbols had fresh decisions while others still showed stale rows from the previous cycle. This produced "phantom opportunities" that no longer existed.
+**Retry budget** (FR-3): `max_retries = ceil(timeout_seconds / poll_interval_seconds)`, derived from `scheduler.yaml` `batch_gate.timeout_seconds` and `batch_gate.poll_interval_seconds`. The `max_retries` key is NOT in the config — it is computed. `timeout_seconds=0` → immediate degraded report (no retries). Invalid values fall back with a warning.
+
+**Degraded report** (FR-1): When the batch is absent, failed, or has zero completed symbols after exhausting retries, the report renders a deterministic degraded report with:
+- Banner: "当前行情分析不可用，本报告未采用历史信号代替"
+- System metadata (scheduler time, retry count, batch state)
+- Risk state (from `AccountRiskGuard`)
+- Position summary (from `paper_positions`)
+- NO historical signals, NO `analysis_states`, NO `ga_decisions`, NO LLM commentary
+
+**Why**: Without a batch gate, the report could render mid-cycle — some symbols had fresh decisions while others still showed stale rows from the previous cycle. Without a degraded path, the report either adopted stale previous-cycle decisions (phantom opportunities) or silently produced an empty report. The degraded path is deterministic and fail-closed: it never substitutes historical data for current analysis.
 
 **Signatures**:
 ```python
@@ -1409,11 +1418,25 @@ def latest_ga_decisions_by_symbol(self, *, batch_id=None, min_analysis_time=None
     # When batch_id given, adds WHERE batch_id=? to SQL
 
 # hourly_report.py
-def _await_batch_completion(repo, *, primary_interval: str = "15m") -> dict:
+def _await_batch_completion(repo, *, primary_interval: str = "15m", expected_batch_id: str | None = None) -> dict:
     """Single snapshot of batch state — NO polling, NO sleep.
     Returns {complete, incomplete, completed_count, total_count, pending_symbols, ...}
-    Caller (build_hourly_report) re-enqueues if incomplete."""
+    Caller (build_hourly_report) re-enqueues if incomplete.
+    expected_batch_id: FR-2 retry identity — keeps original batch across retries."""
+
+def _compute_retry_budget(gate_cfg: dict) -> int:
+    """Derive max_retries from timeout_seconds / poll_interval_seconds.
+    timeout_seconds=0 → 0 retries (immediate degraded).
+    Invalid/missing values → fallback with warning."""
+
+def _should_use_degraded_report(batch_state: dict) -> bool:
+    """True if batch is absent, failed, or zero completed symbols."""
+
+def _render_degraded_report(repo, now: int, batch_state: dict, report_hour_utc: str | None, expected_batch_id: str | None) -> dict:
+    """Render deterministic degraded report with banner, system/risk/position only."""
 ```
+
+**Retry identity chain** (FR-2): Re-enqueue carries `report_hour_utc`, `expected_batch_id`, `expected_analysis_time`, and `retry_count` through scheduler→worker→report→re-enqueue. Session ID pattern: `hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{retry_count}`. Uses `enqueue_job_once()` to prevent duplicate retry jobs. Original delivery context is preserved across retries.
 
 **Scheduler wiring**: `enqueue_market_analysis` in `cron_scheduler.py` creates the batch row + inserts `batch_symbol_status` rows for each enabled symbol (status="pending"). `run_ga_workers.py` marks each symbol completed/failed on job resolution, then checks `is_batch_complete` and calls `finish_analysis_batch`. When a symbol is skipped (already pending), `mark_batch_symbol_completed(batch_id, symbol, status="pending")` marks it as pending (not completed) — the existing job will change it to completed/failed when it resolves.
 
@@ -1568,9 +1591,21 @@ def grade_delta(current: str, previous: str | None) -> int:
 | `opportunity_below_confidence_threshold` | warning | S/A/B grade below min_confidence |
 | `summary_execution_state_conflict` | error | Forbidden phrases in summary despite gate failure |
 | `excessive_grade_flip` | warning | S/A→D/C within 4 hours |
-| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence or BOS/CHoCH structural confirmation (market_bias flip alone is NOT confirmation) |
+| `direction_flip_without_closed_candle` | warning | Direction flip without closed candle evidence or **structured BOS/CHoCH confirmation** (FR-5: text containing BOS/CHoCH keywords is NOT confirmation; requires event_type in structural break set, timeframe in supported set, closed status, parseable event time, direction matching) |
 | `invalid_liquidity_sweep_semantics` | warning | sell_side paired with explicit bearish belief words ("看空"/"bearish"), or buy_side with explicit bullish belief words ("看多"/"bullish"). Neutral direction words like "向下"/"向上" are NOT flagged. |
 | `negative_drawdown_display` | warning | Positive drawdown_percent when equity shows loss |
+
+**Structured direction confirmation** (FR-5): `_has_structured_confirmation(repo, cur, new_side, *, prev_ts=0)` validates ALL fields of a snapshot event before accepting it as confirmation of a direction flip:
+1. `event_type` must be in `_STRUCTURAL_BREAK_TYPES` (BOS, CHoCH, etc.)
+2. `timeframe` must be in `_SUPPORTED_TIMEFRAMES` (15m, 1h, 4h, 1d)
+3. `closed` must be truthy (not pending/None)
+4. Event time must be parseable via `_parse_event_time()` (handles seconds <1e12, milliseconds >=1e12, ISO strings)
+5. Event time must be after `prev_ts` and not after current decision time
+6. Direction must match `new_side`
+
+Text-only evidence (e.g. summary containing "BOS"/"CHoCH" keywords) is explicitly rejected — only structured event objects from `module_analysis_results` qualify.
+
+**Production module shape** (FR-5): `_lookup_snapshot_events(repo, snapshot_id, symbol)` queries `module_analysis_results` with `module IN ('price_action', 'smc', 'smc_orderflow')`. Real production modules are `price_action` and `smc` (4,320 rows each); `smc_orderflow` is included for forward compatibility but currently has 0 rows. The `result_json` field is parsed; `structure_events` is a list of `{event, type, reference_high, reference_low, close}` objects. The normalizer maps `event` (e.g. `bullish_bos`, `bearish_choch`) to canonical `{event_type, direction, closed, time, timeframe}` — `event_type` is uppercased (`BOS`, `CHOCH`), direction is derived from the `bullish_*`/`bearish_*` prefix, `timeframe` and `analysis_time` come from the `module_analysis_results` row columns.
 
 **Integration**: `run_for_report(repo)` wraps the diagnostic call with a never-raises guarantee for render-time use. On exception, returns `ok=False` (fail-closed, not fail-open). `_check_summary_execution_state_conflict` uses `is_valid_trade_plan()` for trade plan validation, not simple dict non-empty check.
 
@@ -1578,4 +1613,241 @@ def grade_delta(current: str, previous: str | None) -> int:
 
 ---
 
-**Last updated**: 2026-06-28 (P0: Hourly report accuracy R3 — re-enqueue instead of polling, ROW_NUMBER window query, risk_gate before hysteresis, deterministic summary generation, batch status three-way logic)
+### Contract 25.6: Lossless batch_symbol_status migration (FR-4)
+
+**What**: `_ensure_batch_symbol_status_check_constraint()` in `migrations.py` rebuilds the `batch_symbol_status` table when the CHECK constraint on `status` is missing or incorrect. The migration is idempotent and lossless.
+
+**Why**: Production databases created before the CHECK constraint was added could have invalid statuses (`running`, `skipped`, etc.) that bypass the batch gate logic. Simply adding the constraint would fail on existing dirty data. The migration normalizes invalid rows before applying the constraint.
+
+**Migration procedure**:
+1. SAVEPOINT — all changes rollback on failure
+2. Check for residual temp table `_batch_symbol_status_old` from prior failed migration; drop if exists
+3. Copy table with explicit column list (NOT `SELECT *`) — guards against schema drift
+4. Separate valid rows (`status IN ('pending', 'completed', 'failed')`) from invalid rows
+5. Normalize invalid statuses to `'pending'` with audit entries in `_migration_state` (key encodes batch_id, symbol, original_status, normalized_to)
+6. Verify row count matches after rebuild
+7. Apply CHECK constraint with exact regex: `CHECK (status IN ('pending', 'completed', 'failed'))`
+8. Validate constraint exists post-migration
+9. RELEASE SAVEPOINT on success; ROLLBACK TO on failure
+
+**Schema health check**: `check_schema_health()` validates the CHECK constraint pattern using exact regex, not substring matching.
+
+**Forbidden**:
+```python
+# WRONG: SELECT * (fragile to schema changes)
+INSERT INTO new_table SELECT * FROM old_table
+
+# CORRECT: Explicit column list
+INSERT INTO new_table (batch_id, symbol, status, updated_at) SELECT batch_id, symbol, status, updated_at FROM old_table
+
+# WRONG: DROP TABLE without residual cleanup
+DROP TABLE IF EXISTS _batch_symbol_status_old  # missed before rebuild starts
+
+# CORRECT: Check and clean residual first
+conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_batch_symbol_status_old'")
+```
+
+---
+
+### Contract 25.7: Account risk guard ordering (FR-6)
+
+**What**: `AccountRiskGuard.check(symbol, side)` in `risk/account_risk_guard.py` MUST compute `combo_avg_r` and `cooldown` blocks BEFORE any early return — including the "no risk-off territory" path and the "recovery eligible" path. If `blocked=True` was computed, the result MUST honor it (return a full result dict with `blocked=True`/`blocked_reason`/`cooldown_active`), NOT call `_ok_result()` which forces `blocked=False`.
+
+**Why**: The recovery-eligible path previously returned `_ok_result()` immediately, ignoring a just-computed `blocked=True` from combo cooldown or negative `combo_avg_r`. This allowed new positions to open on combos with negative historical avg_r, bypassing the combo gate.
+
+**Required ordering**:
+1. Get account, compute `drawdown_pct`
+2. Check daily loss pause, hard_risk_off, risk_off
+3. Compute `cooldown_active` / `cooldown_until` from `cooldown_symbols` config + last loss time
+4. Compute `combo_avg_r` from `paper_trades` (last 20 by symbol+side)
+5. If `combo_avg_r < 0 and not blocked`: set `blocked=True`, `blocked_reason`
+6. Early return paths (not risk_off / recovery_eligible): if `blocked`, return full result dict honoring `blocked`; otherwise `_ok_result()`
+
+**Forbidden**:
+```python
+# WRONG: Recovery bypasses combo gate
+if recovery_eligible:
+    return _ok_result(drawdown_pct=drawdown_pct)  # ignores blocked=True
+
+# CORRECT: Honor blocked flag even on recovery-eligible path
+if recovery_eligible:
+    if blocked:
+        return {"ok": True, "risk_off": False, ..., "blocked": True, "blocked_reason": blocked_reason, ...}
+    return _ok_result(drawdown_pct=drawdown_pct)
+```
+
+---
+
+### Contract 25.8: Retry identity time pinning (FR-2)
+
+**What**: `_await_batch_completion(repo, *, primary_interval, expected_batch_id, expected_analysis_time)` in `notify/hourly_report.py` MUST use `expected_analysis_time` as the `cutoff_ms` for filtering `ga_decisions` when provided. It MUST NOT recompute the cutoff from `utc_ms()` on each retry — that would shift the cutoff across 15-minute boundaries and silently filter out the original batch's decisions.
+
+**Why**: A retry that fires after a 15-minute boundary recomputes `cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())`, which now points to the NEXT 15-minute slot. The original batch's decisions (with `analysis_time` from the previous slot) get filtered out, and the renderer falls back to stale or empty data.
+
+**Retry identity chain**: `build_hourly_report` carries `expected_analysis_time` from the original `enqueue_market_analysis` call through every retry. The chain: `cron_scheduler.enqueue_market_analysis` → `agent_jobs.payload` → `run_ga_workers.build_hourly_report` → `_await_batch_completion(expected_analysis_time=...)`. On retry re-enqueue, the same `expected_analysis_time` is preserved in the new job's payload.
+
+**Config-derived retry budget** (FR-3): `build_hourly_report` and `_await_batch_completion` use `_compute_retry_budget(gate_cfg)` to derive `timeout_seconds` and `poll_interval_seconds`, NOT raw `int(gate_cfg.get("timeout_seconds", 300))`. This ensures invalid config values (e.g. `"not-a-number"`) fall back gracefully instead of crashing the build.
+
+**Forbidden**:
+```python
+# WRONG: Recompute cutoff on each retry
+cutoff_ms = latest_closed_close_time_ms(primary_interval, utc_ms())
+
+# CORRECT: Pin to expected_analysis_time from original batch
+cutoff_ms = int(expected_analysis_time) if expected_analysis_time is not None else latest_closed_close_time_ms(primary_interval, utc_ms())
+
+# WRONG: Direct int() on config value (crashes on invalid input)
+timeout_seconds = int(gate_cfg.get("timeout_seconds", 300))
+
+# CORRECT: Use normalizer with fallback
+retry_budget = _compute_retry_budget(gate_cfg)
+timeout_seconds = retry_budget["timeout_seconds"]
+```
+
+---
+
+## 37. BTC#9 Trade Gate Contracts
+
+### 37.1 Fallback LLM-Failed Must Not Create Paper Orders
+
+**Contract**: When `llm_status` is `"failed"` or `"disabled"`, `apply_risk_to_decision` must force `has_trade_plan=False`, `decision="monitor_only"`, and filter `create_paper_order` from `suggested_actions`.
+
+**Config gate**: `risk.fallback_llm_failed_blocks_paper_order` (default `true`).
+
+**Audit fields**: `fallback_trade_plan_blocked`, `fallback_block_reason`, `original_decision`, `downgraded_decision`.
+
+### 37.2 Entry Confirmation Hard-Blocks Without Structured Evidence
+
+**Contract**: Bare strings (`"x"`, `"manual_close_above_60300"`, `"5m 突破确认"`) are rejected. Only structured dicts of type `closed_candle_confirmation` pass `_validate_entry_confirmation`.
+
+**Config gate**: `risk.require_entry_confirmation_for_paper_order` (default `true`).
+
+### 37.3 HTF Support Reason Must Be Self-Consistent
+
+**Contract**: When `_htf_support` returns `ok=True`, `reason` must be empty (not contain "不支持"). When `ok=False`, `reason` explains why.
+
+**Weak structure**: Two or more TFs in `{range, transition}` → `ok=False` unless a valid structured entry confirmation provides exemption.
+
+### 37.4 Market Phase Chop Must Not Boost Confidence
+
+**Contract**: `apply_regime_gate` `aligned` branch: only `risk_on`, `rebound`, `risk_off`, `selloff` phases may boost. `chop`, `transition`, `unknown` → `effective_delta=0.0` with `confidence_boost_suppressed_reason`.
+
+### 37.5 Fill Must Revalidate Latest GA Before Execution
+
+**Contract**: `_revalidate_pending_before_fill` queries `_latest_ga_decision` with `ORDER BY analysis_time DESC, id DESC`. Exception or missing GA → `ga_recheck_unavailable` (fail-closed). GA conflict (LONG vs bearish S/A/B or SHORT vs bullish S/A/B) → cancel with SAVEPOINT/CAS, audit log on success only.
+
+### 37.6 Limit Fill Must Validate Candle Health
+
+**Contract**: `_validate_limit_fill_candle` requires entry zone reclaim AND no adverse momentum. `_is_unhealthy_pullback_bar` blocks doji-free adverse-body candles with excessive wick ratio.
+
+### 37.7 Invalid Condition Must Have Buffer From Stop Loss
+
+**Contract**: LONG: `stop < invalid_condition_price <= entry`. SHORT: `entry <= invalid_condition_price < stop`. Buffer ratio: `_invalid_condition_price(invalid, side, entry)` uses `buffer_ratio` from `invalid_condition_buffer_ratio` config (default 0.3), clamped [0.1, 0.5].
+
+### 37.8 Per-Candle 1m Closed Candle Processing
+
+**Contract**: `paper_position_updater.update_paper_positions()` processes only fully closed 1m candles. `last_processed_candle_time` cursor advances only on confirmed fills. Unclosed candles are never used for fill decisions.
+
+### 37.9 Independent Contract Marker
+
+**Contract**: BTC#9 diagnostics use `btc9_trade_gate_contract_v1` marker (NOT the R4 marker). Written by `_ensure_btc9_trade_gate_contract_marker` during `initialize_database`. `INSERT OR IGNORE` ensures idempotency.
+
+### 37.10 Diagnostic Severity Semantics
+
+**Contract**: `state_consistency.ok` is `False` only when `error_count > 0`. Severities: `error`, `warning`, `legacy_info`. Six BTC#9 diagnostic types with contract-marker cutoff gating.
+
+### 37.11 Event-Time Threading (Round 2)
+
+**Contract**: `fill_order_if_triggered(event_time)` accepts candle.close_time (ms). All timestamps — `paper_orders.filled_at`, `paper_trades.created_at`, `paper_positions.opened_at/updated_at`, `paper_trade_logs` ts, `stop_take_path_json` filled ts, `paper_event_alert` payload `filled_at` — use `iso_utc_from_ms(event_time)`. Missing/unparseable event_time → fail-closed (`missing_event_time`). Repository APIs (`create_paper_trade`, `update_paper_order_status`, `log_paper_trade_event`) accept explicit `event_time`/`filled_at` params; no internal `utc_iso()`.
+
+### 37.12 Post-Fill Candle Continuation (Round 2)
+
+**Contract**: After fill on candle N, `update_paper_positions` continues processing remaining closed candles through the open-order path (SL/TP, path metrics). The fill candle itself only creates the trade; SL/TP deferred to next candle (conservative). Same-candle SL+TP ambiguity: SL priority, `ambiguous_intrabar` recorded. Cursor advances per-candle; never advances past a failed candle. Restart resumes from last successful cursor without duplicate fills.
+
+### 37.13 Structured Confirmation Real-Source Verification (Round 2)
+
+**Contract**: `_validate_entry_confirmation` accepts `repo`/`snapshot`/`module_analysis_results` kwargs. When provided, confirmation must match a real event in module output (matched via `_find_matching_real_event`): source/module, timeframe, event_type, direction, candle_close_time, price (within 0.01%), closed=True. LLM self-reported closed/source/direction not trusted. `source="deterministic_rule"` must trace to deterministic rule output. Price must be finite positive; NaN/Infinity/0/negative rejected. `candle_close_time` must be positive int ms, closed, and <= analysis_time.
+
+### 37.14 PA structure_events Traversal (Round 2)
+
+**Contract**: `_extract_structured_entry_confirmation` traverses `price_action.structure_events` and `smc.structure_events`. Forbids defaulting `timeframe`/`closed`/`direction` — missing fields reject the event. Generic BOS/CHoCH requires explicit `direction` field. Selection: direction matches trade side, closed=True, `close_time <= analysis_time`, price finite positive. Returns newest valid event (sorted by close_time descending). None if no valid event (deterministic plans blocked by `require_ec` gate).
+
+### 37.15 Strict invalid_condition Ordering (Round 2)
+
+**Contract**: `_invalid_condition_price(invalid, side, entry)` returns None when entry is None (fail-closed, no old fallback). Uses `buffer_ratio` from config (default 0.3, clamped [0.1, 0.5]). LONG: `stop < invalid_condition_price < entry`. SHORT: `entry < invalid_condition_price < stop`. `validate_trade_plan` enforces strict `<` (not `<=`). Rounding re-validates strict ordering. Config anomalies/NaN/越界 use safe defaults with audit.
+
+### 37.16 GA Recheck Fail-Closed with Idempotent Audit (Round 2)
+
+**Contract**: `_revalidate_pending_before_fill` requires `event_time` for limit orders (fail-closed `missing_event_time`). Calls `_latest_ga_decision(repo, symbol, max_analysis_time=event_time)` — SQL adds `AND analysis_time <= ?` upper bound. Only cancels if latest GA `analysis_time` > order's GA `analysis_time`. Exception → `ga_recheck_unavailable` return, order stays pending, cursor not advanced. `_log_ga_recheck_unavailable` writes idempotent audit (dedupe_key). Missing latest GA → fail-closed.
+
+### 37.17 Conflict Cancel SAVEPOINT/CAS Audit (Round 2)
+
+**Contract**: SAVEPOINT wraps `UPDATE paper_orders SET status='revalidator_cancelled' WHERE id=? AND status IN ('pending','needs_recheck')`. `cur.rowcount == 1` checked before audit log. `position_id=NULL` for pending orders (no trade yet). `event_json` includes: `order_id`, `original_ga_decision_id`, `invalidated_by_ga_decision_id`, `order_side`, `latest_bias`, `latest_grade`, `event_time`, `dedupe_key`. CAS failure (rowcount=0) → rollback, no log, no notification, cursor not advanced. Duplicate calls retain one successful audit.
+
+### 37.18 Network Error vs No-Data Distinction (Round 2)
+
+**Contract**: `_fetch_unprocessed_closed_candles` returns `{"ok": False, "error": "network_error", "candles": []}` on exception, `{"ok": True, "error": None, "candles": [...]}` on success. Filters to only closed candles (`close_time < now_ms`), sorts by `open_time` ascending. Network error on first page: skip order with `candle_fetch_network_error` skip_reason, preserve cursor, no fill. Success with no candles: use mark_price for equity only, no fill trigger.
+
+### 37.19 Paged Backfill (Round 2)
+
+**Contract**: `update_paper_positions` fetches multiple pages until: no more closed candles, config cap reached (`max_candles_per_page=500`, `max_pages_per_batch=10`, `max_candles_per_batch=500`), error, or order closed/filled. Each page `startTime` strictly > prev page last `close_time`. Cursor persisted per-candle after successful processing. Network error preserves last successful cursor. Multi-page test (1200 candles) verifies order, no duplicates, no gaps.
+
+### 37.20 Cutoff-Gated Diagnostics (Round 2)
+
+**Contract**: `_check_fallback_llm_failed_created_paper_order` and `_check_missing_entry_confirmation_paper_order` use `_btc9_contract_cutoff(repo)` as SQL WHERE filter. Pre-marker data: `legacy_info` or excluded (never error). Post-marker: `error`. `missing_entry_confirmation` calls unified `_validate_entry_confirmation` (not just non-empty check) — bare strings and fabricated objects are invalid. Aggregate COUNT detects LIMIT truncation. `_check_chop_regime_boosted` checks `transition`/`unknown` (not just `chop`) for abnormal boosts.
+
+### 37.21 Marker Missing Diagnostic (Round 2)
+
+**Contract**: `_check_btc9_contract_marker_missing` emits `severity=error` when `btc9_trade_gate_contract_v1` marker absent from `_migration_state`. Marker absent → diagnostics must not silently skip all BTC#9 checks and report healthy. `initialize_database()` writes marker via `INSERT OR IGNORE` after all schema + migration steps succeed. Fresh DB after `initialize_database()` must have marker. Marker is written LAST (only after `check_schema_health()` passes).
+
+**Verified on production DB (2026-07-01, READ-ONLY)**: Production DB at `data/crypto_guard/crypto_guard.sqlite3` (674MB, 44 tables) has 3 markers (`stop_loss_adjustment_dedup_v1`, `profit_protection_mark_price_contract_v1`, `hourly_report_accuracy_r4_contract_v1`) but `btc9_trade_gate_contract_v1` is MISSING. `diagnose_state_consistency()` correctly emits `btc9_contract_marker_missing` with `severity=error`, `ok=False`, `error_count=1`.
+
+**Verified on fresh DB (2026-07-01)**: Temp DB after `initialize_database()` has both `hourly_report_accuracy_r4_contract_v1` and `btc9_trade_gate_contract_v1` markers. `check_schema_health(conn=conn)` returns `ok=True`. `diagnose_state_consistency()` returns `ok=True`, `error_count=0`, `btc9_contract_marker_missing=0`.
+
+### 37.22 R3-A: Structured Confirmation Provenance-Aware Validation
+
+**Contract**: `_validate_entry_confirmation` (`risk_engine.py:437`) accepts `repo`/`snapshot`/`module_analysis_results` kwargs. When provided, confirmation must match a real event in module output via `_find_matching_real_event` (`risk_engine.py:494`): source/module, timeframe, event_type, direction, candle_close_time, price (within 0.01%), closed=True. LLM self-reported closed/source/direction not trusted. `source="deterministic_rule"` must trace to deterministic rule output. Price must be finite positive; NaN/Infinity/0/negative rejected. `candle_close_time` must be positive int ms, closed, and <= analysis_time. No match → fail-closed.
+
+**Tests**: `test_r3a_fabricated_confirmation_rejected_by_validate_trade_plan`, `test_r3a_fabricated_confirmation_cannot_activate_weak_structure_exemption`, `test_r3a_matching_pa_event_passes`, `test_r3a_matching_smc_event_passes`, `test_r3a_price_mismatch_rejected`, `test_r3a_event_time_mismatch_rejected`, `test_r3a_source_mismatch_rejected`, `test_r3a_direction_mismatch_rejected`, `test_r3a_closed_none_rejected`, `test_r3a_closed_missing_rejected`, `test_r3a_closed_false_rejected`, `test_r3a_deterministic_rule_without_rule_id_rejected`, `test_r3a_deterministic_rule_with_rule_id_shape_passes`.
+
+### 37.23 R3-B: Event-Time Threading and Post-Fill Continuation
+
+**Contract**: `fill_order_if_triggered(repo, order, price, *, event_time=None)` (`paper_broker.py:809`) accepts candle.close_time (ms). All timestamps — `paper_orders.filled_at`, `paper_trades.created_at`, `paper_positions.opened_at/updated_at`, `paper_trade_logs` ts, `stop_take_path_json` filled ts, `paper_event_alert` payload `filled_at` — use `iso_utc_from_ms(event_time)`. Missing/unparseable event_time → fail-closed (`missing_event_time`). `allow_wall_clock=False` in repository APIs for replay paths.
+
+Post-fill: After fill on candle N, `update_paper_positions` (`paper_position_updater.py:109`) continues processing remaining closed candles through the open-order path (SL/TP, path metrics). The fill candle only creates the trade; SL/TP deferred to next candle (conservative). Same-candle SL+TP ambiguity: SL priority, `ambiguous_intrabar` recorded. Cursor advances per-candle; never advances past a failed candle.
+
+**Tests**: `test_r3b_historical_fill_writes_event_time_everywhere`, `test_r3b_historical_sl_writes_closing_candle_time_everywhere`, `test_r3b_historical_tp_writes_closing_candle_time_everywhere`, `test_r3b_missing_replay_event_time_creates_no_trade`, `test_r3b_live_mode_supports_wall_clock_execution`, `test_r3b_replay_crossing_utc_day_boundary_attributed_to_candle_day`.
+
+### 37.24 R3-C: Cursor Preservation on Retryable GA Failure
+
+**Contract**: `_revalidate_pending_before_fill` (`paper_broker.py:593`) requires `event_time` for limit orders (fail-closed `missing_event_time`). Calls `_latest_ga_decision(repo, symbol, max_analysis_time=event_time)` — SQL adds `AND analysis_time <= ?` upper bound. Exception → `ga_recheck_unavailable` return, order stays pending, cursor not advanced. `_log_ga_recheck_unavailable` writes idempotent audit (dedupe_key). Missing latest GA → fail-closed. Retryable skip stops processing of later candles (cursor preserved at failed candle).
+
+**Tests**: `test_r3c_ga_recheck_unavailable_preserves_cursor`, `test_r3c_retryable_skip_stops_processing_later_candles`, `test_r3c_idempotent_audit_single_record_per_order_candle_reason`, `test_r3c_cancel_race_lost_preserves_cursor`.
+
+### 37.25 R3-D: GA Recheck Time Semantics
+
+**Contract**: GA recheck baseline time: if `ga_decision_id` exists, baseline = that GA's integer `analysis_time`; if no `ga_decision_id`, baseline = `order.created_at` converted to ms (`paper_broker.py:593-685`). Only GA decisions with `analysis_time` > baseline AND `analysis_time <= event_time` may invalidate the order. Conflict cancel uses `event_time` (not wall clock) for audit timestamp. SAVEPOINT rollback on cancel exception. Latest GA analysis_time read exception returns `ga_recheck_unavailable`.
+
+**Tests**: `test_r3d_created_at_baseline_when_no_ga_decision_id`, `test_r3d_baseline_unavailable_when_no_ga_id_and_no_created_at`, `test_r3d_conflict_cancel_uses_event_time_not_wall_clock`, `test_r3d_ga_recheck_unavailable_distinct_from_baseline_unavailable`, `test_r3d_savepoint_rollback_on_cancel_exception`, `test_r3d_latest_ga_analysis_time_read_exception_returns_unavailable`.
+
+### 37.26 R3-E: Cutoff-Gated Diagnostics with Aggregate Count
+
+**Contract**: `_check_fallback_llm_failed_created_paper_order` (`state_consistency.py:1543`) and `_check_missing_entry_confirmation_paper_order` (`state_consistency.py:1627`) use `_btc9_contract_cutoff(repo)` as SQL WHERE filter. Pre-marker data: `legacy_info` or excluded (never error). Post-marker: `error`. `missing_entry_confirmation` calls unified `_validate_entry_confirmation` (not just non-empty check) — bare strings and fabricated objects are invalid. Aggregate `COUNT(*)` detects LIMIT truncation (more than 500 candidate rows cannot produce false clean). `_check_chop_regime_boosted` (`state_consistency.py:1821`) checks `chop`, `transition`, AND `unknown` phases for abnormal boosts (not just `chop`).
+
+**Tests**: `test_r3e_persisted_fabricated_confirmation_diagnosed_post_marker`, `test_r3e_equivalent_pre_marker_row_excluded_or_legacy`, `test_r3e_confirmation_matching_persisted_module_evidence_not_reported`, `test_r3e_more_than_500_candidate_rows_cannot_produce_false_clean`.
+
+### 37.27 R3-F: Strict invalid_condition Ordering
+
+**Contract**: `_invalid_condition_price(invalid, side, entry)` (`ga_judge.py:43`) returns `None` when `entry` is `None` (fail-closed, no old fallback). Uses `buffer_ratio` from config (default 0.3, clamped [0.1, 0.5]). LONG: `stop < invalid_condition_price < entry`. SHORT: `entry < invalid_condition_price < stop`. `validate_trade_plan` (`risk_engine.py:183`) enforces strict `<` (not `<=`). Rounding re-validates strict ordering. Missing `closed` field rejected; `closed=False` rejected; equality with entry or stop rejected.
+
+**Tests**: `test_r3f_missing_closed_rejected`, `test_r3f_closed_false_rejected`, `test_r3f_equality_with_entry_rejected_long`, `test_r3f_equality_with_entry_rejected_short`, `test_r3f_equality_with_stop_rejected_long`, `test_r3f_equality_with_stop_rejected_short`, `test_r3f_missing_entry_cannot_generate_invalidation_level`.
+
+### 37.28 R3-G: Paged Backfill Production Config
+
+**Contract**: `update_paper_positions` (`paper_position_updater.py:109`) fetches multiple pages until: no more closed candles, config cap reached, error, or order closed/filled. Each page `startTime` strictly > prev page last `close_time`. Cursor persisted per-candle after successful processing. Network error preserves last successful cursor. Production config (`trading_mode.yaml:48-51`): `max_candles_per_batch=1500`, `max_candles_per_page=500`, `max_pages_per_batch=10`. The invariant `max_candles_per_batch >= 3 * max_candles_per_page` (1500 >= 3*500=1500) ensures at least 3 pages of downtime recovery capacity.
+
+**Tests**: `test_r3g_production_config_processes_1200_candles_over_three_pages`, `test_r3g_page_two_failure_stops_at_last_page_one_candle`, `test_r3g_deduplicates_page_boundary_candles`, `test_r3g_malformed_data_stops_and_preserves_cursor`.
+
+---
+
+**Last updated**: 2026-07-01 (Round 2 Final: BTC#9 trade gate final seal — R3-H production marker verification complete, Sections 37.22-37.28 added for R3-A through R3-G contracts with test names and production verification results)

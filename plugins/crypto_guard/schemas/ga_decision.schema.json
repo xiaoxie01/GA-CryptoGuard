@@ -2,9 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GADecision",
   "type": "object",
-  "required": ["symbol", "decision", "signal_grade", "confidence", "summary", "counter_evidence", "has_trade_plan", "suggested_actions", "risk_notes"],
+  "required": ["symbol", "analysis_time_utc", "decision", "signal_grade", "confidence", "summary", "counter_evidence", "has_trade_plan", "suggested_actions", "risk_notes"],
   "properties": {
     "symbol": {"type": "string"},
+    "analysis_time_utc": {"type": "integer", "minimum": 1, "description": "unix millis, 必须为正整数，与 snapshot.analysis_time_utc 一致"},
     "decision": {
       "type": "string",
       "enum": ["trade_plan_available", "wait_for_pullback", "wait_for_breakout", "wait_for_reclaim", "avoid_chop", "no_edge", "monitor_only"]
@@ -39,7 +40,21 @@
         },
         "risk_percent": {"type": "number"},
         "invalid_condition": {"type": "string"},
-        "reason": {"type": "string"}
+        "reason": {"type": "string"},
+        "entry_trigger_confirmation": {
+          "type": ["object", "null"],
+          "required": ["type", "timeframe", "event_type", "direction", "candle_close_time", "price", "source", "symbol"],
+          "properties": {
+            "type": {"type": "string", "enum": ["closed_candle_confirmation"]},
+            "symbol": {"type": "string", "description": "Must equal top-level decision.symbol — cross-symbol matching is forbidden"},
+            "timeframe": {"type": "string", "enum": ["1m", "5m", "15m", "1h", "4h"]},
+            "event_type": {"type": "string", "enum": ["BOS", "CHOCH", "RECLAIM", "BREAKOUT_RETEST"]},
+            "direction": {"type": "string", "enum": ["bullish", "bearish"]},
+            "candle_close_time": {"type": "integer", "description": "unix millis"},
+            "price": {"type": "number"},
+            "source": {"type": "string", "enum": ["price_action", "smc", "deterministic_rule"]}
+          }
+        }
       }
     },
     "opportunity_watch": {
