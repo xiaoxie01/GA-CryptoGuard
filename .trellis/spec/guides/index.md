@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [CryptoGuard Delivery Guide](./crypto-guard-delivery.md) | Enforce high-risk closure and production readiness | CryptoGuard trading, data, persistence, reporting, or operations changes |
 
 ---
 

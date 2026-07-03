@@ -695,3 +695,14 @@ CREATE TABLE IF NOT EXISTS shadow_virtual_trades (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- R2: backfill_progress tracks the last-open_time fetched per (symbol, interval)
+-- so a paged backfill can resume after interruption without re-fetching
+-- completed pages. Primary key is (symbol, interval) — one progress row per pair.
+CREATE TABLE IF NOT EXISTS backfill_progress (
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    last_open_time_fetched INTEGER,
+    last_updated_ms INTEGER,
+    PRIMARY KEY (symbol, interval)
+);

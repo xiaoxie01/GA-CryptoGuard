@@ -19,7 +19,103 @@ from plugins.crypto_guard.storage.sqlite_db import connect_db
 _START_LOCK = threading.Lock()
 _STARTED = False
 _THREADS: list[threading.Thread] = []
+
+# P1-2 R4: Warmup readiness gate — explicit 3-state machine.
+#
+# The old binary ``threading.Event`` was fail-open: it was set to True on
+# BOTH success and failure, so a failed/degraded warmup let analysis
+# proceed on bad data. The state machine fixes this:
+#
+#   "pending"  — warmup started but not yet finished (analysis deferred)
+#   "ready"    — warmup succeeded AND data is not degraded (analysis allowed)
+#   "failed"   — warmup raised, returned degraded=True, or timed out
+#                (analysis deferred; next periodic warmup can recover to "ready")
+#
+# Only ``state == "ready"`` opens the gate. Exceptions, degraded results,
+# and timeouts all transition to "failed" — the gate stays closed and
+# ``enqueue_market_analysis`` returns a deferred result.
+#
+# Default is "ready" so tests/CLI that never call ``start_all_services``
+# proceed normally. The readiness gate respects this default. In tests we
+# don't run the warmup thread, so the default must allow analysis.
+_WARMUP_STATE = "ready"  # one of "pending", "ready", "failed"
+_WARMUP_LOCK = threading.Lock()
+_WARMUP_STARTED_AT: float | None = None
+_WARMUP_TIMEOUT_SECONDS = 600.0  # 10 minutes
+_WARMUP_FAILURE_REASON: str = ""
+
 LOGGER = get_logger("crypto_guard.service")
+
+
+def _set_warmup_started() -> None:
+    """Called by ``start_all_services`` to mark the warmup race window open."""
+    global _WARMUP_STARTED_AT, _WARMUP_FAILURE_REASON
+    with _WARMUP_LOCK:
+        _WARMUP_STATE_PENDING()  # transition to pending
+        _WARMUP_STARTED_AT = time.time()
+        _WARMUP_FAILURE_REASON = ""
+
+
+def _WARMUP_STATE_PENDING() -> None:
+    """Internal helper to set state=pending (assumes lock held)."""
+    global _WARMUP_STATE
+    _WARMUP_STATE = "pending"
+
+
+def _set_warmup_ready() -> None:
+    """Called when warmup succeeded AND data is not degraded."""
+    global _WARMUP_STATE, _WARMUP_FAILURE_REASON, _WARMUP_STARTED_AT
+    with _WARMUP_LOCK:
+        _WARMUP_STATE = "ready"
+        _WARMUP_FAILURE_REASON = ""
+        _WARMUP_STARTED_AT = None  # clear so timeout check doesn't fire
+
+
+def _set_warmup_failed(reason: str) -> None:
+    """Called on exception, degraded result, or timeout."""
+    global _WARMUP_STATE, _WARMUP_FAILURE_REASON, _WARMUP_STARTED_AT
+    with _WARMUP_LOCK:
+        _WARMUP_STATE = "failed"
+        _WARMUP_FAILURE_REASON = str(reason)
+        _WARMUP_STARTED_AT = None  # clear so timeout check doesn't fire
+
+
+def is_warmup_complete() -> bool:
+    """Check whether the warmup gate is open.
+
+    Returns ``True`` ONLY when ``_WARMUP_STATE == "ready"``. The timeout
+    fallback transitions to "failed" (not "ready") so analysis stays
+    deferred until a subsequent periodic warmup succeeds.
+    """
+    global _WARMUP_STATE, _WARMUP_FAILURE_REASON
+    # Check timeout first: if warmup has been pending longer than the
+    # timeout, transition to failed (fail-closed, not fail-open).
+    if _WARMUP_STARTED_AT is not None:
+        elapsed = time.time() - _WARMUP_STARTED_AT
+        if elapsed >= _WARMUP_TIMEOUT_SECONDS:
+            with _WARMUP_LOCK:
+                if _WARMUP_STATE == "pending":
+                    _WARMUP_STATE = "failed"
+                    _WARMUP_FAILURE_REASON = "timeout"
+                    LOGGER.warning(
+                        "warmup timeout (%.0fs elapsed >= %.0fs) — gate "
+                        "transitions to failed; analysis stays deferred",
+                        elapsed, _WARMUP_TIMEOUT_SECONDS,
+                    )
+    with _WARMUP_LOCK:
+        return _WARMUP_STATE == "ready"
+
+
+def get_warmup_state() -> str:
+    """Return the current warmup state string for diagnostics."""
+    with _WARMUP_LOCK:
+        return _WARMUP_STATE
+
+
+def get_warmup_failure_reason() -> str:
+    """Return the failure reason (empty string if not failed)."""
+    with _WARMUP_LOCK:
+        return _WARMUP_FAILURE_REASON
 
 
 def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
@@ -47,6 +143,52 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
                 LOGGER.warning("Recovered stale running agent_jobs count=%s", recovered)
         finally:
             conn.close()
+
+        # R5: Run market-data warmup once at startup before the scheduler loop.
+        # This backfills any gaps from downtime so the first analysis tick has
+        # healthy data. P1-9: runs in a background thread so it doesn't block
+        # startup or delay the scheduler/worker threads from starting. The
+        # scheduler loop will retry on the next tick if the warmup fails.
+        # P1-2 R4: Transition to "pending" so enqueue_market_analysis defers
+        # analysis until warmup finishes. The warmup thread transitions to
+        # "ready" (success, no degradation) or "failed" (exception/degraded).
+        # The periodic market_data_warmup cron job (every 5 min) can recover
+        # from "failed" to "ready" on a subsequent successful run.
+        _set_warmup_started()
+
+        def _warmup_bg(_=None) -> None:
+            # P1-2 R4: on entry, state is "pending" (set by _set_warmup_started).
+            # market_data_warmup() now handles the state transitions internally:
+            #   - success (no degradation) → _set_warmup_ready()
+            #   - degraded → _set_warmup_failed("degraded")
+            #   - exception → _set_warmup_failed(str(exc))
+            # The finally block below is a safety net: if market_data_warmup
+            # returns without setting state (shouldn't happen, but defensive),
+            # transition to "failed" so the gate doesn't stay in "pending".
+            try:
+                from plugins.crypto_guard.scheduler.cron_scheduler import market_data_warmup
+                warmup_result = market_data_warmup()
+                if warmup_result.get("degraded"):
+                    LOGGER.warning(
+                        "CryptoGuard startup market_data_warmup: degraded=%s symbols=%s",
+                        warmup_result.get("degraded"),
+                        list(warmup_result.get("symbols", {}).keys()),
+                    )
+                else:
+                    LOGGER.info("CryptoGuard startup market_data_warmup: all TFs ready")
+            except Exception as exc:
+                LOGGER.exception("CryptoGuard startup market_data_warmup failed; scheduler will retry on next tick")
+                _set_warmup_failed(str(exc))
+            finally:
+                # P1-2 R4: if state is still "pending" (e.g. market_data_warmup
+                # returned without transitioning state, or an early return path
+                # didn't set it), transition to "failed" so the gate doesn't
+                # stay closed forever. The next periodic warmup job can
+                # recover to "ready".
+                if get_warmup_state() == "pending":
+                    _set_warmup_failed("incomplete")
+
+        _spawn("crypto_guard_warmup", _warmup_bg, None)
 
         _spawn("crypto_guard_user_worker", _user_worker_loop, send_message)
         _spawn("crypto_guard_background_worker", _background_worker_loop, send_message)
@@ -152,6 +294,9 @@ def _due_scheduler_jobs(now: datetime) -> list[str]:
         jobs.append("position_conflict_revalidation")
     # Shadow virtual trade update: every minute
     jobs.append("shadow_virtual_trade_update")
+    # R5: market-data warmup — runs every 5 min before analysis to backfill gaps
+    if minute % 5 == 0:
+        jobs.append("market_data_warmup")
     # Daily review: run between 00:05-00:30 UTC (wider window for crash recovery)
     # _tick_key ensures it only runs once per day
     if hour == 0 and 5 <= minute <= 30:
@@ -182,4 +327,6 @@ def _tick_key(job_name: str, now: datetime) -> int:
         return int(now.timestamp()) // (10 * 60)
     if job_name == "shadow_virtual_trade_update":
         return int(now.timestamp()) // 60
+    if job_name == "market_data_warmup":
+        return int(now.timestamp()) // (5 * 60)
     return int(now.timestamp()) // 86400

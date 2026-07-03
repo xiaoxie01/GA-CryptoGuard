@@ -11,7 +11,7 @@
       "enum": ["trade_plan_available", "wait_for_pullback", "wait_for_breakout", "wait_for_reclaim", "avoid_chop", "no_edge", "monitor_only"]
     },
     "signal_grade": {"type": "string", "enum": ["S", "A", "B", "C", "D"]},
-    "market_bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed"]},
+    "market_bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
     "trend_stage": {"type": "string", "enum": ["early", "middle", "late", "range", "transition", "unknown"]},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     "summary": {"type": "string"},
@@ -70,7 +70,7 @@
     },
     "suggested_actions": {
       "type": "array",
-      "items": {"type": "string", "enum": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore"]}
+      "items": {"type": "string", "enum": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore", "monitor_only"]}
     }
   }
 }

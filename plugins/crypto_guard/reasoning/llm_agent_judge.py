@@ -98,9 +98,9 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
         "schema_contract": {
             "decision": ["trade_plan_available", "wait_for_pullback", "wait_for_breakout", "wait_for_reclaim", "avoid_chop", "no_edge", "monitor_only"],
             "signal_grade": ["S", "A", "B", "C", "D"],
-            "market_bias": ["bullish", "bearish", "neutral", "mixed"],
+            "market_bias": ["bullish", "bearish", "neutral", "mixed", "unknown"],
             "trend_stage": ["early", "middle", "late", "range", "transition", "unknown"],
-            "suggested_actions": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore"],
+            "suggested_actions": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore", "monitor_only"],
         },
         "task": "按 SOP_MULTI_TIMEFRAME_MARKET_ANALYSIS 输出最终 GADecision JSON。",
         "sop": [
@@ -319,6 +319,38 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         decision["counter_evidence"] = list(fallback.get("counter_evidence") or ["LLM 未给出反向证据，沿用规则 SOP 风险提示。"])
     if not isinstance(decision.get("risk_notes"), list):
         decision["risk_notes"] = list(fallback.get("risk_notes") or [])
+
+    # P0-3: Generation layer fail-closed. When analysis_degraded=True (set by
+    # market_state_builder when data health fails), force the decision to a
+    # degraded-but-recorded shape regardless of LLM output. Skip the
+    # auto-build trade plan block below — the data is too degraded to author
+    # a trade plan, even if the LLM claims an A/S grade.
+    analysis_degraded = bool(snapshot.get("analysis_degraded") or
+                             ((snapshot.get("data_quality") or {}).get("analysis_degraded")))
+    if analysis_degraded:
+        decision["market_bias"] = "unknown"
+        decision["signal_grade"] = "C"
+        decision["confidence"] = min(float(decision.get("confidence") or 0.3), 0.3)
+        decision["has_trade_plan"] = False
+        decision["trade_plan"] = None
+        decision["decision"] = "monitor_only"
+        decision["opportunity_watch"] = None
+        decision["suggested_actions"] = ["monitor_only"]
+        decision["trend_stage"] = "unknown"
+        decision["degraded_reason"] = "analysis_degraded: market data health check failed (contiguity/freshness/gap)"
+        # P1-6: overwrite summary and final_summary with a deterministic
+        # degraded string. Previously the original LLM bullish/bearish text
+        # (e.g. "强势看涨，可创建模拟盘多单") was preserved, contradicting
+        # the forced market_bias=unknown. Do NOT keep the original LLM text.
+        decision["summary"] = "分析降级，方向不可靠"
+        decision["final_summary"] = "分析降级，方向不可靠"
+        notes = list(decision.get("risk_notes") or [])
+        if not any("分析降级" in str(n) for n in notes):
+            notes.append("分析降级：数据不完整，强制 market_bias=unknown、signal_grade=C、无交易计划。")
+        decision["risk_notes"] = notes
+        # Skip the auto-build trade plan block — do NOT fall through to the
+        # grade-based auto-build logic below.
+        return decision
 
     # 当 LLM 给出 A/S 级但没有 trade_plan 时，自动补建
     grade = str(decision.get("signal_grade") or "D").upper()

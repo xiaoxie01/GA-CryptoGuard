@@ -44,11 +44,14 @@ def analyze_trend_stage(price_action: dict[str, Any], momentum: dict[str, Any], 
 
 
 def fuse_trend_stage(profiles: dict[str, Any], primary_stage: dict[str, Any], *, analysis_time_utc: int) -> dict[str, Any]:
-    weights = {"4h": 0.35, "1h": 0.25, "15m": 0.20, "5m": 0.20}
+    # P0-6: Add "1d" weight (was missing — 1D defaulted to 1.0 via
+    # weights.get(timeframe, 1), dominating all other TFs combined).
+    # Also change default from 1 to 0 so unknown TFs don't dominate.
+    weights = {"1d": 0.10, "4h": 0.35, "1h": 0.25, "15m": 0.20, "5m": 0.10}
     stage_scores: dict[str, float] = {}
     structure_scores: dict[str, float] = {}
     for timeframe, profile in profiles.items():
-        weight = weights.get(timeframe, 1)
+        weight = weights.get(timeframe, 0)
         stage = profile.get("trend_stage") or "transition"
         structure = profile.get("market_structure") or "unknown"
         stage_scores[stage] = stage_scores.get(stage, 0) + weight

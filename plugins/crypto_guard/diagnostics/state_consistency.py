@@ -113,6 +113,17 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_chop_regime_boosted(repo))
     issues.extend(_check_fill_without_ga_revalidation(repo))
     issues.extend(_check_invalid_condition_equals_stop_loss(repo))
+    # R7: 10 market-data-contract diagnostic checks
+    issues.extend(_check_market_data_insufficient_contiguous_samples(repo))
+    issues.extend(_check_market_data_gap_detected(repo))
+    issues.extend(_check_market_data_stale_last_candle(repo))
+    issues.extend(_check_market_data_future_candle(repo))
+    issues.extend(_check_market_data_duplicate_open_time(repo))
+    issues.extend(_check_analysis_created_with_unready_market_data(repo))
+    issues.extend(_check_executable_decision_with_unready_market_data(repo))
+    issues.extend(_check_paper_order_created_with_unready_market_data(repo))
+    issues.extend(_check_report_claims_complete_for_gapped_data(repo))
+    issues.extend(_check_deterministic_direction_from_failed_llm(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -2002,6 +2013,806 @@ def _check_invalid_condition_equals_stop_loss(repo: CryptoGuardRepository) -> li
                 "suggested_action": (
                     "invalid_condition 价与 stop_loss 同价，缺少失效缓冲层。"
                     "检查 ga_judge._build_trade_plan 的 invalid_condition_price 计算。"
+                ),
+            })
+    return issues
+
+
+def _market_data_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
+    """R7: Return the cutoff timestamp for market-data-contract checks.
+
+    Uses the independent ``market_data_contract_v1`` marker (written by R2's
+    ``_ensure_market_data_contract_marker`` during ``initialize_database``).
+    Returns ``None`` if the marker is absent, meaning market-data diagnostics
+    should be skipped (no contract yet).
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = 'market_data_contract_v1' "
+            "LIMIT 1"
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        pass
+    return None
+
+
+def _check_market_data_insufficient_contiguous_samples(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-1 (error): ga_decisions where any required TF's contiguous_count < required_count.
+
+    Parses ``market_snapshots.data_quality_json`` (joined via
+    ``ga_decisions.snapshot_id``) for the ``health`` mapping. Each TF entry
+    contains ``contiguous_count`` and ``required_count``. When any TF has
+    ``contiguous_count < required_count``, the analysis ran with insufficient
+    contiguous samples — a contract violation flagged for review.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.snapshot_id,
+                   ms.data_quality_json
+            FROM ga_decisions gd
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE gd.snapshot_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_market_data_insufficient_contiguous_samples query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        health = dq.get("health") or {}
+        if not isinstance(health, dict):
+            continue
+        for tf, h in health.items():
+            if not isinstance(h, dict):
+                continue
+            contiguous = int(h.get("contiguous_count") or 0)
+            required = int(h.get("required_count") or 0)
+            if required > 0 and contiguous < required:
+                issues.append({
+                    "type": "market_data_insufficient_contiguous_samples",
+                    "severity": "error",
+                    "scope": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                    },
+                    "time_window": {
+                        "analysis_time_utc": row["analysis_time_utc"],
+                        "analysis_time_ms": row["analysis_time"],
+                    },
+                    "details": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                        "contiguous_count": contiguous,
+                        "required_count": required,
+                        "snapshot_id": row["snapshot_id"],
+                    },
+                    "message": (
+                        f"{row['symbol']} {tf} 连续样本数 {contiguous} < 要求 {required}，"
+                        "分析在数据不足时运行（contiguous_tail_count < required_count）。"
+                    ),
+                    "suggested_action": (
+                        "检查 market_data_warmup 是否在该分析周期前完成回填。"
+                        "contiguous_count 不足时 analysis_degraded 必须为 True。"
+                    ),
+                })
+                break  # one violation per decision is enough
+    return issues
+
+
+def _check_market_data_gap_detected(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-2 (error): ga_decisions where data_quality.health[tf].gap_count > 0
+    within the analysis window.
+
+    A gap inside the analysis window means indicators may have crossed the
+    gap, producing unreliable RSI/MACD/ATR/trend_stage values.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.snapshot_id,
+                   ms.data_quality_json
+            FROM ga_decisions gd
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE gd.snapshot_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_market_data_gap_detected query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        health = dq.get("health") or {}
+        if not isinstance(health, dict):
+            continue
+        for tf, h in health.items():
+            if not isinstance(h, dict):
+                continue
+            gap_count = int(h.get("gap_count") or 0)
+            if gap_count > 0:
+                largest = int(h.get("largest_gap_bars") or 0)
+                issues.append({
+                    "type": "market_data_gap_detected",
+                    "severity": "error",
+                    "scope": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                    },
+                    "time_window": {
+                        "analysis_time_utc": row["analysis_time_utc"],
+                        "analysis_time_ms": row["analysis_time"],
+                    },
+                    "details": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                        "gap_count": gap_count,
+                        "largest_gap_bars": largest,
+                        "snapshot_id": row["snapshot_id"],
+                    },
+                    "message": (
+                        f"{row['symbol']} {tf} 检测到 {gap_count} 个缺口"
+                        f"（最大缺口 {largest} 根），指标不应跨越缺口计算。"
+                    ),
+                    "suggested_action": (
+                        "运行 repair_market_data 或 market_data_warmup 回填缺口。"
+                        "缺口存在时 analysis_degraded 必须为 True。"
+                    ),
+                })
+                break  # one violation per decision is enough
+    return issues
+
+
+def _check_market_data_stale_last_candle(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-3 (error): ga_decisions where data_quality.health[tf].last_close_time
+    != expected_last_close_time.
+
+    A stale last candle means the most recent closed candle is older than the
+    interval boundary expects — the analysis used outdated data.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.snapshot_id,
+                   ms.data_quality_json
+            FROM ga_decisions gd
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE gd.snapshot_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_market_data_stale_last_candle query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        health = dq.get("health") or {}
+        if not isinstance(health, dict):
+            continue
+        for tf, h in health.items():
+            if not isinstance(h, dict):
+                continue
+            last_ct = h.get("last_close_time")
+            expected_ct = h.get("expected_last_close_time")
+            if last_ct is not None and expected_ct is not None and int(last_ct) != int(expected_ct):
+                stale = int(h.get("stale_bars") or 0)
+                issues.append({
+                    "type": "market_data_stale_last_candle",
+                    "severity": "error",
+                    "scope": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                    },
+                    "time_window": {
+                        "analysis_time_utc": row["analysis_time_utc"],
+                        "analysis_time_ms": row["analysis_time"],
+                    },
+                    "details": {
+                        "decision_id": row["decision_id"],
+                        "symbol": row["symbol"],
+                        "timeframe": tf,
+                        "last_close_time": last_ct,
+                        "expected_last_close_time": expected_ct,
+                        "stale_bars": stale,
+                        "snapshot_id": row["snapshot_id"],
+                    },
+                    "message": (
+                        f"{row['symbol']} {tf} 最新收盘时间 {last_ct} != 期望 {expected_ct}"
+                        f"（滞后 {stale} 根），分析使用了过期数据。"
+                    ),
+                    "suggested_action": (
+                        "检查 fetch_and_upsert_closed_klines 是否在该周期正常执行。"
+                        "stale 数据时 analysis_degraded 必须为 True。"
+                    ),
+                })
+                break  # one violation per decision is enough
+    return issues
+
+
+def _check_market_data_future_candle(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-4 (error): candles table rows where is_closed=1 but close_time >
+    analysis_time of the corresponding ga_decision, or close_time > now.
+
+    A closed candle with a future close_time is a data integrity violation —
+    closed candles must have close_time <= analysis_time_utc. This check
+    scans the candles table directly (no ga_decisions join needed).
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    # Check for is_closed=1 candles with close_time > current wall-clock time.
+    # These are unambiguous integrity violations regardless of analysis_time.
+    from plugins.crypto_guard.utils import utc_ms
+    now_ms = utc_ms()
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT symbol, interval, open_time, close_time, is_closed
+            FROM candles
+            WHERE is_closed = 1 AND close_time > ?
+            ORDER BY close_time DESC
+            LIMIT 200
+            """,
+            (now_ms,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_market_data_future_candle query failed: %s", exc)
+        return issues
+    for row in rows:
+        issues.append({
+            "type": "market_data_future_candle",
+            "severity": "error",
+            "scope": {
+                "symbol": row["symbol"],
+                "interval": row["interval"],
+                "open_time": row["open_time"],
+            },
+            "time_window": {
+                "close_time_ms": row["close_time"],
+                "now_ms": now_ms,
+            },
+            "details": {
+                "symbol": row["symbol"],
+                "interval": row["interval"],
+                "open_time": row["open_time"],
+                "close_time": row["close_time"],
+                "is_closed": row["is_closed"],
+            },
+            "message": (
+                f"{row['symbol']} {row['interval']} open_time={row['open_time']} "
+                f"标记为已收盘但 close_time={row['close_time']} > 当前时间，"
+                "数据完整性违规（未来 K 线被标记为已收盘）。"
+            ),
+            "suggested_action": (
+                "检查 fetch_klines 的 is_closed 过滤逻辑。"
+                "已收盘 K 线的 close_time 必须 <= analysis_time_utc。"
+            ),
+        })
+    return issues
+
+
+def _check_market_data_duplicate_open_time(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-5 (error): candles table with duplicate (symbol, interval, open_time).
+
+    The ``candles`` table has ``UNIQUE(symbol, interval, open_time)`` so
+    duplicates should be impossible at the DB level. This check is defensive —
+    if the UNIQUE constraint was somehow dropped or circumvented, duplicates
+    would corrupt contiguity detection.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT symbol, interval, open_time, COUNT(*) AS cnt
+            FROM candles
+            GROUP BY symbol, interval, open_time
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            LIMIT 200
+            """,
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_market_data_duplicate_open_time query failed: %s", exc)
+        return issues
+    for row in rows:
+        issues.append({
+            "type": "market_data_duplicate_open_time",
+            "severity": "error",
+            "scope": {
+                "symbol": row["symbol"],
+                "interval": row["interval"],
+                "open_time": row["open_time"],
+            },
+            "time_window": {
+                "open_time_ms": row["open_time"],
+            },
+            "details": {
+                "symbol": row["symbol"],
+                "interval": row["interval"],
+                "open_time": row["open_time"],
+                "duplicate_count": row["cnt"],
+            },
+            "message": (
+                f"{row['symbol']} {row['interval']} open_time={row['open_time']} "
+                f"存在 {row['cnt']} 条重复记录，UNIQUE 约束可能被绕过。"
+            ),
+            "suggested_action": (
+                "检查 candles 表的 UNIQUE(symbol, interval, open_time) 约束是否存在。"
+                "运行 check_schema_health() 验证索引完整性。"
+            ),
+        })
+    return issues
+
+
+def _check_analysis_created_with_unready_market_data(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-6: ga_decisions created when data_quality.status != "complete".
+
+    P1-10: Previously this check flagged ALL degraded decisions as "error",
+    creating a contract contradiction — the generation layer (P0-3) is
+    designed to produce monitor_only decisions when data is degraded, which
+    is correct behavior, not an error. Now we only flag as "error" when a
+    degraded decision has a trade_plan (decision=trade_plan_available or
+    trade_plan_json is non-empty), which is a real violation. Degraded
+    decisions without trade plans are downgraded to "warning" severity.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.snapshot_id, gd.decision,
+                   gd.trade_plan_json,
+                   ms.data_quality_json
+            FROM ga_decisions gd
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE gd.snapshot_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_analysis_created_with_unready_market_data query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        status = str(dq.get("status") or "complete").lower()
+        if status == "complete":
+            continue
+        # P1-10: Determine if this is a real violation (has trade plan) or
+        # expected degraded behavior (monitor_only, no trade plan).
+        decision = str(row["decision"] or "")
+        trade_plan_raw = row["trade_plan_json"] or ""
+        has_trade_plan = bool(trade_plan_raw and trade_plan_raw.strip() not in ("", "{}", "null"))
+        is_real_violation = has_trade_plan or decision in {"trade_plan_available", "create_paper_order"}
+        severity = "error" if is_real_violation else "warning"
+        issues.append({
+            "type": "analysis_created_with_unready_market_data",
+            "severity": severity,
+            "scope": {
+                "decision_id": row["decision_id"],
+                "symbol": row["symbol"],
+            },
+            "time_window": {
+                "analysis_time_utc": row["analysis_time_utc"],
+                "analysis_time_ms": row["analysis_time"],
+            },
+            "details": {
+                "decision_id": row["decision_id"],
+                "symbol": row["symbol"],
+                "data_quality_status": status,
+                "decision": decision,
+                "has_trade_plan": has_trade_plan,
+                "snapshot_id": row["snapshot_id"],
+            },
+            "message": (
+                f"{row['symbol']} GA 决策 {row['decision_id']} 在数据状态={status} "
+                f"时创建（decision={decision}, has_trade_plan={has_trade_plan}），"
+                f"{'严重违规：降级分析不应有交易计划。' if is_real_violation else '分析在数据不完整时运行，已正确降级为 monitor_only。'}"
+            ),
+            "suggested_action": (
+                "若 has_trade_plan=True 则检查 ga_judge / llm_agent_judge 的 P0-3 fail-closed 是否被绕过。"
+                "若 has_trade_plan=False 则为预期行为，无需操作。"
+            ),
+        })
+    return issues
+
+
+def _check_executable_decision_with_unready_market_data(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-7 (error): ga_decisions where decision="trade_plan_available" or
+    has_trade_plan=True but data_quality.status != "complete".
+
+    This is a hard violation — trade plans must not be created when market
+    data is degraded. The generation gate (R4) should have prevented this.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.snapshot_id, gd.decision,
+                   gd.trade_plan_json, gd.signal_grade, gd.market_bias,
+                   ms.data_quality_json
+            FROM ga_decisions gd
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE gd.snapshot_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND (gd.decision = 'trade_plan_available' OR gd.trade_plan_json IS NOT NULL)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_executable_decision_with_unready_market_data query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        status = str(dq.get("status") or "complete").lower()
+        if status == "complete":
+            continue
+        issues.append({
+            "type": "executable_decision_with_unready_market_data",
+            "severity": "error",
+            "scope": {
+                "decision_id": row["decision_id"],
+                "symbol": row["symbol"],
+            },
+            "time_window": {
+                "analysis_time_utc": row["analysis_time_utc"],
+                "analysis_time_ms": row["analysis_time"],
+            },
+            "details": {
+                "decision_id": row["decision_id"],
+                "symbol": row["symbol"],
+                "data_quality_status": status,
+                "decision": row["decision"],
+                "signal_grade": row["signal_grade"],
+                "market_bias": row["market_bias"],
+                "has_trade_plan": row["trade_plan_json"] is not None,
+                "snapshot_id": row["snapshot_id"],
+            },
+            "message": (
+                f"{row['symbol']} GA 决策 {row['decision_id']} 在数据状态={status} "
+                f"时输出了可执行决策（decision={row['decision']}，"
+                f"grade={row['signal_grade']}），交易计划在数据降级时被创建——严重违规。"
+            ),
+            "suggested_action": (
+                "检查 ga_judge/llm_agent_judge 是否在 analysis_degraded=True 时"
+                "强制 signal_grade<=C、trade_plan=None、decision=opportunity_watch。"
+                "同时检查 risk_engine.validate_trade_plan 的第二道门禁。"
+            ),
+        })
+    return issues
+
+
+def _check_paper_order_created_with_unready_market_data(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-8 (error): paper_orders created from a ga_decision_id where the
+    ga_decision had data_quality.status != "complete".
+
+    The third fail-closed gate (paper_broker) should have refused to create
+    the order. This check catches any order that slipped through.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT po.id AS order_id, po.symbol, po.side, po.status,
+                   po.ga_decision_id, po.created_at,
+                   gd.analysis_time, gd.analysis_time_utc, gd.snapshot_id,
+                   ms.data_quality_json
+            FROM paper_orders po
+            JOIN ga_decisions gd ON po.ga_decision_id = gd.id
+            LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+            WHERE po.ga_decision_id IS NOT NULL
+              AND ms.data_quality_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
+                                    'expired', 'risk_off_cancelled', 'cancelled')
+            ORDER BY po.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_paper_order_created_with_unready_market_data query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            dq = json.loads(row["data_quality_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        status = str(dq.get("status") or "complete").lower()
+        if status == "complete":
+            continue
+        issues.append({
+            "type": "paper_order_created_with_unready_market_data",
+            "severity": "error",
+            "scope": {
+                "order_id": row["order_id"],
+                "symbol": row["symbol"],
+                "ga_decision_id": row["ga_decision_id"],
+            },
+            "time_window": {
+                "order_created_at": row["created_at"],
+                "analysis_time_utc": row["analysis_time_utc"],
+                "analysis_time_ms": row["analysis_time"],
+            },
+            "details": {
+                "order_id": row["order_id"],
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "status": row["status"],
+                "ga_decision_id": row["ga_decision_id"],
+                "data_quality_status": status,
+                "snapshot_id": row["snapshot_id"],
+            },
+            "message": (
+                f"{row['symbol']} 订单 {row['order_id']} 在数据状态={status} "
+                f"时创建（side={row['side']}，status={row['status']}），"
+                "模拟盘在数据降级时创建了订单——第三道门禁失效。"
+            ),
+            "suggested_action": (
+                "检查 paper_broker.create_paper_order_from_signal / fill_order_if_triggered "
+                "是否在 data_quality.status != complete 时拒绝创建/成交。"
+            ),
+        })
+    return issues
+
+
+def _check_report_claims_complete_for_gapped_data(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-9 (warning): hourly reports that claimed "complete" market data when
+    ga_decisions in the same window had gaps.
+
+    Cross-references ``alert_outbox`` rows with ``alert_type='hourly_summary'``
+    against ``ga_decisions`` in the same time window. If the report payload
+    contains a ``market_data_quality`` section with ``degraded=False`` but
+    ga_decisions in the window had ``gap_count > 0``, the report falsely
+    claimed completeness.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT id, alert_type, payload_json, created_at
+            FROM alert_outbox
+            WHERE alert_type = 'hourly_summary'
+              AND status = 'sent'
+              AND created_at >= ?
+            ORDER BY id DESC
+            LIMIT 50
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_report_claims_complete_for_gapped_data alert_outbox query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        mdq = payload.get("market_data_quality")
+        if not isinstance(mdq, dict):
+            continue
+        # If the report explicitly says degraded=True, it's honest — no issue.
+        if mdq.get("degraded"):
+            continue
+        # The report claims not degraded. Check if any ga_decision in a
+        # reasonable window (±2 hours of the report) had gaps.
+        report_time_str = row["created_at"]
+        try:
+            report_dt = datetime.fromisoformat(str(report_time_str).replace("Z", "+00:00"))
+            if report_dt.tzinfo is None:
+                report_dt = report_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        window_start = (report_dt - timedelta(hours=2)).isoformat()
+        window_end = (report_dt + timedelta(hours=2)).isoformat()
+        try:
+            gapped = repo.conn.execute(
+                """
+                SELECT gd.id AS decision_id, gd.symbol, ms.data_quality_json
+                FROM ga_decisions gd
+                LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
+                WHERE gd.snapshot_id IS NOT NULL
+                  AND ms.data_quality_json IS NOT NULL
+                  AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+                  AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) <= datetime(?)
+                ORDER BY gd.id DESC
+                LIMIT 50
+                """,
+                (window_start, window_end),
+            ).fetchall()
+        except Exception as exc:
+            LOGGER.warning("_check_report_claims_complete_for_gapped_data gapped query failed: %s", exc)
+            continue
+        found_gap = False
+        for gd_row in gapped:
+            try:
+                dq = json.loads(gd_row["data_quality_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            health = dq.get("health") or {}
+            for tf_h in (health.values() if isinstance(health, dict) else []):
+                if isinstance(tf_h, dict) and int(tf_h.get("gap_count") or 0) > 0:
+                    found_gap = True
+                    break
+            if found_gap:
+                break
+        if found_gap:
+            issues.append({
+                "type": "report_claims_complete_for_gapped_data",
+                "severity": "warning",
+                "scope": {
+                    "outbox_id": row["id"],
+                    "alert_type": row["alert_type"],
+                },
+                "time_window": {
+                    "report_created_at": report_time_str,
+                    "scan_window_start": window_start,
+                    "scan_window_end": window_end,
+                },
+                "details": {
+                    "outbox_id": row["id"],
+                    "report_degraded_flag": mdq.get("degraded"),
+                    "gapped_decisions_in_window": len(gapped),
+                },
+                "message": (
+                    f"每小时报告 outbox_id={row['id']} 声称数据完整（degraded=False），"
+                    f"但同窗口内有 {len(gapped)} 条 GA 决策存在缺口，报告与实际数据状态不符。"
+                ),
+                "suggested_action": (
+                    "检查 hourly_report.build_hourly_report 的 market_data_quality "
+                    "section 是否正确聚合了所有 TF 的 health 状态。"
+                ),
+            })
+    return issues
+
+
+def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """R7-10 (warning): ga_decisions where llm_status="failed" but
+    market_bias is bullish/bearish (should be "unknown" when degraded).
+
+    When the LLM fails, the deterministic fallback must force
+    ``market_bias="unknown"`` — never bullish or bearish. This check catches
+    cases where the fallback path leaked a definite direction.
+    """
+    import json
+    issues: list[dict[str, Any]] = []
+    cutoff = _market_data_contract_cutoff(repo)
+    if cutoff is None:
+        return issues
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
+                   gd.analysis_time_utc, gd.market_bias, gd.signal_grade,
+                   gd.raw_decision_json
+            FROM ga_decisions gd
+            WHERE gd.raw_decision_json IS NOT NULL
+              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+            ORDER BY gd.id DESC
+            LIMIT 500
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as exc:
+        LOGGER.warning("_check_deterministic_direction_from_failed_llm query failed: %s", exc)
+        return issues
+    for row in rows:
+        try:
+            raw = json.loads(row["raw_decision_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        llm_status = str(raw.get("llm_status") or "ok").lower()
+        if llm_status not in {"failed", "disabled"}:
+            continue
+        bias = str(row["market_bias"] or "neutral").lower()
+        if bias in {"bullish", "bearish"}:
+            issues.append({
+                "type": "deterministic_direction_from_failed_llm",
+                "severity": "warning",
+                "scope": {
+                    "decision_id": row["decision_id"],
+                    "symbol": row["symbol"],
+                },
+                "time_window": {
+                    "analysis_time_utc": row["analysis_time_utc"],
+                    "analysis_time_ms": row["analysis_time"],
+                },
+                "details": {
+                    "decision_id": row["decision_id"],
+                    "symbol": row["symbol"],
+                    "llm_status": llm_status,
+                    "market_bias": bias,
+                    "signal_grade": row["signal_grade"],
+                },
+                "message": (
+                    f"{row['symbol']} GA 决策 {row['decision_id']} llm_status={llm_status} "
+                    f"但 market_bias={bias}（应为 unknown），确定性引擎在 LLM 失败时输出了方向。"
+                ),
+                "suggested_action": (
+                    "检查 llm_agent_judge._normalize_llm_decision 在 llm_status=failed/disabled 时"
+                    "是否强制 market_bias=unknown。同时检查 report_consistency.rewrite_inconsistent_summary "
+                    "是否剥离了 bullish/bearish 文本。"
                 ),
             })
     return issues

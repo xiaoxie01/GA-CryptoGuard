@@ -145,6 +145,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     market_regime_gate = _fetch_market_regime_gate_stats(repo)
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=batches_reported)
+    market_data_quality = _fetch_market_data_quality(repo)
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -167,12 +168,13 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
         "market_regime_gate": market_regime_gate,
         "state_consistency": state_consistency,
         "report_accuracy_diagnostics": report_accuracy_diagnostics,
+        "market_data_quality": market_data_quality,
         "batch": batch_state,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
             if ga_decisions
-            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics)
+            else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
         ),
     }
 
@@ -490,6 +492,7 @@ def render_ga_hourly_summary(
     state_consistency: dict[str, Any] | None = None,
     batch_state: dict[str, Any] | None = None,
     report_accuracy_diagnostics: dict[str, Any] | None = None,
+    market_data_quality: dict[str, Any] | None = None,
 ) -> str:
     rows = [_decision_row(row) for row in ga_decisions]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
@@ -587,6 +590,43 @@ def render_ga_hourly_summary(
         else:
             lines.append("- 风险状态：正常")
 
+    # P0-5: Market data quality section — surface degraded state in GA path.
+    # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
+    # "data is genuinely gappy" (degraded=True, fail_closed != True). The
+    # generic "数据不完整" banner only appears when the health check ran
+    # successfully and found real gaps. When the health check itself crashed,
+    # a distinct "行情质量状态不可用" message is shown with the error.
+    if market_data_quality:
+        if market_data_quality.get("fail_closed"):
+            error_msg = market_data_quality.get("error", "unknown")
+            lines.extend(["", f"⚠️ 行情质量状态不可用：{error_msg}"])
+        elif market_data_quality.get("degraded"):
+            lines.extend(["", "⚠️ 行情分析不可用/降级 — 数据不完整"])
+        symbols_md = market_data_quality.get("symbols") or {}
+        if symbols_md:
+            lines.extend(["", "**行情数据质量**"])
+            for sym, tf_health in symbols_md.items():
+                for tf, h in (tf_health or {}).items():
+                    if not isinstance(h, dict):
+                        continue
+                    contiguous = h.get("contiguous_tail_count", h.get("contiguous_count", 0))
+                    required = h.get("required_count", 0)
+                    gap_count = h.get("gap_count", 0)
+                    largest_gap = h.get("largest_gap_bars", 0)
+                    last_close = h.get("last_close_time")
+                    ready = h.get("ready", False)
+                    reason = h.get("reason", "")
+                    status_text = "就绪" if ready else f"降级({reason})"
+                    last_close_str = _format_time_utc8(str(last_close)) if last_close else "-"
+                    lines.append(
+                        f"- {sym} {tf}：连续 {contiguous}/{required}，"
+                        f"缺口 {gap_count}（最大 {largest_gap}），"
+                        f"最新收盘 {last_close_str}，{status_text}"
+                    )
+        deferred = market_data_quality.get("deferred_analyses") or []
+        if deferred:
+            lines.append(f"- 延迟分析：{len(deferred)} 项")
+
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
         snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
@@ -625,14 +665,17 @@ def render_ga_hourly_summary(
     open_by_symbol: dict[str, list[dict[str, Any]]] = {}
     for o in open_orders:
         open_by_symbol.setdefault(o["symbol"], []).append(o)
+    # P1-5: pass market_data_degraded so direction/stage text is suppressed
+    # when the data is degraded.
+    md_degraded = bool(market_data_quality and market_data_quality.get("degraded"))
     for row in executable[:10]:
-        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="可执行"))
+        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="可执行", market_data_degraded=md_degraded))
 
     lines.extend(["", "**四、观察候选（评级较高但未通过执行门禁）**"])
     if not observation:
         lines.append("- 暂无观察候选")
     for row in observation[:20]:
-        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="观察候选"))
+        lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="观察候选", market_data_degraded=md_degraded))
 
     lines.extend(["", "**五、当前机会监控**"])
     if not active_watches:
@@ -864,6 +907,79 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"error": str(exc), "real_pnl_count": 0, "pseudo_r_count": 0}
+
+
+def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """P0-5: Fetch market data quality for the hourly report.
+
+    Aggregates per-symbol per-TF health using assess_health. Returns a dict
+    with ``degraded`` (bool), ``symbols`` (dict[str, dict[str, health]]),
+    and ``deferred_analyses`` (list). When the config or DB is unavailable,
+    returns ``degraded=False`` with empty symbols (fail-open for the report
+    text path — the generation layer fail-closed is handled elsewhere).
+    """
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.data.market_data_health import assess_health
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+
+        cfg = load_config()
+        market_data_cfg = cfg.market_data or {}
+        required_samples = market_data_cfg.get("required_samples", {})
+        tfs = list(market_data_cfg.get("analysis_window", {}).keys()) or ["1d", "4h", "1h", "15m", "5m"]
+
+        # Determine the analysis time for health assessment — use the latest
+        # closed 15m candle close_time as the canonical reference.
+        analysis_time = latest_closed_close_time_ms("15m", utc_ms())
+
+        # Get active symbols from the repo
+        symbols = repo.active_analysis_symbols()
+        if not symbols:
+            return {"degraded": False, "symbols": {}, "deferred_analyses": []}
+
+        symbols_md: dict[str, dict[str, Any]] = {}
+        any_degraded = False
+        deferred: list[dict[str, Any]] = []
+
+        for sym in symbols:
+            tf_health: dict[str, Any] = {}
+            for tf in tfs:
+                required = int(required_samples.get(tf, 200))
+                health = assess_health(
+                    repo, sym, tf,
+                    analysis_time_utc=analysis_time,
+                    required_count=required,
+                )
+                tf_health[tf] = health
+                if not health.get("ready"):
+                    any_degraded = True
+                    deferred.append({
+                        "symbol": sym,
+                        "interval": tf,
+                        "reason": health.get("reason", ""),
+                        "contiguous_count": health.get("contiguous_count", 0),
+                        "required_count": required,
+                    })
+            symbols_md[sym] = tf_health
+
+        return {
+            "degraded": any_degraded,
+            "symbols": symbols_md,
+            "deferred_analyses": deferred,
+        }
+    except Exception as exc:
+        LOGGER.warning("_fetch_market_data_quality failed: %s", exc)
+        # P2-9: fail-closed. Previously this returned degraded=False, causing
+        # the report to show "data is fine" when the health check itself
+        # crashed. Now return degraded=True so the report shows the
+        # "行情质量状态不可用" banner.
+        return {
+            "degraded": True,
+            "symbols": {},
+            "deferred_analyses": [],
+            "error": str(exc),
+            "fail_closed": True,
+        }
 
 
 def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
@@ -1195,6 +1311,7 @@ def render_hourly_report_text(
     state_consistency: dict[str, Any] | None = None,
     batch_state: dict[str, Any] | None = None,
     report_accuracy_diagnostics: dict[str, Any] | None = None,
+    market_data_quality: dict[str, Any] | None = None,
 ) -> str:
     signal_by_symbol = {s["symbol"]: s for s in signals}
     state_by_symbol: dict[str, dict[str, Any]] = {}
@@ -1212,6 +1329,19 @@ def render_hourly_report_text(
         "",
         "**产品分析概览：**",
     ]
+
+    # R6: Market data degraded banner — show at top when any TF not ready.
+    # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
+    # "data is genuinely gappy" (degraded=True, fail_closed != True).
+    if market_data_quality and market_data_quality.get("fail_closed"):
+        error_msg = market_data_quality.get("error", "unknown")
+        lines.insert(4, "")
+        lines.insert(4, f"⚠️ 行情质量状态不可用：{error_msg}")
+        lines.insert(4, "")
+    elif market_data_quality and market_data_quality.get("degraded"):
+        lines.insert(4, "")
+        lines.insert(4, "⚠️ 行情分析不可用/降级 — 数据不完整")
+        lines.insert(4, "")
 
     # P0: render legacy summary also surfaces batch completion header if provided.
     if batch_state:
@@ -1344,8 +1474,52 @@ def render_hourly_report_text(
                 lines.append(f"- 提示：{'，'.join(info_parts)}")
             if not critical_parts and not info_parts:
                 lines.append(f"- 发现问题 {total} 个（非关键）")
+            # R6/AC17: Show structured issue details — type, scope, time_window
+            issues = state_consistency.get("issues") or []
+            for issue in issues[:10]:
+                issue_type = issue.get("type") or issue.get("issue_type") or ""
+                scope = issue.get("scope") or ""
+                time_window = issue.get("time_window") or ""
+                severity = issue.get("severity") or ""
+                detail = issue.get("detail") or issue.get("details") or ""
+                parts = [p for p in (issue_type, scope, time_window, severity, detail) if p]
+                if parts:
+                    lines.append(f"  - {' | '.join(parts)}")
         else:
             lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])
+
+    # R6: Market data quality section
+    # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
+    # "data is genuinely gappy" (degraded=True, fail_closed != True).
+    if market_data_quality:
+        lines.extend(["", "**行情数据质量：**"])
+        if market_data_quality.get("fail_closed"):
+            error_msg = market_data_quality.get("error", "unknown")
+            lines.append(f"- ⚠️ 行情质量状态不可用：{error_msg}")
+        elif market_data_quality.get("degraded"):
+            lines.append("- ⚠️ 行情分析不可用/降级 — 数据不完整")
+        symbols_md = market_data_quality.get("symbols") or {}
+        for sym, tf_health in symbols_md.items():
+            for tf, h in (tf_health or {}).items():
+                if not isinstance(h, dict):
+                    continue
+                contiguous = h.get("contiguous_tail_count", h.get("contiguous_count", 0))
+                required = h.get("required_count", 0)
+                gap_count = h.get("gap_count", 0)
+                largest_gap = h.get("largest_gap_bars", 0)
+                last_close = h.get("last_close_time")
+                ready = h.get("ready", False)
+                reason = h.get("reason", "")
+                status_text = "就绪" if ready else f"降级({reason})"
+                last_close_str = _format_time_utc8(str(last_close)) if last_close else "-"
+                lines.append(
+                    f"- {sym} {tf}：连续 {contiguous}/{required}，"
+                    f"缺口 {gap_count}（最大 {largest_gap}），"
+                    f"最新收盘 {last_close_str}，{status_text}"
+                )
+        deferred = market_data_quality.get("deferred_analyses") or []
+        if deferred:
+            lines.append(f"- 延迟分析：{len(deferred)} 项")
 
     # P2-B: Add top failure patterns
     if feedback_patterns and not feedback_patterns.get("error"):
@@ -1542,11 +1716,16 @@ def _format_opportunity_row(
     open_by_symbol: dict[str, list[dict[str, Any]]],
     *,
     tier_label: str,
+    market_data_degraded: bool = False,
 ) -> str:
     """Render a concise user-facing opportunity row.
 
     Full batch IDs, millisecond timestamps, grade deltas and raw gate keys
     remain available in the structured report payload for audit purposes.
+
+    P1-5: when ``market_data_degraded=True``, suppress the deterministic
+    direction/stage text and replace with "方向不可靠" / "数据降级" so the
+    report does not show "方向偏多 · 趋势初期" while the data is degraded.
     """
     symbol = row.get("symbol") or "-"
     grade = str(row.get("signal_grade") or "D").upper()
@@ -1568,8 +1747,13 @@ def _format_opportunity_row(
     open_orders = open_by_symbol.get(symbol, [])
     pos_status = _position_summary(open_orders) if open_orders else "无持仓"
     blockers = row.get("_blockers") or []
-    bias = _market_bias_label(row.get("market_bias"))
-    stage = _trend_stage_label(row.get("trend_stage"))
+    # P1-5: when market data is degraded, do not show deterministic direction/stage.
+    if market_data_degraded:
+        bias = "方向不可靠"
+        stage = "数据降级"
+    else:
+        bias = _market_bias_label(row.get("market_bias"))
+        stage = _trend_stage_label(row.get("trend_stage"))
     age_text = _age_label(age_min)
     status_text = "可执行" if tier_label == "可执行" else "继续观察"
     details = [bias, stage, pos_status, age_text]
@@ -1794,6 +1978,11 @@ def _analysis_conclusion(symbol: str, decision: dict[str, Any]) -> str:
     grade = str(decision.get("signal_grade") or "D").upper()
     decision_name = decision.get("decision")
     has_tp = decision.get("has_trade_plan")
+    llm_status = str(decision.get("llm_status") or "")
+
+    # R6/AC16: LLM failed/disabled — show degraded summary text.
+    if llm_status in {"failed", "disabled"} and summary:
+        return str(summary)
 
     if summary and decision_name == "trade_plan_available":
         return str(summary)

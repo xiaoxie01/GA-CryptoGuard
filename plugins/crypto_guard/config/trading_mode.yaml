@@ -49,6 +49,11 @@ pending_order_revalidation:
   # C5: paged backfill — per-page fetch size and max pages per batch
   max_candles_per_page: 500
   max_pages_per_batch: 10
+  # P0-4: third fail-closed gate — assess_health before create_paper_trade.
+  # When true, fill_order_if_triggered calls assess_health and refuses to
+  # fill if the market data is not ready. Set to false only for isolated
+  # unit tests that need to bypass the data-health gate.
+  require_market_data_health_for_fill: true
 
 account_risk:
   drawdown_risk_off_threshold: -2.5   # %

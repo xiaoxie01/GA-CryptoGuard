@@ -71,6 +71,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
             )
         _ensure_hourly_report_accuracy_r4_contract_marker(conn)
         _ensure_btc9_trade_gate_contract_marker(conn)
+        _ensure_market_data_contract_marker(conn)
         conn.commit()
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
@@ -1463,6 +1464,25 @@ def _ensure_btc9_trade_gate_contract_marker(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_market_data_contract_marker(conn: sqlite3.Connection) -> None:
+    """R2: Write the market_data_contract_v1 marker.
+
+    The marker is the cutoff timestamp for the new market-data diagnostics
+    added in R7 (state_consistency._check_*). Historical data before the
+    marker is not flagged. INSERT OR IGNORE ensures idempotency.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migration_state ("
+        "  key TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("market_data_contract_v1",),
+    )
+
+
 def _migrate_batch_json_to_symbol_status(conn: sqlite3.Connection) -> None:
     """One-shot migration: populate batch_symbol_status from existing JSON columns.
 
@@ -1669,6 +1689,8 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
         "paper_trade_logs": ["dedupe_key"],
         "shadow_virtual_trades": ["strategy_name", "status", "entry_type", "opened_at", "expires_at", "last_processed_candle_time"],
+        # P1-11: backfill_progress table must exist with correct columns.
+        "backfill_progress": ["symbol", "interval", "last_open_time_fetched", "last_updated_ms"],
     }
 
     # Required indexes
@@ -1682,7 +1704,7 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
     ]
 
     # Required tables
-    required_tables = ["analysis_batches", "batch_symbol_status"]
+    required_tables = ["analysis_batches", "batch_symbol_status", "backfill_progress"]
 
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []
@@ -1781,6 +1803,49 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
                 missing.append({
                     "table": "paper_trade_logs",
                     "column": f"idx_paper_trade_logs_dedupe_key column=dedupe_key (PRAGMA index_info failed: {exc})",
+                })
+
+        # P2-10: verify backfill_progress has the correct composite primary key
+        # (symbol, interval). A corrupted/migrated DB with the right columns
+        # but wrong PK would pass the column check above but silently allow
+        # duplicate progress rows. Check the CREATE TABLE SQL from sqlite_master.
+        # P2-3 R3: The old check only verified that "symbol" and "interval" are
+        # IN the PK column list, but didn't verify the list is EXACTLY
+        # ["symbol", "interval"]. A table with PRIMARY KEY(symbol, interval,
+        # extra_column) would incorrectly pass. Now we normalize (lowercase,
+        # strip, sort) and compare to ["interval", "symbol"] (sorted).
+        import re as _re_pk
+        bp_sql_row = _conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='backfill_progress'"
+        ).fetchone()
+        if bp_sql_row and bp_sql_row["sql"]:
+            bp_sql = bp_sql_row["sql"]
+            # Handle both forms: PRIMARY KEY (symbol, interval) and inline
+            # PRIMARY KEY(column1, column2). Extract the PK clause.
+            pk_match = _re_pk.search(
+                r"PRIMARY\s+KEY\s*\(\s*([^)]+)\s*\)",
+                bp_sql,
+                _re_pk.IGNORECASE,
+            )
+            if pk_match:
+                pk_cols_raw = pk_match.group(1)
+                # Split by comma, strip whitespace/quotes, normalize to lowercase
+                pk_cols = [c.strip().strip('"`[]').lower() for c in pk_cols_raw.split(",")]
+                # P2-3 R3: Normalize and compare to exactly ["interval", "symbol"]
+                # (sorted form of ["symbol", "interval"]). A PK with extra
+                # columns like (symbol, interval, extra) must fail.
+                pk_cols_sorted = sorted(pk_cols)
+                expected_sorted = ["interval", "symbol"]
+                if pk_cols_sorted != expected_sorted:
+                    missing.append({
+                        "table": "backfill_progress",
+                        "column": f"PRIMARY KEY(symbol, interval) (actual: ({pk_cols_raw.strip()}))",
+                    })
+            else:
+                # No PRIMARY KEY clause found in the CREATE TABLE SQL.
+                missing.append({
+                    "table": "backfill_progress",
+                    "column": "PRIMARY KEY(symbol, interval) (missing)",
                 })
 
         return {

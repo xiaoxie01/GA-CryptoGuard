@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -816,6 +817,96 @@ def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str
     return {"proceed": True}
 
 
+def _should_check_market_data_health_for_fill() -> bool:
+    """P0-4: read the broker config flag for the market-data-health gate.
+
+    Default is True (fail-closed). Returns False only when the config
+    explicitly sets ``require_market_data_health_for_fill: false``.
+
+    P0-4 R2: the hidden env-var bypass has been REMOVED from production
+    code. It was a silent escape hatch that could disable the safety gate
+    in production. Tests that need to bypass the gate must use
+    ``unittest.mock.patch`` to monkey-patch this function, or seed the DB
+    with full contiguous data so the gate passes naturally.
+    """
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        rev_cfg = load_config().trading_mode.get("pending_order_revalidation") or {}
+        return bool(rev_cfg.get("require_market_data_health_for_fill", True))
+    except Exception:
+        # Config load failure — fail-closed (check health).
+        return True
+
+
+def _check_market_data_health_for_fill(
+    repo: CryptoGuardRepository,
+    order: dict[str, Any],
+    *,
+    event_time: int | None = None,
+) -> dict[str, Any] | None:
+    """P0-4: assess market data health before filling a pending order.
+
+    Returns None when the data is healthy (fill should proceed). Returns a
+    skip dict ``{"ok": True, "filled": False, "skip_reason": ...}`` when the
+    data is not ready — the order stays pending.
+
+    P0-2 R2: iterate over ALL required intervals from
+    ``market_data.required_samples`` (1d/4h/1h/15m/5m), not just
+    ``order["primary_interval"]``. If ANY interval is not ready, block the
+    fill with ``skip_reason=market_data_not_ready`` and include
+    ``health_reason`` listing which interval(s) failed.
+
+    The analysis_time defaults to ``event_time`` when provided (the candle
+    close_time that triggered the fill check), else ``utc_ms()``.
+    """
+    try:
+        from plugins.crypto_guard.data.market_data_health import assess_health
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.utils import utc_ms
+
+        symbol = order.get("symbol") or ""
+        if not symbol:
+            return None  # cannot check without a symbol — let other gates handle
+
+        cfg = load_config()
+        required_samples = (cfg.market_data.get("required_samples") or {})
+        if not required_samples:
+            # Config missing — fall back to primary_interval only.
+            required_samples = {order.get("primary_interval") or "15m": 200}
+
+        analysis_time = int(event_time) if (event_time is not None and int(event_time) > 0) else utc_ms()
+
+        # P0-2: check ALL required intervals, not just primary_interval.
+        failed_intervals: list[str] = []
+        for interval, required_count in required_samples.items():
+            required_count = int(required_count)
+            health = assess_health(
+                repo, symbol, interval,
+                analysis_time_utc=analysis_time, required_count=required_count,
+            )
+            if not health.get("ready"):
+                reason = health.get("reason", "unknown")
+                failed_intervals.append(f"{interval}: {reason}")
+
+        if failed_intervals:
+            return {
+                "ok": True,
+                "filled": False,
+                "skip_reason": "market_data_not_ready",
+                "health_reason": ", ".join(failed_intervals),
+            }
+        return None
+    except Exception as exc:
+        # Fail-closed on unexpected errors — don't fill if we can't verify
+        # data health. Log the exception for debugging.
+        return {
+            "ok": True,
+            "filled": False,
+            "skip_reason": "market_data_health_check_error",
+            "health_reason": str(exc)[:200],
+        }
+
+
 def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], price: float | dict[str, Any], *, event_time: int | None = None) -> dict[str, Any]:
     market = price if isinstance(price, dict) else market_from_price(order["symbol"], float(price))
     last_price = float(market["close"])
@@ -860,6 +951,18 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     rev = _revalidate_pending_before_fill(repo, order, market, event_time=event_time)
     if not rev.get("proceed"):
         return {"ok": True, "filled": False, "skip_reason": rev.get("skip_reason")}
+    # P0-4: third fail-closed gate — assess_health before create_paper_trade.
+    # The generation gate (P0-3) and risk_engine second gate already enforce
+    # this at decision time, but the broker must independently verify at fill
+    # time because (a) data may have degraded between decision and fill, and
+    # (b) AC44 was previously a test-name lie — the body only called
+    # risk_engine, never the broker. Now the broker actually checks.
+    # Config flag ``require_market_data_health_for_fill`` (default true) lets
+    # isolated unit tests bypass this gate when they need to.
+    if _should_check_market_data_health_for_fill():
+        health_skip = _check_market_data_health_for_fill(repo, order, event_time=event_time)
+        if health_skip is not None:
+            return health_skip
     # Size AFTER fill price is determined (slippage applied for market orders)
     sizing = compute_position_size(float(entry_price), stop, risk_percent=risk_pct)
     if sizing is not None:

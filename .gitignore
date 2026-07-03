@@ -1,6 +1,18 @@
 temp/
 tmp/
 data/
+# Allow plugins/crypto_guard/data/ Python module (not a data dump directory)
+!plugins/crypto_guard/data/
+!plugins/crypto_guard/data/**
+# P1-12: Re-exclude database files that the broad !** pattern above unblocks.
+# Without this, zero-byte or stale .sqlite3/.db files can be accidentally
+# committed, corrupting the repo state.
+plugins/crypto_guard/data/**/*.sqlite3
+plugins/crypto_guard/data/**/*.sqlite3-wal
+plugins/crypto_guard/data/**/*.sqlite3-shm
+plugins/crypto_guard/data/**/*.db
+plugins/crypto_guard/data/**/*.db-wal
+plugins/crypto_guard/data/**/*.db-shm
 
 __pycache__/
 *.py[cod]
@@ -143,7 +155,27 @@ frontends/conductor_im_plugins/config.local.json
 # Universal: never track __pycache__ anywhere
 **/__pycache__/
 
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/crypto-guard-reviewer.md
+!.claude/agents/crypto-guard-ops-auditor.md
+!.claude/commands/
+.claude/commands/*
+!.claude/commands/trellis/
+.claude/commands/trellis/*
+!.claude/commands/trellis/crypto-guard-diagnose.md
+!.claude/commands/trellis/crypto-guard-final-seal.md
+!.claude/commands/trellis/crypto-guard-release.md
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/crypto-guard-command-guard.py
+!.claude/hooks/test_crypto_guard_command_guard.py
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/crypto-guard-final-seal/
+!.claude/skills/crypto-guard-final-seal/**
 .ace-tool/
 
 # Project Mode SOP

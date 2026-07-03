@@ -69,7 +69,7 @@ jobs:
     task: "analyze_market"
     params:
       primary_interval: "15m"
-      timeframes: ["4h", "1h", "15m", "5m"]
+      timeframes: ["1d", "4h", "1h", "15m", "5m"]
       allow_signal: true
       allow_paper_order: true
       notify_feishu: true
@@ -113,6 +113,12 @@ jobs:
       interval_seconds: 60
       enabled: true
 
+  market_data_warmup:
+    cron: "*/5 * * * *"
+    task: "market_data_warmup"
+    params:
+      enabled: true
+
 queues:
   priorities:
     user_message: 1
@@ -123,3 +129,35 @@ queues:
     scheduled_market_analysis: 5
     higher_timeframe_summary: 7
     shadow_testing: 9
+
+# R1: configurable sample contract — no scattered hardcodes.
+# CryptoGuardConfig.loader loads this section and exposes
+# cfg.scheduler["market_data"] (until config/loader.py is extended in the
+# next dispatch to surface cfg.market_data as a top-level attribute).
+market_data:
+  required_samples:    # per-TF minimum contiguous closed-candle floor (follow-up: 1D/4H/1H ≥ 250)
+    1d: 250
+    4h: 250
+    1h: 250
+    15m: 200
+    5m: 150
+  analysis_window:     # per-TF read limit for analysis (market_state_builder._analyze_timeframe); DELETE hardcoded limit=120
+    1d: 250
+    4h: 250
+    1h: 250
+    15m: 200
+    5m: 150
+  fetch_lookback:      # per-tick incremental lookback (unchanged from existing job params)
+    1d: 3
+    4h: 6
+    1h: 12
+    15m: 12
+    5m: 24
+  backfill:
+    enabled: true
+    page_limit: 1500      # Binance /fapi/v1/klines hard cap
+    max_pages_per_run: 50
+    require_healthy_kline_for_limit: true
+    unhealthy_kline_wick_ratio: 2.0
+  freshness:
+    require_latest_closed: true

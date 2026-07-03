@@ -401,6 +401,46 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         snapshot: Market state snapshot
         score_adjustment: Optional score adjustment for candidate evaluation
     """
+    # P0-3: Generation layer fail-closed. When analysis_degraded=True (set by
+    # market_state_builder when data health fails), force the decision to a
+    # degraded-but-recorded shape: market_bias=unknown, confidence_tier=C,
+    # has_trade_plan=False, no create_paper_order in suggested_actions. Do NOT
+    # call _build_trade_plan — the data is too degraded to author a trade plan.
+    analysis_degraded = bool(snapshot.get("analysis_degraded") or
+                             ((snapshot.get("data_quality") or {}).get("analysis_degraded")))
+    if analysis_degraded:
+        symbol = snapshot["symbol"]
+        result = {
+            "symbol": symbol,
+            "decision": "monitor_only",
+            "signal_grade": "C",
+            "market_bias": "unknown",
+            "trend_stage": "unknown",
+            "confidence": 0.3,
+            "summary": f"{symbol} 行情数据不完整，分析降级，方向不可靠，仅记录本次分析。",
+            "evidence": [],
+            "counter_evidence": ["行情数据不完整，无法产生可靠方向判断"],
+            "risk_notes": ["分析降级：数据不完整，不生成交易计划。", "不构成实盘建议，仅用于模拟盘与策略研究。"],
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "opportunity_watch": None,
+            "suggested_actions": ["monitor_only"],
+            "strategy_name": "ga_sop_degraded",
+            "strategy_version": "1.0",
+            "analysis_time_utc": snapshot.get("analysis_time_utc"),
+            "degraded_reason": "analysis_degraded: market data health check failed (contiguity/freshness/gap)",
+        }
+        ok, err = validate_json("ga_decision.schema.json", result)
+        if not ok:
+            # Schema validation failed — fall back to no_edge rather than
+            # raising; degraded decisions must still be recorded.
+            fallback = no_edge_decision(symbol, err or "degraded schema error")
+            ok2, err2 = validate_json("ga_decision.schema.json", fallback)
+            if not ok2:
+                raise ValueError(f"no_edge fallback schema 校验失败: {err2}")
+            return fallback
+        return result
+
     scoring = score_snapshot(snapshot, score_adjustment=score_adjustment)
     symbol = snapshot["symbol"]
     grade = scoring["signal_grade"]

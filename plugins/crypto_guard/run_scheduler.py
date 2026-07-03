@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
-from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_15m_analysis, enqueue_market_analysis, fetch_closed_klines_for_active_symbols
+from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_15m_analysis, enqueue_market_analysis, fetch_closed_klines_for_active_symbols, market_data_warmup
 from plugins.crypto_guard.scheduler.job_runner import run_scheduled_job
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
@@ -210,6 +210,16 @@ def run_job(job_name: str) -> dict:
                 job_name=job_name,
                 scheduled_time=scheduled_time,
                 task_fn=lambda: update_shadow_virtual_trades(repo),
+            )
+            LOGGER.info("run_job done job=%s result=%s", job_name, result)
+            return result
+        if job_name == "market_data_warmup":
+            scheduled_time = (now // (5 * 60 * 1000)) * (5 * 60 * 1000)
+            result = run_scheduled_job(
+                repo,
+                job_name=job_name,
+                scheduled_time=scheduled_time,
+                task_fn=lambda: market_data_warmup(),
             )
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result

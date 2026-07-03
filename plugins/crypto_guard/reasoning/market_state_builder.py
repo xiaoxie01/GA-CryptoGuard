@@ -1,20 +1,44 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from plugins.crypto_guard.analysis.counter_evidence_engine import build_counter_evidence
 from plugins.crypto_guard.analysis.market_regime_engine import classify_market_regime
 from plugins.crypto_guard.analysis.trend_stage_engine import fuse_trend_stage
+from plugins.crypto_guard.data.market_data_health import assess_health
+from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.decision_schema import validate_json
 from plugins.crypto_guard.skills.runner import execute_market_skills
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.utils import INTERVAL_MS
 
 
-DEFAULT_TIMEFRAMES = ["4h", "1h", "15m", "5m"]
+logger = logging.getLogger(__name__)
 
 
-def _analyze_timeframe(repo: CryptoGuardRepository, symbol: str, timeframe: str, analysis_time_utc: int, previous_analysis_state: dict[str, Any] | None) -> dict[str, Any]:
-    candles = repo.get_candles(symbol, timeframe, analysis_time_utc=analysis_time_utc, limit=120)
+# R1: 1D must enter the snapshot as a real profile (not just background text).
+DEFAULT_TIMEFRAMES = ["1d", "4h", "1h", "15m", "5m"]
+
+
+def _analyze_timeframe(
+    repo: CryptoGuardRepository,
+    symbol: str,
+    timeframe: str,
+    analysis_time_utc: int,
+    previous_analysis_state: dict[str, Any] | None,
+    *,
+    read_limit: int | None = None,
+) -> dict[str, Any]:
+    """Analyze one timeframe.
+
+    R1: ``read_limit`` replaces the old hardcoded ``limit=120``. Callers pass
+    ``cfg.market_data.analysis_window[timeframe]`` (250/250/250/200/150).
+    R4.1: when a gap exists, callers pass ``contiguous_count`` as the limit so
+    indicators only receive the post-gap suffix (no gap-crossing).
+    """
+    limit = read_limit if read_limit is not None else 120
+    candles = repo.get_candles(symbol, timeframe, analysis_time_utc=analysis_time_utc, limit=limit)
     modules = execute_market_skills(
         repo,
         symbol=symbol,
@@ -25,7 +49,13 @@ def _analyze_timeframe(repo: CryptoGuardRepository, symbol: str, timeframe: str,
     )
     for name, result in modules.items():
         repo.save_module_result(symbol, timeframe, analysis_time_utc, name, result, result.get("confidence"))
-    return {"timeframe": timeframe, "candles_count": len(candles), "modules": modules, "preprocessing": _preprocessing_provenance(), "candles": candles}
+    return {
+        "timeframe": timeframe,
+        "candles_count": len(candles),
+        "modules": modules,
+        "preprocessing": _preprocessing_provenance(),
+        "candles": candles,
+    }
 
 
 def build_market_state_snapshot(
@@ -37,11 +67,47 @@ def build_market_state_snapshot(
     timeframes: list[str] | None = None,
 ) -> dict[str, Any]:
     tfs = timeframes or DEFAULT_TIMEFRAMES
+    cfg = load_config()
+    market_data_cfg = cfg.market_data
+    required_samples = market_data_cfg.get("required_samples", {})
+    analysis_window = market_data_cfg.get("analysis_window", {})
+
+    # R3: Assess health for each TF before building profiles.
+    health_by_tf: dict[str, dict[str, Any]] = {}
+    any_degraded = False
+    for tf in tfs:
+        required = int(required_samples.get(tf, 200))
+        health = assess_health(
+            repo, symbol, tf,
+            analysis_time_utc=analysis_time_utc,
+            required_count=required,
+        )
+        health_by_tf[tf] = health
+        if not health["ready"]:
+            any_degraded = True
+
     profiles: dict[str, Any] = {}
     primary_modules: dict[str, Any] = {}
     previous_analysis_state = repo.latest_analysis_state(symbol)
     for tf in tfs:
-        result = _analyze_timeframe(repo, symbol, tf, analysis_time_utc, previous_analysis_state)
+        # R1: per-TF read limit from analysis_window (DELETE hardcoded 120).
+        # R4.1: when degraded, read only the contiguous tail to prevent
+        # indicator gap-crossing. When healthy, read the full analysis_window.
+        health = health_by_tf.get(tf) or {}
+        contiguous = int(health.get("contiguous_count") or 0)
+        window = int(analysis_window.get(tf, 200))
+        if contiguous > 0:
+            read_limit = min(contiguous, window)
+        else:
+            read_limit = 0  # no closed candles — empty profile
+
+        result = _analyze_timeframe(
+            repo, symbol, tf, analysis_time_utc, previous_analysis_state,
+            read_limit=read_limit,
+        )
+        # Set loaded_count in health (4-field split)
+        health_by_tf[tf]["loaded_count"] = len(result["candles"])
+
         profiles[tf] = {
             "candles_count": result["candles_count"],
             "trend_stage": result["modules"]["trend_stage"].get("trend_stage"),
@@ -54,8 +120,24 @@ def build_market_state_snapshot(
             primary_modules = result["modules"]
             primary_candles = result.get("candles") or []
     primary_candles = locals().get("primary_candles", [])
+
+    # R4: When degraded, force trend_stage and market_structure to unknown.
+    if any_degraded:
+        for tf in tfs:
+            profiles[tf]["trend_stage"] = "unknown"
+            profiles[tf]["market_structure"] = "unknown"
+            profiles[tf]["momentum"] = "neutral"
+
     fused_trend = fuse_trend_stage(profiles, primary_modules.get("trend_stage") or {}, analysis_time_utc=analysis_time_utc)
+    # R4: When degraded, force fused trend_stage to unknown.
+    if any_degraded:
+        fused_trend["trend_stage"] = "unknown"
+        fused_trend["stage"] = "unknown"
     market_regime = classify_market_regime(primary_candles, analysis_time_utc=analysis_time_utc)
+    # R4: When degraded, regime = unknown, no boost.
+    if any_degraded:
+        market_regime["regime"] = "unknown"
+        market_regime["extreme"] = False
     previous_stage = _previous_trend_stage(repo, symbol, analysis_time_utc)
     if previous_stage and previous_stage != fused_trend.get("trend_stage"):
         fused_trend["stage_change_event"] = {
@@ -68,6 +150,16 @@ def build_market_state_snapshot(
     primary_modules["market_regime"] = market_regime
     repo.save_module_result(symbol, "multi", analysis_time_utc, "trend_stage_fusion", fused_trend, fused_trend.get("confidence"))
     repo.save_module_result(symbol, "multi", analysis_time_utc, "market_regime", market_regime, 0.7)
+
+    # R4: market_bias = "unknown" when degraded (stricter than "neutral" per follow-up §4)
+    if any_degraded:
+        primary_modules["market_bias"] = "unknown"
+
+    data_quality = _data_quality(profiles, analysis_time_utc, health_by_tf, any_degraded)
+
+    # Determine degraded status string for data_quality
+    degraded_status = _degraded_status(health_by_tf) if any_degraded else "complete"
+
     snapshot = {
         "symbol": symbol,
         "analysis_time_utc": int(analysis_time_utc),
@@ -75,7 +167,11 @@ def build_market_state_snapshot(
         "profiles": profiles,
         "modules": primary_modules,
         "counter_evidence": build_counter_evidence(primary_modules),
-        "data_quality": _data_quality(profiles, analysis_time_utc),
+        "data_quality": data_quality,
+        "analysis_degraded": any_degraded,
+        "has_trade_plan": not any_degraded and bool(primary_modules.get("trade_plan")),
+        "trade_plan": None if any_degraded else primary_modules.get("trade_plan"),
+        "decision": "opportunity_watch" if any_degraded else (primary_modules.get("decision") or "monitor_only"),
         "paper_context": {},
         "previous_analysis_state": (previous_analysis_state or {}).get("state") if previous_analysis_state else None,
         "active_opportunity_watches": repo.list_active_opportunity_watches_for_symbol(symbol),
@@ -97,6 +193,10 @@ def build_market_state_snapshot(
         },
         "global_context": {"time_policy": "UTC; closed candles only; HTF confirmation uses last closed 4h/1h/15m candles"},
     }
+    # R4: Override data_quality status with degraded value when applicable.
+    if any_degraded:
+        snapshot["data_quality"]["status"] = degraded_status
+
     ok, err = validate_json("market_state_snapshot.schema.json", snapshot)
     if not ok:
         raise ValueError(f"MarketStateSnapshot schema 校验失败: {err}")
@@ -120,17 +220,62 @@ def _preprocessing_provenance() -> dict[str, Any]:
     }
 
 
-def _data_quality(profiles: dict[str, Any], analysis_time_utc: int) -> dict[str, Any]:
+def _degraded_status(health_by_tf: dict[str, dict[str, Any]]) -> str:
+    """Map health reasons to a single data_quality.status string."""
+    reasons = {h.get("reason", "") for h in health_by_tf.values() if not h.get("ready")}
+    if "future_candle" in reasons:
+        return "future_candle"
+    if "stale" in reasons:
+        return "stale"
+    if "gapped" in reasons:
+        return "gapped"
+    if "duplicate_open_time" in reasons:
+        return "duplicate_open_time"
+    return "insufficient"
+
+
+def _data_quality(
+    profiles: dict[str, Any],
+    analysis_time_utc: int,
+    health_by_tf: dict[str, dict[str, Any]] | None = None,
+    any_degraded: bool = False,
+) -> dict[str, Any]:
     missing = [tf for tf, profile in profiles.items() if int(profile.get("candles_count") or 0) == 0]
     partial = [tf for tf, profile in profiles.items() if 0 < int(profile.get("candles_count") or 0) < 30]
-    return {
-        "status": "complete" if not missing and not partial else "partial",
+    status = "complete" if not (missing or partial) and not any_degraded else (
+        _degraded_status(health_by_tf) if any_degraded and health_by_tf else "partial"
+    )
+    result: dict[str, Any] = {
+        "status": status,
         "closed_candles_only": True,
         "analysis_time_utc": int(analysis_time_utc),
         "missing_timeframes": missing,
         "low_sample_timeframes": partial,
-        "note": "所有 K 线查询均限制 close_time <= analysis_time_utc。",
+        "note": "所有 K 线查询均限制 close_time <= analysis_time_utc。R3: contiguity + freshness gate。",
     }
+    # R1/R3: 4-field split per TF in data_quality.health[tf]
+    if health_by_tf:
+        result["health"] = {}
+        for tf, health in health_by_tf.items():
+            result["health"][tf] = {
+                "total_count": health.get("total_count", 0),
+                "loaded_count": health.get("loaded_count", 0),
+                "contiguous_count": health.get("contiguous_count", 0),
+                "required_count": health.get("required_count", 0),
+                # Full health fields for downstream consumers
+                "ready": health.get("ready", False),
+                "reason": health.get("reason", ""),
+                "gap_count": health.get("gap_count", 0),
+                "largest_gap_bars": health.get("largest_gap_bars", 0),
+                "last_close_time": health.get("last_close_time"),
+                "expected_last_close_time": health.get("expected_last_close_time"),
+                "stale_bars": health.get("stale_bars", 0),
+                "missing_ranges": health.get("missing_ranges", []),
+                "first_close_time": health.get("first_close_time"),
+                "total_closed_count": health.get("total_closed_count", 0),
+                "contiguous_tail_count": health.get("contiguous_tail_count", 0),
+            }
+    return result
 
 
 def _previous_trend_stage(repo: CryptoGuardRepository, symbol: str, analysis_time_utc: int) -> str | None:

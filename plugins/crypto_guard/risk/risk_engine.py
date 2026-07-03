@@ -109,6 +109,14 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
 
     analysis_time = snap_analysis_time
 
+    # R4: Second fail-closed gate — market data readiness.
+    # If snapshot.data_quality.status != "complete", refuse to validate.
+    data_quality = (snapshot or {}).get("data_quality") or {}
+    dq_status = str(data_quality.get("status") or "")
+    if dq_status and dq_status != "complete":
+        reasons.append("market_data_not_ready: data_quality.status=" + dq_status)
+        return {"ok": False, "reasons": reasons, "metrics": metrics}
+
     if entry_confirmation is None:
         metrics["has_entry_confirmation"] = False
         if require_ec:

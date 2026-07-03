@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -26,12 +25,26 @@ def iso_utc_from_ms(ts_ms: int) -> str:
 
 
 def latest_closed_close_time_ms(interval: str, now_ms: int | None = None) -> int:
-    """返回最近一根已收盘 K 线的 Binance close_time，永远不含当前未收盘 K 线。"""
+    """返回最近一根已收盘 K 线的 Binance close_time，永远不含当前未收盘 K 线。
 
+    Binance close_time = open_time + span - 1 (e.g. 14:14:59.999 for the
+    14:00-14:15 15m candle). A candle is "closed" when close_time <= now.
+
+    P0-1 fix: when ``now`` is exactly a close_time (e.g. 14:14:59.999), the
+    old ``floor(now/span)*span - 1`` formula returned the PREVIOUS candle's
+    close_time (13:59:59.999) because ``floor((open+span-1)/span) = open/span``
+    drops the ``span-1`` remainder. This caused ``assess_health`` to report
+    ``stale_bars=-1`` for a fully contiguous DB when ``analysis_time_utc``
+    was set to the last candle's real close_time.
+
+    New formula ``((now + 1) // span) * span - 1`` correctly returns ``now``
+    when ``now`` is a close_time, and the previous close_time otherwise.
+    Verified for all 5 cases: now=close, now=next_open, now=open, now=open+1,
+    now=close-1.
+    """
     span = INTERVAL_MS[interval]
     now = utc_ms() if now_ms is None else int(now_ms)
-    current_open = math.floor(now / span) * span
-    return current_open - 1
+    return ((now + 1) // span) * span - 1
 
 
 def _strict_positive_int_ms(value: Any) -> int | None:
