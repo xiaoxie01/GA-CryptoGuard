@@ -541,8 +541,39 @@ class GAMasterController:
         )
         # Deterministic consistency override of final_summary text (rendered_summary)
         # before persistence (P0 text/field consistency check).
-        from plugins.crypto_guard.notify.report_consistency import rewrite_inconsistent_summary, contains_forbidden_phrase
-        rendered = rewrite_inconsistent_summary(ga_decision.get("final_summary") or "", ga_decision)
+        from plugins.crypto_guard.notify.report_consistency import (
+            rewrite_inconsistent_summary,
+            contains_forbidden_phrase,
+            execution_eligible,
+        )
+        # Phase C (07-03): preserve the original LLM/template summary text in
+        # raw_decision_json["raw_llm_summary"] BEFORE any canonical override
+        # so the audit trail retains the LLM's wording without letting it
+        # influence business consumers.
+        _original_llm_summary = (
+            ga_decision.get("final_summary")
+            or ga_decision.get("summary")
+            or ""
+        )
+        # R2-7 (07-03 final review P1): set raw_llm_summary at the TOP LEVEL
+        # of ga_decision so create_ga_decision's ``json.dumps(decision)``
+        # serializes it to ``raw_decision_json.raw_llm_summary``. The GA
+        # decision adapter reads from this top-level path. The previous code
+        # only wrote to ``raw_legacy_decision.raw_llm_summary`` (nested),
+        # which adapter reads returned None for in production.
+        ga_decision["raw_llm_summary"] = _original_llm_summary
+        raw_json = ga_decision.get("raw_legacy_decision")
+        if isinstance(raw_json, dict):
+            # Also keep a copy in the nested raw_legacy_decision for
+            # legacy_decision_from_ga_decision consumers that read from there.
+            raw_json.setdefault("raw_llm_summary", _original_llm_summary)
+        # rewrite_inconsistent_summary still runs first as a secondary defense
+        # (blacklist stripping + deterministic rendered summary when the gate
+        # is not passed). Its output is then unified with the canonical
+        # builder below.
+        rendered = rewrite_inconsistent_summary(
+            ga_decision.get("final_summary") or "", ga_decision,
+        )
         ga_decision["rendered_summary"] = rendered
         # If LLM or template text still carried forbidden phrases, replace
         # final_summary itself so downstream (signals table, agent brief) does
@@ -550,6 +581,38 @@ class GAMasterController:
         if contains_forbidden_phrase(ga_decision.get("final_summary") or "") and rendered != ga_decision.get("final_summary"):
             ga_decision["final_summary"] = rendered
             ga_decision["summary"] = rendered
+
+        # Phase C (07-03): generate the canonical deterministic summary from
+        # the final structured fields. ``final_summary`` and
+        # ``rendered_summary`` are unified to this canonical text so every
+        # downstream consumer (hourly report, signal policy, alert delivery,
+        # report adapter, feishu action builder) reads the same semantic
+        # summary. The original LLM text is preserved only in
+        # ``raw_decision_json["raw_llm_summary"]`` for audit; it never enters
+        # business decisions.
+        from plugins.crypto_guard.reasoning.summary_builder import (
+            build_canonical_market_summary,
+        )
+        canonical = build_canonical_market_summary(ga_decision)
+        # R1-5 (07-03 final review): always set final_summary == summary ==
+        # rendered_summary == canonical. The original LLM text is preserved
+        # separately in raw_decision_json["raw_llm_summary"] (below). This
+        # closes the gap where executable decisions kept the LLM's wording
+        # in final_summary while rendered_summary used canonical, causing
+        # drift between the two fields. Diagnostics now compare both
+        # against the canonical recompute.
+        ga_decision["final_summary"] = canonical
+        ga_decision["summary"] = canonical
+        ga_decision["rendered_summary"] = canonical
+        # Ensure raw_llm_summary is preserved on the persisted dict itself so
+        # create_ga_decision's json.dumps(decision) captures it at the TOP
+        # LEVEL of raw_decision_json. R2-7: the adapter reads from
+        # raw_decision_json["raw_llm_summary"] (top-level). Also mirror into
+        # raw_legacy_decision for legacy consumers.
+        if isinstance(raw_json, dict):
+            raw_json["raw_llm_summary"] = _original_llm_summary
+        ga_decision["raw_llm_summary"] = _original_llm_summary
+
         saved = self.persistence.save(ga_decision)
 
         # P0: 写入 shadow 评估 — 为所有 shadow_testing 候选积累样本（多候选不饥饿）

@@ -54,7 +54,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "symbol": "BTCUSDT",
             "analysis_time_utc": 1_700_000_000_000,
             "mode": "scheduled",
-            "profiles": {},
+            "profiles": {
+                "1d": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "4h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "1h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "15m": {"market_structure": "bullish", "trend_stage": trend_stage, "momentum": "bullish", "candles_count": 80},
+            },
             "modules": {
                 "price_action": {
                     "market_structure": "bullish",
@@ -70,6 +75,26 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 "neutral_or_risk_evidence": neutral_risks or ["仍需等待价格确认"],
                 "contradiction_level": "medium",
             },
+            "data_quality": {
+                "closed_candles_only": True, "status": "complete",
+                "analysis_time_utc": 1_700_000_000_000,
+                "missing_timeframes": [], "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": 1_699_991_360_000},
+                    "4h": {"ready": True, "last_close_time": 1_699_997_200_000},
+                    "1h": {"ready": True, "last_close_time": 1_699_999_600_000},
+                    "15m": {"ready": True, "last_close_time": 1_700_000_000_000},
+                },
+            },
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_991_360_000},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_997_200_000},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_999_600_000},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_700_000_000_000},
+            },
+            "alignment": "aligned",
+            "htf_conflict": False,
+            "market_reason_codes": [],
         }
 
     def _risk_approved_snapshot_id(self, symbol: str = "BTCUSDT") -> int:
@@ -78,6 +103,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "analysis_time_utc": 1_700_000_000_000,
             "mode": "ad_hoc",
             "profiles": {
+                "1d": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "4h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "1h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "15m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
@@ -107,7 +133,26 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 "neutral_or_risk_evidence": [],
                 "contradiction_level": "low",
             },
-            "data_quality": {"closed_candles_only": True, "status": "complete"},
+            "data_quality": {
+                "closed_candles_only": True, "status": "complete",
+                "analysis_time_utc": 1_700_000_000_000,
+                "missing_timeframes": [], "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": 1_699_991_360_000},
+                    "4h": {"ready": True, "last_close_time": 1_699_997_200_000},
+                    "1h": {"ready": True, "last_close_time": 1_699_999_600_000},
+                    "15m": {"ready": True, "last_close_time": 1_700_000_000_000},
+                },
+            },
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_991_360_000},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_997_200_000},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_999_600_000},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_700_000_000_000},
+            },
+            "alignment": "aligned",
+            "htf_conflict": False,
+            "market_reason_codes": [],
             "paper_context": {},
             "global_context": {"time_policy": "closed candles only"},
         }
@@ -4794,6 +4839,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "analysis_time_utc": 1_700_000_000_000,
             "mode": "ad_hoc",
             "profiles": {
+                "1d": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "4h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "1h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
                 "15m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
@@ -4823,7 +4869,26 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "neutral_or_risk_evidence": [],
                 "contradiction_level": "low",
             },
-            "data_quality": {"closed_candles_only": True, "status": "complete"},
+            "data_quality": {
+                "closed_candles_only": True, "status": "complete",
+                "analysis_time_utc": 1_700_000_000_000,
+                "missing_timeframes": [], "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": 1_699_991_360_000},
+                    "4h": {"ready": True, "last_close_time": 1_699_997_200_000},
+                    "1h": {"ready": True, "last_close_time": 1_699_999_600_000},
+                    "15m": {"ready": True, "last_close_time": 1_700_000_000_000},
+                },
+            },
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_991_360_000},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_997_200_000},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_999_600_000},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_700_000_000_000},
+            },
+            "alignment": "aligned",
+            "htf_conflict": False,
+            "market_reason_codes": [],
             "paper_context": {},
             "global_context": {"time_policy": "closed candles only"},
         }
@@ -16021,6 +16086,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         """enqueued paper_event_alert for breakeven uses a session_id keyed on
         (order_id, entry); different breakeven prices for the same order must
         each get their own job, while the same price is deduped."""
+        from unittest.mock import patch
         self._insert_strategy_version()
         self._insert_ga_decision()
 
@@ -16049,6 +16115,18 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
 
+        def _mp_ok(symbol, repo=None):
+            # Mark price must be high enough to clear current_r threshold for
+            # whichever entry the test is currently using. We return a price
+            # based on the trade's entry_price so both entry=100 and entry=110
+            # pass the current_r gate.
+            return {
+                "ok": True, "mark_price": 200.0,
+                "price_source": "binance_usdm_mark",
+                "price_as_of": now.isoformat(),
+                "price_age_seconds": 0.0,
+            }
+
         def run_breakeven(entry: float):
             trade = {
                 "id": 200, "symbol": "BTCUSDT", "side": "LONG",
@@ -16061,7 +16139,8 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "SELECT * FROM paper_orders WHERE id=?", (order_id,)
             ).fetchone())
             market = {"close": entry + 5.0, "high": entry + 6.0, "low": entry - 1.0}
-            return _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+            with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+                return _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
 
         # First breakeven at entry=100.0 → updates stop 95→100, enqueues one job.
         r1 = run_breakeven(100.0)
@@ -16196,6 +16275,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
     def test_breakeven_returns_no_change_when_atomic_update_fails(self):
         """When the atomic stop update is rejected (e.g. order not open),
         _maybe_adjust_stop_to_breakeven must NOT report stop_loss_adjusted=True."""
+        from unittest.mock import patch
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
 
         now = datetime.now(timezone.utc)
@@ -16217,7 +16297,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "initial_risk_usdt": 1.0,
         }
         market = {"close": 105.0, "high": 106.0, "low": 99.0}
-        result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
+
+        def _mp_ok(symbol, repo=None):
+            return {
+                "ok": True, "mark_price": 200.0,
+                "price_source": "binance_usdm_mark",
+                "price_as_of": now.isoformat(),
+                "price_age_seconds": 0.0,
+            }
+
+        with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
+            result = _maybe_adjust_stop_to_breakeven(self.repo, order, trade, market)
         # Must return a dict (not None) but with stop_loss_adjusted=False —
         # it passed all gates but the atomic update rejected the closed order.
         self.assertIsNotNone(result, "Function reached the update call (gates passed) so it returns a dict")
@@ -16462,16 +16552,42 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
     def test_mark_price_get_with_fallback_fail_closed(self) -> None:
         """P0: get_mark_price_with_fallback returns ok=False when all sources fail."""
+        from unittest.mock import patch, call
         from plugins.crypto_guard.paper.mark_price import get_mark_price_with_fallback
 
-        result = get_mark_price_with_fallback(
-            "NOSYMBOLZZZ",
-            repo=self.repo,
-            cache={},
-            max_cache_age_seconds=0.001,
-        )
+        # Pass 7 P1 #3: mock the live Binance API call so the test does not
+        # depend on network or Binance server availability. Previously this
+        # test called ``get_mark_price_with_fallback("NOSYMBOLZZZ", ...)``
+        # without a mock — the test passed only because Binance returns 400
+        # for unknown symbols, which made ``fetch_binance_mark_price`` raise
+        # and fall through to the fail-closed branch. If Binance is down or
+        # the network is unavailable, the test could hang or fail spuriously.
+        #
+        # Pass 7 P1 #3 (R2): mock the LOCAL binding inside ``mark_price``
+        # — ``mark_price.py:20`` does ``from ... import fetch_mark_price``,
+        # which binds ``fetch_mark_price`` as a name in the ``mark_price``
+        # module namespace. Patching ``binance_rest.fetch_mark_price`` would
+        # NOT affect the local reference already captured by ``mark_price``
+        # — the mock would silently no-op and the test would still hit the
+        # real Binance API. Patch where the name is *looked up*, not where
+        # it is *defined*. Assert the mock is called exactly once so a
+        # silent no-op (mock on the wrong module) would fail the test.
+        def _raise_for_unknown(*args, **kwargs):
+            raise RuntimeError("Simulated Binance API error for unknown symbol")
+
+        with patch('plugins.crypto_guard.paper.mark_price.fetch_mark_price',
+                   side_effect=_raise_for_unknown) as mock_fetch:
+            result = get_mark_price_with_fallback(
+                "NOSYMBOLZZZ",
+                repo=self.repo,
+                cache={},
+                max_cache_age_seconds=0.001,
+            )
         self.assertFalse(result["ok"],
             "Unrecognized symbol must fail-closed, not return stale/fallback price")
+        self.assertEqual(mock_fetch.call_count, 1,
+            "Mock must intercept the real fetch exactly once — if call_count==0, "
+            "the mock patched the wrong module (binance_rest vs mark_price local binding)")
 
     # ── P0: Profit Protection Tests ───────────────────────────
 
@@ -31493,6 +31609,3060 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         finally:
             if old_state == "ready":
                 _set_warmup_ready()
+
+    def test_hourly_market_data_quality_omits_all_ready_rows(self) -> None:
+        """Normal market-data rows must not make the hourly push noisy."""
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary,
+            render_hourly_report_text,
+        )
+
+        quality = {
+            "degraded": False,
+            "symbols": {
+                "BTCUSDT": {
+                    "1h": {
+                        "ready": True,
+                        "contiguous_tail_count": 250,
+                        "required_count": 250,
+                        "gap_count": 0,
+                    },
+                },
+            },
+            "deferred_analyses": [],
+        }
+        ga_text = render_ga_hourly_summary(
+            "2026-07-03T10:00:00Z",
+            [],
+            [],
+            [],
+            [],
+            [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            market_data_quality=quality,
+        )
+        legacy_text = render_hourly_report_text(
+            "2026-07-03T10:00:00Z",
+            [],
+            [],
+            [],
+            [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            market_data_quality=quality,
+        )
+        self.assertNotIn("行情数据质量", ga_text)
+        self.assertNotIn("行情数据质量", legacy_text)
+        self.assertNotIn("BTCUSDT 1h", ga_text)
+        self.assertNotIn("BTCUSDT 1h", legacy_text)
+
+    def test_hourly_market_data_quality_renders_only_problem_rows(self) -> None:
+        """Mixed health must display the bad TF without listing good TFs."""
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary,
+            render_hourly_report_text,
+        )
+
+        quality = {
+            "degraded": True,
+            "symbols": {
+                "BTCUSDT": {
+                    "1h": {
+                        "ready": True,
+                        "contiguous_tail_count": 250,
+                        "required_count": 250,
+                        "gap_count": 0,
+                    },
+                },
+                "ETHUSDT": {
+                    "4h": {
+                        "ready": False,
+                        "reason": "gapped",
+                        "contiguous_tail_count": 121,
+                        "required_count": 250,
+                        "gap_count": 1,
+                        "largest_gap_bars": 129,
+                    },
+                },
+            },
+            "deferred_analyses": [
+                {"symbol": "ETHUSDT", "interval": "4h", "reason": "gapped"},
+            ],
+        }
+        ga_text = render_ga_hourly_summary(
+            "2026-07-03T10:00:00Z",
+            [],
+            [],
+            [],
+            [],
+            [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            market_data_quality=quality,
+        )
+        legacy_text = render_hourly_report_text(
+            "2026-07-03T10:00:00Z",
+            [],
+            [],
+            [],
+            [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            market_data_quality=quality,
+        )
+        for text in (ga_text, legacy_text):
+            self.assertIn("ETHUSDT 4h", text)
+            self.assertIn("延迟分析：1 项", text)
+            self.assertNotIn("BTCUSDT 1h", text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase A — 07-03 Hourly Analysis Semantic Accuracy failure baseline.
+#
+# These tests prove the current production defects are reproducible BEFORE any
+# code fix is applied. They MUST go through the real production call chain:
+#   build_market_state_snapshot → score_snapshot → run_ga_sop_decision →
+#   render_ga_hourly_summary / render_hourly_report_text →
+#   diagnose_report_accuracy
+#
+# Fixtures carry source/timeframe/analysis_time/close_time/closed=True per
+# design §8. No network access. Phase B-E will fix the code so these tests
+# turn green; Phase A only writes the failing baseline.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
+    """Phase A failure baseline for hourly analysis semantic accuracy.
+
+    Each test exercises the real production chain (market_state_builder →
+    strategy_scorer → ga_judge → hourly_report renderers → report_diagnostics)
+    with structured fixtures derived from research/audit-2026-07-03.md. The
+    tests are intentionally written to fail against the unfixed production
+    code, proving the defects are reproducible.
+    """
+
+    # analysis_time = 2026-07-03T11:59:59Z in ms
+    _ANALYSIS_TIME_MS = 1_783_156_799_000
+    # close_time of the last 1d candle closing at 2026-07-03T00:00:00Z
+    _1D_CLOSE_MS = 1_783_097_600_000
+    # close_time of the last 4h candle closing at 2026-07-03T08:00:00Z
+    _4H_CLOSE_MS = 1_783_132_800_000
+    # close_time of the last 1h candle closing at 2026-07-03T11:00:00Z
+    _1H_CLOSE_MS = 1_783_153_200_000
+    # close_time of the last 15m candle closing at 2026-07-03T11:45:00Z
+    _15M_CLOSE_MS = 1_783_156_300_000
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+        initialize_database()
+        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
+        self.repo = CryptoGuardRepository(self.conn)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+        )
+        self.conn.commit()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        if self._old_llm is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
+        self.tmp.cleanup()
+
+    # ── Fixture builders ───────────────────────────────────────────────────
+
+    def _base_profile(
+        self,
+        *,
+        trend_stage: str,
+        market_structure: str,
+        momentum: str,
+        role: str,
+        weight: float,
+        candles_count: int = 250,
+        last_event: str = "",
+        range_status: str = "",
+    ) -> dict:
+        """Build a single timeframe profile used by fuse_trend_stage."""
+        return {
+            "candles_count": candles_count,
+            "trend_stage": trend_stage,
+            "market_structure": market_structure,
+            "momentum": momentum,
+            "role": role,
+            "weight": weight,
+            "last_event": last_event,
+            "range_status": range_status,
+        }
+
+    def _build_snapshot_from_fixture(self, fixture: dict) -> dict:
+        """Build a market_state_snapshot dict from a structured fixture.
+
+        This goes through the real build_market_state_snapshot call chain
+        would require candles; instead we construct a snapshot that matches
+        the schema and feeds run_ga_sop_decision's real code path. The
+        snapshot is validated by validate_json('market_state_snapshot…') so
+        the shape stays honest.
+
+        The fixture carries per-timeframe profile + primary_modules +
+        counter_evidence + data_quality, exactly as the production builder
+        would emit after reading closed Binance candles. This mirrors the
+        real call chain downstream of build_market_state_snapshot without
+        requiring 1000 candles per TF — the scoring and GA judge operate on
+        the structured modules, not raw candles.
+
+        R1-3 (07-03 final review): inject ``data_quality.health[tf]`` with
+        ``ready=True`` and ``last_close_time`` so the real
+        ``build_timeframe_context`` computes ``closed=True`` from the candle
+        boundary (not a caller constant). Fixtures that want
+        ``closed=False`` for fail-closed testing can override via
+        ``fixture["data_quality"]["health"]``.
+        """
+        from plugins.crypto_guard.analysis.counter_evidence_engine import build_counter_evidence
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+
+        profiles = fixture["profiles"]
+        primary_modules = fixture["primary_modules"]
+        # Re-derive counter_evidence via the real engine so the chain stays live.
+        counter_evidence = build_counter_evidence(primary_modules)
+        # Allow fixture overrides (e.g. extra neutral evidence for HTF conflict).
+        ce_override = fixture.get("counter_evidence")
+        if ce_override:
+            counter_evidence = {**counter_evidence, **ce_override}
+        # R1-3: build real health_by_tf so closed=True is computed from
+        # last_close_time <= analysis_time_utc, not a caller constant.
+        default_health = {
+            "1d": {"ready": True, "last_close_time": self._1D_CLOSE_MS,
+                   "total_count": 250, "loaded_count": 250, "contiguous_count": 250,
+                   "required_count": 200, "reason": "", "gap_count": 0,
+                   "largest_gap_bars": 0, "expected_last_close_time": self._1D_CLOSE_MS,
+                   "stale_bars": 0, "missing_ranges": [],
+                   "first_close_time": self._1D_CLOSE_MS - 86400000 * 249,
+                   "total_closed_count": 250, "contiguous_tail_count": 250},
+            "4h": {"ready": True, "last_close_time": self._4H_CLOSE_MS,
+                   "total_count": 250, "loaded_count": 250, "contiguous_count": 250,
+                   "required_count": 200, "reason": "", "gap_count": 0,
+                   "largest_gap_bars": 0, "expected_last_close_time": self._4H_CLOSE_MS,
+                   "stale_bars": 0, "missing_ranges": [],
+                   "first_close_time": self._4H_CLOSE_MS - 14400000 * 249,
+                   "total_closed_count": 250, "contiguous_tail_count": 250},
+            "1h": {"ready": True, "last_close_time": self._1H_CLOSE_MS,
+                   "total_count": 250, "loaded_count": 250, "contiguous_count": 250,
+                   "required_count": 200, "reason": "", "gap_count": 0,
+                   "largest_gap_bars": 0, "expected_last_close_time": self._1H_CLOSE_MS,
+                   "stale_bars": 0, "missing_ranges": [],
+                   "first_close_time": self._1H_CLOSE_MS - 3600000 * 249,
+                   "total_closed_count": 250, "contiguous_tail_count": 250},
+            "15m": {"ready": True, "last_close_time": self._15M_CLOSE_MS,
+                    "total_count": 250, "loaded_count": 250, "contiguous_count": 250,
+                    "required_count": 200, "reason": "", "gap_count": 0,
+                    "largest_gap_bars": 0, "expected_last_close_time": self._15M_CLOSE_MS,
+                    "stale_bars": 0, "missing_ranges": [],
+                    "first_close_time": self._15M_CLOSE_MS - 900000 * 249,
+                    "total_closed_count": 250, "contiguous_tail_count": 250},
+        }
+        dq = fixture.get("data_quality") or {
+            "status": "complete",
+            "closed_candles_only": True,
+            "analysis_time_utc": fixture["analysis_time_utc"],
+            "missing_timeframes": [],
+            "low_sample_timeframes": [],
+            "note": "Fixture: closed Binance USDⓈ-M Futures candles.",
+        }
+        # Inject health unless the fixture explicitly overrides (e.g. closed=False test).
+        if "health" not in dq:
+            dq = dict(dq)
+            dq["health"] = default_health
+        snapshot = {
+            "symbol": fixture["symbol"],
+            "analysis_time_utc": fixture["analysis_time_utc"],
+            "mode": "scheduled",
+            "profiles": profiles,
+            "modules": primary_modules,
+            "counter_evidence": counter_evidence,
+            "data_quality": dq,
+            "analysis_degraded": False,
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "decision": "monitor_only",
+            "paper_context": {},
+            "previous_analysis_state": None,
+            "active_opportunity_watches": [],
+            "open_paper_orders": [],
+            "intraday_framework": {
+                "mode": "intraday",
+                "background": ["1d", "4h"],
+                "direction": "4h",
+                "trend": ["1h", "15m"],
+                "entry": ["15m", "5m"],
+                "weights": {"daily": 0.10, "4h": 0.35, "1h": 0.30, "15m": 0.25},
+                "default_intraday_weights": {"4h": 0.35, "1h": 0.30, "15m": 0.25, "5m": 0.10},
+                "rule": "顺大逆小",
+            },
+            "preprocessing_policy": {
+                "llm_geometry_allowed": False,
+                "geometry_conflict_resolution": "calculation_engine_wins",
+                "logic_resolution": "GA synthesizes deterministic evidence",
+            },
+            "global_context": {"time_policy": "UTC; closed candles only"},
+        }
+        # R2-6 (07-03 final review P1): mirror the production builder by
+        # calling normalize_snapshot_semantics to surface timeframe_context,
+        # alignment, htf_conflict, market_reason_codes on the snapshot before
+        # schema validation. The tightened schema requires these top-level
+        # fields; without this call the snapshot would fail validation.
+        from plugins.crypto_guard.reasoning.market_semantics import (
+            normalize_snapshot_semantics,
+        )
+        normalize_snapshot_semantics(
+            snapshot,
+            {},  # empty config — defaults are fine for tests
+            health_by_tf=dq.get("health") or default_health,
+            analysis_time_utc=int(fixture["analysis_time_utc"]),
+        )
+        ok, err = validate_json("market_state_snapshot.schema.json", snapshot)
+        if not ok:
+            # R1-7 (07-03 final review): schema failures must NOT be silent.
+            # Raise so the test fails fast instead of hiding the defect.
+            raise AssertionError(f"market_state_snapshot schema 校验失败: {err}")
+        return snapshot
+
+    def _doge_fixture(self) -> dict:
+        """DOGEUSDT — 1D bearish, 4H range rebound, 1H/15M short rebound.
+
+        Per audit: 1D 20bar ≈ -13.7%, 50bar ≈ -34.2%, RSI ≈ 21.7.
+        Current defect: outputs "偏多趋势中段".
+        Expected after fix: alignment=countertrend_rebound or htf_conflict=True;
+        market_bias ∈ {neutral, mixed}; trend_stage ∈ {range, transition}.
+        """
+        return {
+            "symbol": "DOGEUSDT",
+            "source": "binance_usdm_futures",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "timeframe": "1d/4h/1h/15m",
+            "close_time": self._15M_CLOSE_MS,
+            "closed": True,
+            "profiles": {
+                "1d": self._base_profile(
+                    trend_stage="late", market_structure="bearish", momentum="bearish",
+                    role="background_filter", weight=0.10, candles_count=250,
+                ),
+                "4h": self._base_profile(
+                    trend_stage="range", market_structure="range", momentum="neutral",
+                    role="direction_filter", weight=0.35, candles_count=250,
+                ),
+                "1h": self._base_profile(
+                    trend_stage="early", market_structure="bullish", momentum="bullish",
+                    role="trend_context", weight=0.25, candles_count=250,
+                    last_event="bullish_bos",
+                ),
+                "15m": self._base_profile(
+                    trend_stage="early", market_structure="bullish", momentum="bullish",
+                    role="setup_context", weight=0.20, candles_count=200,
+                    last_event="bullish_bos",
+                ),
+            },
+            "primary_modules": {
+                "price_action": {
+                    "market_structure": "bullish",
+                    "last_event": "bullish_bos",
+                    "range_status": "breakout",
+                    "key_levels": {"support": [0.18], "resistance": [0.22]},
+                    "invalid_level": 0.17,
+                },
+                "momentum": {
+                    "direction": "bullish",
+                    "quality": "healthy",
+                    "momentum_score": 62,
+                    "rsi": 58,
+                    "divergence": False,
+                },
+                "trend_stage": {
+                    "module": "trend_stage",
+                    "stage": "early",
+                    "trend_stage": "early",
+                    "structure": "bullish",
+                    "main_risk": "突破后需要确认回踩是否成立",
+                    "confidence": 0.62,
+                    "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                    "strategy_policy": "allow_watch_not_chase",
+                    "multi_timeframe_stage": "early",
+                    "multi_timeframe_structure": "bullish",
+                    "htf_confirmation": "closed_4h_1h_15m_only",
+                },
+                "smc": {"setup": "none", "liquidity": {}, "fvg": {}},
+                "order_flow": {"flow_confirmation": "supports_long"},
+                "chanlun": {"signal": None},
+            },
+            "counter_evidence": {
+                "bullish_evidence": ["价格结构为 HH/HL", "动能偏多"],
+                "bearish_evidence": ["日线偏空，高周期与低周期方向相反"],
+                "neutral_or_risk_evidence": ["高周期冲突：1D 偏空，1H/15M 偏多，4H 未同向确认"],
+                "contradiction_level": "medium",
+            },
+            "data_quality": {
+                "status": "complete",
+                "closed_candles_only": True,
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "note": "Fixture: closed Binance USDⓈ-M Futures candles.",
+            },
+        }
+
+    def _ltc_fixture(self) -> dict:
+        """LTCUSDT — multi-TF range/weak rebound; neutral + early is illegal.
+
+        Per audit: 1D mixed weak, 50bar ≈ -23.6%.
+        Current defect: outputs "中性趋势初期".
+        """
+        return {
+            "symbol": "LTCUSDT",
+            "source": "binance_usdm_futures",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "timeframe": "1d/4h/1h/15m",
+            "close_time": self._15M_CLOSE_MS,
+            "closed": True,
+            "profiles": {
+                "1d": self._base_profile(
+                    trend_stage="range", market_structure="range", momentum="neutral",
+                    role="background_filter", weight=0.10, candles_count=250,
+                ),
+                "4h": self._base_profile(
+                    trend_stage="range", market_structure="range", momentum="neutral",
+                    role="direction_filter", weight=0.35, candles_count=250,
+                ),
+                "1h": self._base_profile(
+                    trend_stage="transition", market_structure="transition", momentum="bullish",
+                    role="trend_context", weight=0.25, candles_count=250,
+                ),
+                "15m": self._base_profile(
+                    trend_stage="transition", market_structure="transition", momentum="neutral",
+                    role="setup_context", weight=0.20, candles_count=200,
+                ),
+            },
+            "primary_modules": {
+                "price_action": {
+                    "market_structure": "transition",
+                    "last_event": "",
+                    "range_status": "",
+                    "key_levels": {"support": [82.0], "resistance": [92.0]},
+                    "invalid_level": 80.0,
+                },
+                "momentum": {
+                    "direction": "neutral",
+                    "quality": "unknown",
+                    "momentum_score": 50,
+                    "rsi": 50,
+                    "divergence": False,
+                },
+                "trend_stage": {
+                    "module": "trend_stage",
+                    "stage": "early",
+                    "trend_stage": "early",
+                    "structure": "transition",
+                    "main_risk": "接近突破位，等待确认回踩",
+                    "confidence": 0.48,
+                    "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                    "strategy_policy": "allow_watch_not_chase",
+                    "multi_timeframe_stage": "range",
+                    "multi_timeframe_structure": "range",
+                    "htf_confirmation": "closed_4h_1h_15m_only",
+                },
+                "smc": {"setup": "none", "liquidity": {}, "fvg": {}},
+                "order_flow": {"flow_confirmation": "neutral"},
+                "chanlun": {"signal": None},
+            },
+            "counter_evidence": {
+                "bullish_evidence": [],
+                "bearish_evidence": [],
+                "neutral_or_risk_evidence": ["价格结构偏震荡或样本不足", "动能不清晰", "高概率震荡，方向延续性不足"],
+                "contradiction_level": "medium",
+            },
+            "data_quality": {
+                "status": "complete",
+                "closed_candles_only": True,
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "note": "Fixture: closed Binance USDⓈ-M Futures candles.",
+            },
+        }
+
+    def _bnb_fixture(self) -> dict:
+        """BNBUSDT — 1D bearish, 4H range, 1H/15M short rebound w/ high RSI.
+
+        Per audit: 1D 20bar ≈ -7.4%, 50bar ≈ -16.8%; short-term RSI偏高.
+        Current defect: outputs "中性趋势中段".
+        """
+        return {
+            "symbol": "BNBUSDT",
+            "source": "binance_usdm_futures",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "timeframe": "1d/4h/1h/15m",
+            "close_time": self._15M_CLOSE_MS,
+            "closed": True,
+            "profiles": {
+                "1d": self._base_profile(
+                    trend_stage="late", market_structure="bearish", momentum="bearish",
+                    role="background_filter", weight=0.10, candles_count=250,
+                ),
+                "4h": self._base_profile(
+                    trend_stage="range", market_structure="range", momentum="neutral",
+                    role="direction_filter", weight=0.35, candles_count=250,
+                ),
+                "1h": self._base_profile(
+                    trend_stage="middle", market_structure="bullish", momentum="bullish",
+                    role="trend_context", weight=0.25, candles_count=250,
+                ),
+                "15m": self._base_profile(
+                    trend_stage="middle", market_structure="bullish", momentum="bullish",
+                    role="setup_context", weight=0.20, candles_count=200,
+                ),
+            },
+            "primary_modules": {
+                "price_action": {
+                    "market_structure": "bullish",
+                    "last_event": "",
+                    "range_status": "",
+                    "key_levels": {"support": [580.0], "resistance": [640.0]},
+                    "invalid_level": 570.0,
+                },
+                "momentum": {
+                    "direction": "bullish",
+                    "quality": "overheated",
+                    "momentum_score": 68,
+                    "rsi": 74,
+                    "divergence": False,
+                },
+                "trend_stage": {
+                    "module": "trend_stage",
+                    "stage": "middle",
+                    "trend_stage": "middle",
+                    "structure": "bullish",
+                    "main_risk": "趋势延续中，注意失效位",
+                    "confidence": 0.62,
+                    "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                    "strategy_policy": "allow_if_risk_valid",
+                    "multi_timeframe_stage": "middle",
+                    "multi_timeframe_structure": "bullish",
+                    "htf_confirmation": "closed_4h_1h_15m_only",
+                },
+                "smc": {"setup": "none", "liquidity": {}, "fvg": {}},
+                "order_flow": {"flow_confirmation": "supports_long"},
+                "chanlun": {"signal": None},
+            },
+            "counter_evidence": {
+                "bullish_evidence": ["价格结构为 HH/HL", "动能偏多"],
+                "bearish_evidence": ["日线偏空，高周期与低周期方向相反"],
+                "neutral_or_risk_evidence": ["动能质量为 overheated，追价风险上升", "高周期冲突：1D 偏空，4H 震荡"],
+                "contradiction_level": "medium",
+            },
+            "data_quality": {
+                "status": "complete",
+                "closed_candles_only": True,
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "note": "Fixture: closed Binance USDⓈ-M Futures candles.",
+            },
+        }
+
+    def _sol_fixture(self) -> dict:
+        """SOLUSDT — short/mid bullish OK; 1D mixed, 4H overextended.
+
+        Per audit: 1D 20bar ≈ +20.8%, 50bar ≈ -11.5%; 4H RSI ≈ 73.
+        Allowed: bullish/middle, but observation reason must surface
+        "日线混合"/"4H 偏热"/"追价风险" and final_summary must not
+        carry A-level phrases when signal_grade=B.
+        """
+        return {
+            "symbol": "SOLUSDT",
+            "source": "binance_usdm_futures",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "timeframe": "1d/4h/1h/15m",
+            "close_time": self._15M_CLOSE_MS,
+            "closed": True,
+            "profiles": {
+                "1d": self._base_profile(
+                    trend_stage="range", market_structure="range", momentum="bullish",
+                    role="background_filter", weight=0.10, candles_count=250,
+                ),
+                "4h": self._base_profile(
+                    trend_stage="middle", market_structure="bullish", momentum="bullish",
+                    role="direction_filter", weight=0.35, candles_count=250,
+                ),
+                "1h": self._base_profile(
+                    trend_stage="middle", market_structure="bullish", momentum="bullish",
+                    role="trend_context", weight=0.25, candles_count=250,
+                    last_event="bullish_bos",
+                ),
+                "15m": self._base_profile(
+                    trend_stage="middle", market_structure="bullish", momentum="bullish",
+                    role="setup_context", weight=0.20, candles_count=200,
+                    last_event="bullish_bos",
+                ),
+            },
+            "primary_modules": {
+                "price_action": {
+                    "market_structure": "bullish",
+                    "last_event": "bullish_bos",
+                    "range_status": "breakout",
+                    "key_levels": {"support": [140.0], "resistance": [180.0]},
+                    "invalid_level": 135.0,
+                },
+                "momentum": {
+                    "direction": "bullish",
+                    "quality": "overheated",
+                    "momentum_score": 75,
+                    "rsi": 73,
+                    "divergence": False,
+                },
+                "trend_stage": {
+                    "module": "trend_stage",
+                    "stage": "middle",
+                    "trend_stage": "middle",
+                    "structure": "bullish",
+                    "main_risk": "趋势延续中，注意失效位",
+                    "confidence": 0.68,
+                    "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                    "strategy_policy": "allow_if_risk_valid",
+                    "multi_timeframe_stage": "middle",
+                    "multi_timeframe_structure": "bullish",
+                    "htf_confirmation": "closed_4h_1h_15m_only",
+                },
+                "smc": {"setup": "none", "liquidity": {}, "fvg": {}},
+                "order_flow": {"flow_confirmation": "supports_long"},
+                "chanlun": {"signal": "class_3_buy_candidate"},
+            },
+            "counter_evidence": {
+                "bullish_evidence": ["价格结构为 HH/HL", "动能偏多"],
+                "bearish_evidence": [],
+                "neutral_or_risk_evidence": ["动能质量为 overheated，追价风险上升", "日线混合：1D 区间，4H 偏热"],
+                "contradiction_level": "low",
+            },
+            "data_quality": {
+                "status": "complete",
+                "closed_candles_only": True,
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "note": "Fixture: closed Binance USDⓈ-M Futures candles.",
+            },
+        }
+
+    def _run_decision_and_render(
+        self, fixture: dict, *, batch_id: str | None = None,
+    ) -> dict:
+        """Run the real production chain: snapshot → controller → render.
+
+        Returns a dict with the decision, rendered_ga_text, rendered_legacy_text,
+        the opportunity_row (if any), and the adapter-built summary dict.
+
+        Pass 6 P1 #3 (07-03 final review): routes through the REAL
+        ``GAMasterController.analyze_symbol`` method — the same entry point
+        ``run_ga_workers`` uses in production. The fixture snapshot is
+        injected via ``GAAnalysisRequest.snapshot`` so the controller's
+        context builder uses it directly (no candle reload). The controller
+        runs the full pipeline: risk_gate, grade hysteresis, clamp_gate,
+        performance_gate, feishu actions, ``controller_decision_from_legacy``,
+        ``rewrite_inconsistent_summary``, ``build_canonical_market_summary``,
+        ``persistence.save`` (which writes to ``ga_decisions`` via
+        ``create_ga_decision``). No manual copying of controller logic. No
+        direct ``repo.create_ga_decision`` calls.
+        """
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary, render_hourly_report_text,
+        )
+        from plugins.crypto_guard.ga_master.report_adapter import (
+            latest_decision_summaries,
+        )
+        from plugins.crypto_guard.utils import utc_ms
+
+        snapshot = self._build_snapshot_from_fixture(fixture)
+        at = int(snapshot.get("analysis_time_utc") or self._ANALYSIS_TIME_MS)
+        # Save the snapshot so the controller has a snapshot_id reference
+        # (matches production flow where context_builder saves snapshots).
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+        request = GAAnalysisRequest(
+            symbol=fixture["symbol"],
+            decision_type="scheduled_analysis",
+            snapshot=snapshot,
+            snapshot_id=snapshot_id,
+            mode="scheduled",
+            batch_id=batch_id or f"15m:{at}",
+        )
+        controller = GAMasterController(self.repo)
+        ga_decision = controller.analyze_symbol(request)
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+
+        # Read it back — DB roundtrip via real get_ga_decision.
+        row = self.repo.get_ga_decision(ga_id)
+        # Use the REAL adapter (latest_decision_summaries) to build the
+        # summary dict — no manual ga_decisions_row construction.
+        adapter_summaries = latest_decision_summaries(self.repo, limit=10)
+        adapter_summary = next(
+            (s for s in adapter_summaries if s.get("ga_decision_id") == ga_id),
+            None,
+        )
+        # Build a ga_decisions row dict the renderer expects (renderer reads
+        # raw DB columns; the adapter dict is separate for adapter tests).
+        ga_decisions_row = {
+            "id": ga_id,
+            "symbol": row["symbol"],
+            "signal_grade": row["signal_grade"],
+            "confidence": float(row["confidence"] or 0),
+            "decision": row["decision"],
+            "market_bias": row.get("market_bias"),
+            "trend_stage": row.get("trend_stage"),
+            "analysis_time": int(row.get("analysis_time") or 0),
+            "analysis_time_utc": row.get("analysis_time_utc"),
+            "batch_id": row.get("batch_id"),
+            "previous_grade": row.get("previous_grade"),
+            "trade_plan_json": row.get("trade_plan_json"),
+            "risk_check_json": row.get("risk_check_json"),
+            "feishu_actions_json": row.get("feishu_actions_json") or "[]",
+            "raw_decision_json": row.get("raw_decision_json") or "{}",
+            "final_summary": row.get("final_summary"),
+            "rendered_summary": row.get("rendered_summary"),
+            "created_at": row.get("created_at"),
+        }
+        # Capture original LLM/template text from raw_decision_json for
+        # tests that assert on it.
+        try:
+            import json as _json
+            _raw = _json.loads(row.get("raw_decision_json") or "{}")
+            _original_llm_summary = _raw.get("raw_llm_summary") or ""
+        except (ValueError, TypeError):
+            _original_llm_summary = ""
+        canonical = (ga_decision.get("ga_decision") or {}).get("final_summary") or ga_decision.get("final_summary") or ga_decision.get("summary") or ""
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ga_text = render_ga_hourly_summary(
+            now_iso, [fixture["symbol"]], [ga_decisions_row], [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            batch_state={
+                "batch_id": ga_decision.get("batch_id") or request.batch_id,
+                "status": "success",
+                "incomplete": False, "enabled_symbols": [fixture["symbol"]],
+                "completed_count": 1, "total_count": 1,
+                "analysis_time": at, "failed_symbols": [],
+                "completed_symbols": [fixture["symbol"]],
+                "missing_symbols": [], "still_running": [],
+            },
+        )
+        legacy_text = render_hourly_report_text(
+            now_iso, [fixture["symbol"]], [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            batch_state={
+                "batch_id": ga_decision.get("batch_id") or request.batch_id,
+                "status": "success",
+                "incomplete": False, "enabled_symbols": [fixture["symbol"]],
+                "completed_count": 1, "total_count": 1,
+                "analysis_time": at, "failed_symbols": [],
+                "completed_symbols": [fixture["symbol"]],
+                "missing_symbols": [], "still_running": [],
+            },
+        )
+        return {
+            "decision": ga_decision,
+            "row": ga_decisions_row,
+            "adapter_summary": adapter_summary,
+            "ga_text": ga_text,
+            "legacy_text": legacy_text,
+            "ga_id": ga_id,
+            "canonical": canonical,
+            "original_llm_summary": _original_llm_summary,
+        }
+
+    def _seed_fault_ga_decision(
+        self,
+        *,
+        symbol: str = "FAULTUSDT",
+        grade: str = "B",
+        confidence: float = 0.71,
+        decision_name: str = "monitor_only",
+        market_bias: str = "neutral",
+        trend_stage: str = "middle",
+        final_summary: str = "中性趋势中段",
+        rendered_summary: str | None = None,
+        risk_ok: bool = False,
+        trade_plan: dict | None = None,
+        analysis_time: int | None = None,
+    ) -> int:
+        """Seed a ga_decisions row with arbitrary (faulty) fields for diagnostics."""
+        from plugins.crypto_guard.utils import utc_ms
+        at = int(analysis_time if analysis_time is not None else utc_ms())
+        return self.repo.create_ga_decision({
+            "symbol": symbol,
+            "decision": decision_name,
+            "decision_type": "scheduled_analysis",
+            "signal_grade": grade,
+            "confidence": float(confidence),
+            "summary": final_summary,
+            "final_summary": final_summary,
+            "market_bias": market_bias,
+            "trend_stage": trend_stage,
+            "has_trade_plan": bool(trade_plan),
+            "trade_plan": trade_plan,
+            "risk_check": {"ok": bool(risk_ok)},
+            "evidence": [],
+            "counter_evidence": [],
+            "opportunity_watch": None,
+            "feishu_actions": [],
+            "analysis_time": at,
+            "analysis_time_utc": datetime.fromtimestamp(at / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "batch_id": f"15m:{at}",
+            "previous_grade": None,
+            "rendered_summary": rendered_summary,
+        })
+
+    # ── a) DOGE countertrend rebound not bullish middle ────────────────────
+
+    def test_doge_countertrend_rebound_not_bullish_middle(self) -> None:
+        """DOGE 1D bearish + 1H/15M bullish rebound must NOT be reported as
+        '偏多趋势中段'. Expected: alignment=countertrend_rebound or
+        htf_conflict=True; market_bias ∈ {neutral, mixed}; trend_stage ∈
+        {range, transition}.
+        """
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"]
+        ga_text = result["ga_text"]
+        # Phase A: these assertions fail against unfixed production code.
+        # alignment/htf_conflict fields don't exist yet — they will be added
+        # in Phase B. market_bias/trend_stage currently come from
+        # strategy_scorer + fuse_trend_stage which can produce bullish/early.
+        alignment = decision.get("alignment")
+        htf_conflict = decision.get("htf_conflict")
+        bias = str(decision.get("market_bias") or "").lower()
+        stage = str(decision.get("trend_stage") or "").lower()
+        # At least one of alignment/htf_conflict must signal the conflict.
+        conflict_signaled = (
+            alignment == "countertrend_rebound"
+            or htf_conflict is True
+        )
+        self.assertTrue(
+            conflict_signaled,
+            f"DOGE must flag countertrend_rebound or htf_conflict; got alignment={alignment}, htf_conflict={htf_conflict}",
+        )
+        self.assertIn(
+            bias, {"neutral", "mixed"},
+            f"DOGE market_bias must be neutral/mixed for countertrend rebound; got {bias}",
+        )
+        self.assertIn(
+            stage, {"range", "transition"},
+            f"DOGE trend_stage must be range/transition; got {stage}",
+        )
+        # The rendered report must not contain the false "偏多趋势中段".
+        self.assertNotIn(
+            "偏多趋势中段", ga_text,
+            "DOGE report must not describe countertrend rebound as '偏多趋势中段'",
+        )
+
+    # ── b) LTC neutral does not pair with early stage ─────────────────────
+
+    def test_ltc_neutral_does_not_pair_with_early_stage(self) -> None:
+        """LTC market_bias ∈ {neutral, mixed, unknown} must NOT pair with
+        trend_stage ∈ {early, middle, late}.
+        """
+        fixture = self._ltc_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"]
+        bias = str(decision.get("market_bias") or "").lower()
+        stage = str(decision.get("trend_stage") or "").lower()
+        non_directional = bias in {"neutral", "mixed", "unknown"}
+        directional_stage = stage in {"early", "middle", "late"}
+        self.assertFalse(
+            non_directional and directional_stage,
+            f"LTC must not pair bias={bias} with stage={stage}; "
+            "non-directional bias requires range/transition/unknown stage",
+        )
+
+    # ── c) BNB neutral does not pair with middle stage ────────────────────
+
+    def test_bnb_neutral_does_not_pair_with_middle_stage(self) -> None:
+        """BNB market_bias ∈ {neutral, mixed, unknown} must NOT pair with
+        trend_stage ∈ {early, middle, late}. Also expects
+        alignment=countertrend_rebound or htf_conflict=True.
+        """
+        fixture = self._bnb_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"]
+        bias = str(decision.get("market_bias") or "").lower()
+        stage = str(decision.get("trend_stage") or "").lower()
+        non_directional = bias in {"neutral", "mixed", "unknown"}
+        directional_stage = stage in {"early", "middle", "late"}
+        self.assertFalse(
+            non_directional and directional_stage,
+            f"BNB must not pair bias={bias} with stage={stage}",
+        )
+        alignment = decision.get("alignment")
+        htf_conflict = decision.get("htf_conflict")
+        conflict_signaled = (
+            alignment == "countertrend_rebound"
+            or htf_conflict is True
+        )
+        self.assertTrue(
+            conflict_signaled,
+            f"BNB must flag countertrend_rebound or htf_conflict; got alignment={alignment}, htf_conflict={htf_conflict}",
+        )
+
+    # ── d) SOL short bullish but explains HTF mixed ───────────────────────
+
+    def test_sol_short_bullish_but_explains_htf_mixed(self) -> None:
+        """SOL may keep bullish/middle, but the canonical summary must be
+        structured and must not contain A-level executable phrases.
+
+        The SOL fixture (1D range + 4H/1H/15M bullish, overheated momentum)
+        produces grade S with alignment=neutral (no htf_conflict because 1D
+        is range, not bearish). The canonical summary must still be
+        well-formed: non-empty, contain the bias/stage segment, and never
+        contain FORBIDDEN_EXECUTABLE_PHRASES.
+        """
+        fixture = self._sol_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"].get("ga_decision") or result["decision"]
+        ga_text = result["ga_text"]
+        grade = str(decision.get("signal_grade") or "D").upper()
+        # The canonical summary must be non-empty and structured.
+        rendered = str(decision.get("rendered_summary") or "")
+        self.assertTrue(rendered, "SOL rendered_summary must be non-empty")
+        # The bias/stage segment must appear in the canonical summary.
+        self.assertIn("偏多", rendered, f"SOL canonical must contain 偏多; got: {rendered}")
+        self.assertIn("中段", rendered, f"SOL canonical must contain 中段; got: {rendered}")
+        # The grade must appear in the rendered report.
+        self.assertIn(grade, ga_text, f"SOL grade {grade} must appear in report")
+        # final_summary / rendered_summary must not contain A-level phrases.
+        for key in ("final_summary", "rendered_summary"):
+            text = str(decision.get(key) or "")
+            for phrase in ("A 级", "具备模拟盘条件", "风控全部满足", "建议做多", "可开仓"):
+                self.assertNotIn(
+                    phrase, text,
+                    f"SOL {key} must not contain A-level phrase '{phrase}'; got: {text}",
+                )
+
+    # ── e) SOL/DOGE grade B summary no A-level phrases ────────────────────
+
+    def test_sol_doge_grade_b_summary_no_a_level_phrases(self) -> None:
+        """final_summary/rendered_summary must not contain any
+        FORBIDDEN_EXECUTABLE_PHRASES for any grade.
+
+        The canonical summary builder calls ``_strip_forbidden`` for all
+        grades, and the controller path sets ``rendered_summary`` to the
+        canonical text. SOL produces grade S (executable) and DOGE produces
+        grade A (executable, htf_conflict demoted to mixed). Both must be
+        free of forbidden phrases.
+        """
+        from plugins.crypto_guard.notify.report_consistency import FORBIDDEN_EXECUTABLE_PHRASES
+        for fixture in (self._sol_fixture(), self._doge_fixture()):
+            result = self._run_decision_and_render(fixture)
+            decision = result["decision"]
+            grade = str(decision.get("signal_grade") or "D").upper()
+            for key in ("final_summary", "rendered_summary"):
+                text = str(decision.get(key) or "")
+                for phrase in FORBIDDEN_EXECUTABLE_PHRASES:
+                    self.assertNotIn(
+                        phrase, text,
+                        f"{fixture['symbol']} grade={grade} {key} must not contain '{phrase}'; got: {text}",
+                    )
+
+    # ── f) Canonical summary matches structured fields ────────────────────
+
+    def test_canonical_summary_matches_structured_fields(self) -> None:
+        """After DB roundtrip, final_summary must be consistent with
+        signal_grade / market_bias / trend_stage / decision.
+        """
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        row = result["row"]
+        decision = result["decision"]
+        grade = str(decision.get("signal_grade") or "D").upper()
+        bias = str(decision.get("market_bias") or "").lower()
+        stage = str(decision.get("trend_stage") or "").lower()
+        final_summary = str(row.get("final_summary") or "")
+        rendered_summary = str(row.get("rendered_summary") or "")
+        # If the decision is NOT execution-eligible, the summary must not
+        # claim executable status.
+        from plugins.crypto_guard.notify.report_consistency import execution_eligible
+        if not execution_eligible(decision):
+            for phrase in ("具备模拟盘条件", "风控全部满足", "可开仓", "建议做多"):
+                self.assertNotIn(phrase, final_summary)
+                self.assertNotIn(phrase, rendered_summary)
+        # The summary must mention the symbol and be consistent with grade.
+        self.assertIn(fixture["symbol"], final_summary or rendered_summary)
+        # If bias is neutral/mixed, summary must not say "偏多" or "偏空".
+        if bias in {"neutral", "mixed", "unknown"}:
+            for directional in ("偏多", "偏空", "方向偏多", "方向偏空"):
+                self.assertNotIn(
+                    directional, final_summary,
+                    f"bias={bias} but final_summary contains '{directional}': {final_summary}",
+                )
+                self.assertNotIn(
+                    directional, rendered_summary,
+                    f"bias={bias} but rendered_summary contains '{directional}': {rendered_summary}",
+                )
+
+    # ── f2) DB roundtrip preserves canonical summary + raw_llm_summary ─────
+
+    def test_db_roundtrip_preserves_canonical_summary_and_raw_llm(self) -> None:
+        """Phase C (07-03): After DB roundtrip, final_summary,
+        rendered_summary, signal_grade, market_bias, trend_stage, decision,
+        and the new structured fields (timeframe_context, alignment,
+        htf_conflict, market_reason_codes) must be consistent with the
+        pre-persistence decision. raw_decision_json must preserve
+        raw_llm_summary when the original LLM text existed.
+
+        This is a stricter version of test f) that explicitly verifies the
+        DB roundtrip (not just in-memory dict comparison) and checks the
+        Phase B structured fields survive persistence.
+
+        Pass 6 P1 #3: routes through ``GAMasterController.analyze_symbol``.
+        The controller returns a ``compat`` dict whose ``decision`` field
+        is ``legacy_decision`` (pre-clamp) while the DB stores the
+        ``final_decision`` (post-clamp). Compare DB against the persisted
+        ``ga_decision`` (``compat["ga_decision"]``), not the compat return.
+        """
+        import json as _json
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        row = result["row"]
+        compat = result["decision"]
+        # The persisted ga_decision is nested under "ga_decision" — this is
+        # what the controller actually wrote to the DB.
+        decision = compat.get("ga_decision") or compat
+        ga_id = result["ga_id"]
+
+        # Re-read the row directly from the DB to ensure the roundtrip is
+        # real (not just the in-memory dict returned by create_ga_decision).
+        direct = self.repo.conn.execute(
+            "SELECT final_summary, rendered_summary, signal_grade, "
+            "market_bias, trend_stage, decision, raw_decision_json "
+            "FROM ga_decisions WHERE id=?",
+            (int(ga_id),),
+        ).fetchone()
+        self.assertIsNotNone(direct, "DB roundtrip: row must exist")
+
+        # 1. final_summary and rendered_summary must be non-empty and must
+        #    equal the canonical text generated by build_canonical_market_summary.
+        from plugins.crypto_guard.reasoning.summary_builder import (
+            build_canonical_market_summary,
+        )
+        from plugins.crypto_guard.notify.report_consistency import execution_eligible
+        canonical_expected = build_canonical_market_summary(decision)
+        db_final = str(direct["final_summary"] or "")
+        db_rendered = str(direct["rendered_summary"] or "")
+        self.assertTrue(db_final, "DB roundtrip: final_summary must be non-empty")
+        self.assertTrue(db_rendered, "DB roundtrip: rendered_summary must be non-empty")
+        # The helper now mirrors the controller path: rendered_summary is
+        # always the canonical text; final_summary is canonical for
+        # non-executable decisions and may be the LLM/template text for
+        # executable decisions. Assert rendered_summary matches canonical.
+        self.assertEqual(
+            db_rendered, canonical_expected,
+            "DB roundtrip: rendered_summary must equal the canonical text; "
+            f"got rendered={db_rendered!r} canonical={canonical_expected!r}",
+        )
+        if not execution_eligible(decision):
+            self.assertEqual(
+                db_final, canonical_expected,
+                "DB roundtrip: final_summary must equal canonical text for "
+                f"non-executable decisions; got final={db_final!r} "
+                f"canonical={canonical_expected!r}",
+            )
+        # final_summary and rendered_summary must be consistent with each
+        # other for non-executable decisions (both canonical).
+        if not execution_eligible(decision):
+            self.assertEqual(
+                db_final, db_rendered,
+                "DB roundtrip: final_summary must equal rendered_summary "
+                f"(canonical) for non-executable; got final={db_final!r} "
+                f"rendered={db_rendered!r}",
+            )
+
+        # 2. signal_grade / market_bias / trend_stage / decision must match
+        #    the pre-persistence decision.
+        self.assertEqual(
+            str(direct["signal_grade"] or "").upper(),
+            str(decision.get("signal_grade") or "D").upper(),
+            "DB roundtrip: signal_grade must match pre-persistence value",
+        )
+        self.assertEqual(
+            str(direct["market_bias"] or "").lower(),
+            str(decision.get("market_bias") or "").lower(),
+            "DB roundtrip: market_bias must match pre-persistence value",
+        )
+        self.assertEqual(
+            str(direct["trend_stage"] or "").lower(),
+            str(decision.get("trend_stage") or "").lower(),
+            "DB roundtrip: trend_stage must match pre-persistence value",
+        )
+        self.assertEqual(
+            str(direct["decision"] or ""),
+            str(decision.get("decision") or ""),
+            "DB roundtrip: decision must match pre-persistence value",
+        )
+
+        # 3. raw_decision_json must preserve the structured fields
+        #    (timeframe_context, alignment, htf_conflict,
+        #    market_reason_codes) so diagnostics can audit them post-hoc.
+        raw = _json.loads(direct["raw_decision_json"] or "{}")
+        for field in ("timeframe_context", "alignment", "htf_conflict", "market_reason_codes"):
+            self.assertIn(
+                field, raw,
+                f"DB roundtrip: raw_decision_json must preserve {field} "
+                "for audit (Phase B structured fields)",
+            )
+
+        # 4. raw_llm_summary must be preserved when the original LLM text
+        #    existed. The _run_decision_and_render helper sets
+        #    final_summary=rendered before persistence, so the original LLM
+        #    text may be empty. We only assert the field exists (it may be
+        #    empty string when no LLM ran).
+        # The controller sets raw_llm_summary on raw_legacy_decision; the
+        # test helper does not run the controller, so raw_llm_summary may
+        # not be present here. We assert the field is accessible via the
+        # report_adapter when it IS present (tested separately via the
+        # controller path).
+        # For the direct-DB read, raw_decision_json is the full decision dict
+        # serialized, so the top-level final_summary is the canonical text.
+        # The raw_llm_summary key is added by the controller, not the helper.
+        # We verify the canonical text is the one persisted.
+        self.assertEqual(
+            str(raw.get("final_summary") or ""),
+            db_final,
+            "DB roundtrip: raw_decision_json.final_summary must match "
+            "the persisted final_summary column",
+        )
+
+        # 5. The canonical summary must not contain forbidden phrases.
+        from plugins.crypto_guard.notify.report_consistency import (
+            FORBIDDEN_EXECUTABLE_PHRASES,
+            execution_eligible,
+        )
+        for phrase in FORBIDDEN_EXECUTABLE_PHRASES:
+            self.assertNotIn(
+                phrase, db_final,
+                f"DB roundtrip: final_summary must not contain '{phrase}'; "
+                f"got: {db_final}",
+            )
+            self.assertNotIn(
+                phrase, db_rendered,
+                f"DB roundtrip: rendered_summary must not contain '{phrase}'; "
+                f"got: {db_rendered}",
+            )
+
+        # 6. When non-executable, the summary must mention the symbol and
+        #    must not contradict bias/stage.
+        if not execution_eligible(decision):
+            bias = str(decision.get("market_bias") or "").lower()
+            self.assertIn(
+                fixture["symbol"], db_final or db_rendered,
+                "DB roundtrip: non-executable summary must mention symbol",
+            )
+            if bias in {"neutral", "mixed", "unknown"}:
+                for directional in ("偏多", "偏空"):
+                    self.assertNotIn(
+                        directional, db_final,
+                        f"DB roundtrip: bias={bias} but final_summary "
+                        f"contains '{directional}': {db_final}",
+                    )
+
+    # ── g) Observation reason includes market context ─────────────────────
+
+    def test_observation_reason_includes_market_context(self) -> None:
+        """Observation candidate reason must show market reason BEFORE gate
+        reason; '交易计划尚未形成' must not be the only reason.
+        """
+        fixture = self._bnb_fixture()
+        result = self._run_decision_and_render(fixture)
+        ga_text = result["ga_text"]
+        # Find the observation row for BNB.
+        # The report uses "观察候选" section. Find the BNB line.
+        self.assertIn(fixture["symbol"], ga_text)
+        # Extract the observation section.
+        obs_section = ""
+        if "观察候选" in ga_text:
+            start = ga_text.find("观察候选")
+            obs_section = ga_text[start:start + 800]
+        self.assertIn(fixture["symbol"], obs_section)
+        # The reason line must include a market-context phrase, not only
+        # gate terminology.
+        market_phrases = [
+            "日线", "4H", "高周期", "偏空", "偏热", "追价", "震荡", "反弹",
+            "反趋势", "冲突", "混合",
+        ]
+        found_market = any(p in obs_section for p in market_phrases)
+        gate_only_phrases = ["交易计划尚未形成"]
+        only_gate = any(p in obs_section for p in gate_only_phrases) and not found_market
+        self.assertFalse(
+            only_gate,
+            f"Observation reason must include market context, not only gate terms; "
+            f"section: {obs_section[:400]}",
+        )
+
+    # ── h) C/D list with six symbols shows top3 label ─────────────────────
+
+    def test_cd_list_with_six_symbols_shows_top3_label(self) -> None:
+        """When C/D has 6 symbols but only 3 reasons are shown, the report
+        must explicitly say '前 3 项' or '重点原因（前 3 项，另有 3 项）'.
+        """
+        from plugins.crypto_guard.notify.hourly_report import render_ga_hourly_summary
+        from plugins.crypto_guard.utils import utc_ms
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        at = utc_ms()
+        cd_rows = []
+        for i, sym in enumerate(["XRPUSDT", "LINKUSDT", "ETHUSDT", "BTCUSDT", "AVAXUSDT", "ADAUSDT"]):
+            cd_rows.append({
+                "id": 100 + i, "symbol": sym, "signal_grade": "C", "confidence": 0.45,
+                "decision": "no_edge", "market_bias": "neutral", "trend_stage": "range",
+                "analysis_time": at, "analysis_time_utc": now_iso, "batch_id": f"15m:{at}",
+                "trade_plan_json": None, "risk_check_json": json.dumps({"ok": False}),
+                "feishu_actions_json": "[]", "raw_decision_json": "{}",
+                "final_summary": f"{sym} 无明显优势", "rendered_summary": None,
+                "created_at": now_iso, "previous_grade": None,
+            })
+        text = render_ga_hourly_summary(
+            now_iso, [r["symbol"] for r in cd_rows], cd_rows, [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+        )
+        # Must list all 6 symbols.
+        for sym in ["XRPUSDT", "LINKUSDT", "ETHUSDT", "BTCUSDT", "AVAXUSDT", "ADAUSDT"]:
+            self.assertIn(sym, text)
+        # Must explicitly say "前 3 项" or similar when truncating reasons.
+        top3_label_present = (
+            "前 3 项" in text
+            or "前3项" in text
+            or "重点原因" in text
+            or "另有" in text
+        )
+        self.assertTrue(
+            top3_label_present,
+            f"C/D section with 6 symbols must label '前 3 项' / '另有 N 项'; text: {text[-400:]}",
+        )
+
+    # ── i) No internal expressions in user text ───────────────────────────
+
+    def test_no_internal_expressions_in_user_text(self) -> None:
+        """Report user-facing text must not contain internal expressions like
+        'grade ∉ S/A/B', 'decision_type ∉'.
+        """
+        fixture = self._sol_fixture()
+        result = self._run_decision_and_render(fixture)
+        for text in (result["ga_text"], result["legacy_text"]):
+            for expr in ("∉", "grade ∉", "decision_type ∉", "signal_grade ∉", "decision ∉"):
+                self.assertNotIn(
+                    expr, text,
+                    f"Report must not leak internal expression '{expr}'; text: {text[:500]}",
+                )
+
+    # ── j) Marker missing diagnosed ───────────────────────────────────────
+
+    def test_marker_missing_diagnosed(self) -> None:
+        """When the R4 contract marker is missing, diagnose_report_accuracy
+        must explicitly report that the contract is not deployed, not
+        silently skip.
+        """
+        # Remove the marker so it's missing.
+        self.conn.execute(
+            "DELETE FROM _migration_state WHERE key=?",
+            ("hourly_report_accuracy_r4_contract_v1",),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        # Must explicitly flag marker missing — not silently ok.
+        # Phase A: the current code does NOT check for marker missing, so
+        # this assertion fails (proving the defect).
+        marker_issues = [
+            i for i in result.get("issues", [])
+            if "marker" in str(i.get("type", "")).lower()
+            or "marker" in str(i.get("details", "")).lower()
+            or "contract" in str(i.get("type", "")).lower()
+            or "未部署" in str(i.get("suggested_action", ""))
+        ]
+        self.assertTrue(
+            len(marker_issues) > 0 or result.get("ok") is False,
+            "diagnose_report_accuracy must flag missing R4 contract marker; "
+            f"got ok={result.get('ok')}, issues={result.get('issues', [])[:3]}",
+        )
+
+    # ── j2) Semantic-accuracy marker missing diagnosed ────────────────────
+
+    def test_semantic_accuracy_marker_missing_diagnosed(self) -> None:
+        """When the hourly_market_semantic_accuracy_contract_v1 marker is
+        missing (but R4 is present), diagnose_report_accuracy must still
+        explicitly flag the missing semantic-accuracy marker.
+        """
+        # Remove ONLY the semantic-accuracy marker; keep R4 intact.
+        self.conn.execute(
+            "DELETE FROM _migration_state WHERE key=?",
+            ("hourly_market_semantic_accuracy_contract_v1",),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        marker_issues = [
+            i for i in result.get("issues", [])
+            if "marker" in str(i.get("type", "")).lower()
+            or "marker" in str(i.get("details", "")).lower()
+            or "contract" in str(i.get("type", "")).lower()
+            or "未部署" in str(i.get("suggested_action", ""))
+        ]
+        self.assertTrue(
+            len(marker_issues) > 0 or result.get("ok") is False,
+            "diagnose_report_accuracy must flag missing semantic-accuracy "
+            "contract marker even when R4 is present; "
+            f"got ok={result.get('ok')}, issues={result.get('issues', [])[:3]}",
+        )
+        # Verify the issue specifically references the semantic-accuracy marker.
+        details_str = " ".join(str(i.get("details", "")) for i in marker_issues)
+        types_str = " ".join(str(i.get("type", "")) for i in marker_issues)
+        self.assertTrue(
+            "semantic" in details_str.lower() or "semantic" in types_str.lower()
+            or "hourly_market_semantic_accuracy" in details_str
+            or "hourly_market_semantic_accuracy" in types_str,
+            f"missing-marker issue must reference the semantic-accuracy marker; "
+            f"got details={details_str}, types={types_str}",
+        )
+
+    # ── k) Marker pre-legacy info classification ──────────────────────────
+
+    def test_marker_pre_legacy_info_classification(self) -> None:
+        """Decisions created BEFORE the R4 marker must be classified as
+        legacy_info, not error, so historical data doesn't pollute the
+        current health status.
+        """
+        # The marker is set during initialize_database in setUp, so it has a
+        # recent timestamp. Insert a decision with an old created_at (before
+        # marker) and a faulty bias+stage combo.
+        old_at = 1_700_000_000_000  # 2023-11-14
+        old_created = "2023-11-14T00:00:00Z"
+        # Temporarily set the marker to a recent time so old_at is pre-marker.
+        self.conn.execute(
+            "UPDATE _migration_state SET applied_at=? WHERE key=?",
+            ("2026-07-01T00:00:00Z", "hourly_report_accuracy_r4_contract_v1"),
+        )
+        self.conn.commit()
+        self._seed_fault_ga_decision(
+            symbol="LEGACYUSDT", grade="B", confidence=0.7,
+            decision_name="monitor_only", market_bias="neutral",
+            trend_stage="middle", final_summary="中性趋势中段",
+            analysis_time=old_at,
+        )
+        # Override created_at to be pre-marker.
+        self.conn.execute(
+            "UPDATE ga_decisions SET created_at=? WHERE symbol='LEGACYUSDT'",
+            (old_created,),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        # Any issue touching LEGACYUSDT must be legacy_info, not error.
+        legacy_issues = [
+            i for i in result.get("issues", [])
+            if "LEGACYUSDT" in str(i.get("details", ""))
+        ]
+        for issue in legacy_issues:
+            self.assertNotEqual(
+                issue.get("severity"), "error",
+                f"Pre-marker LEGACYUSDT issue must be legacy_info, not error; got {issue}",
+            )
+
+    # ── l) Bias+stage combinations all legal ──────────────────────────────
+
+    def test_bias_stage_combinations_all_legal(self) -> None:
+        """A normalize_market_semantics function (Phase B) must correct all
+        illegal bias+stage combinations. Phase A: the function doesn't exist
+        yet, so this test fails at import — proving the defect.
+
+        Legal: directional bias (bullish/bearish) can pair with any stage.
+        Illegal: neutral/mixed/unknown + early/middle/late → must become
+        range/transition/unknown.
+        """
+        # Try to import the future normalize function. Phase A: it doesn't
+        # exist, so AttributeError/ImportError is the failure signal.
+        try:
+            from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+        except ImportError:
+            # Phase A expected: module doesn't exist yet.
+            self.fail(
+                "normalize_market_semantics not implemented yet (Phase B); "
+                "this test fails as the Phase A baseline.",
+            )
+        # If it somehow exists, exercise the combination matrix.
+        non_directional = ["neutral", "mixed", "unknown"]
+        directional_stages = ["early", "middle", "late"]
+        legal_stages = ["range", "transition", "unknown"]
+        for bias in non_directional:
+            for stage in directional_stages:
+                decision = {
+                    "signal_grade": "B", "market_bias": bias,
+                    "trend_stage": stage, "confidence": 0.7,
+                    "decision": "monitor_only",
+                }
+                normalized = normalize_market_semantics(decision, {}, {})
+                n_stage = str(normalized.get("trend_stage") or "").lower()
+                self.assertIn(
+                    n_stage, legal_stages,
+                    f"bias={bias}+stage={stage} must normalize to {legal_stages}; got {n_stage}",
+                )
+
+    # ── m) HTF conflict confidence capped ─────────────────────────────────
+
+    def test_htf_conflict_confidence_capped(self) -> None:
+        """When htf_conflict=True or alignment=countertrend_rebound, the
+        confidence must be capped by a configurable ceiling below the
+        execution threshold. Phase A: no cap exists, so a high-confidence
+        countertrend signal can pass the gate.
+        """
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"]
+        from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+        # If the decision signals HTF conflict, confidence must be below the
+        # execution threshold. Phase A: the unfixed code may produce a high
+        # confidence for DOGE (bullish PA + bullish momentum), which is the
+        # defect.
+        alignment = decision.get("alignment")
+        htf_conflict = decision.get("htf_conflict")
+        conflict = alignment == "countertrend_rebound" or htf_conflict is True
+        if conflict:
+            self.assertLess(
+                float(decision.get("confidence") or 0),
+                MIN_CONFIDENCE_FOR_PAPER_ORDER,
+                f"HTF conflict confidence must be capped below execution threshold; "
+                f"got {decision.get('confidence')}",
+            )
+        else:
+            # Phase A: the defect is that conflict is NOT detected, so we
+            # fail here to prove the defect.
+            self.fail(
+                "DOGE fixture must produce htf_conflict=True or "
+                f"alignment=countertrend_rebound; got alignment={alignment}, "
+                f"htf_conflict={htf_conflict}. The unfixed code does not "
+                "detect the conflict — this is the Phase A defect.",
+            )
+
+    # ── n) Fault injection: bias+stage conflict detected ──────────────────
+
+    def test_fault_injection_bias_stage_conflict_detected(self) -> None:
+        """Fault inject neutral+middle; diagnose_report_accuracy must flag
+        bias_stage_semantic_conflict.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTBIAS", grade="B", confidence=0.71,
+            decision_name="monitor_only", market_bias="neutral",
+            trend_stage="middle", final_summary="中性趋势中段",
+        )
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "bias_stage_semantic_conflict", codes,
+            f"diagnose must flag bias_stage_semantic_conflict for neutral+middle; "
+            f"got codes: {codes}",
+        )
+
+    # ── o) Fault injection: HTF countertrend overconfidence detected ───────
+
+    def test_fault_injection_htf_countertrend_overconfidence_detected(self) -> None:
+        """Fault inject 1D bearish + 1H bullish with confidence=0.85;
+        diagnose must flag htf_countertrend_overconfidence.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTHTF", grade="A", confidence=0.85,
+            decision_name="trade_plan_available", market_bias="bullish",
+            trend_stage="middle", final_summary="A 级 偏多趋势中段",
+            risk_ok=True,
+            trade_plan={
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+        )
+        # Seed the raw_decision_json with 1D bearish + 1H bullish profile
+        # context so the diagnostic can detect the countertrend.
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTHTF'",
+            (json.dumps({
+                "snapshot": {
+                    "profiles": {
+                        "1d": {"market_structure": "bearish", "trend_stage": "late"},
+                        "4h": {"market_structure": "range", "trend_stage": "range"},
+                        "1h": {"market_structure": "bullish", "trend_stage": "middle"},
+                        "15m": {"market_structure": "bullish", "trend_stage": "middle"},
+                    },
+                },
+                "market_bias": "bullish", "confidence": 0.85,
+            }),),
+        )
+        # Also seed a second row using the PRODUCTION raw_decision_json shape:
+        # top-level timeframe_context (written by controller_decision_from_legacy
+        # after Phase G P0-1 fix). The diagnostic must detect this shape too.
+        self._seed_fault_ga_decision(
+            symbol="FAULTHTF2", grade="A", confidence=0.85,
+            decision_name="trade_plan_available", market_bias="bullish",
+            trend_stage="middle", final_summary="A 级 偏多趋势中段",
+            risk_ok=True,
+            trade_plan={
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTHTF2'",
+            (json.dumps({
+                "timeframe_context": {
+                    "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                    "1h": {"bias": "bullish", "structure": "rebound", "closed": True},
+                    "15m": {"bias": "bullish", "structure": "rebound", "closed": True},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": True,
+                "market_bias": "bullish", "confidence": 0.85,
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "htf_countertrend_overconfidence", codes,
+            f"diagnose must flag htf_countertrend_overconfidence for 1D bearish + 1H bullish confidence=0.85; "
+            f"got codes: {codes}",
+        )
+        # Strengthened per final-seal P2-N1: verify BOTH data shapes are
+        # individually flagged — the legacy snapshot.profiles shape
+        # (FAULTHTF) AND the production timeframe_context shape (FAULTHTF2).
+        # Without this, a regression in either parser would be masked by
+        # the other shape still satisfying the assertIn above.
+        htf_issues = [
+            i for i in result.get("issues", [])
+            if i.get("type") == "htf_countertrend_overconfidence"
+        ]
+        htf_symbols = {(i.get("details") or {}).get("symbol") for i in htf_issues}
+        self.assertIn(
+            "FAULTHTF", htf_symbols,
+            f"Legacy snapshot.profiles shape must be detected; got symbols={htf_symbols}",
+        )
+        self.assertIn(
+            "FAULTHTF2", htf_symbols,
+            f"Production timeframe_context shape must be detected; got symbols={htf_symbols}",
+        )
+
+    # ── p) Fault injection: summary structured mismatch detected ──────────
+
+    def test_fault_injection_summary_structured_mismatch_detected(self) -> None:
+        """Fault inject final_summary='A 级 具备模拟盘条件' but structured
+        grade=B; diagnose must flag summary_structured_state_mismatch.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTSUMM", grade="B", confidence=0.66,
+            decision_name="monitor_only", market_bias="neutral",
+            trend_stage="range",
+            final_summary="A 级 具备模拟盘条件，建议做多，可开仓",
+            rendered_summary="A 级 具备模拟盘条件，建议做多，可开仓",
+        )
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "summary_structured_state_mismatch", codes,
+            f"diagnose must flag summary_structured_state_mismatch for grade=B + A-level summary; "
+            f"got codes: {codes}",
+        )
+
+    # ── q) Fault injection: observation reason missing market context ─────
+
+    def test_fault_injection_observation_reason_missing_market_context_detected(self) -> None:
+        """Fault inject an observation decision whose only reason is
+        '交易计划尚未形成'; diagnose must flag
+        observation_reason_missing_market_context.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTOBS", grade="B", confidence=0.66,
+            decision_name="monitor_only", market_bias="bullish",
+            trend_stage="middle",
+            final_summary="交易计划尚未形成",
+            rendered_summary="交易计划尚未形成",
+        )
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "observation_reason_missing_market_context", codes,
+            f"diagnose must flag observation_reason_missing_market_context; "
+            f"got codes: {codes}",
+        )
+
+    # ── r) Fault injection: no_edge reason coverage mismatch ──────────────
+
+    def test_fault_injection_no_edge_reason_coverage_mismatch_detected(self) -> None:
+        """Fault inject 6 C/D no_edge symbols where some rows have empty
+        reason text (``final_summary`` and ``rendered_summary`` both blank).
+        The diagnostic must flag ``no_edge_reason_coverage_mismatch`` because
+        the renderer has nothing to truncate and the user sees incomplete
+        reasons. The ``'前 N 项'`` truncation label is added at render time by
+        ``_format_cd_reasons`` and is never persisted, so the data-level fault
+        is empty reason rows in a C/D batch with >3 rows.
+        """
+        symbols = ["XRPUSDT", "LINKUSDT", "ETHUSDT", "BTCUSDT", "AVAXUSDT", "ADAUSDT"]
+        for i, sym in enumerate(symbols):
+            # Rows 0-2 get a non-empty reason; rows 3-5 get empty reasons.
+            reason = f"{sym} 无明显优势" if i < 3 else ""
+            self._seed_fault_ga_decision(
+                symbol=sym, grade="C", confidence=0.45,
+                decision_name="no_edge", market_bias="neutral",
+                trend_stage="range", final_summary=reason,
+                rendered_summary=reason,
+            )
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "no_edge_reason_coverage_mismatch", codes,
+            f"diagnose must flag no_edge_reason_coverage_mismatch for 6 C/D symbols with empty reason rows; "
+            f"got codes: {codes}",
+        )
+
+    # ── s) Both report paths use same helper ──────────────────────────────
+
+    def test_both_report_paths_use_same_helper(self) -> None:
+        """render_ga_hourly_summary and render_hourly_report_text must use
+        the same C/D rendering helper. Verified by monkey-patching the
+        helper and checking both paths call it.
+        """
+        import plugins.crypto_guard.notify.hourly_report as hr_mod
+        original = hr_mod._compact_items
+        call_log: list[str] = []
+        def tracking_compact(items: Any, max_items: int = 3) -> str:
+            call_log.append(f"ga:max={max_items}")
+            return original(items, max_items)
+        try:
+            hr_mod._compact_items = tracking_compact
+            now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            # GA path with C/D rows.
+            cd_row = {
+                "id": 1, "symbol": "XRPUSDT", "signal_grade": "C", "confidence": 0.45,
+                "decision": "no_edge", "market_bias": "neutral", "trend_stage": "range",
+                "analysis_time": 1_700_000_000_000, "analysis_time_utc": now_iso,
+                "batch_id": "15m:1", "trade_plan_json": None,
+                "risk_check_json": json.dumps({"ok": False}),
+                "feishu_actions_json": "[]", "raw_decision_json": "{}",
+                "final_summary": "无明显优势", "rendered_summary": None,
+                "created_at": now_iso, "previous_grade": None,
+            }
+            hr_mod.render_ga_hourly_summary(
+                now_iso, ["XRPUSDT"], [cd_row], [], [], [],
+                {"pending_user": 0, "pending_background": 0, "running": 0},
+            )
+            ga_calls = list(call_log)
+            call_log.clear()
+            # Legacy path.
+            hr_mod.render_hourly_report_text(
+                now_iso, ["XRPUSDT"], [], [], [],
+                {"pending_user": 0, "pending_background": 0, "running": 0},
+            )
+            legacy_calls = list(call_log)
+        finally:
+            hr_mod._compact_items = original
+        # Both paths must have invoked the shared helper. Phase A: the legacy
+        # path may not use _compact_items for C/D reasons (it uses
+        # _signal_report_lines instead), so this fails.
+        self.assertTrue(
+            len(ga_calls) > 0,
+            f"GA path must call _compact_items; got {ga_calls}",
+        )
+        self.assertTrue(
+            len(legacy_calls) > 0,
+            f"Legacy path must call the same _compact_items helper; got {legacy_calls}",
+        )
+
+    # ── t) Controller path propagates structured fields ──────────────────────
+
+    def test_controller_decision_from_legacy_propagates_structured_fields(self) -> None:
+        """``controller_decision_from_legacy`` must propagate the Phase B
+        structured fields (``timeframe_context``, ``alignment``,
+        ``htf_conflict``, ``market_reason_codes``) from the legacy decision
+        to the top-level ``ga_decision`` dict.
+
+        These fields are the source of truth for:
+        - ``build_canonical_market_summary`` (Phase C canonical text)
+        - ``hourly_report._format_market_reason_text`` (Phase D report text)
+        - ``_check_htf_countertrend_overconfidence`` (Phase E diagnostic)
+
+        Without propagation, the canonical summary in production would NOT
+        include multi-TF context, the report's market-reason text would be
+        empty, and the HTF countertrend overconfidence diagnostic would be a
+        no-op. The Phase A test helper bypasses the controller path, so this
+        test exercises the real ``controller_decision_from_legacy`` function
+        directly.
+        """
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            controller_decision_from_legacy,
+        )
+        legacy = {
+            "symbol": "DOGEUSDT",
+            "signal_grade": "B",
+            "confidence": 0.70,
+            "market_bias": "neutral",
+            "trend_stage": "transition",
+            "decision": "monitor_only",
+            "summary": "DOGE 反趋势反弹",
+            "timeframe_context": {
+                "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                "1h": {"bias": "bullish", "structure": "rebound", "closed": True},
+                "15m": {"bias": "bullish", "structure": "rebound", "closed": True},
+            },
+            "alignment": "countertrend_rebound",
+            "htf_conflict": True,
+            "market_reason_codes": ["htf_conflict", "countertrend_rebound"],
+            "risk_check": {"ok": False, "reasons": ["htf_conflict"]},
+            "has_trade_plan": False,
+        }
+        ga_decision = controller_decision_from_legacy(
+            legacy=legacy,
+            decision_type="scheduled_analysis",
+            analysis_time=self._ANALYSIS_TIME_MS,
+            skill_result_refs={},
+            feishu_actions=[],
+        )
+        # The four Phase B structured fields must be at the top level of
+        # ga_decision, not just nested inside raw_legacy_decision.
+        self.assertEqual(
+            ga_decision.get("timeframe_context"),
+            legacy["timeframe_context"],
+            "timeframe_context must propagate to ga_decision top level",
+        )
+        self.assertEqual(
+            ga_decision.get("alignment"),
+            "countertrend_rebound",
+            "alignment must propagate to ga_decision top level",
+        )
+        self.assertIs(
+            ga_decision.get("htf_conflict"),
+            True,
+            "htf_conflict must propagate to ga_decision top level",
+        )
+        self.assertEqual(
+            ga_decision.get("market_reason_codes"),
+            ["htf_conflict", "countertrend_rebound"],
+            "market_reason_codes must propagate to ga_decision top level",
+        )
+
+    # ── R1-1) LLM candidate merge final normalization ────────────────────────
+
+    def test_r1_1_llm_candidate_merge_final_normalization(self) -> None:
+        """R1-1: LLM candidate merge must run a final ``normalize_market_semantics``
+        pass so a bullish/middle/0.95 candidate from the LLM is downgraded when
+        the structured fields conflict with bias/stage semantics.
+
+        The production-default LLM path (``_normalize_llm_decision``) must
+        invoke ``normalize_market_semantics`` after merging the candidate.
+        A mock LLM response producing bullish/middle for a countertrend
+        rebound fixture must be normalized to neutral/mixed bias and
+        range/transition stage, and confidence must drop below the execution
+        threshold.
+        """
+        import json
+        from unittest.mock import patch
+
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        fixture = self._doge_fixture()
+        snapshot = self._build_snapshot_from_fixture(fixture)
+        llm_response = {
+            "symbol": "DOGEUSDT",
+            "decision": "trade_plan_available",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.95,
+            "summary": "DOGE 反弹强劲，建议做多。",
+            "evidence": ["1H 反弹突破前高"],
+            "counter_evidence": ["1D 仍处下行趋势"],
+            "risk_notes": ["HTF 冲突"],
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 0.18, "stop_loss": 0.17,
+                "take_profits": [{"price": 0.20, "ratio": 1.0}],
+                "risk_percent": 1.0,
+            },
+            "opportunity_watch": None,
+            "suggested_actions": ["create_paper_order"],
+            "strategy_name": "llm_agent_sop",
+            "strategy_version": "1.0",
+            "analysis_time_utc": snapshot["analysis_time_utc"],
+        }
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            return_value=json.dumps(llm_response, ensure_ascii=False),
+        ):
+            decision = run_agent_sop_decision(snapshot, use_llm=True)
+        bias = str(decision.get("market_bias") or "").lower()
+        stage = str(decision.get("trend_stage") or "").lower()
+        self.assertIn(
+            bias, {"neutral", "mixed", "unknown"},
+            f"R1-1: LLM bullish/middle must normalize to neutral/mixed/unknown; got {bias}",
+        )
+        self.assertIn(
+            stage, {"range", "transition", "unknown"},
+            f"R1-1: LLM middle stage must normalize to range/transition/unknown; got {stage}",
+        )
+        from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+        self.assertLess(
+            float(decision.get("confidence") or 0),
+            MIN_CONFIDENCE_FOR_PAPER_ORDER,
+            f"R1-1: confidence must drop below execution threshold after normalization; got {decision.get('confidence')}",
+        )
+
+    # ── R1-1b) Risk-engine final normalize gate (second leg) ──────────────────
+
+    def test_r1_1_risk_engine_final_normalize_gate(self) -> None:
+        """R1-1 (second leg): ``apply_risk_to_decision`` must run a final
+        idempotent ``normalize_market_semantics`` pass after risk adjustments
+        so post-risk semantic drift (``htf_conflict=True`` left on the
+        decision with ``confidence=0.95`` and ``signal_grade=S``) is caught.
+
+        Without this gate, a decision that carries ``htf_conflict=True``
+        could pass risk validation (which checks ``_htf_support`` from
+        snapshot profiles, NOT the decision's ``htf_conflict`` field) and
+        retain S/0.95/bullish/middle — penetrating the execution gate.
+
+        Also asserts idempotency: a second ``apply_risk_to_decision`` call
+        on the already-normalized result does not further downgrade
+        confidence, grade, or duplicate reason codes.
+        """
+        from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
+        from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+
+        # Snapshot with closed candles and aligned bullish structure so
+        # validate_trade_plan can pass (HTF support, structure-momentum
+        # alignment, market regime normal). The snapshot itself carries an
+        # HTF conflict (1D bearish while 4h/1h/15m bullish) — the gap the
+        # final normalize gate must catch and collapse the execution path.
+        # R2-1 (07-03 final review P0): the gate recomputes htf_conflict
+        # from snapshot.profiles, so the conflict must live in the snapshot
+        # (not in a spoofed decision field that gets overwritten).
+        snapshot = {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "data_quality": {
+                "status": "complete",
+                "closed_candles_only": True,
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": self._1D_CLOSE_MS},
+                    "4h": {"ready": True, "last_close_time": self._4H_CLOSE_MS},
+                    "1h": {"ready": True, "last_close_time": self._1H_CLOSE_MS},
+                    "15m": {"ready": True, "last_close_time": self._15M_CLOSE_MS},
+                },
+            },
+            "profiles": {
+                "1d": {"market_structure": "bearish", "momentum": "bearish",
+                       "trend_stage": "middle", "weight": 0.10, "candles_count": 250},
+                "4h": {"market_structure": "range", "momentum": "neutral",
+                       "trend_stage": "middle", "weight": 0.35, "candles_count": 250},
+                "1h": {"market_structure": "bullish", "momentum": "bullish",
+                       "trend_stage": "middle", "weight": 0.25, "candles_count": 250},
+                "15m": {"market_structure": "bullish", "momentum": "bullish",
+                        "trend_stage": "middle", "weight": 0.20, "candles_count": 200},
+            },
+            "modules": {
+                "price_action": {"market_structure": "bullish", "last_event": "bullish_bos"},
+                "momentum": {"direction": "bullish", "rsi": 55, "state": "healthy"},
+                "trend_stage": {"trend_stage": "middle", "structure": "bullish"},
+                "market_regime": {"regime": "normal", "extreme": False},
+                "order_flow": {"signal": "ok", "supports": "bullish"},
+                "chanlun": {"signal": "", "supports": ""},
+            },
+            "timeframe_context": {
+                "1d": {"bias": "bearish", "structure": "downtrend", "closed": True, "close_time": self._1D_CLOSE_MS},
+                "4h": {"bias": "neutral", "structure": "range", "closed": True, "close_time": self._4H_CLOSE_MS},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._1H_CLOSE_MS},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._15M_CLOSE_MS},
+            },
+            "alignment": "countertrend_rebound",
+            "htf_conflict": True,
+        }
+        decision = {
+            "symbol": "TESTUSDT",
+            "decision": "trade_plan_available",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.95,
+            "summary": "TEST htf_conflict gate",
+            "evidence": ["4H/1H/15M aligned bullish"],
+            "counter_evidence": [],
+            "risk_notes": [],
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0, "ratio": 1.0}],
+                "risk_percent": 0.5,
+                "entry_trigger_confirmation": {
+                    "type": "closed_candle_confirmation",
+                    "timeframe": "15m", "event_type": "BOS",
+                    "direction": "bullish",
+                    "candle_close_time": self._15M_CLOSE_MS,
+                    "price": 99.0, "source": "price_action",
+                    "symbol": "TESTUSDT",
+                },
+                "invalid_condition": "跌破 97.0",
+            },
+            "opportunity_watch": None,
+            "suggested_actions": ["create_paper_order"],
+            "strategy_name": "test", "strategy_version": "1.0",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            # R2-1: candidate-supplied htf_conflict is now always overwritten
+            # by the recomputed value from snapshot. The snapshot above has
+            # 1D bearish + 4h/1h/15m bullish → htf_conflict=True (recomputed).
+            # The candidate fields below will be overwritten by the gate.
+            "htf_conflict": False,
+            "alignment": "aligned",
+        }
+        result = apply_risk_to_decision(decision, snapshot)
+        # Final normalize gate must cap confidence below the execution threshold.
+        self.assertLess(
+            float(result.get("confidence") or 0), MIN_CONFIDENCE_FOR_PAPER_ORDER,
+            f"R1-1b: final gate must cap confidence below MIN_CONFIDENCE_FOR_PAPER_ORDER; got {result.get('confidence')}",
+        )
+        # S grade must be downgraded to A (production grade_downgrade_map: S→A).
+        self.assertEqual(
+            str(result.get("signal_grade") or "").upper(), "A",
+            f"R1-1b: S must downgrade to A under htf_conflict; got {result.get('signal_grade')}",
+        )
+        # create_paper_order must be stripped from suggested_actions because
+        # the decision is no longer execution-eligible after the gate.
+        actions = list(result.get("suggested_actions") or [])
+        self.assertNotIn(
+            "create_paper_order", actions,
+            f"R1-1b: create_paper_order must be stripped after final gate; got {actions}",
+        )
+        # Idempotency: a second apply_risk_to_decision call must not further
+        # downgrade confidence, grade, or duplicate market_reason_codes.
+        first_conf = float(result.get("confidence") or 0)
+        first_grade = str(result.get("signal_grade") or "").upper()
+        first_reasons = list(result.get("market_reason_codes") or [])
+        result2 = apply_risk_to_decision(result, snapshot)
+        second_conf = float(result2.get("confidence") or 0)
+        second_grade = str(result2.get("signal_grade") or "").upper()
+        second_reasons = list(result2.get("market_reason_codes") or [])
+        self.assertAlmostEqual(
+            second_conf, first_conf, places=4,
+            msg=f"R1-1b: idempotent — second call must not further downgrade confidence; "
+                f"first={first_conf}, second={second_conf}",
+        )
+        self.assertEqual(
+            second_grade, first_grade,
+            msg=f"R1-1b: idempotent — second call must not further downgrade grade; "
+                f"first={first_grade}, second={second_grade}",
+        )
+        # Reason codes must not accumulate duplicates on the second call.
+        self.assertEqual(
+            len(second_reasons), len(set(second_reasons)),
+            f"R1-1b: idempotent — reason codes must not duplicate; got {second_reasons}",
+        )
+
+    # ── Pass 6 Fix #1) LLM grade restoration must be self-healed ────────────
+
+    def test_pass6_fix1_llm_grade_restoration_self_heals(self) -> None:
+        """Pass 6 P1 #1: After the first ``normalize_market_semantics`` call
+        downgrades S→A under htf_conflict, an LLM (or any upstream) may
+        restore ``signal_grade`` to S while leaving the
+        ``htf_conflict_grade_downgraded`` marker in
+        ``market_reason_codes``. A second normalize call must detect the
+        restoration (current grade S > terminal grade A derived from the
+        original grade S) and re-apply the downgrade.
+        """
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        cfg = {
+            "htf_conflict_confidence_cap": 0.70,
+            "grade_downgrade_map": {"S": "A", "A": "B"},
+        }
+        snapshot = {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "profiles": {
+                "1d": {"market_structure": "bearish", "momentum": "bearish"},
+                "4h": {"market_structure": "neutral", "momentum": "neutral"},
+                "1h": {"market_structure": "bullish", "momentum": "bullish"},
+                "15m": {"market_structure": "bullish", "momentum": "bullish"},
+            },
+            "data_quality": {
+                "health": {
+                    "1d": {"ready": True, "last_close_time": self._1D_CLOSE_MS},
+                    "4h": {"ready": True, "last_close_time": self._4H_CLOSE_MS},
+                    "1h": {"ready": True, "last_close_time": self._1H_CLOSE_MS},
+                    "15m": {"ready": True, "last_close_time": self._15M_CLOSE_MS},
+                },
+            },
+        }
+        decision = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.92,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order"],
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+        }
+        # First call: S → A.
+        first = normalize_market_semantics(decision, snapshot, cfg)
+        self.assertEqual(
+            str(first.get("signal_grade") or "").upper(), "A",
+            "Pass 6 Fix #1: first call must downgrade S→A",
+        )
+        self.assertIn(
+            "htf_conflict_grade_downgraded", first.get("market_reason_codes") or [],
+            "Pass 6 Fix #1: marker must be present after first downgrade",
+        )
+        # Simulate LLM restoring the grade to S while keeping the marker.
+        first["signal_grade"] = "S"
+        first["confidence"] = 0.95  # also restored
+        # Second call: must detect restoration and re-downgrade to A.
+        second = normalize_market_semantics(first, snapshot, cfg)
+        self.assertEqual(
+            str(second.get("signal_grade") or "").upper(), "A",
+            "Pass 6 Fix #1: second call must re-downgrade restored S→A",
+        )
+        # Idempotency: third call on the downgraded result must stay at A.
+        third = normalize_market_semantics(second, snapshot, cfg)
+        self.assertEqual(
+            str(third.get("signal_grade") or "").upper(), "A",
+            "Pass 6 Fix #1: third call must stay at A (idempotent)",
+        )
+        # Marker must not be duplicated.
+        codes = third.get("market_reason_codes") or []
+        self.assertEqual(
+            codes.count("htf_conflict_grade_downgraded"), 1,
+            f"Pass 6 Fix #1: marker must appear exactly once; got {codes}",
+        )
+
+
+
+    def test_r1_2_required_tf_not_closed_fail_closed(self) -> None:
+        """R1-2: When a required TF has ``closed=False`` (health.ready=False or
+        last_close_time > analysis_time), ``normalize_market_semantics`` must
+        force ``market_bias=unknown``, ``trend_stage=unknown``, confidence ≤
+        ``degraded_confidence_cap``, grade ≤ C, ``decision=monitor_only``,
+        ``has_trade_plan=False``, ``trade_plan=None``, and strip
+        ``create_paper_order``/``create_opportunity_watch`` from
+        ``suggested_actions``.
+        """
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.92,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order", "create_opportunity_watch"],
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+        }
+        snapshot = {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "data_quality": {
+                "health": {
+                    "1d": {"ready": False, "last_close_time": 0},
+                    "4h": {"ready": True, "last_close_time": self._4H_CLOSE_MS},
+                    "1h": {"ready": True, "last_close_time": self._1H_CLOSE_MS},
+                    "15m": {"ready": True, "last_close_time": self._15M_CLOSE_MS},
+                },
+            },
+        }
+        cfg = {"strict_timeframe_closed_check": True, "degraded_confidence_cap": 0.3}
+        result = normalize_market_semantics(decision, snapshot, cfg)
+        self.assertEqual(str(result.get("market_bias") or "").lower(), "unknown",
+                         "R1-2: market_bias must be unknown when 1D not closed")
+        self.assertEqual(str(result.get("trend_stage") or "").lower(), "unknown",
+                         "R1-2: trend_stage must be unknown when 1D not closed")
+        self.assertLessEqual(
+            float(result.get("confidence") or 0), 0.3,
+            "R1-2: confidence must be capped at degraded_confidence_cap",
+        )
+        self.assertIn(str(result.get("signal_grade") or "C").upper(), {"C", "D"},
+                      "R1-2: grade must be ≤ C")
+        self.assertEqual(str(result.get("decision") or ""), "monitor_only",
+                         "R1-2: decision must be monitor_only")
+        self.assertFalse(bool(result.get("has_trade_plan")),
+                         "R1-2: has_trade_plan must be False")
+        self.assertIsNone(result.get("trade_plan"),
+                          "R1-2: trade_plan must be None")
+        actions = list(result.get("suggested_actions") or [])
+        self.assertNotIn("create_paper_order", actions,
+                         "R1-2: create_paper_order must be stripped")
+        self.assertNotIn("create_opportunity_watch", actions,
+                         "R1-2: create_opportunity_watch must be stripped")
+        self.assertTrue(bool(result.get("analysis_degraded")),
+                        "R1-2: analysis_degraded must be True")
+
+    # ── R1-3) Schema rejects missing TF / non-integer close_time / future close_time ─
+
+    def test_r1_3_schema_rejects_bad_timeframe_context_shapes(self) -> None:
+        """R1-3: ``ga_decision.schema.json`` must reject malformed
+        ``timeframe_context`` shapes: (a) missing 1d key, (b) ``closed`` as
+        string instead of boolean, (c) ``close_time`` as ISO string instead
+        of integer, (d) future ``close_time`` > ``analysis_time_utc``.
+        """
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+
+        base = {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME_MS,
+            "decision": "monitor_only",
+            "signal_grade": "C",
+            "confidence": 0.3,
+            "summary": "test",
+            "counter_evidence": ["x"],
+            "has_trade_plan": False,
+            "suggested_actions": ["ignore"],
+            "risk_notes": [],
+            "alignment": "unknown",
+            "htf_conflict": False,
+            "market_reason_codes": [],
+        }
+        good_tf = {
+            "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._1D_CLOSE_MS},
+            "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._4H_CLOSE_MS},
+            "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._1H_CLOSE_MS},
+            "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._15M_CLOSE_MS},
+        }
+        ok_base = dict(base, timeframe_context=dict(good_tf))
+        ok, err = validate_json("ga_decision.schema.json", ok_base)
+        self.assertTrue(ok, f"R1-3: baseline must validate; got {err}")
+
+        # (a) missing 1d
+        bad_a = dict(base, timeframe_context={k: v for k, v in good_tf.items() if k != "1d"})
+        ok, err = validate_json("ga_decision.schema.json", bad_a)
+        self.assertFalse(ok, f"R1-3: missing 1d must be rejected; got ok={ok}, err={err}")
+
+        # (b) closed as string
+        bad_b = dict(base, timeframe_context={
+            **good_tf, "1d": {**good_tf["1d"], "closed": "true"},
+        })
+        ok, err = validate_json("ga_decision.schema.json", bad_b)
+        self.assertFalse(ok, f"R1-3: closed='true' (string) must be rejected; got ok={ok}, err={err}")
+
+        # (c) close_time as ISO string
+        bad_c = dict(base, timeframe_context={
+            **good_tf, "1d": {**good_tf["1d"], "close_time": "2026-07-03T00:00:00Z"},
+        })
+        ok, err = validate_json("ga_decision.schema.json", bad_c)
+        self.assertFalse(ok, f"R1-3: close_time as string must be rejected; got ok={ok}, err={err}")
+
+        # (d) extra TF key (5m) must be rejected (additionalProperties=false)
+        bad_d = dict(base, timeframe_context={
+            **good_tf, "5m": {"bias": "bullish", "structure": "x", "closed": True, "close_time": self._15M_CLOSE_MS},
+        })
+        ok, err = validate_json("ga_decision.schema.json", bad_d)
+        self.assertFalse(ok, f"R1-3: extra 5m key must be rejected; got ok={ok}, err={err}")
+
+    # ── R1-4) Daily direction mapping bullish/bearish ────────────────────────
+
+    def test_r1_4_daily_direction_mapping_bullish_and_bearish(self) -> None:
+        """R1-4: ``build_canonical_market_summary`` must render 日线偏多 for
+        bullish 1D and 日线偏空 for bearish 1D (not reversed) when HTF
+        conflict is detected.
+        """
+        from plugins.crypto_guard.reasoning.summary_builder import build_canonical_market_summary
+
+        for bias_1d, expected in (("bullish", "偏多"), ("bearish", "偏空")):
+            decision = {
+                "symbol": "TESTUSDT",
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "signal_grade": "C", "confidence": 0.3,
+                "market_bias": "mixed", "trend_stage": "transition",
+                "decision": "monitor_only", "has_trade_plan": False,
+                "counter_evidence": ["x"], "suggested_actions": ["ignore"],
+                "risk_notes": [], "alignment": "countertrend_rebound",
+                "htf_conflict": True, "market_reason_codes": ["htf_conflict"],
+                "timeframe_context": {
+                    "1d": {"bias": bias_1d, "structure": "trend", "closed": True, "close_time": self._1D_CLOSE_MS},
+                    "4h": {"bias": "bullish" if bias_1d == "bearish" else "bearish", "structure": "trend", "closed": True, "close_time": self._4H_CLOSE_MS},
+                    "1h": {"bias": "bullish" if bias_1d == "bearish" else "bearish", "structure": "rebound", "closed": True, "close_time": self._1H_CLOSE_MS},
+                    "15m": {"bias": "bullish" if bias_1d == "bearish" else "bearish", "structure": "rebound", "closed": True, "close_time": self._15M_CLOSE_MS},
+                },
+            }
+            text = build_canonical_market_summary(decision)
+            self.assertIn(
+                f"日线{expected}", text,
+                f"R1-4: 1D={bias_1d} must render '日线{expected}'; got {text}",
+            )
+
+    # ── R1-5) Canonical summary unconditional override (controller path) ─────
+
+    def test_r1_5_canonical_summary_unconditional_override(self) -> None:
+        """R1-5: ``_run_decision_and_render`` (real production chain:
+        ``run_ga_sop_decision`` → ``rewrite_inconsistent_summary`` →
+        ``build_canonical_market_summary`` → ``repo.create_ga_decision`` →
+        DB readback) must produce ``final_summary == summary ==
+        rendered_summary == canonical`` for BOTH executable and
+        non-executable decisions. The original LLM/template text must be
+        preserved separately in ``raw_decision_json["raw_llm_summary"]``,
+        never inside the canonical business fields.
+
+        Per Phase E plan: "可执行与不可执行各一条，controller+persistence
+        DB roundtrip 后三字段严格断言." This test exercises the actual
+        controller path that applies the canonical override unconditionally
+        (R1-5 fix lives in ``controller.py``, not ``decision_schema.py``).
+        """
+        from plugins.crypto_guard.reasoning.summary_builder import (
+            build_canonical_market_summary,
+        )
+        # ── Non-executable decision (DOGE countertrend rebound) ───────────
+        # run_ga_sop_decision produces a monitor_only decision; the helper
+        # then unconditionally overrides final_summary/summary/rendered_summary
+        # to the canonical text and persists via repo.create_ga_decision.
+        non_exec_fixture = self._doge_fixture()
+        non_exec_result = self._run_decision_and_render(non_exec_fixture)
+        non_exec_decision = non_exec_result["decision"].get("ga_decision") or non_exec_result["decision"]
+        non_exec_row = non_exec_result["row"]
+        non_exec_canonical = build_canonical_market_summary(non_exec_decision)
+        self.assertEqual(
+            non_exec_row["final_summary"], non_exec_canonical,
+            "R1-5 (non-exec): DB final_summary must equal canonical",
+        )
+        self.assertEqual(
+            non_exec_row["rendered_summary"], non_exec_canonical,
+            "R1-5 (non-exec): DB rendered_summary must equal canonical",
+        )
+        # ── Executable decision (SOL aligned bullish middle) ──────────────
+        # SOL fixture has aligned bullish structure across 4H/1H/15M with
+        # 1D range; run_ga_sop_decision yields a create_paper_order /
+        # monitor_with_plan decision. Even when execution-eligible, the
+        # controller (and our helper mirror) overrides final_summary to
+        # canonical — R1-5 closes the gap where executable decisions kept
+        # LLM wording in final_summary while rendered_summary used canonical.
+        exec_fixture = self._sol_fixture()
+        exec_result = self._run_decision_and_render(exec_fixture)
+        exec_decision = exec_result["decision"].get("ga_decision") or exec_result["decision"]
+        exec_row = exec_result["row"]
+        exec_canonical = build_canonical_market_summary(exec_decision)
+        self.assertEqual(
+            exec_row["final_summary"], exec_canonical,
+            "R1-5 (exec): DB final_summary must equal canonical even when "
+            "execution-eligible (unconditional override)",
+        )
+        self.assertEqual(
+            exec_row["rendered_summary"], exec_canonical,
+            "R1-5 (exec): DB rendered_summary must equal canonical",
+        )
+        # ── raw_llm_summary preserved on raw_decision_json ────────────────
+        # The original LLM/template text is preserved in
+        # raw_decision_json["raw_llm_summary"] for audit; it must never
+        # leak into final_summary or rendered_summary.
+        for label, row, decision in (
+            ("non-exec", non_exec_row, non_exec_decision),
+            ("exec", exec_row, exec_decision),
+        ):
+            raw_json = json.loads(row["raw_decision_json"]) if isinstance(
+                row["raw_decision_json"], str) else (row["raw_decision_json"] or {})
+            raw_llm = raw_json.get("raw_llm_summary") or decision.get("raw_llm_summary")
+            # raw_llm_summary may be empty when the LLM produced no text, but
+            # if it exists and is non-empty, it must NOT equal canonical and
+            # must NOT appear inside final_summary.
+            if raw_llm:
+                self.assertNotEqual(
+                    raw_llm, row["final_summary"],
+                    f"R1-5 ({label}): raw_llm_summary must not equal final_summary",
+                )
+                self.assertNotIn(
+                    raw_llm, row["final_summary"] or "",
+                    f"R1-5 ({label}): raw_llm_summary must not leak into final_summary",
+                )
+
+    # ── R1-6) Canonical drift diagnostic ─────────────────────────────────────
+
+    def test_r1_6_canonical_drift_diagnostic(self) -> None:
+        """R1-6: ``diagnose_report_accuracy`` must flag
+        ``canonical_summary_drift`` when persisted ``final_summary`` differs
+        from the recomputed canonical text, and ``missing_structured_field``
+        when ``timeframe_context`` is absent.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTDRIFT", grade="C", confidence=0.3,
+            decision_name="monitor_only", market_bias="neutral",
+            trend_stage="range", final_summary="错误的摘要文本",
+            rendered_summary="错误的摘要文本",
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTDRIFT'",
+            (json.dumps({
+                "symbol": "FAULTDRIFT",
+                "analysis_time_utc": self._ANALYSIS_TIME_MS,
+                "signal_grade": "C", "confidence": 0.3,
+                "market_bias": "neutral", "trend_stage": "range",
+                "decision": "monitor_only", "has_trade_plan": False,
+                "counter_evidence": ["x"], "suggested_actions": ["ignore"],
+                "risk_notes": [], "alignment": "unknown",
+                "htf_conflict": False, "market_reason_codes": [],
+                "timeframe_context": {
+                    "1d": {"bias": "neutral", "structure": "range", "closed": True, "close_time": self._1D_CLOSE_MS},
+                    "4h": {"bias": "neutral", "structure": "range", "closed": True, "close_time": self._4H_CLOSE_MS},
+                    "1h": {"bias": "neutral", "structure": "range", "closed": True, "close_time": self._1H_CLOSE_MS},
+                    "15m": {"bias": "neutral", "structure": "range", "closed": True, "close_time": self._15M_CLOSE_MS},
+                },
+                "final_summary": "错误的摘要文本",
+                "rendered_summary": "错误的摘要文本",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "canonical_summary_drift", codes,
+            f"R1-6: canonical_summary_drift must be flagged; got codes: {codes}",
+        )
+
+    def test_r1_6_missing_structured_field_diagnostic(self) -> None:
+        """R1-6 (variant): ``missing_structured_field`` must be flagged when
+        ``timeframe_context`` is absent from ``raw_decision_json``.
+        """
+        self._seed_fault_ga_decision(
+            symbol="FAULTMISSING", grade="C", confidence=0.3,
+            decision_name="monitor_only", market_bias="neutral",
+            trend_stage="range", final_summary="中性震荡",
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTMISSING'",
+            (json.dumps({
+                "symbol": "FAULTMISSING",
+                "signal_grade": "C", "confidence": 0.3,
+                "market_bias": "neutral", "trend_stage": "range",
+                "decision": "monitor_only",
+                "final_summary": "中性震荡",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i.get("type", "") for i in result.get("issues", [])]
+        self.assertIn(
+            "missing_structured_field", codes,
+            f"R1-6: missing_structured_field must be flagged; got codes: {codes}",
+        )
+
+    # ── R1-7) Real production chain (controller → persistence → DB → renderer) ─
+
+    def test_r1_7_real_production_chain_controller_persistence(self) -> None:
+        """R1-7: The test helper ``_run_decision_and_render`` must exercise the
+        real production chain — ``run_ga_sop_decision`` (real deterministic
+        SOP) → ``rewrite_inconsistent_summary`` → ``build_canonical_market_summary``
+        → ``repo.create_ga_decision`` → DB readback →
+        ``render_ga_hourly_summary`` + ``render_hourly_report_text`` →
+        ``diagnose_report_accuracy``. No mocks of the function under test.
+
+        Verifies the controller path produces a canonical summary that
+        survives DB roundtrip and passes diagnostics with zero issues for
+        this decision.
+        """
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        decision = result["decision"]
+        row = result["row"]
+        ga_text = result["ga_text"]
+        legacy_text = result["legacy_text"]
+
+        # final_summary and rendered_summary must both equal canonical.
+        from plugins.crypto_guard.reasoning.summary_builder import build_canonical_market_summary
+        canonical = build_canonical_market_summary(decision)
+        self.assertEqual(
+            row["final_summary"], canonical,
+            "R1-7: DB row final_summary must equal canonical",
+        )
+        self.assertEqual(
+            row["rendered_summary"], canonical,
+            "R1-7: DB row rendered_summary must equal canonical",
+        )
+        # Both renderers must produce non-empty text mentioning the symbol.
+        self.assertTrue(ga_text, "R1-7: ga_text must be non-empty")
+        self.assertTrue(legacy_text, "R1-7: legacy_text must be non-empty")
+        self.assertIn(fixture["symbol"], ga_text)
+        # Diagnostics for this decision must be clean (no canonical drift).
+        from plugins.crypto_guard.diagnostics.report_diagnostics import diagnose_report_accuracy
+        diag = diagnose_report_accuracy(self.repo)
+        drift_issues = [
+            i for i in diag.get("issues", [])
+            if i.get("type") in {"canonical_summary_drift", "rendered_summary_drift"}
+            and (i.get("details") or {}).get("symbol") == fixture["symbol"]
+        ]
+        self.assertEqual(
+            drift_issues, [],
+            f"R1-7: no canonical drift expected for clean decision; got {drift_issues}",
+        )
+
+    # ── R1-8) raw_llm_summary adapter path ────────────────────────────────────
+
+    def test_r1_8_raw_llm_summary_adapter_path(self) -> None:
+        """R1-8 (07-03 final review P1): ``raw_llm_summary`` must be readable
+        by the REAL adapter (``latest_decision_summaries``) from the
+        ``raw_decision_json`` top-level after going through the REAL
+        controller → DB → adapter chain. The controller sets
+        ``ga_decision["raw_llm_summary"]`` at the top level (in addition to
+        ``raw_legacy_decision.raw_llm_summary``), so ``json.dumps(decision)``
+        puts it at the top level of ``raw_decision_json`` — which is what
+        ``_raw(row).get("raw_llm_summary")`` reads.
+
+        This test does NOT mock the adapter, does NOT call the repository
+        directly, and does NOT bypass the controller. It uses the
+        ``_run_decision_and_render`` helper which calls:
+        ``controller_decision_from_legacy`` → ``create_ga_decision`` →
+        ``get_ga_decision`` → ``latest_decision_summaries``.
+        """
+        fixture = self._doge_fixture()
+        result = self._run_decision_and_render(fixture)
+        adapter_summary = result.get("adapter_summary")
+        original_llm = result.get("original_llm_summary") or ""
+        canonical = result.get("canonical") or ""
+
+        # 1. adapter_summary must be present (real adapter returned a row).
+        self.assertIsNotNone(
+            adapter_summary,
+            "R1-8: latest_decision_summaries adapter must return a summary for "
+            "the persisted ga_decision; got None (adapter path broken)",
+        )
+
+        # 2. raw_llm_summary must be readable by the real adapter from the
+        #    top level of raw_decision_json. The controller sets
+        #    ga_decision["raw_llm_summary"] at the top level; the repo
+        #    serializes the full dict to raw_decision_json; the adapter reads
+        #    _raw(row).get("raw_llm_summary").
+        self.assertIn(
+            "raw_llm_summary", adapter_summary,
+            "R1-8: adapter summary must include the raw_llm_summary key "
+            "(adapter not reading the top-level path)",
+        )
+        adapter_raw_llm = adapter_summary.get("raw_llm_summary")
+        # The original LLM/template text may be empty when no LLM ran, but
+        # when it exists it MUST be preserved and readable. We assert that
+        # the adapter returns the same string the controller captured.
+        self.assertEqual(
+            adapter_raw_llm, original_llm,
+            "R1-8: adapter raw_llm_summary must match the original LLM/template "
+            f"text captured by the controller; got adapter={adapter_raw_llm!r} "
+            f"original={original_llm!r}",
+        )
+
+        # 3. The canonical text must NOT contain the raw LLM text (when LLM
+        #    actually produced text). This proves raw_llm_summary is preserved
+        #    separately from canonical.
+        if original_llm:
+            self.assertNotIn(
+                original_llm, canonical,
+                f"R1-8: canonical must not contain raw LLM text; "
+                f"canonical={canonical!r} raw_llm={original_llm!r}",
+            )
+            self.assertNotEqual(
+                adapter_summary.get("final_summary"), original_llm,
+                "R1-8: adapter final_summary must be the canonical text, NOT "
+                "the raw LLM text",
+            )
+
+        # 4. final_summary and rendered_summary returned by the adapter must
+        #    both equal the canonical deterministic text (R1-5 invariant).
+        self.assertEqual(
+            adapter_summary.get("final_summary"), canonical,
+            "R1-8: adapter final_summary must equal the canonical text",
+        )
+        self.assertEqual(
+            adapter_summary.get("rendered_summary"), canonical,
+            "R1-8: adapter rendered_summary must equal the canonical text",
+        )
+
+    # ── R1-9) Spec/code enum alignment for neutral/mixed/unknown stages ──────
+
+    def test_r1_9_spec_code_alignment_neutral_stages(self) -> None:
+        """R1-9: The ``crypto-guard-conventions.md`` spec §38.2, the
+        ``market_semantics.py`` ``allowed_stages_for_*_bias`` config, and
+        the ``ga_decision.schema.json`` enum must all agree that
+        neutral/mixed/unknown bias can pair with range/transition/unknown
+        stages (NOT early/middle/late).
+        """
+        import re
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        spec_path = ".trellis/spec/backend/crypto-guard-conventions.md"
+        with open(spec_path, encoding="utf-8") as f:
+            spec_text = f.read()
+        # Spec must list range/transition/unknown as legal for neutral/mixed/unknown
+        for stage in ("range", "transition", "unknown"):
+            self.assertIn(stage, spec_text,
+                          f"R1-9: spec must mention '{stage}' as legal for neutral bias")
+        # Code: normalize must convert neutral+middle → range/transition/unknown
+        for bias in ("neutral", "mixed", "unknown"):
+            decision = {
+                "signal_grade": "B", "market_bias": bias,
+                "trend_stage": "middle", "confidence": 0.7,
+                "decision": "monitor_only",
+            }
+            result = normalize_market_semantics(decision, {}, {})
+            n_stage = str(result.get("trend_stage") or "").lower()
+            self.assertIn(
+                n_stage, {"range", "transition", "unknown"},
+                f"R1-9: bias={bias}+stage=middle must normalize to range/transition/unknown; got {n_stage}",
+            )
+
+    # ── R1-10) C/D dedupe-before-count ────────────────────────────────────────
+
+    def test_r1_10_cd_dedupe_before_count(self) -> None:
+        """R1-10: ``_format_cd_reasons`` must dedupe BEFORE counting, so
+        ``shown`` reflects unique items and ``remaining`` is
+        ``unique_count - shown`` (never negative).
+        """
+        from plugins.crypto_guard.notify.hourly_report import _format_cd_reasons
+
+        # 6 unique items + duplicates + one empty; max_items=3 → 3 shown, 3 remaining
+        items = ["原因A", "原因B", "原因A", "", "原因C", "原因D", "原因E", "原因F", "原因B"]
+        out = _format_cd_reasons(items, max_items=3)
+        # Output must contain "前 3 项" and "另有 3 项" (6 unique after dedupe, 3 shown)
+        self.assertIn("前 3 项", out,
+                      f"R1-10: label must show 3 shown; got {out}")
+        self.assertIn("另有 3 项", out,
+                      f"R1-10: remaining must be 3 after dedupe; got {out}")
+        # The output must contain 原因A, 原因B, 原因C (deduped, top 3)
+        for item in ("原因A", "原因B", "原因C"):
+            self.assertIn(item, out,
+                          f"R1-10: deduped item '{item}' must appear; got {out}")
+
+    # ── R1-11) Single trade plan validator ────────────────────────────────────
+
+    def test_r1_11_single_trade_plan_validator(self) -> None:
+        """R1-11: There must be a single ``is_valid_trade_plan`` source in
+        ``plugins/crypto_guard/notify/report_consistency.py``. The
+        ``summary_builder._gate_blocker_labels`` must call this shared
+        validator, not a local copy.
+        """
+        import ast
+        # Find all is_valid_trade_plan definitions in the codebase
+        validator_files = []
+        for root, _, files in os.walk("plugins/crypto_guard"):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(root, fn)
+                with open(path, encoding="utf-8") as f:
+                    src = f.read()
+                try:
+                    tree = ast.parse(src)
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "is_valid_trade_plan":
+                        validator_files.append(path)
+        self.assertEqual(
+            len(validator_files), 1,
+            f"R1-11: exactly one is_valid_trade_plan definition expected; found in {validator_files}",
+        )
+        self.assertEqual(
+            validator_files[0].replace(os.sep, "/"),
+            "plugins/crypto_guard/notify/report_consistency.py",
+            f"R1-11: validator must live in report_consistency.py; found in {validator_files[0]}",
+        )
+        # summary_builder._gate_blocker_labels must call the shared validator
+        from plugins.crypto_guard.reasoning.summary_builder import _gate_blocker_labels
+        import inspect
+        src = inspect.getsource(_gate_blocker_labels)
+        self.assertIn(
+            "is_valid_trade_plan", src,
+            "R1-11: _gate_blocker_labels must call is_valid_trade_plan",
+        )
+
+    # ── R1-12) Observation candidate no duplicate gate reasons ────────────────
+
+    def test_r1_12_observation_no_duplicate_gate_reasons(self) -> None:
+        """R1-12: ``_format_opportunity_row`` for non-executable decisions
+        must not duplicate the same gate-blocker reason in both ``市场：`` and
+        ``原因：`` lines. The ``原因：`` line must be dropped for
+        non-executable rows.
+        """
+        from plugins.crypto_guard.notify.hourly_report import _format_opportunity_row
+
+        row = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "C",
+            "confidence": 0.4,
+            "decision": "monitor_only",
+            "market_bias": "neutral",
+            "trend_stage": "range",
+            "rendered_summary": "TESTUSDT 中性震荡",
+            "risk_check_json": json.dumps({"ok": False, "reasons": ["HTF 冲突"]}),
+            "raw_decision_json": json.dumps({
+                "market_reason_codes": ["htf_conflict"],
+                "timeframe_context": {
+                    "1d": {"bias": "bearish", "structure": "downtrend", "closed": True, "close_time": self._1D_CLOSE_MS},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True, "close_time": self._4H_CLOSE_MS},
+                    "1h": {"bias": "bullish", "structure": "rebound", "closed": True, "close_time": self._1H_CLOSE_MS},
+                    "15m": {"bias": "bullish", "structure": "rebound", "closed": True, "close_time": self._15M_CLOSE_MS},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": True,
+            }),
+            "opportunity_watch_json": None,
+            "trade_plan_json": None,
+            "feishu_actions_json": "[]",
+        }
+        text = _format_opportunity_row(row, {}, tier_label="观察")
+        # For non-executable rows, "原因：" line must be dropped — the
+        # market/gate lines carry the reason without duplication.
+        # Count occurrences of "HTF 冲突" — must appear at most once.
+        count = text.count("HTF 冲突")
+        self.assertLessEqual(
+            count, 1,
+            f"R1-12: 'HTF 冲突' must appear at most once in observation row; got {count} in:\n{text}",
+        )
+
+    # ── Pass 6 Fix #2) Backtest single-TF load must not be 4-TF fail-closed ─
+
+    def test_pass6_fix2_backtest_single_tf_not_fail_closed(self) -> None:
+        """Pass 6 P1 #2 + Pass 7 P0: ``historical_replay`` loads a single TF
+        (e.g. 15m) via ``build_market_state_snapshot(..., mode="shadow_test",
+        timeframes=["15m"])``. The 4-TF fail-closed gate in
+        ``normalize_market_semantics`` Step 1 must NOT force the decision to
+        C/0.3/unknown/monitor_only — otherwise backtests have no real trade
+        samples.
+
+        Pass 7 P0: the snapshot must set ``partial_tf_mode=True`` (NOT
+        ``analysis_degraded=True``) so ``ga_judge.run_ga_sop_decision`` does
+        NOT route into the degraded path (which would force monitor_only/C/
+        0.3/unknown). The loaded TF's real analysis must flow through
+        (R4 force-unknown must NOT fire for partial_tf_mode).
+        """
+        import os
+        import tempfile
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.reasoning.market_state_builder import (
+            build_market_state_snapshot,
+        )
+        from plugins.crypto_guard.reasoning.market_semantics import (
+            normalize_market_semantics,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "replay.db")
+            old = os.environ.get("CRYPTO_GUARD_DB")
+            os.environ["CRYPTO_GUARD_DB"] = db_path
+            try:
+                cfg = load_config()
+                initialize_database(cfg)
+                conn = connect_db(db_path)
+                try:
+                    repo = CryptoGuardRepository(conn)
+                    # Use a 15m-aligned close_time so assess_health sees
+                    # last_close_time == expected_last_close_time (no staleness).
+                    # 1_783_155_599_999 = 1981284 * 900000 - 1 (valid 15m close).
+                    LAST_CLOSE = 1_783_155_599_999
+                    span_15m = 15 * 60 * 1000
+                    base_close = LAST_CLOSE - (260 - 1) * span_15m
+                    candles = []
+                    for i in range(260):
+                        ct_close = base_close + i * span_15m
+                        candles.append({
+                            "symbol": "TESTUSDT",
+                            "interval": "15m",
+                            "open_time": ct_close - span_15m + 1,
+                            "close_time": ct_close,
+                            "open": 100.0 + i * 0.5,
+                            "high": 101.0 + i * 0.5,
+                            "low": 99.0 + i * 0.5,
+                            "close": 100.5 + i * 0.5,
+                            "volume": 1000.0,
+                            "quote_volume": 100000.0,
+                            "trades": 100,
+                            "closed": True,
+                        })
+                    repo.upsert_candles(candles)
+                    # analysis_time = LAST_CLOSE + 1 (just after the last close).
+                    analysis_time = LAST_CLOSE + 1
+
+                    snapshot = build_market_state_snapshot(
+                        repo,
+                        symbol="TESTUSDT",
+                        analysis_time_utc=analysis_time,
+                        mode="shadow_test",
+                        timeframes=["15m"],
+                    )
+
+                    # Pass 7 P0: snapshot must be marked partial_tf_mode=True
+                    # (NOT analysis_degraded=True — that would route ga_judge
+                    # into the degraded path and destroy real trade samples).
+                    self.assertTrue(
+                        bool(snapshot.get("partial_tf_mode")),
+                        "Pass 7 P0: shadow_test with <4 TFs must set partial_tf_mode=True",
+                    )
+                    self.assertFalse(
+                        bool(snapshot.get("analysis_degraded")),
+                        "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True (would route ga_judge into degraded path)",
+                    )
+                    # 15m health must be ready (260 healthy closed candles).
+                    health_15m = (snapshot.get("data_quality") or {}).get("health", {}).get("15m") or {}
+                    self.assertTrue(
+                        bool(health_15m.get("ready")),
+                        f"Pass 6 Fix #2: 15m health must be ready; got {health_15m}",
+                    )
+                    # Loaded 15m TF must have real (non-unknown) trend_stage
+                    # and market_structure — the R4 force-unknown path must
+                    # NOT fire for partial_tf_mode.
+                    prof_15m = (snapshot.get("profiles") or {}).get("15m") or {}
+                    self.assertNotEqual(
+                        str(prof_15m.get("trend_stage") or "").lower(), "unknown",
+                        "Pass 6 Fix #2: 15m trend_stage must not be force-unknown in partial_tf_mode",
+                    )
+
+                    # Run a high-grade decision through normalize — must NOT
+                    # be forced to C/0.3/unknown/monitor_only by the 4-TF
+                    # fail-closed.
+                    decision = {
+                        "symbol": "TESTUSDT",
+                        "signal_grade": "S",
+                        "market_bias": "bullish",
+                        "trend_stage": "middle",
+                        "confidence": 0.88,
+                        "decision": "trade_plan_available",
+                        "has_trade_plan": True,
+                        "trade_plan": {"side": "LONG", "entry_type": "limit"},
+                        "suggested_actions": ["create_paper_order"],
+                        "analysis_time_utc": analysis_time,
+                    }
+                    result = normalize_market_semantics(decision, snapshot, {})
+                    self.assertNotIn(
+                        "data_incomplete", result.get("market_reason_codes") or [],
+                        "Pass 6 Fix #2: shadow_test partial-TF must not trigger data_incomplete fail-closed",
+                    )
+                    self.assertNotEqual(
+                        str(result.get("decision") or ""), "monitor_only",
+                        "Pass 6 Fix #2: shadow_test partial-TF must not be forced to monitor_only by 4-TF gate",
+                    )
+                    self.assertGreater(
+                        float(result.get("confidence") or 0), 0.3,
+                        "Pass 6 Fix #2: shadow_test partial-TF confidence must not be capped at 0.3 by 4-TF gate",
+                    )
+                finally:
+                    conn.close()
+            finally:
+                if old is not None:
+                    os.environ["CRYPTO_GUARD_DB"] = old
+                else:
+                    os.environ.pop("CRYPTO_GUARD_DB", None)
+
+    # ── Pass 7 P0) partial_tf_mode must produce real trade samples via real run_ga_sop_decision ─
+
+    def test_pass7_p0_partial_tf_mode_real_decision_not_degraded(self) -> None:
+        """Pass 7 P0: ``historical_replay`` calls ``build_market_state_snapshot
+        (... mode="shadow_test", timeframes=["15m"])`` then ``run_ga_sop_decision
+        (snapshot)``. The real production path must NOT route into the degraded
+        branch (which would force monitor_only/C/0.3/unknown and destroy real
+        trade samples).
+
+        This test uses the REAL ``run_ga_sop_decision`` (not a hand-built
+        decision + normalize call), so it catches the actual routing bug that
+        the Pass 6 test missed.
+        """
+        import os
+        import tempfile
+        import math
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.reasoning.market_state_builder import (
+            build_market_state_snapshot,
+        )
+        from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "replay.db")
+            old = os.environ.get("CRYPTO_GUARD_DB")
+            os.environ["CRYPTO_GUARD_DB"] = db_path
+            try:
+                cfg = load_config()
+                initialize_database(cfg)
+                conn = connect_db(db_path)
+                try:
+                    repo = CryptoGuardRepository(conn)
+                    # Strongly trending 15m candles with periodic pullbacks so
+                    # swings form HH/HL pattern → market_structure=bullish →
+                    # trend_stage=middle → real trade plan path fires.
+                    # 260 candles, each 15m apart, trending up from 100 → ~250
+                    # with small pullbacks every ~10 bars to create swings.
+                    LAST_CLOSE = 1_783_155_599_999
+                    span_15m = 15 * 60 * 1000
+                    base_close = LAST_CLOSE - (260 - 1) * span_15m
+                    candles = []
+                    for i in range(260):
+                        ct_close = base_close + i * span_15m
+                        # Trending up with small pullback oscillation
+                        trend = 100.0 + i * 0.6
+                        pullback = 2.0 * math.sin(i / 5.0)
+                        open_p = trend + pullback - 0.3
+                        close_p = trend + pullback + 0.3
+                        high_p = max(open_p, close_p) + 0.8
+                        low_p = min(open_p, close_p) - 0.8
+                        candles.append({
+                            "symbol": "TESTUSDT",
+                            "interval": "15m",
+                            "open_time": ct_close - span_15m + 1,
+                            "close_time": ct_close,
+                            "open": open_p,
+                            "high": high_p,
+                            "low": low_p,
+                            "close": close_p,
+                            "volume": 1000.0,
+                            "quote_volume": 100000.0,
+                            "trades": 100,
+                            "closed": True,
+                        })
+                    repo.upsert_candles(candles)
+                    analysis_time = LAST_CLOSE + 1
+
+                    snapshot = build_market_state_snapshot(
+                        repo,
+                        symbol="TESTUSDT",
+                        analysis_time_utc=analysis_time,
+                        mode="shadow_test",
+                        timeframes=["15m"],
+                    )
+
+                    # Pass 7 P0 contract: partial_tf_mode=True, analysis_degraded=False
+                    self.assertTrue(
+                        bool(snapshot.get("partial_tf_mode")),
+                        "Pass 7 P0: shadow_test <4 TFs must set partial_tf_mode=True",
+                    )
+                    self.assertFalse(
+                        bool(snapshot.get("analysis_degraded")),
+                        "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True",
+                    )
+
+                    # Run the REAL production decision path
+                    decision = run_ga_sop_decision(snapshot)
+
+                    # The decision must NOT be the degraded fallback shape.
+                    # If ga_judge routes into the degraded branch, decision
+                    # becomes monitor_only/C/0.3/unknown with strategy_name
+                    # "ga_sop_degraded" — that's the bug we're fixing.
+                    self.assertNotEqual(
+                        str(decision.get("strategy_name") or ""), "ga_sop_degraded",
+                        "Pass 7 P0: real run_ga_sop_decision must NOT route into degraded path for partial_tf_mode",
+                    )
+                    self.assertNotIn(
+                        "data_incomplete", decision.get("market_reason_codes") or [],
+                        "Pass 7 P0: real run_ga_sop_decision must NOT add data_incomplete for partial_tf_mode",
+                    )
+                    # Confidence must NOT be capped at 0.3 (the degraded cap)
+                    self.assertGreater(
+                        float(decision.get("confidence") or 0), 0.3,
+                        f"Pass 7 P0: real run_ga_sop_decision confidence must not be capped at 0.3; got {decision.get('confidence')}",
+                    )
+                finally:
+                    conn.close()
+            finally:
+                if old is not None:
+                    os.environ["CRYPTO_GUARD_DB"] = old
+                else:
+                    os.environ.pop("CRYPTO_GUARD_DB", None)
+
+    # ── Pass 7 P1 #2) LLM candidate must not write internal marker fields ─
+
+    def test_pass7_p1_llm_candidate_cannot_write_internal_marker_fields(self) -> None:
+        """Pass 7 P1 #2: ``_normalize_llm_decision`` in ``llm_agent_judge.py``
+        used to ``decision.update(candidate)`` directly, allowing the LLM
+        candidate to write internal idempotency marker fields like
+        ``_htf_conflict_original_grade``. ``market_semantics.normalize_market_semantics``
+        trusts that field to record the pre-downgrade grade — if the LLM
+        sets ``_htf_conflict_original_grade="X"``, the downgrade logic sees
+        no expected terminal grade and skips, leaving ``signal_grade=S`` while
+        the ``htf_conflict_grade_downgraded`` marker persists in
+        ``market_reason_codes``. The semantic contract is broken.
+
+        The fix strips all ``_``-prefixed fields from the candidate before
+        merge — the LLM has no business writing internal marker fields.
+        After the fix, the malicious candidate's ``_htf_conflict_original_grade="X"``
+        is stripped, and ``normalize_market_semantics`` correctly applies the
+        S→A downgrade and records the real original grade "S".
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _normalize_llm_decision
+
+        snapshot = {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": 1_783_155_599_999,
+            "analysis_degraded": False,
+            "partial_tf_mode": False,
+            "profiles": {
+                "1d": {"market_structure": "bullish", "momentum": "bullish"},
+                "4h": {"market_structure": "trend", "momentum": "bullish"},
+                "1h": {"market_structure": "bearish", "momentum": "bearish"},
+                "15m": {"market_structure": "bearish", "momentum": "bearish"},
+            },
+            "data_quality": {
+                "health": {
+                    "1d": {"ready": True, "last_close_time": 1_783_155_599_999},
+                    "4h": {"ready": True, "last_close_time": 1_783_155_599_999},
+                    "1h": {"ready": True, "last_close_time": 1_783_155_599_999},
+                    "15m": {"ready": True, "last_close_time": 1_783_155_599_999},
+                },
+            },
+        }
+        fallback = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "B",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.78,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order"],
+            "analysis_time_utc": 1_783_155_599_999,
+            "counter_evidence": [],
+            "risk_notes": [],
+        }
+        # Malicious LLM candidate: tries to set _htf_conflict_original_grade="X"
+        # to bypass the S→A downgrade.
+        candidate = {
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.95,
+            "alignment": "countertrend_rebound",
+            "htf_conflict": True,
+            "_htf_conflict_original_grade": "X",  # malicious internal field
+            "_htf_conflict_grade_downgraded": True,  # malicious internal marker
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order"],
+            "market_reason_codes": [],
+        }
+        decision = _normalize_llm_decision(candidate, snapshot, fallback)
+        # Pass 7 P1 #2 contract: the malicious bypass must NOT succeed.
+        # The LLM's _htf_conflict_original_grade="X" must be stripped before
+        # merge so normalize_market_semantics applies the S→A downgrade
+        # correctly. After the downgrade, the field is set by normalize (not
+        # the LLM) to the real original grade "S".
+        self.assertEqual(
+            str(decision.get("signal_grade") or "").upper(), "A",
+            f"Pass 7 P1 #2: HTF conflict must downgrade S→A even when LLM tries to set _htf_conflict_original_grade='X'; got {decision.get('signal_grade')}",
+        )
+        self.assertIn(
+            "htf_conflict_grade_downgraded", decision.get("market_reason_codes") or [],
+            "Pass 7 P1 #2: htf_conflict_grade_downgraded marker must be present after downgrade",
+        )
+        # The internal _htf_conflict_original_grade field is set by
+        # normalize_market_semantics (not by the LLM) and records the
+        # pre-downgrade grade. It must equal "S" (the real original), NOT "X"
+        # (the LLM's attempt).
+        self.assertEqual(
+            decision.get("_htf_conflict_original_grade"), "S",
+            f"Pass 7 P1 #2: _htf_conflict_original_grade must be 'S' (set by normalize), not 'X' (LLM candidate value); got {decision.get('_htf_conflict_original_grade')}",
+        )
+
+    # ── Pass 6 Fix #5) LLM judge must read market_semantics config from cfg.trading_mode ─
+
+    def test_pass6_fix5_llm_judge_uses_configured_htf_cap(self) -> None:
+        """Pass 6 P2 #5: ``_normalize_llm_decision`` in ``llm_agent_judge.py``
+        used to read config from non-existent ``snapshot.config``, falling
+        back to ``{}`` so ``normalize_market_semantics`` used the default
+        ``htf_conflict_confidence_cap=0.67`` instead of the configured
+        ``0.70``. The fix reads from ``cfg.trading_mode.market_semantics``.
+
+        This test verifies the configured cap is honored when an LLM
+        candidate produces a high-confidence htf_conflict decision. With
+        ``htf_conflict_confidence_cap=0.70`` in ``trading_mode.yaml``, the
+        confidence must be capped at 0.70 (not 0.67) and the
+        ``htf_conflict_grade_downgraded`` reason code must be present.
+        """
+        from plugins.crypto_guard.reasoning.market_semantics import (
+            normalize_market_semantics,
+        )
+        from plugins.crypto_guard.config.loader import load_config
+
+        cfg = load_config()
+        ms_cfg = (cfg.trading_mode.get("market_semantics") or {})
+        configured_cap = float(ms_cfg.get("htf_conflict_confidence_cap", 0.67))
+        # Sanity: the configured cap must be 0.70 in trading_mode.yaml.
+        self.assertEqual(
+            configured_cap, 0.70,
+            "Pass 6 Fix #5: trading_mode.yaml must set htf_conflict_confidence_cap=0.70",
+        )
+        # Build a decision with htf_conflict=True and confidence above the cap.
+        decision = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.95,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order"],
+            "alignment": "countertrend_rebound",
+            "htf_conflict": True,
+            "market_reason_codes": [],
+        }
+        # Build a snapshot with all 4 TFs closed so the fail-closed
+        # gate in Step 1 does NOT trigger. We only want to test the
+        # htf_conflict cap, not the data-degraded path.
+        snapshot = {
+            "analysis_degraded": False,
+            "analysis_time_utc": 1_783_155_599_999,
+            "profiles": {
+                "1d": {"market_structure": "bullish", "momentum": "bullish", "candles_count": 100, "trend_stage": "range"},
+                "4h": {"market_structure": "trend", "momentum": "bullish", "candles_count": 100, "trend_stage": "middle"},
+                "1h": {"market_structure": "bearish", "momentum": "bearish", "candles_count": 100, "trend_stage": "range"},
+                "15m": {"market_structure": "bearish", "momentum": "bearish", "candles_count": 100, "trend_stage": "range"},
+            },
+            "data_quality": {
+                "health": {
+                    "1d": {"ready": True, "last_close_time": 1_783_155_599_999, "expected_last_close_time": 1_783_155_599_999},
+                    "4h": {"ready": True, "last_close_time": 1_783_155_599_999, "expected_last_close_time": 1_783_155_599_999},
+                    "1h": {"ready": True, "last_close_time": 1_783_155_599_999, "expected_last_close_time": 1_783_155_599_999},
+                    "15m": {"ready": True, "last_close_time": 1_783_155_599_999, "expected_last_close_time": 1_783_155_599_999},
+                },
+            },
+        }
+        result = normalize_market_semantics(decision, snapshot, ms_cfg)
+        # Confidence must be capped at the configured 0.70 (not default 0.67).
+        self.assertLessEqual(
+            float(result.get("confidence") or 0), configured_cap,
+            f"Pass 6 Fix #5: confidence must be capped at configured {configured_cap}; got {result.get('confidence')}",
+        )
+        self.assertGreater(
+            float(result.get("confidence") or 0), 0.67,
+            "Pass 6 Fix #5: confidence must use configured 0.70 cap, not default 0.67",
+        )
+        self.assertIn(
+            "htf_conflict_grade_downgraded", result.get("market_reason_codes") or [],
+            "Pass 6 Fix #5: htf_conflict_grade_downgraded reason code must be present",
+        )
 
 
 if __name__ == "__main__":

@@ -1850,4 +1850,130 @@ Post-fill: After fill on candle N, `update_paper_positions` (`paper_position_upd
 
 ---
 
-**Last updated**: 2026-07-01 (Round 2 Final: BTC#9 trade gate final seal — R3-H production marker verification complete, Sections 37.22-37.28 added for R3-A through R3-G contracts with test names and production verification results)
+## 38. Hourly Analysis Semantic Accuracy Contracts (07-03)
+
+> **Trigger**: Production hourly report contained multi-timeframe semantic contradictions — neutral bias paired with middle trend stage, countertrend rebounds labeled as bullish-middle, HTF conflicts not capping confidence, canonical summary diverging from structured fields, and observation reasons lacking market context. The legacy diagnostic `htf_countertrend_overconfidence` was a no-op in production because it read `snapshot.profiles` (which never exists in the production `ga_decision` shape).
+
+### Contract 38.1: Multi-Timeframe Direction Transparency (FR-1)
+
+**What**: `market_semantics.build_timeframe_context(snapshot, config)` produces a `timeframe_context` dict mapping each of `{1d, 4h, 1h, 15m}` to `{bias, structure, closed}`. `compute_alignment(timeframe_context)` derives an `alignment` enum in `{aligned, partial, countertrend_rebound, neutral, unknown}`. `htf_conflict` is True when 1D bias opposes 1H/15M bias AND 4H does not confirm the lower-timeframe direction.
+
+**Why**: Without structured per-timeframe context, the hourly report could claim "bullish middle" based on a 15m rebound while 1D/4H were bearish — a countertrend rebound disguised as a trend-following opportunity. Persisting the structured context in `ga_decisions.raw_decision_json.timeframe_context` makes the multi-TF state inspectable by diagnostics and report renderers without re-deriving from the snapshot.
+
+**Propagation contract**: `controller_decision_from_legacy` (`ga_master/decision_schema.py:27`) MUST propagate `timeframe_context`, `alignment`, `htf_conflict`, and `market_reason_codes` from the legacy judge output to the top-level `ga_decision` dict. The test helper must not bypass this path — production and test must exercise the same normalizer.
+
+**Forbidden**:
+```python
+# WRONG: test helper constructs ga_decision dict directly, bypassing controller_decision_from_legacy
+ga_decision = {"symbol": s, "signal_grade": g, "timeframe_context": tc, ...}
+
+# CORRECT: test exercises the production controller path
+ga_decision = controller_decision_from_legacy(legacy=legacy_judge_output, ...)
+```
+
+### Contract 38.2: Bias-Stage Semantic Contract (FR-2)
+
+**What**: `normalize_market_semantics(decision, snapshot, config)` (`reasoning/market_semantics.py`) applies a 5-step pipeline. Step 2b enforces the bias-stage contract: `neutral`/`mixed`/`unknown` bias MUST pair with `range`, `transition`, or `unknown` stage; `bullish`/`bearish` bias MUST pair with `early`, `middle`, or `late`. Illegal combinations are normalized to the closest legal pairing (non-directional bias → `transition`; directional bias unchanged), and `market_reason_codes` records the original contradiction.
+
+**Why**: A `neutral` bias with a `middle` stage is semantically meaningless — middle stages require directional bias. Previously the report accepted this contradiction, producing labels like "中性-中段" that mislead traders into expecting a continuation that the bias does not support. R1-9 (07-03 final review): the original spec text listed `early/accumulation` as legal stages for `neutral`, which contradicted the PRD/contract used by `market_semantics.py` Step 2b (`range/transition/unknown`). This misalignment allowed tests to assert `neutral+early` as legal while the code demoted it.
+
+**Legal combinations** (R1-9 aligned with `market_semantics.py` + `ga_decision.schema.json`):
+| Bias | Allowed stages |
+|------|----------------|
+| bullish | early, middle, late |
+| bearish | early, middle, late |
+| neutral | range, transition, unknown |
+| mixed | range, transition, unknown |
+| unknown | range, transition, unknown |
+
+### Contract 38.3: HTF Conflict Confidence Cap (FR-3)
+
+**What**: When `htf_conflict=True`, `normalize_market_semantics` Step 3 caps `confidence` to `htf_conflict_confidence_cap` (default 0.70, config-driven). Step 4 then checks `non_executable = signal_grade not in {S,A} OR capped_conf < MIN_CONFIDENCE_FOR_PAPER_ORDER`. When `non_executable=True`, the pipeline collapses `decision` to `monitor_only`, sets `has_trade_plan=False`/`trade_plan=None`, and strips `create_paper_order` from `suggested_actions`.
+
+**Why**: Previously, an S-grade countertrend rebound with `htf_conflict=True` could retain confidence 0.78 and trigger `create_paper_order` — executable against the higher-timeframe direction. The cap plus the action-collapse guarantees that HTF-conflicting decisions never cross the execution threshold.
+
+**Config validation at startup**: `htf_conflict_confidence_cap` MUST be < `MIN_CONFIDENCE_FOR_PAPER_ORDER` (0.72). The config loader validates this; invalid values raise at startup (fail-closed, not silent fallback).
+
+**Why both conditions in Step 4**: The S→A grade downgrade alone (Step 3) keeps the grade in `{S,A}`, so without the `capped_conf < threshold` check, action-collapse would not trigger and the decision would remain executable with sub-threshold confidence. Both conditions are required.
+
+### Contract 38.4: Canonical Summary Single Source (FR-5)
+
+**What**: `summary_builder.build_canonical_market_summary(decision)` produces a deterministic Chinese summary string from the structured fields (bias, stage, alignment, htf_conflict, market_reason_codes, evidence). The controller ALWAYS sets `rendered_summary` on the persisted ga_decision. `legacy_decision_from_ga_decision` (`ga_master/decision_schema.py:81`) prefers `rendered_summary` over `final_summary` for the legacy `summary` field so downstream signal/brief consumers read the canonical text. The original LLM text is preserved in `raw["raw_llm_summary"]`.
+
+**Why**: The LLM summary could contradict the structured fields — claiming "具备做多条件" while `alignment=countertrend_rebound` and `htf_conflict=True`. The canonical summary is deterministic: it cannot contradict the structured fields because it is derived from them. Persisting it as `rendered_summary` makes the canonical text available to report renderers without re-deriving from raw fields.
+
+**Round-trip contract**: `ga_decisions.raw_decision_json` MUST preserve both `rendered_summary` (canonical) and `raw_llm_summary` (original LLM text). The DB round-trip test verifies both are intact after insert+read.
+
+### Contract 38.5: Observation Reason Explains Market (FR-4)
+
+**What**: `hourly_report._format_market_reason_text(decision)` produces a market-context string from `timeframe_context`, `alignment`, `htf_conflict`, and `market_reason_codes`. `_format_observation_market_and_gate_reasons(decision)` combines the market reason with gate blockers (invalid trade_plan, risk reasons, low confidence) so the observation line explains BOTH the market state AND why execution is blocked.
+
+**Why**: Previously the observation reason only listed gate blockers ("confidence 0.65 below threshold") without explaining the market state. A trader reading "confidence too low" had no context for WHY — was it an HTF conflict? A countertrend rebound? Data incomplete? The market reason provides that context.
+
+**Market context phrases** (`_MARKET_CONTEXT_PHRASES`): maps `market_reason_codes` to Chinese phrases. `htf_conflict` → "高周期冲突", `countertrend_rebound` → "逆势反弹", `overextended` → "过度延伸", `data_incomplete` → "数据不完整", `bias_stage_contradiction` → "bias-stage 矛盾".
+
+### Contract 38.6: C/D List Top-N Labeling (FR-6)
+
+**What**: `hourly_report._format_cd_reasons(decisions)` labels the C/D list with "重点原因（前 N 项，另有 M 项）" where N is the top-N shown (default 3) and M is the count of additional reasons. Both the legacy C/D path and the new hourly-report path call the shared `_compact_items` helper so the labeling is identical.
+
+**Why**: Previously the C/D list could show all reasons (verbose) or a truncated list without indicating truncation (misleading). The "前 N 项，另有 M 项" label makes truncation explicit and preserves auditability.
+
+### Contract 38.7: Five Semantic Diagnostics + Marker (FR-7)
+
+**What**: `diagnostics/report_diagnostics.py` registers 5 semantic checks plus a marker-missing check, all gated by the `hourly_market_semantic_accuracy_contract_v1` marker:
+
+| Code | Severity | What it checks |
+|------|----------|----------------|
+| `timeframe_context_missing` | error | ga_decision lacks `timeframe_context` or it's empty |
+| `bias_stage_contradiction` | error | bias/stage pairing violates Contract 38.2 |
+| `htf_conflict_not_capped` | error | `htf_conflict=True` but `confidence > htf_conflict_confidence_cap` |
+| `canonical_summary_missing` | error | ga_decision lacks `rendered_summary` |
+| `htf_countertrend_overconfidence` | error | LONG/SHORT with bullish/bearish S/A/B grade while `htf_conflict=True` AND confidence not capped (production-shape: reads `raw_decision_json.timeframe_context` first, falls back to legacy `snapshot.profiles` and `raw_legacy_decision.snapshot.profiles`) |
+| `hourly_market_semantic_accuracy_contract_marker_missing` | error | `hourly_market_semantic_accuracy_contract_v1` marker absent from `_migration_state` |
+
+**Production-shape reading** (P0-2 fix): `_check_htf_countertrend_overconfidence` reads `raw_decision_json.timeframe_context` (the production path) FIRST, then falls back to `snapshot.profiles` (legacy shape) and `raw_legacy_decision.snapshot.profiles` (nested legacy). The `_tf_ctx_bias(entry)` helper reads the `bias` field, falling back to `structure` for directional values (`bullish`/`bearish`/`range`/`transition`/`unknown`). This ensures the diagnostic fires on production data, not just legacy test fixtures.
+
+**Marker**: `hourly_market_semantic_accuracy_contract_v1` is written by `_ensure_hourly_market_semantic_accuracy_contract_marker` during `initialize_database()`, AFTER `check_schema_health()` passes. `INSERT OR IGNORE` ensures idempotency. The marker is the cutoff gate: pre-marker data is `legacy_info` or excluded (never error); post-marker data is `error`.
+
+**Marker cutoff**: `_apply_semantic_marker_cutoff` filters diagnostic candidates by `created_at >= marker_timestamp`. Pre-marker rows are excluded or downgraded to `legacy_info` (sev `warning`), never `error`.
+
+### Contract 38.8: Data/Time Contract (FR-8)
+
+**What**: `build_timeframe_context(snapshot, config)` requires `closed=True` for each timeframe. When `closed=False` or missing, the timeframe is marked `data_incomplete` and `market_reason_codes` includes `data_incomplete`. The degraded path (`_is_data_degraded`) is exercised indirectly via config-loading tests.
+
+**Why**: Acting on a partially-closed timeframe means acting on a candle that hasn't confirmed — the bias could flip on the next 1m tick. The `closed=True` requirement is the multi-TF analogue of the single-TF closed-candle contract (§37.1).
+
+### Contract 38.9: Acceptance Test Coverage
+
+**Required tests** (all in `plugins/crypto_guard/tests/test_smoke.py::TestHourlyAnalysisSemanticAccuracy07_03`):
+
+| Test | Contract |
+|------|----------|
+| `test_doge_countertrend_rebound_not_bullish_middle` | 38.1 |
+| `test_bnb_neutral_does_not_pair_with_middle_stage` | 38.1, 38.2 |
+| `test_controller_decision_from_legacy_propagates_structured_fields` | 38.1 (propagation) |
+| `test_ltc_neutral_does_not_pair_with_early_stage` | 38.2 |
+| `test_bias_stage_combinations_all_legal` | 38.2 |
+| `test_htf_conflict_confidence_capped` | 38.3 |
+| `test_fault_injection_htf_countertrend_overconfidence_detected` | 38.7 (both legacy `FAULTHTF` and production `FAULTHTF2` shapes) |
+| `test_observation_reason_includes_market_context` | 38.5 |
+| `test_fault_injection_observation_reason_missing_market_context_detected` | 38.7 |
+| `test_canonical_summary_matches_structured_fields` | 38.4 |
+| `test_db_roundtrip_preserves_canonical_summary_and_raw_llm` | 38.4 |
+| `test_cd_list_with_six_symbols_shows_top3_label` | 38.6 |
+| `test_both_report_paths_use_same_helper` | 38.6 |
+| `test_marker_missing_diagnosed` | 38.7 (marker) |
+| `test_semantic_accuracy_marker_missing_diagnosed` | 38.7 (semantic-accuracy marker specifically) |
+| `test_marker_pre_legacy_info_classification` | 38.7 (cutoff) |
+
+**Test authenticity requirements**: tests MUST call the production `controller_decision_from_legacy` path (not bypass it), MUST NOT mock the function under test, MUST NOT use env-var bypasses, MUST NOT loosen assertions to make tests pass.
+
+### Contract 38.10: Migration Idempotency
+
+**What**: `_ensure_hourly_market_semantic_accuracy_contract_marker` in `storage/migrations.py` writes the marker via `INSERT OR IGNORE` into `_migration_state` after `check_schema_health()` passes. The migration is idempotent: running it twice produces no duplicate rows and no errors. It is dirty-DB compatible: an existing dirty DB (with prior markers) receives the new marker without affecting existing rows.
+
+**Why**: A non-idempotent migration could fail on restart, leaving the schema in an inconsistent state. The marker is the diagnostic cutoff gate — its presence MUST be guaranteed after `initialize_database()` succeeds.
+
+---
+
+**Last updated**: 2026-07-03 (07-03 hourly analysis semantic accuracy final seal — Sections 38.1-38.10 added for multi-TF semantics, bias-stage contract, HTF conflict cap, canonical summary, observation reason, C/D top-N labeling, 5 diagnostics + marker, data/time contract, acceptance tests, migration idempotency)

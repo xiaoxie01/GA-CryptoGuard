@@ -298,6 +298,27 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
 
 def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     decision = dict(fallback)
+    # Pass 7 P1 #2: strip internal marker fields from the LLM candidate before
+    # merge. ``_htf_conflict_original_grade`` and ``_htf_conflict_grade_downgraded``
+    # are internal idempotency markers owned by ``market_semantics.normalize_market_semantics``
+    # — they record the pre-downgrade grade so a subsequent call can detect
+    # LLM-driven grade restoration. If the LLM candidate can write these fields
+    # directly, a malicious or confused LLM could set
+    # ``_htf_conflict_original_grade="X"`` to bypass the S→A downgrade (the
+    # downgrade logic sees no expected terminal grade and skips). The fault
+    # injection ``_htf_conflict_original_grade="X"`` + ``signal_grade=S`` +
+    # ``htf_conflict=True`` reproduced this bypass: the marker
+    # ``htf_conflict_grade_downgraded`` stays in market_reason_codes while
+    # signal_grade remains S. The confidence cap (0.70) still blocks execution
+    # for now, but the semantic contract is broken. Strip all internal ``_``-
+    # prefixed fields from the candidate before merge — the LLM has no business
+    # writing them.
+    INTERNAL_FIELD_PREFIX = "_"
+    if isinstance(candidate, dict):
+        candidate = {
+            k: v for k, v in candidate.items()
+            if not (isinstance(k, str) and k.startswith(INTERNAL_FIELD_PREFIX))
+        }
     decision.update(candidate)
     decision["symbol"] = snapshot["symbol"]
     # R11-6: snapshot.analysis_time_utc must be a strict positive int, else fail-closed
@@ -401,15 +422,63 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     # phrases from final_summary when the structured execution gate is not
     # satisfied. apply_risk_to_decision may have already downgraded
     # decision/has_trade_plan; here we only silence the LLM's own text.
-    from plugins.crypto_guard.notify.report_consistency import rewrite_inconsistent_summary
+    # Phase C (07-03): the canonical summary builder is now the single source
+    # of truth for the final rendered text. rewrite_inconsistent_summary still
+    # runs first as a blacklist-defense layer, but the canonical builder
+    # produces the final deterministic text that downstream consumers read.
+    # R1-1 (07-03 final review): run normalize_market_semantics here as the
+    # single semantic boundary so LLM-produced bullish/middle/0.95 is
+    # normalized BEFORE the canonical builder reads structured fields. This
+    # closes the gap where LLM candidate merge skips the bias+stage contract
+    # and HTF-conflict cap. The final normalize call is idempotent: repeated
+    # runs do not continue to downgrade or duplicate reason codes.
+    from plugins.crypto_guard.notify.report_consistency import (
+        rewrite_inconsistent_summary,
+        execution_eligible,
+    )
+    from plugins.crypto_guard.reasoning.summary_builder import (
+        build_canonical_market_summary,
+    )
+    from plugins.crypto_guard.reasoning.market_semantics import (
+        normalize_market_semantics,
+    )
+    try:
+        # Pass 6 P2 #5 (07-03 final review): read market_semantics config from
+        # the real source (cfg.trading_mode.market_semantics) instead of the
+        # non-existent snapshot.config. snapshot.config was always None, so
+        # ms_cfg fell back to {} and normalize_market_semantics used default
+        # caps (0.67) instead of the configured 0.70. Load_config is cheap
+        # (cached) and matches how market_state_builder reads the same config.
+        from plugins.crypto_guard.config.loader import load_config
+        ms_cfg = (load_config().trading_mode.get("market_semantics") or {})
+    except Exception:
+        ms_cfg = {}
+    # R1-1 (07-03 final review): normalize_market_semantics returns a new dict
+    # (it does ``result = dict(decision)`` internally). The caller MUST assign
+    # the return value — without assignment, bias/stage/confidence demotion is
+    # silently discarded and the LLM's bullish/middle/0.95 penetrates the gate.
+    decision = normalize_market_semantics(decision, snapshot, ms_cfg)
     summary_text = decision.get("final_summary") or decision.get("summary") or ""
     rewritten = rewrite_inconsistent_summary(summary_text, decision)
+    # Phase C: always produce the canonical summary so final_summary and
+    # rendered_summary carry the same deterministic text. The canonical
+    # builder reads the structured fields (grade/bias/stage/alignment/
+    # htf_conflict/market_reason_codes/risk_check/trade_plan) and emits a
+    # concise Chinese summary. The original LLM text is preserved in
+    # raw_legacy_decision["raw_llm_summary"] by the controller after this
+    # function returns; here we only set final_summary/rendered_summary.
+    canonical = build_canonical_market_summary(decision)
+    decision["rendered_summary"] = canonical
+    # R1-5 (07-03 final review): always set final_summary == summary ==
+    # canonical. The original LLM text is preserved separately by the
+    # controller in raw_decision_json["raw_llm_summary"]. Do not gate on
+    # execution_eligible — all decisions use the canonical text.
+    decision["final_summary"] = canonical
+    if "summary" in decision:
+        decision["summary"] = canonical
     if rewritten != summary_text:
-        decision["final_summary"] = rewritten
-        if "summary" in decision:
-            decision["summary"] = rewritten
         notes = list(decision.get("risk_notes") or [])
-        notes.append("final_summary 与结构化执行状态冲突，已确定性覆盖为未通过执行门禁。")
+        notes.append("final_summary 已由 canonical deterministic summary 覆盖。")
         decision["risk_notes"] = notes
     return decision
 

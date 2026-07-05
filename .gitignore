@@ -1,5 +1,7 @@
 temp/
 tmp/
+.tmp_crypto_guard_pass6_diag/
+.tmp_pass7_*.sqlite3
 data/
 # Allow plugins/crypto_guard/data/ Python module (not a data dump directory)
 !plugins/crypto_guard/data/

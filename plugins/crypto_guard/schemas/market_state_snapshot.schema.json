@@ -2,10 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MarketStateSnapshot",
   "type": "object",
-  "required": ["symbol", "analysis_time_utc", "mode", "profiles", "modules", "counter_evidence"],
+  "required": [
+    "symbol",
+    "analysis_time_utc",
+    "mode",
+    "profiles",
+    "modules",
+    "counter_evidence",
+    "timeframe_context",
+    "alignment",
+    "htf_conflict",
+    "market_reason_codes"
+  ],
   "properties": {
     "symbol": {"type": "string"},
-    "analysis_time_utc": {"type": "integer"},
+    "analysis_time_utc": {"type": "integer", "minimum": 1, "description": "unix millis, must be a strict positive integer"},
     "mode": {"type": "string", "enum": ["scheduled", "ad_hoc", "opportunity_watch", "paper_review", "shadow_test"]},
     "profiles": {"type": "object"},
     "modules": {
@@ -30,6 +41,67 @@
       }
     },
     "paper_context": {"type": "object"},
-    "global_context": {"type": "object"}
+    "global_context": {"type": "object"},
+    "timeframe_context": {
+      "type": "object",
+      "description": "Phase B (07-03): structured per-timeframe bias/structure/closed/close_time. Fixed keys: 1d/4h/1h/15m only. R2-6 (07-03 final review): close_time is REQUIRED for every TF.",
+      "additionalProperties": false,
+      "required": ["1d", "4h", "1h", "15m"],
+      "properties": {
+        "1d": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bias", "structure", "closed", "close_time"],
+          "properties": {
+            "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
+            "structure": {"type": "string"},
+            "closed": {"type": "boolean"},
+            "close_time": {"type": "integer", "minimum": 0, "description": "unix millis of last closed candle; 0 when unknown; must be <= analysis_time_utc when > 0"}
+          }
+        },
+        "4h": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bias", "structure", "closed", "close_time"],
+          "properties": {
+            "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
+            "structure": {"type": "string"},
+            "closed": {"type": "boolean"},
+            "close_time": {"type": "integer", "minimum": 0}
+          }
+        },
+        "1h": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bias", "structure", "closed", "close_time"],
+          "properties": {
+            "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
+            "structure": {"type": "string"},
+            "closed": {"type": "boolean"},
+            "close_time": {"type": "integer", "minimum": 0}
+          }
+        },
+        "15m": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bias", "structure", "closed", "close_time"],
+          "properties": {
+            "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
+            "structure": {"type": "string"},
+            "closed": {"type": "boolean"},
+            "close_time": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "alignment": {
+      "type": "string",
+      "enum": ["aligned", "partial", "countertrend_rebound", "neutral", "unknown"]
+    },
+    "htf_conflict": {"type": "boolean"},
+    "market_reason_codes": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
   }
 }

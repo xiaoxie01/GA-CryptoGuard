@@ -36,6 +36,24 @@ risk:
   # BTC#9 P2-1: HTF weak structure fail-closed — 多周期结构偏弱需更强入场确认
   require_stronger_confirmation_for_weak_structure: true
 
+# Phase B (07-03): structured market-semantic normalization.
+# Single source of truth for bias+stage contract, HTF-conflict confidence cap,
+# and grade downgrade rules. The cap must be < MIN_CONFIDENCE_FOR_PAPER_ORDER
+# (0.72) so countertrend rebounds cannot reach the execution gate.
+market_semantics:
+  htf_conflict_confidence_cap: 0.70
+  enforce_bias_stage_contract: true
+  allowed_stages_for_neutral_bias: ["range", "transition", "unknown"]
+  allowed_stages_for_mixed_bias: ["range", "transition", "unknown"]
+  allowed_stages_for_unknown_bias: ["range", "transition", "unknown"]
+  # When htf_conflict=True, downgrade S/A grades one tier; B stays B.
+  grade_downgrade_map:
+    S: "A"
+    A: "B"
+    B: "B"
+    C: "C"
+    D: "D"
+
 # BTC#9 fix: pending 订单 fill 前复核最新 GA + K 线健康
 pending_order_revalidation:
   enabled: true

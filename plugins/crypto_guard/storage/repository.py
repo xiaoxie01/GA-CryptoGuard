@@ -248,6 +248,27 @@ class CryptoGuardRepository:
         )
 
     def create_ga_decision(self, decision: dict[str, Any]) -> int:
+        """Persist a GA decision and return its row id.
+
+        R1-8 (07-03 final review) audit-path contract:
+        - ``raw_decision_json`` is the top-level JSON column that stores the
+          full decision dict (via ``json.dumps(decision)``). All structured
+          audit fields (``timeframe_context``, ``alignment``,
+          ``htf_conflict``, ``market_reason_codes``, ``risk_check``,
+          ``trade_plan``, ``has_trade_plan``, ``opportunity_watch``) live
+          at the top level of this JSON.
+        - ``raw_llm_summary`` (the original LLM-produced summary text, NOT
+          the canonical deterministic summary) is stored at
+          ``raw_decision_json["raw_llm_summary"]`` when the controller sets
+          it on the legacy decision dict before persistence. Readers (e.g.
+          the GA decision adapter) MUST read it from this single path
+          rather than guessing nested locations.
+        - ``final_summary`` / ``rendered_summary`` are persisted as their
+          own columns AND inside ``raw_decision_json``. Per R1-5 both must
+          equal the canonical deterministic summary produced by
+          ``build_canonical_market_summary``; the original LLM text lives
+          only in ``raw_llm_summary``.
+        """
         trade_plan = decision.get("trade_plan")
         opportunity_watch = decision.get("opportunity_watch")
         # Hourly Report Accuracy: optional batch linkage + previous grade +

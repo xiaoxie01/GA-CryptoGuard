@@ -26,6 +26,14 @@ def validate_json(name: str, payload: dict[str, Any]) -> tuple[bool, str | None]
 
 
 def no_edge_decision(symbol: str, reason: str) -> dict[str, Any]:
+    # R1-3 (07-03 final review): include the structured fields required by
+    # the tightened ga_decision.schema.json so the no_edge fallback is
+    # schema-valid. All TFs are marked unknown/closed=False because the
+    # decision was produced without a valid snapshot.
+    tf_ctx = {
+        tf: {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0}
+        for tf in ("1d", "4h", "1h", "15m")
+    }
     return {
         "symbol": symbol,
         "decision": "no_edge",
@@ -41,4 +49,8 @@ def no_edge_decision(symbol: str, reason: str) -> dict[str, Any]:
         "trade_plan": None,
         "opportunity_watch": None,
         "suggested_actions": ["ignore"],
+        "timeframe_context": tf_ctx,
+        "alignment": "unknown",
+        "htf_conflict": False,
+        "market_reason_codes": ["schema_validation_failed"],
     }

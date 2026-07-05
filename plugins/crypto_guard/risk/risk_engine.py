@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES, score_market_regime
 from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
 from plugins.crypto_guard.utils import _strict_positive_int_ms
+
+
+logger = logging.getLogger(__name__)
 
 
 def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +55,56 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
         result["suggested_actions"] = [a for a in result["suggested_actions"] if a != "create_paper_order"]
     if "create_opportunity_watch" in result["suggested_actions"] and not result.get("opportunity_watch"):
         result["opportunity_watch"] = default_watch_from_decision(result, risk)
+    # R1-1 / R2-5 (07-03 final review): final idempotent semantic gate. Re-run
+    # normalize_market_semantics so any bias+stage/HTF/closed drift induced
+    # by risk adjustments is caught and the structured fields stay
+    # consistent with the final decision. This is idempotent: a second call
+    # does not continue to downgrade or duplicate reason codes because the
+    # function checks the already-normalized state and only corrects
+    # contradictions.
+    #
+    # R2-5: if normalize raises, the final safety gate has failed. The
+    # prior risk-validated state may carry stale semantics that bypass
+    # the bias+stage / HTF / fail-closed contract. Default to fail-closed:
+    # strip trade plan, downgrade decision to monitor_only, and surface
+    # the failure for audit. Never let the prior executable state stand
+    # when the final gate cannot verify it.
+    try:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+        ms_cfg = (cfg.get("market_semantics") or {}) if isinstance(cfg, dict) else {}
+        # R1-1 (07-03 final review): assign return value — normalize creates a
+        # shallow copy and mutations on the copy are discarded without assignment.
+        result = normalize_market_semantics(result, snapshot, ms_cfg)
+    except Exception as exc:
+        logger.warning(
+            "normalize_market_semantics failed in risk final gate: %s",
+            exc, exc_info=True,
+        )
+        result["normalize_gate_warning"] = str(exc)
+        # R2-5: fail-closed — strip executable state. The final gate is the
+        # last line of defense; if it cannot verify the decision's
+        # semantics, the decision must not create a paper order.
+        result["has_trade_plan"] = False
+        result["trade_plan"] = None
+        if result.get("decision") in {
+            "trade_plan_available", "create_paper_order",
+            "wait_for_pullback", "wait_for_breakout", "wait_for_reclaim",
+        }:
+            result["decision"] = "monitor_only"
+        actions = result.get("suggested_actions") or []
+        result["suggested_actions"] = [
+            a for a in actions
+            if a not in {"create_paper_order", "create_opportunity_watch"}
+        ]
+        if not result["suggested_actions"]:
+            result["suggested_actions"] = ["add_to_watchlist", "ignore"]
+        # Force risk_check to fail so downstream consumers see the gate fired.
+        risk = dict(result.get("risk_check") or {"ok": False, "reasons": []})
+        risk["ok"] = False
+        risk["reasons"] = list(risk.get("reasons") or []) + [
+            f"final semantic gate failed: {exc}",
+        ]
+        result["risk_check"] = risk
     return result
 
 

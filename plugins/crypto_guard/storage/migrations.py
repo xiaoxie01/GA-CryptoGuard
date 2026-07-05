@@ -72,6 +72,12 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         _ensure_hourly_report_accuracy_r4_contract_marker(conn)
         _ensure_btc9_trade_gate_contract_marker(conn)
         _ensure_market_data_contract_marker(conn)
+        # Phase E (07-03): semantic-accuracy contract marker. Written AFTER
+        # the R4 marker so both are present when semantic diagnostics run.
+        # Independent cutoff for the five new checks (bias_stage_semantic_conflict,
+        # htf_countertrend_overconfidence, summary_structured_state_mismatch,
+        # observation_reason_missing_market_context, no_edge_reason_coverage_mismatch).
+        _ensure_hourly_market_semantic_accuracy_contract_marker(conn)
         conn.commit()
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
@@ -1480,6 +1486,30 @@ def _ensure_market_data_contract_marker(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
         ("market_data_contract_v1",),
+    )
+
+
+def _ensure_hourly_market_semantic_accuracy_contract_marker(conn: sqlite3.Connection) -> None:
+    """Phase E (07-03): Write the hourly_market_semantic_accuracy_contract_v1 marker.
+
+    Independent of the R4 marker — the five new semantic-accuracy diagnostics
+    (bias_stage_semantic_conflict, htf_countertrend_overconfidence,
+    summary_structured_state_mismatch, observation_reason_missing_market_context,
+    no_edge_reason_coverage_mismatch) use this cutoff, not the R4 contract
+    boundary. ``applied_at`` is the cutoff between ``legacy_info`` (pre-marker)
+    and ``error`` / ``warning`` (post-marker). INSERT OR IGNORE ensures
+    idempotency — re-running initialize_database() never refreshes the timestamp
+    or fails on a duplicate key.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migration_state ("
+        "  key TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("hourly_market_semantic_accuracy_contract_v1",),
     )
 
 

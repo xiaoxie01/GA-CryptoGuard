@@ -52,6 +52,10 @@ def controller_decision_from_legacy(
         "trend_stage": legacy.get("trend_stage") or "unknown",
         "decision": final_decision,
         "legacy_decision": old_decision,
+        "timeframe_context": legacy.get("timeframe_context") or {},
+        "alignment": legacy.get("alignment"),
+        "htf_conflict": legacy.get("htf_conflict"),
+        "market_reason_codes": list(legacy.get("market_reason_codes") or []),
         "skill_result_refs": skill_result_refs,
         "evidence": list(legacy.get("evidence") or []),
         "counter_evidence": list(legacy.get("counter_evidence") or legacy.get("risk_notes") or ["缺少反向证据记录"]),
@@ -76,6 +80,11 @@ def controller_decision_from_legacy(
 
 def legacy_decision_from_ga_decision(ga_decision: dict[str, Any]) -> dict[str, Any]:
     raw = dict(ga_decision.get("raw_legacy_decision") or {})
+    # Phase C (07-03): prefer rendered_summary (canonical) over final_summary
+    # for the legacy summary field so downstream signal/brief consumers read
+    # the deterministic canonical text. The original LLM text is preserved
+    # in raw["raw_llm_summary"] by the controller.
+    summary = ga_decision.get("rendered_summary") or ga_decision.get("final_summary")
     raw.update(
         {
             "symbol": ga_decision["symbol"],
@@ -84,7 +93,7 @@ def legacy_decision_from_ga_decision(ga_decision: dict[str, Any]) -> dict[str, A
             "confidence": ga_decision.get("confidence"),
             "market_bias": ga_decision.get("market_bias"),
             "trend_stage": ga_decision.get("trend_stage"),
-            "summary": ga_decision.get("final_summary"),
+            "summary": summary,
             "evidence": ga_decision.get("evidence") or [],
             "counter_evidence": ga_decision.get("counter_evidence") or [],
             "risk_check": ga_decision.get("risk_check") or {},

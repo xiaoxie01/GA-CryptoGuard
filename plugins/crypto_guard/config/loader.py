@@ -103,4 +103,56 @@ def load_config(config_dir: Path | None = None) -> CryptoGuardConfig:
     mode = config.trading_mode.get("trading_mode", {})
     if mode.get("allow_trade_api") or mode.get("allow_withdraw_api") or mode.get("real_order_api_enabled"):
         raise RuntimeError("CryptoGuard 禁止交易/提现权限 API")
+    # Phase B (07-03): validate market_semantics config segment.
+    _validate_market_semantics(config.trading_mode)
     return config
+
+
+def _validate_market_semantics(trading_mode: dict[str, Any]) -> None:
+    """Validate the ``market_semantics`` segment of trading_mode.yaml.
+
+    The cap must be a finite float in [0, 1] and strictly below
+    ``MIN_CONFIDENCE_FOR_PAPER_ORDER`` so countertrend rebounds cannot reach
+    the execution gate. Allowed-stage lists must be subsets of the legal
+    stage enum. Misconfiguration fails fast at startup, not at decision time.
+    """
+    from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+
+    seg = trading_mode.get("market_semantics")
+    if not isinstance(seg, dict):
+        raise ValueError(
+            "trading_mode.market_semantics must be a mapping; "
+            f"got {type(seg).__name__}"
+        )
+    raw_cap = seg.get("htf_conflict_confidence_cap")
+    try:
+        cap = float(raw_cap)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "market_semantics.htf_conflict_confidence_cap 必须是数字；"
+            f"got {raw_cap!r}"
+        ) from exc
+    import math as _math
+    if not _math.isfinite(cap) or cap < 0.0 or cap > 1.0:
+        raise ValueError(
+            f"market_semantics.htf_conflict_confidence_cap 必须 ∈ [0, 1]；got {cap}"
+        )
+    if cap >= MIN_CONFIDENCE_FOR_PAPER_ORDER:
+        raise ValueError(
+            f"market_semantics.htf_conflict_confidence_cap={cap} 必须 < "
+            f"MIN_CONFIDENCE_FOR_PAPER_ORDER={MIN_CONFIDENCE_FOR_PAPER_ORDER}"
+        )
+    legal_stages = {"early", "middle", "late", "range", "transition", "unknown"}
+    for key in (
+        "allowed_stages_for_neutral_bias",
+        "allowed_stages_for_mixed_bias",
+        "allowed_stages_for_unknown_bias",
+    ):
+        raw = seg.get(key)
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f"market_semantics.{key} 必须是非空 list；got {raw!r}")
+        invalid = [s for s in raw if s not in legal_stages]
+        if invalid:
+            raise ValueError(
+                f"market_semantics.{key} 含非法 stage {invalid}；合法集合 {sorted(legal_stages)}"
+            )

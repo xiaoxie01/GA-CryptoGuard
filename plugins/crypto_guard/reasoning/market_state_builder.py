@@ -9,6 +9,7 @@ from plugins.crypto_guard.analysis.trend_stage_engine import fuse_trend_stage
 from plugins.crypto_guard.data.market_data_health import assess_health
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.decision_schema import validate_json
+from plugins.crypto_guard.reasoning.market_semantics import normalize_snapshot_semantics
 from plugins.crypto_guard.skills.runner import execute_market_skills
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.utils import INTERVAL_MS
@@ -86,6 +87,27 @@ def build_market_state_snapshot(
         if not health["ready"]:
             any_degraded = True
 
+    # Pass 7 P0 (07-03 final review): backtest / shadow_test mode loads a
+    # single TF (e.g. ``timeframes=["15m"]``) via historical_replay. The
+    # 4-TF fail-closed gate in normalize_market_semantics Step 1 would
+    # otherwise mark the missing 1d/4h/1h as ``closed=False`` and force the
+    # decision to C/0.3/unknown/monitor_only — destroying real trade
+    # samples. Expose a separate ``partial_tf_mode`` flag (NOT merged into
+    # ``analysis_degraded``) so normalize_market_semantics Step 1 skips the
+    # 4-TF fail-closed via ``snap.get("partial_tf_mode")`` without routing
+    # the decision into the degraded branch. ``analysis_degraded`` is
+    # reserved for real data-quality problems (``any_degraded`` from
+    # health_by_tf); mixing partial_tf_mode into it caused ga_judge to
+    # produce ``strategy_name="ga_sop_degraded"`` for healthy partial-TF
+    # replays. The loaded TFs still contribute their real
+    # trend_stage/momentum to the fused result so backtests have
+    # meaningful signals.
+    REQUIRED_TFS_FOR_FAIL_CLOSED = ("1d", "4h", "1h", "15m")
+    partial_tf_mode = (
+        mode == "shadow_test"
+        and not all(tf in tfs for tf in REQUIRED_TFS_FOR_FAIL_CLOSED)
+    )
+
     profiles: dict[str, Any] = {}
     primary_modules: dict[str, Any] = {}
     previous_analysis_state = repo.latest_analysis_state(symbol)
@@ -122,7 +144,12 @@ def build_market_state_snapshot(
     primary_candles = locals().get("primary_candles", [])
 
     # R4: When degraded, force trend_stage and market_structure to unknown.
-    if any_degraded:
+    # Pass 6 P1 #2: partial_tf_mode (shadow_test with <4 TFs) is NOT a data
+    # quality problem — the loaded TFs have real, healthy candles. Only
+    # force-unknown when real data quality is degraded, not when we merely
+    # have fewer TFs in a backtest.
+    data_quality_degraded = any_degraded
+    if data_quality_degraded:
         for tf in tfs:
             profiles[tf]["trend_stage"] = "unknown"
             profiles[tf]["market_structure"] = "unknown"
@@ -130,12 +157,12 @@ def build_market_state_snapshot(
 
     fused_trend = fuse_trend_stage(profiles, primary_modules.get("trend_stage") or {}, analysis_time_utc=analysis_time_utc)
     # R4: When degraded, force fused trend_stage to unknown.
-    if any_degraded:
+    if data_quality_degraded:
         fused_trend["trend_stage"] = "unknown"
         fused_trend["stage"] = "unknown"
     market_regime = classify_market_regime(primary_candles, analysis_time_utc=analysis_time_utc)
     # R4: When degraded, regime = unknown, no boost.
-    if any_degraded:
+    if data_quality_degraded:
         market_regime["regime"] = "unknown"
         market_regime["extreme"] = False
     previous_stage = _previous_trend_stage(repo, symbol, analysis_time_utc)
@@ -152,13 +179,23 @@ def build_market_state_snapshot(
     repo.save_module_result(symbol, "multi", analysis_time_utc, "market_regime", market_regime, 0.7)
 
     # R4: market_bias = "unknown" when degraded (stricter than "neutral" per follow-up §4)
-    if any_degraded:
+    if data_quality_degraded:
         primary_modules["market_bias"] = "unknown"
 
     data_quality = _data_quality(profiles, analysis_time_utc, health_by_tf, any_degraded)
 
     # Determine degraded status string for data_quality
-    degraded_status = _degraded_status(health_by_tf) if any_degraded else "complete"
+    degraded_status = _degraded_status(health_by_tf) if data_quality_degraded else "complete"
+
+    # Pass 7 P0: partial_tf_mode (shadow_test with <4 TFs) must NOT be
+    # treated as analysis_degraded. The loaded TFs have real, healthy
+    # candles — the caller intentionally requested a partial-TF replay.
+    # Setting analysis_degraded=True would route ga_judge into the
+    # degraded path (monitor_only/C/0.3/unknown) and destroy real trade
+    # samples in historical_replay. Instead, expose a separate
+    # ``partial_tf_mode`` flag so normalize_market_semantics can skip
+    # the 4-TF fail-closed without triggering the degraded path.
+    snapshot_analysis_degraded = any_degraded
 
     snapshot = {
         "symbol": symbol,
@@ -168,10 +205,11 @@ def build_market_state_snapshot(
         "modules": primary_modules,
         "counter_evidence": build_counter_evidence(primary_modules),
         "data_quality": data_quality,
-        "analysis_degraded": any_degraded,
-        "has_trade_plan": not any_degraded and bool(primary_modules.get("trade_plan")),
-        "trade_plan": None if any_degraded else primary_modules.get("trade_plan"),
-        "decision": "opportunity_watch" if any_degraded else (primary_modules.get("decision") or "monitor_only"),
+        "analysis_degraded": snapshot_analysis_degraded,
+        "partial_tf_mode": partial_tf_mode,
+        "has_trade_plan": not data_quality_degraded and bool(primary_modules.get("trade_plan")),
+        "trade_plan": None if data_quality_degraded else primary_modules.get("trade_plan"),
+        "decision": "opportunity_watch" if data_quality_degraded else (primary_modules.get("decision") or "monitor_only"),
         "paper_context": {},
         "previous_analysis_state": (previous_analysis_state or {}).get("state") if previous_analysis_state else None,
         "active_opportunity_watches": repo.list_active_opportunity_watches_for_symbol(symbol),
@@ -194,8 +232,22 @@ def build_market_state_snapshot(
         "global_context": {"time_policy": "UTC; closed candles only; HTF confirmation uses last closed 4h/1h/15m candles"},
     }
     # R4: Override data_quality status with degraded value when applicable.
-    if any_degraded:
+    if data_quality_degraded:
         snapshot["data_quality"]["status"] = degraded_status
+
+    # Phase B (07-03): structured multi-timeframe context + alignment +
+    # htf_conflict + bias/stage contract normalization. Surfaces
+    # ``timeframe_context``, ``alignment``, ``htf_conflict`` and
+    # ``market_reason_codes`` on the snapshot and corrects the top-level
+    # market_bias/trend_stage so downstream GA decisions inherit the
+    # corrected semantics.
+    market_semantics_cfg = (cfg.trading_mode.get("market_semantics") or {}) if hasattr(cfg, "trading_mode") else {}
+    normalize_snapshot_semantics(
+        snapshot,
+        market_semantics_cfg,
+        health_by_tf=health_by_tf,
+        analysis_time_utc=int(analysis_time_utc),
+    )
 
     ok, err = validate_json("market_state_snapshot.schema.json", snapshot)
     if not ok:

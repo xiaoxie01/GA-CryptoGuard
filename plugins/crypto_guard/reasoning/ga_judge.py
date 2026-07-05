@@ -410,6 +410,24 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
                              ((snapshot.get("data_quality") or {}).get("analysis_degraded")))
     if analysis_degraded:
         symbol = snapshot["symbol"]
+        # R1-3 (07-03 final review): degraded decisions must still satisfy
+        # the tightened schema (timeframe_context/alignment/htf_conflict/
+        # market_reason_codes required). Build structured fields from the
+        # snapshot so the degraded record is schema-valid and downstream
+        # diagnostics can reason about the degraded state.
+        from plugins.crypto_guard.reasoning.market_semantics import (
+            build_timeframe_context, compute_alignment,
+        )
+        snap_dq = snapshot.get("data_quality") or {}
+        snap_health = snap_dq.get("health_by_tf") or snap_dq.get("health") or {}
+        tf_ctx = build_timeframe_context(
+            snapshot.get("profiles") or {},
+            closed_candles_only=True,
+            analysis_degraded=True,
+            health_by_tf=snap_health if snap_health else None,
+            analysis_time_utc=snapshot.get("analysis_time_utc"),
+        )
+        alignment, htf_conflict = compute_alignment(snapshot.get("profiles") or {}, tf_ctx)
         result = {
             "symbol": symbol,
             "decision": "monitor_only",
@@ -429,6 +447,10 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
             "strategy_version": "1.0",
             "analysis_time_utc": snapshot.get("analysis_time_utc"),
             "degraded_reason": "analysis_degraded: market data health check failed (contiguity/freshness/gap)",
+            "timeframe_context": tf_ctx,
+            "alignment": alignment,
+            "htf_conflict": htf_conflict,
+            "market_reason_codes": ["data_incomplete"],
         }
         ok, err = validate_json("ga_decision.schema.json", result)
         if not ok:
@@ -496,6 +518,22 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         "strategy_version": scoring["strategy_version"],
         "analysis_time_utc": snapshot.get("analysis_time_utc"),
     }
+    # Phase B (07-03): structured market-semantic normalization. Surfaces
+    # timeframe_context/alignment/htf_conflict/market_reason_codes and applies
+    # the bias+stage contract + htf_conflict confidence cap + grade downgrade.
+    # Must run BEFORE schema validation so downstream consumers see the
+    # normalized state.
+    from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+    market_semantics_cfg = (load_config().trading_mode.get("market_semantics") or {})
+    # Propagate snapshot-level alignment/htf_conflict/timeframe_context onto
+    # the decision so normalize_market_semantics can read them.
+    if snapshot.get("timeframe_context"):
+        result.setdefault("timeframe_context", snapshot.get("timeframe_context"))
+    if snapshot.get("alignment"):
+        result.setdefault("alignment", snapshot.get("alignment"))
+    if snapshot.get("htf_conflict") is not None:
+        result.setdefault("htf_conflict", snapshot.get("htf_conflict"))
+    result = normalize_market_semantics(result, snapshot, market_semantics_cfg)
     ok, err = validate_json("ga_decision.schema.json", result)
     if not ok:
         fallback = no_edge_decision(symbol, err or "unknown schema error")

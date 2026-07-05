@@ -33,6 +33,27 @@ DIRECTION_FLIP_NO_CLOSED_CANDLE = "direction_flip_without_closed_candle_confirma
 INVALID_LIQUIDITY_SWEEP = "invalid_liquidity_sweep_semantics"
 NEGATIVE_DRAWDOWN_DISPLAY = "negative_drawdown_display"
 
+# Phase E (07-03): five new semantic-accuracy issue codes plus the
+# marker-missing code. These use the independent
+# ``hourly_market_semantic_accuracy_contract_v1`` marker as the cutoff
+# between ``legacy_info`` (pre-marker) and ``error`` / ``warning``
+# (post-marker). The R4 marker remains the cutoff for the original ten codes.
+BIAS_STAGE_SEMANTIC_CONFLICT = "bias_stage_semantic_conflict"
+HTF_COUNTERTREND_OVERCONFIDENCE = "htf_countertrend_overconfidence"
+SUMMARY_STRUCTURED_STATE_MISMATCH = "summary_structured_state_mismatch"
+OBSERVATION_REASON_MISSING_MARKET_CONTEXT = "observation_reason_missing_market_context"
+NO_EDGE_REASON_COVERAGE_MISMATCH = "no_edge_reason_coverage_mismatch"
+SEMANTIC_CONTRACT_MARKER_MISSING = "semantic_contract_marker_missing"
+# R2-8 (07-03 final review P1): register the three new diagnostic types
+# emitted by _check_summary_structured_state_mismatch so they get the
+# semantic-accuracy marker cutoff demotion (legacy_info for pre-marker
+# rows, error for post-marker rows). Without registration, post-marker
+# data with these issues would always be error-severity even when the
+# marker has not been deployed, and pre-marker data would never demote.
+MISSING_STRUCTURED_FIELD = "missing_structured_field"
+CANONICAL_SUMMARY_DRIFT = "canonical_summary_drift"
+RENDERED_SUMMARY_DRIFT = "rendered_summary_drift"
+
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
     """Run all hourly-report-accuracy diagnostics.
@@ -50,6 +71,9 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     visible and must be explained, but do not fail the diagnostic.
     """
     issues: list[dict[str, Any]] = []
+    # Phase E: marker-missing check runs first so a missing contract is
+    # explicitly surfaced even when all other checks would otherwise pass.
+    issues.extend(_check_semantic_contract_markers_missing(repo))
     issues.extend(_check_hourly_report_incomplete_batch(repo, batch_id))
     issues.extend(_check_hourly_report_stale_decision(repo, batch_id=batch_id))
     issues.extend(_check_executable_opportunity_without_trade_plan(repo))
@@ -60,6 +84,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_direction_flip_without_closed_candle(repo))
     issues.extend(_check_invalid_liquidity_sweep_semantics(repo))
     issues.extend(_check_negative_drawdown_display(repo))
+    # Phase E: five new semantic-accuracy checks. These use the independent
+    # ``hourly_market_semantic_accuracy_contract_v1`` marker as the cutoff,
+    # applied below via _apply_semantic_marker_cutoff.
+    issues.extend(_check_bias_stage_semantic_conflict(repo))
+    issues.extend(_check_htf_countertrend_overconfidence(repo))
+    issues.extend(_check_summary_structured_state_mismatch(repo))
+    issues.extend(_check_observation_reason_missing_market_context(repo))
+    issues.extend(_check_no_edge_reason_coverage_mismatch(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -74,6 +106,11 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
             if decision_ts is not None and decision_ts < marker_ts:
                 # Pre-marker decision — demote to legacy_info, preserve visibility.
                 issue["severity"] = "legacy_info"
+
+    # Phase E: apply the independent semantic-accuracy marker cutoff to the
+    # five new semantic checks. Decisions created before the semantic marker
+    # are demoted to legacy_info; post-marker errors stay error/warning.
+    _apply_semantic_marker_cutoff(repo, issues)
 
     error_count = sum(1 for i in issues if i["severity"] == "error")
     warning_count = sum(1 for i in issues if i["severity"] == "warning")
@@ -90,6 +127,12 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         DIRECTION_FLIP_NO_CLOSED_CANDLE: _count(issues, DIRECTION_FLIP_NO_CLOSED_CANDLE),
         INVALID_LIQUIDITY_SWEEP: _count(issues, INVALID_LIQUIDITY_SWEEP),
         NEGATIVE_DRAWDOWN_DISPLAY: _count(issues, NEGATIVE_DRAWDOWN_DISPLAY),
+        BIAS_STAGE_SEMANTIC_CONFLICT: _count(issues, BIAS_STAGE_SEMANTIC_CONFLICT),
+        HTF_COUNTERTREND_OVERCONFIDENCE: _count(issues, HTF_COUNTERTREND_OVERCONFIDENCE),
+        SUMMARY_STRUCTURED_STATE_MISMATCH: _count(issues, SUMMARY_STRUCTURED_STATE_MISMATCH),
+        OBSERVATION_REASON_MISSING_MARKET_CONTEXT: _count(issues, OBSERVATION_REASON_MISSING_MARKET_CONTEXT),
+        NO_EDGE_REASON_COVERAGE_MISMATCH: _count(issues, NO_EDGE_REASON_COVERAGE_MISMATCH),
+        SEMANTIC_CONTRACT_MARKER_MISSING: _count(issues, SEMANTIC_CONTRACT_MARKER_MISSING),
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
@@ -111,6 +154,29 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
 # before this marker are legacy audit findings, not current R4 errors.
 R4_CONTRACT_MARKER_KEY = "hourly_report_accuracy_r4_contract_v1"
 
+# Phase E (07-03): independent semantic-accuracy contract marker. The five
+# new checks (bias_stage_semantic_conflict, htf_countertrend_overconfidence,
+# summary_structured_state_mismatch, observation_reason_missing_market_context,
+# no_edge_reason_coverage_mismatch) use this marker as the cutoff between
+# ``legacy_info`` (pre-marker) and ``error`` / ``warning`` (post-marker).
+SEMANTIC_ACCURACY_MARKER_KEY = "hourly_market_semantic_accuracy_contract_v1"
+
+# The set of issue types that fall under the semantic-accuracy contract.
+# Used by _apply_semantic_marker_cutoff to demote pre-marker findings.
+# R2-8 (07-03 final review P1): includes the three new diagnostic types
+# emitted by _check_summary_structured_state_mismatch
+# (missing_structured_field, canonical_summary_drift, rendered_summary_drift).
+_SEMANTIC_ISSUE_TYPES: frozenset[str] = frozenset({
+    BIAS_STAGE_SEMANTIC_CONFLICT,
+    HTF_COUNTERTREND_OVERCONFIDENCE,
+    SUMMARY_STRUCTURED_STATE_MISMATCH,
+    OBSERVATION_REASON_MISSING_MARKET_CONTEXT,
+    NO_EDGE_REASON_COVERAGE_MISMATCH,
+    MISSING_STRUCTURED_FIELD,
+    CANONICAL_SUMMARY_DRIFT,
+    RENDERED_SUMMARY_DRIFT,
+})
+
 
 def _get_r4_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
     """Return the R4 contract marker's applied_at timestamp, or None."""
@@ -124,6 +190,60 @@ def _get_r4_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _get_semantic_accuracy_marker_ts(repo: CryptoGuardRepository) -> str | None:
+    """Phase E: return the semantic-accuracy marker's applied_at, or None.
+
+    None means the marker has not been deployed — callers (the five new
+    checks) skip themselves in that case so historical data is not flagged
+    with ``error`` severity against a contract that has not yet been
+    initialized. The marker-missing check separately surfaces the absence.
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=?",
+            (SEMANTIC_ACCURACY_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        return None
+    return None
+
+
+def _apply_semantic_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
+    """Phase E: demote pre-marker semantic-accuracy findings to legacy_info.
+
+    Mirrors the R4 marker cutoff pattern but scoped to the five new
+    semantic-accuracy issue types. When the semantic marker is absent the
+    function is a no-op — the marker-missing check (_check_semantic_contract_markers_missing)
+    already surfaces the absence as an error.
+    """
+    marker_ts = _get_semantic_accuracy_marker_ts(repo)
+    if marker_ts is None:
+        return
+    for issue in issues:
+        if issue.get("type") not in _SEMANTIC_ISSUE_TYPES:
+            continue
+        decision_id = (issue.get("details") or {}).get("decision_id")
+        if decision_id is None:
+            # Aggregate-level issues (e.g. no_edge batch mismatches) without a
+            # single decision_id fall back to the batch analysis_time lookup
+            # via details.analysis_time when available.
+            at_ms = (issue.get("details") or {}).get("analysis_time")
+            if at_ms is not None:
+                try:
+                    dt = datetime.fromtimestamp(int(at_ms) / 1000, tz=timezone.utc)
+                    decision_ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError, OSError):
+                    continue
+            else:
+                continue
+        else:
+            decision_ts = _get_decision_created_ts(repo, decision_id)
+        if decision_ts is not None and decision_ts < marker_ts:
+            issue["severity"] = "legacy_info"
 
 
 def _get_decision_created_ts(repo: CryptoGuardRepository, decision_id: int | None) -> str | None:
@@ -857,6 +977,491 @@ def _check_negative_drawdown_display(repo: CryptoGuardRepository) -> list[dict[s
                  "initial_balance": initial_balance,
                  "drawdown_percent_internal": dd},
                 "对外显示回撤需统一为非负幅度；内部保留 sign 语义",
+            ))
+    return issues
+
+
+# ── Phase E (07-03): semantic-accuracy diagnostics ──────────────────────────
+# Five new checks + a marker-missing check. Each uses the independent
+# ``hourly_market_semantic_accuracy_contract_v1`` marker as the cutoff
+# between ``legacy_info`` (pre-marker) and ``error`` / ``warning``
+# (post-marker), applied by ``_apply_semantic_marker_cutoff`` after all
+# checks have run.
+
+# Directional vs non-directional bias/stage enums (mirrors market_semantics).
+_NON_DIRECTIONAL_BIAS_E: frozenset[str] = frozenset({"neutral", "mixed", "unknown"})
+_DIRECTIONAL_STAGE_E: frozenset[str] = frozenset({"early", "middle", "late"})
+
+# Phrases that indicate a summary is gate-only (no market context).
+_GATE_ONLY_PHRASES: tuple[str, ...] = (
+    "交易计划尚未形成",
+    "缺少有效交易计划",
+    "尚未形成交易计划",
+)
+
+# Market-context phrases that, if present in the summary, exempt it from the
+# observation_reason_missing_market_context check.
+_MARKET_CONTEXT_PHRASES: tuple[str, ...] = (
+    "日线", "4H", "4h", "1H", "1h", "15M", "15m", "高周期", "偏空", "偏多",
+    "偏热", "追价", "震荡", "反弹", "反趋势", "冲突", "混合", "趋势",
+    "结构", "动量", "突破", "回踩", "空头", "多头", "压力", "支撑",
+)
+
+
+def _check_semantic_contract_markers_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag missing semantic-accuracy AND R4 contract markers.
+
+    Both markers must exist in ``_migration_state``. If either is absent,
+    emit an ``error`` issue whose ``type`` contains "marker" and whose
+    ``suggested_action`` contains "未部署" so callers can detect the missing
+    contract rather than receiving a silently-healthy report.
+    """
+    issues: list[dict[str, Any]] = []
+    required_markers = (
+        (R4_CONTRACT_MARKER_KEY, "R4"),
+        (SEMANTIC_ACCURACY_MARKER_KEY, "semantic-accuracy"),
+    )
+    for key, label in required_markers:
+        try:
+            row = repo.conn.execute(
+                "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+                (key,),
+            ).fetchone()
+        except Exception:
+            row = None
+        if not row or not row["applied_at"]:
+            issues.append(_issue(
+                SEMANTIC_CONTRACT_MARKER_MISSING, "error",
+                {
+                    "marker_key": key,
+                    "contract": label,
+                    "issue": "marker_absent",
+                },
+                f"{label} contract marker 未部署。运行 initialize_database() 部署 marker；"
+                f"marker 缺失时语义诊断被跳过，可能导致假绿。",
+            ))
+    return issues
+
+
+def _check_bias_stage_semantic_conflict(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag ga_decisions where market_bias is non-directional
+    (neutral/mixed/unknown) but trend_stage is directional (early/middle/late).
+
+    Per design §4 / PRD FR-2, this combination is illegal and must be
+    corrected at the normalization layer. The diagnostic surfaces rows that
+    slipped through (e.g. legacy data or a faulty fixture) so they can be
+    audited. Severity: ``error`` post-marker, ``legacy_info`` pre-marker
+    (applied by ``_apply_semantic_marker_cutoff``).
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, market_bias, trend_stage, created_at
+        FROM ga_decisions
+        WHERE market_bias IN ('neutral', 'mixed', 'unknown')
+          AND trend_stage IN ('early', 'middle', 'late')
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        bias = str(r["market_bias"] or "").lower()
+        stage = str(r["trend_stage"] or "").lower()
+        if bias in _NON_DIRECTIONAL_BIAS_E and stage in _DIRECTIONAL_STAGE_E:
+            issues.append(_issue(
+                BIAS_STAGE_SEMANTIC_CONFLICT, "error",
+                {
+                    "decision_id": int(r["id"]), "symbol": r["symbol"],
+                    "market_bias": bias, "trend_stage": stage,
+                },
+                "bias+stage 语义冲突：非方向性 bias 不得与方向性 stage 组合；"
+                "必须在归一化层修正为 range/transition/unknown。",
+            ))
+    return issues
+
+
+def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag ga_decisions where 1D bias opposes 1H/15M bias in the
+    raw_decision_json snapshot profiles AND confidence >= the paper-order
+    threshold.
+
+    Per PRD FR-3, a countertrend rebound must not reach executable-level
+    confidence purely on 15M/1H momentum. The fault test seeds
+    ``raw_decision_json.snapshot.profiles`` with ``1d.market_structure=bearish``
+    + ``1h.market_structure=bullish`` and ``confidence=0.85``.
+
+    Detection parses ``raw_decision_json`` (the structured audit JSON), NOT
+    the free-text ``final_summary``. Severity: ``error`` post-marker.
+
+    Production ``raw_decision_json`` stores ``timeframe_context`` at the top
+    level (set by ``controller_decision_from_legacy`` from the normalized
+    legacy decision). Older rows or test fixtures may nest the data under
+    ``snapshot.profiles`` or ``raw_legacy_decision.snapshot.profiles`` —
+    fall back to those shapes so the diagnostic stays robust.
+    """
+    from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, confidence, market_bias,
+               raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE confidence >= ?
+        ORDER BY id DESC LIMIT 200
+        """,
+        (MIN_CONFIDENCE_FOR_PAPER_ORDER,),
+    ).fetchall()
+    for r in rows:
+        conf = float(r["confidence"] or 0)
+        if conf < MIN_CONFIDENCE_FOR_PAPER_ORDER:
+            continue
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        # Production path: top-level timeframe_context with 1d/4h/1h/15m
+        # entries carrying {bias, structure, closed}.
+        tf_ctx = raw.get("timeframe_context")
+        if isinstance(tf_ctx, dict) and tf_ctx:
+            bias_1d = _tf_ctx_bias(tf_ctx.get("1d"))
+            bias_4h = _tf_ctx_bias(tf_ctx.get("4h"))
+            bias_1h = _tf_ctx_bias(tf_ctx.get("1h"))
+            bias_15m = _tf_ctx_bias(tf_ctx.get("15m"))
+        else:
+            # Legacy / fixture path: snapshot.profiles (or nested under
+            # raw_legacy_decision.snapshot.profiles for rows written
+            # before the Phase E controller fix).
+            snapshot = raw.get("snapshot")
+            if not isinstance(snapshot, dict):
+                legacy = raw.get("raw_legacy_decision")
+                if isinstance(legacy, dict):
+                    snapshot = legacy.get("snapshot") or {}
+            if not isinstance(snapshot, dict):
+                continue
+            profiles = snapshot.get("profiles") or {}
+            if not isinstance(profiles, dict):
+                continue
+            bias_1d = _profile_structure_bias(profiles.get("1d"))
+            bias_4h = _profile_structure_bias(profiles.get("4h"))
+            bias_1h = _profile_structure_bias(profiles.get("1h"))
+            bias_15m = _profile_structure_bias(profiles.get("15m"))
+        if not bias_1d or bias_1d not in {"bullish", "bearish"}:
+            continue
+        opposite = "bullish" if bias_1d == "bearish" else "bearish"
+        low_tf_opposite = opposite in {bias_1h, bias_15m}
+        if not low_tf_opposite:
+            continue
+        # 4H must NOT confirm the low-TF direction to count as a conflict.
+        if bias_4h == opposite:
+            continue
+        issues.append(_issue(
+            HTF_COUNTERTREND_OVERCONFIDENCE, "error",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "confidence": conf,
+                "threshold": MIN_CONFIDENCE_FOR_PAPER_ORDER,
+                "1d_bias": bias_1d, "1h_bias": bias_1h,
+                "15m_bias": bias_15m, "4h_bias": bias_4h,
+            },
+            "高周期空头中的低周期反弹不得获得执行级置信度；"
+            "htf_conflict 须触发置信度上限并降级。",
+        ))
+    return issues
+
+
+def _tf_ctx_bias(entry: Any) -> str:
+    """Read a directional bias from a timeframe_context entry.
+
+    Each entry has {bias, structure, closed}. Prefers the explicit ``bias``
+    field; falls back to ``structure`` when it carries a directional value.
+    Returns "" for non-directional or missing entries.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    bias = str(entry.get("bias") or "").lower()
+    if bias in {"bullish", "bearish"}:
+        return bias
+    struct = str(entry.get("structure") or "").lower()
+    if struct in {"bullish", "bearish"}:
+        return struct
+    return ""
+
+
+def _profile_structure_bias(profile: Any) -> str:
+    """Read a directional bias from a snapshot profile dict.
+
+    Prefers an explicit ``bias`` field; falls back to ``market_structure``
+    when it carries a directional value (bullish/bearish). Returns "" for
+    non-directional or missing profiles. This reads structured audit JSON,
+    not LLM free text.
+    """
+    if not isinstance(profile, dict):
+        return ""
+    bias = str(profile.get("bias") or "").lower()
+    if bias in {"bullish", "bearish"}:
+        return bias
+    struct = str(profile.get("market_structure") or "").lower()
+    if struct in {"bullish", "bearish"}:
+        return struct
+    return ""
+
+
+def _check_summary_structured_state_mismatch(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag ga_decisions whose ``final_summary`` / ``rendered_summary``
+    text mentions a grade letter (S/A/B 级) that disagrees with the structured
+    ``signal_grade``.
+
+    Per PRD FR-5, the persisted summary must be the canonical deterministic
+    summary and must not contradict the structured grade. The fault test
+    seeds ``grade=B`` with ``final_summary="A 级 具备模拟盘条件"``.
+
+    This is a regex match on the summary *text* to detect inconsistent
+    statements — it is NOT inferring structured state from text. Severity:
+    ``error`` post-marker.
+
+    R1-6 (07-03 final review): also rebuild the canonical summary from the
+    structured fields in ``raw_decision_json`` and compare against the
+    persisted ``final_summary`` / ``rendered_summary``. Any drift is flagged
+    as ``canonical_summary_drift`` / ``rendered_summary_drift``. Missing
+    structured fields (timeframe_context/alignment/htf_conflict/
+    market_reason_codes) are flagged as ``missing_structured_field``. This
+    closes the gap where the regex miss non-grade-text drift (e.g. plain
+    summary text that diverges from the structured bias/stage).
+    """
+    import re as _re
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, market_bias, trend_stage, decision,
+               confidence, analysis_time, final_summary, rendered_summary,
+               raw_decision_json, created_at
+        FROM ga_decisions
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    # Match grade letters with optional Chinese "级" suffix or ASCII space.
+    # We look for explicit grade-letter mentions like "A 级", "S级", "B 级".
+    grade_pattern = _re.compile(r"([SABCD])\s*级")
+    from plugins.crypto_guard.reasoning.summary_builder import (
+        build_canonical_market_summary,
+    )
+    for r in rows:
+        grade = str(r["signal_grade"] or "").upper().strip()
+        if not grade:
+            continue
+        for field_name in ("final_summary", "rendered_summary"):
+            text = r[field_name] or ""
+            if not text:
+                continue
+            mentioned = grade_pattern.findall(text)
+            # Filter to the canonical grade letters we care about.
+            mentioned = [m for m in mentioned if m in {"S", "A", "B", "C", "D"}]
+            if not mentioned:
+                continue
+            if grade not in mentioned:
+                issues.append(_issue(
+                    SUMMARY_STRUCTURED_STATE_MISMATCH, "error",
+                    {
+                        "decision_id": int(r["id"]), "symbol": r["symbol"],
+                        "structured_grade": grade,
+                        "summary_grades_mentioned": mentioned,
+                        "field": field_name,
+                        "snippet": text[:200],
+                    },
+                    "final_summary/rendered_summary 与 signal_grade 不一致；"
+                    "必须使用 canonical deterministic summary 覆盖文案。",
+                ))
+                break
+
+        # R1-6: canonical drift detection via rebuild. Rebuild canonical
+        # from the structured fields in raw_decision_json and compare.
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        rebuilt = {
+            "symbol": r["symbol"],
+            "analysis_time_utc": int(r["analysis_time"] or 0),
+            "signal_grade": r["signal_grade"],
+            "market_bias": r["market_bias"],
+            "trend_stage": r["trend_stage"],
+            "decision": r["decision"],
+            "confidence": r["confidence"],
+            "timeframe_context": raw.get("timeframe_context"),
+            "alignment": raw.get("alignment"),
+            "htf_conflict": raw.get("htf_conflict"),
+            "market_reason_codes": raw.get("market_reason_codes"),
+            "risk_check": raw.get("risk_check"),
+            "trade_plan": raw.get("trade_plan"),
+            "has_trade_plan": raw.get("has_trade_plan"),
+            "opportunity_watch": raw.get("opportunity_watch"),
+        }
+        # Missing structured field check
+        missing_fields = [
+            fname for fname in (
+                "timeframe_context", "alignment", "htf_conflict",
+                "market_reason_codes",
+            )
+            if rebuilt.get(fname) is None
+        ]
+        if missing_fields:
+            issues.append(_issue(
+                MISSING_STRUCTURED_FIELD, "error",
+                {
+                    "decision_id": int(r["id"]), "symbol": r["symbol"],
+                    "missing_fields": missing_fields,
+                },
+                "结构化字段缺失：raw_decision_json 缺少 "
+                f"{missing_fields}，无法重建 canonical summary。",
+            ))
+            continue  # cannot rebuild canonical reliably
+        try:
+            recomputed = build_canonical_market_summary(rebuilt)
+        except Exception:
+            continue
+        final_text = (r["final_summary"] or "")
+        rendered_text = (r["rendered_summary"] or "")
+        if final_text and final_text != recomputed:
+            issues.append(_issue(
+                CANONICAL_SUMMARY_DRIFT, "error",
+                {
+                    "decision_id": int(r["id"]), "symbol": r["symbol"],
+                    "persisted_final_summary": final_text[:200],
+                    "recomputed_canonical": recomputed[:200],
+                },
+                "final_summary 与重算 canonical summary 不一致；"
+                "必须使用 build_canonical_market_summary 覆盖。",
+            ))
+        if rendered_text and final_text and rendered_text != final_text:
+            issues.append(_issue(
+                RENDERED_SUMMARY_DRIFT, "error",
+                {
+                    "decision_id": int(r["id"]), "symbol": r["symbol"],
+                    "final_summary": final_text[:200],
+                    "rendered_summary": rendered_text[:200],
+                },
+                "rendered_summary 与 final_summary 不一致；"
+                "R1-5 要求两者都等于 canonical。",
+            ))
+    return issues
+
+
+def _check_observation_reason_missing_market_context(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag observation decisions whose summary is ONLY gate
+    terminology (e.g. "交易计划尚未形成") with no market context.
+
+    Per PRD FR-4, the observation reason must explain the market, not only
+    the gate. The fault test seeds ``market_bias=bullish, trend_stage=middle,
+    final_summary="交易计划尚未形成"``. Severity: ``warning`` per design §7
+    (the diagnostic must surface the gap, but it is not a hard error).
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, market_bias, trend_stage,
+               final_summary, rendered_summary, created_at
+        FROM ga_decisions
+        WHERE decision IN ('monitor_only', 'opportunity_watch', 'no_edge',
+                           'watch_only', 'add_to_watchlist', 'ignore')
+           OR decision NOT IN ('create_paper_order', 'trade_plan_available')
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        text = (r["final_summary"] or "") + " " + (r["rendered_summary"] or "")
+        text = text.strip()
+        if not text:
+            continue
+        has_gate_only = any(p in text for p in _GATE_ONLY_PHRASES)
+        if not has_gate_only:
+            continue
+        has_market_context = any(p in text for p in _MARKET_CONTEXT_PHRASES)
+        if has_market_context:
+            continue
+        issues.append(_issue(
+            OBSERVATION_REASON_MISSING_MARKET_CONTEXT, "warning",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "decision": r["decision"],
+                "market_bias": r["market_bias"], "trend_stage": r["trend_stage"],
+                "snippet": (r["final_summary"] or "")[:200],
+            },
+            "观察原因缺少市场上下文：'交易计划尚未形成' 不得成为唯一解释；"
+            "必须先写市场原因（多周期冲突/趋势后段/结构未确认等）。",
+        ))
+    return issues
+
+
+def _check_no_edge_reason_coverage_mismatch(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase E: flag C/D no_edge batches where >3 rows exist but some rows
+    have empty reason text, so the renderer cannot label "前 N 项，另有 M 项".
+
+    Per PRD FR-6, when the C/D list is truncated the report must explicitly
+    label "重点原因（前 N 项，另有 M 项）". The label is added at render time
+    by ``_format_cd_reasons`` (Phase D), so it is never persisted in
+    ``rendered_summary``. The data-level fault this diagnostic can catch is:
+    a C/D batch with >3 rows where some rows have empty reason text, meaning
+    the renderer has nothing to truncate and the user sees incomplete reasons.
+    The fault test seeds 6 no_edge rows with empty ``final_summary`` and
+    ``rendered_summary``.
+
+    Detection: group recent C/D no_edge rows by a 15-minute time bucket
+    (the primary report interval). For each bucket with >3 rows, verify every
+    row has non-empty reason text. Flag the bucket when any row is missing a
+    reason. Severity: ``warning`` per design §7.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, batch_id,
+               final_summary, rendered_summary, analysis_time, created_at
+        FROM ga_decisions
+        WHERE signal_grade IN ('C', 'D')
+           OR decision = 'no_edge'
+        ORDER BY id DESC LIMIT 300
+        """
+    ).fetchall()
+    # Group by a 15-minute time bucket (900000 ms). This mirrors how the
+    # hourly report renders C/D symbols — by time window, not by exact
+    # batch_id string. Tight-loop test seeding that spans a few milliseconds
+    # still lands in the same bucket.
+    _BUCKET_MS = 900_000
+    by_bucket: dict[int, list[dict[str, Any]]] = {}
+    for r in rows:
+        at = int(r["analysis_time"] or 0)
+        bucket = at // _BUCKET_MS if at > 0 else 0
+        by_bucket.setdefault(bucket, []).append({
+            "id": int(r["id"]), "symbol": r["symbol"],
+            "grade": r["signal_grade"], "decision": r["decision"],
+            "batch_id": r["batch_id"] or "",
+            "final_summary": r["final_summary"] or "",
+            "rendered_summary": r["rendered_summary"] or "",
+            "analysis_time": at,
+        })
+    for bucket, group in by_bucket.items():
+        if len(group) <= 3:
+            continue
+        # The "前 N 项" truncation label is added at render time by
+        # _format_cd_reasons whenever the reason count exceeds max_items.
+        # The label is never persisted in rendered_summary. So the data-level
+        # fault we can detect is: rows with empty reason text, which leaves
+        # the renderer with nothing to truncate or label.
+        missing_reasons = [
+            i for i in group
+            if not (i["rendered_summary"] or "").strip()
+            and not (i["final_summary"] or "").strip()
+        ]
+        if missing_reasons:
+            issues.append(_issue(
+                NO_EDGE_REASON_COVERAGE_MISMATCH, "warning",
+                {
+                    "batch_id": group[0]["batch_id"] if group else "",
+                    "time_bucket": bucket,
+                    "no_edge_count": len(group),
+                    "missing_reason_count": len(missing_reasons),
+                    "missing_symbols": [i["symbol"] for i in missing_reasons],
+                    "symbols": [i["symbol"] for i in group],
+                    "analysis_time": group[0]["analysis_time"] if group else 0,
+                },
+                "C/D 原因覆盖不一致：>3 个 no_edge 品种中存在空原因行；"
+                "报告渲染必须为每个 C/D 品种提供非空原因并由 _compact_items 标注截断。",
             ))
     return issues
 

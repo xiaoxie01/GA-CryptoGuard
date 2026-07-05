@@ -473,6 +473,68 @@ def _json_list(raw: Any) -> list[str]:
         return []
 
 
+def _market_data_quality_problem_rows(
+    market_data_quality: dict[str, Any],
+) -> list[str]:
+    """Render only unhealthy symbol/timeframe rows for user notifications."""
+    rows: list[str] = []
+    symbols_md = market_data_quality.get("symbols") or {}
+    for sym, tf_health in symbols_md.items():
+        for tf, health in (tf_health or {}).items():
+            if not isinstance(health, dict) or health.get("ready") is True:
+                continue
+            contiguous = health.get(
+                "contiguous_tail_count",
+                health.get("contiguous_count", 0),
+            )
+            required = health.get("required_count", 0)
+            gap_count = health.get("gap_count", 0)
+            largest_gap = health.get("largest_gap_bars", 0)
+            last_close = health.get("last_close_time")
+            reason = health.get("reason", "")
+            last_close_str = _format_time_utc8(str(last_close)) if last_close else "-"
+            rows.append(
+                f"- {sym} {tf}：连续 {contiguous}/{required}，"
+                f"缺口 {gap_count}（最大 {largest_gap}），"
+                f"最新收盘 {last_close_str}，降级({reason})"
+            )
+    return rows
+
+
+def _append_market_data_quality_section(
+    lines: list[str],
+    market_data_quality: dict[str, Any] | None,
+    *,
+    heading: str,
+    include_status: bool,
+) -> None:
+    """Append a compact market-data section only when a problem exists."""
+    if not market_data_quality:
+        return
+    problem_rows = _market_data_quality_problem_rows(market_data_quality)
+    deferred = market_data_quality.get("deferred_analyses") or []
+    fail_closed = bool(market_data_quality.get("fail_closed"))
+    degraded = bool(market_data_quality.get("degraded"))
+
+    # Legacy reports already render the status banner near the top. Avoid an
+    # empty duplicate section when there are no per-TF/deferred details.
+    if not include_status and not problem_rows and not deferred:
+        return
+    if not (fail_closed or degraded or problem_rows or deferred):
+        return
+
+    lines.extend(["", heading])
+    if include_status:
+        if fail_closed:
+            error_msg = market_data_quality.get("error", "unknown")
+            lines.append(f"- ⚠️ 行情质量状态不可用：{error_msg}")
+        elif degraded or problem_rows:
+            lines.append("- ⚠️ 行情分析不可用/降级 — 数据不完整")
+    lines.extend(problem_rows)
+    if deferred:
+        lines.append(f"- 延迟分析：{len(deferred)} 项")
+
+
 def render_ga_hourly_summary(
     generated_at_utc: str,
     active_symbols: list[str],
@@ -596,36 +658,12 @@ def render_ga_hourly_summary(
     # generic "数据不完整" banner only appears when the health check ran
     # successfully and found real gaps. When the health check itself crashed,
     # a distinct "行情质量状态不可用" message is shown with the error.
-    if market_data_quality:
-        if market_data_quality.get("fail_closed"):
-            error_msg = market_data_quality.get("error", "unknown")
-            lines.extend(["", f"⚠️ 行情质量状态不可用：{error_msg}"])
-        elif market_data_quality.get("degraded"):
-            lines.extend(["", "⚠️ 行情分析不可用/降级 — 数据不完整"])
-        symbols_md = market_data_quality.get("symbols") or {}
-        if symbols_md:
-            lines.extend(["", "**行情数据质量**"])
-            for sym, tf_health in symbols_md.items():
-                for tf, h in (tf_health or {}).items():
-                    if not isinstance(h, dict):
-                        continue
-                    contiguous = h.get("contiguous_tail_count", h.get("contiguous_count", 0))
-                    required = h.get("required_count", 0)
-                    gap_count = h.get("gap_count", 0)
-                    largest_gap = h.get("largest_gap_bars", 0)
-                    last_close = h.get("last_close_time")
-                    ready = h.get("ready", False)
-                    reason = h.get("reason", "")
-                    status_text = "就绪" if ready else f"降级({reason})"
-                    last_close_str = _format_time_utc8(str(last_close)) if last_close else "-"
-                    lines.append(
-                        f"- {sym} {tf}：连续 {contiguous}/{required}，"
-                        f"缺口 {gap_count}（最大 {largest_gap}），"
-                        f"最新收盘 {last_close_str}，{status_text}"
-                    )
-        deferred = market_data_quality.get("deferred_analyses") or []
-        if deferred:
-            lines.append(f"- 延迟分析：{len(deferred)} 项")
+    _append_market_data_quality_section(
+        lines,
+        market_data_quality,
+        heading="**行情数据质量**",
+        include_status=True,
+    )
 
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
@@ -693,7 +731,19 @@ def render_ga_hourly_summary(
     if no_edge:
         symbols = ", ".join(row["symbol"] for row in no_edge[:30])
         lines.append(f"- C/D：{symbols}")
-        reasons = _compact_items([row.get("final_summary") for row in no_edge], max_items=3)
+        # Phase C (07-03): prefer rendered_summary (canonical) over
+        # final_summary for the C/D reason display. rendered_summary is the
+        # deterministic canonical text generated by
+        # build_canonical_market_summary; final_summary is kept as a
+        # fallback for rows written before the Phase C integration.
+        # Phase D (07-03): route through _format_cd_reasons so the "前 N 项"
+        # truncation label appears when reasons exceed max_items. This also
+        # keeps both report paths on the shared _compact_items helper.
+        reason_items = [
+            row.get("rendered_summary") or row.get("final_summary")
+            for row in no_edge
+        ]
+        reasons = _format_cd_reasons(reason_items, max_items=3)
         lines.append(f"- 主要原因：{reasons or '趋势不清晰或风控不足'}")
     else:
         lines.append("- 暂无 C/D 无优势品种")
@@ -1384,6 +1434,23 @@ def render_hourly_report_text(
     if len(active_symbols) > 30:
         lines.append(f"- 其余 {len(active_symbols) - 30} 个产品略。")
 
+    # Phase D (07-03): C/D reason summary — route through the shared
+    # _format_cd_reasons helper (which calls _compact_items) so both report
+    # paths share the same C/D rendering logic. Extract C/D signals from
+    # ga_decision_json. When there are no signals, _compact_items is still
+    # called with an empty list to satisfy the shared-helper contract.
+    cd_reason_items: list[str] = []
+    for signal in signals:
+        decision_json = _safe_json(signal.get("ga_decision_json"), {})
+        grade = str((decision_json or {}).get("signal_grade") or signal.get("signal_grade") or "").upper()
+        if grade in {"C", "D"}:
+            summary = (decision_json or {}).get("rendered_summary") or (decision_json or {}).get("summary") or (decision_json or {}).get("final_summary") or signal.get("summary") or ""
+            if summary:
+                cd_reason_items.append(str(summary))
+    cd_reasons_text = _format_cd_reasons(cd_reason_items, max_items=3)
+    if cd_reasons_text:
+        lines.extend(["", "**无优势品种汇总（C/D）**", f"- 主要原因：{cd_reasons_text}"])
+
     lines.extend(["", "**模拟盘持仓/订单：**"])
     if not open_orders:
         lines.append("- 当前无 pending/open 模拟盘订单")
@@ -1491,35 +1558,12 @@ def render_hourly_report_text(
     # R6: Market data quality section
     # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
     # "data is genuinely gappy" (degraded=True, fail_closed != True).
-    if market_data_quality:
-        lines.extend(["", "**行情数据质量：**"])
-        if market_data_quality.get("fail_closed"):
-            error_msg = market_data_quality.get("error", "unknown")
-            lines.append(f"- ⚠️ 行情质量状态不可用：{error_msg}")
-        elif market_data_quality.get("degraded"):
-            lines.append("- ⚠️ 行情分析不可用/降级 — 数据不完整")
-        symbols_md = market_data_quality.get("symbols") or {}
-        for sym, tf_health in symbols_md.items():
-            for tf, h in (tf_health or {}).items():
-                if not isinstance(h, dict):
-                    continue
-                contiguous = h.get("contiguous_tail_count", h.get("contiguous_count", 0))
-                required = h.get("required_count", 0)
-                gap_count = h.get("gap_count", 0)
-                largest_gap = h.get("largest_gap_bars", 0)
-                last_close = h.get("last_close_time")
-                ready = h.get("ready", False)
-                reason = h.get("reason", "")
-                status_text = "就绪" if ready else f"降级({reason})"
-                last_close_str = _format_time_utc8(str(last_close)) if last_close else "-"
-                lines.append(
-                    f"- {sym} {tf}：连续 {contiguous}/{required}，"
-                    f"缺口 {gap_count}（最大 {largest_gap}），"
-                    f"最新收盘 {last_close_str}，{status_text}"
-                )
-        deferred = market_data_quality.get("deferred_analyses") or []
-        if deferred:
-            lines.append(f"- 延迟分析：{len(deferred)} 项")
+    _append_market_data_quality_section(
+        lines,
+        market_data_quality,
+        heading="**行情数据质量：**",
+        include_status=False,
+    )
 
     # P2-B: Add top failure patterns
     if feedback_patterns and not feedback_patterns.get("error"):
@@ -1654,6 +1698,13 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row.get("created_at"),
         "batch_id": row.get("batch_id"),
         "previous_grade": row.get("previous_grade"),
+        # Phase D (07-03): expose structured multi-TF fields from
+        # raw_decision_json so the report renderer can build market-context
+        # reason text without re-parsing the LLM summary.
+        "timeframe_context": raw.get("timeframe_context") or {},
+        "alignment": raw.get("alignment"),
+        "htf_conflict": raw.get("htf_conflict"),
+        "market_reason_codes": raw.get("market_reason_codes") or [],
     }
 
 
@@ -1759,11 +1810,31 @@ def _format_opportunity_row(
     details = [bias, stage, pos_status, age_text]
     details_text = " · ".join(x for x in details if x)
     reason = _humanize_gate_blockers(blockers, row)
-    return (
-        f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
-        f"  {details_text}\n"
-        f"  {'条件：' if tier_label == '可执行' else '原因：'}{reason}"
-    )
+    # Phase D (07-03): for observation rows, append the structured
+    # 市场/门禁 reason block so the user sees multi-TF context before
+    # gate terminology. This ensures "交易计划尚未形成" is never the
+    # sole explanation.
+    # R1-12 (07-03 final review): drop the separate "原因：{reason}" line
+    # for non-executable rows because it duplicates the "门禁：{reason}"
+    # line emitted by _format_observation_market_and_gate_reasons (both
+    # call _humanize_gate_blockers on the same blockers). For executable
+    # rows the "条件：{reason}" line is preserved because no 市场/门禁
+    # block is appended for them.
+    if tier_label == "可执行":
+        result = (
+            f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
+            f"  {details_text}\n"
+            f"  条件：{reason}"
+        )
+    else:
+        result = (
+            f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
+            f"  {details_text}"
+        )
+        market_gate_lines = _format_observation_market_and_gate_reasons(row)
+        if market_gate_lines:
+            result += "\n  " + "\n  ".join(market_gate_lines)
+    return result
 
 
 def _batch_status_label(status: Any, incomplete: bool = False) -> str:
@@ -1809,6 +1880,153 @@ def _humanize_gate_blockers(blockers: list[Any], row: dict[str, Any]) -> str:
             "market": "执行门禁已通过",
         }.get(entry_type, "执行门禁已通过")
     return "；".join(_dedupe(labels)) or "当前条件不足，继续观察"
+
+
+# Phase D (07-03): structured market-reason / gate-reason helpers. These
+# translate structured fields (timeframe_context, alignment, htf_conflict,
+# market_reason_codes) into user-facing Chinese so the report explains the
+# real market structure instead of only citing execution-gate terminology.
+
+# Mapping from market_reason_codes to concise Chinese reason phrases.
+_MARKET_REASON_CODE_LABELS: dict[str, str] = {
+    "htf_conflict": "高周期冲突",
+    "countertrend_rebound": "反趋势反弹",
+    "bias_stage_contradiction": "方向与阶段矛盾",
+    "overextended": "追价风险",
+    "data_incomplete": "数据不完整",
+}
+
+# Mapping from alignment enum to concise Chinese label.
+_ALIGNMENT_LABELS_REPORT: dict[str, str] = {
+    "aligned": "已对齐",
+    "partial": "部分对齐",
+    "countertrend_rebound": "反趋势反弹",
+    "neutral": "中性",
+    "unknown": "未知",
+}
+
+# Mapping from market_bias to concise Chinese label for market-reason text.
+_BIAS_LABELS_REPORT: dict[str, str] = {
+    "bullish": "偏多",
+    "bearish": "偏空",
+    "neutral": "中性",
+    "mixed": "混合",
+    "unknown": "未知",
+}
+
+
+def _format_market_reason_text(row: dict[str, Any]) -> str:
+    """Build a concise Chinese market-reason line from structured fields.
+
+    Reads ``timeframe_context``, ``alignment``, ``htf_conflict`` and
+    ``market_reason_codes`` from the decision row and produces text like:
+    ``日线偏空，4H震荡，1H反弹；尚未形成高周期同向确认``.
+
+    Returns "" when no structured market context is available.
+    """
+    tf_ctx = row.get("timeframe_context") or {}
+    if not isinstance(tf_ctx, dict):
+        tf_ctx = {}
+    alignment = str(row.get("alignment") or "").lower()
+    htf_conflict = bool(row.get("htf_conflict"))
+    reason_codes = row.get("market_reason_codes") or []
+    if not isinstance(reason_codes, list):
+        reason_codes = []
+
+    # Build per-TF summary (1d, 4h, 1h).
+    tf_parts: list[str] = []
+    tf_labels = {"1d": "日线", "4h": "4H", "1h": "1H"}
+    for tf, label in tf_labels.items():
+        ctx = tf_ctx.get(tf)
+        if not isinstance(ctx, dict):
+            continue
+        bias = str(ctx.get("bias") or "").lower()
+        structure = str(ctx.get("structure") or "").lower()
+        bias_label = _BIAS_LABELS_REPORT.get(bias, "")
+        # Describe the TF with a concise phrase.
+        if structure == "range":
+            tf_parts.append(f"{label}震荡")
+        elif structure == "transition":
+            tf_parts.append(f"{label}转换")
+        elif structure in {"bullish", "uptrend"}:
+            tf_parts.append(f"{label}偏多")
+        elif structure in {"bearish", "downtrend"}:
+            tf_parts.append(f"{label}偏空")
+        elif structure == "rebound":
+            tf_parts.append(f"{label}反弹")
+        elif bias_label:
+            tf_parts.append(f"{label}{bias_label}")
+    tf_text = "，".join(tf_parts)
+
+    # Build the conflict / alignment qualifier.
+    qualifier = ""
+    if alignment == "countertrend_rebound" or htf_conflict:
+        qualifier = "尚未形成高周期同向确认"
+    elif alignment == "partial":
+        qualifier = "部分周期未同向确认"
+    elif alignment == "aligned":
+        qualifier = "高周期已同向确认"
+
+    # Reason-code labels (additional context).
+    code_labels: list[str] = []
+    for code in reason_codes:
+        label = _MARKET_REASON_CODE_LABELS.get(str(code))
+        if label and label not in code_labels:
+            code_labels.append(label)
+
+    # Compose: TF summary ; qualifier ; reason codes.
+    segments: list[str] = []
+    if tf_text:
+        segments.append(tf_text)
+    if qualifier:
+        segments.append(qualifier)
+    # Reason codes are appended only when they add info not already in the
+    # TF summary or qualifier (e.g. "追价风险", "数据不完整").
+    extra_codes = [
+        c for c in code_labels
+        if c not in {"高周期冲突", "反趋势反弹"}
+        or (c == "高周期冲突" and not qualifier)
+    ]
+    if extra_codes:
+        segments.append("；".join(extra_codes))
+
+    return "；".join(segments) if segments else ""
+
+
+def _format_observation_market_and_gate_reasons(row: dict[str, Any]) -> list[str]:
+    """Build the multi-line 市场/门禁 reason block for an observation row.
+
+    Market reasons are rendered first (multi-TF context, alignment, conflict),
+    followed by gate-blocker reasons. This ensures '交易计划尚未形成' is
+    never the sole explanation — the market context always precedes it.
+
+    Returns a list of report lines (without the leading "- " bullet). Each
+    line is prefixed with "市场：" or "门禁：". Returns an empty list when
+    neither market nor gate context is available.
+    """
+    lines: list[str] = []
+    market_text = _format_market_reason_text(row)
+    if market_text:
+        lines.append(f"市场：{market_text}")
+
+    blockers = row.get("_blockers") or []
+    gate_text = _humanize_gate_blockers(blockers, row)
+    # Suppress the default "当前条件不足，继续观察" placeholder when there
+    # are no real blockers — it carries no information.
+    if gate_text and gate_text != "当前条件不足，继续观察":
+        lines.append(f"门禁：{gate_text}")
+
+    # If the gate text is the only reason and there's no market context,
+    # force a market-context line so "交易计划尚未形成" is not the sole
+    # explanation. Fall back to the bias/stage labels.
+    if not market_text and gate_text:
+        bias = _market_bias_label(row.get("market_bias"))
+        stage = _trend_stage_label(row.get("trend_stage"))
+        fallback_parts = [p for p in (bias, stage) if p]
+        if fallback_parts:
+            lines.insert(0, f"市场：{'，'.join(fallback_parts)}")
+
+    return lines
 
 
 def _market_bias_label(value: Any) -> str:
@@ -2075,6 +2293,41 @@ def _compact_items(items: Any, max_items: int = 3) -> str:
         return ""
     values = [str(x) for x in items if x not in (None, "")]
     return "；".join(_dedupe(values)[:max_items])
+
+
+def _format_cd_reasons(reason_items: list[Any], max_items: int = 3) -> str:
+    """Phase D (07-03): Format C/D reason text with a '前 N 项' truncation label.
+
+    When the number of unique non-empty reasons exceeds ``max_items``, the
+    output is prefixed with ``重点原因（前 {shown} 项，另有 {remaining} 项）：``
+    so the user knows not all reasons are shown. When ``len <= max_items``,
+    no label is added.
+
+    R1-10 (07-03 final review): dedupe BEFORE counting so duplicate reasons
+    are not double-counted in the "另有 M 项" label. Previously ``n`` was
+    computed from the raw non-empty list, which inflated ``remaining``
+    when duplicates existed. Now ``unique_count`` reflects only distinct
+    reasons, and the label shows the actual number of unique items beyond
+    what is displayed.
+
+    Always calls ``_compact_items`` so both report paths share the same
+    helper (design §6 requirement 4).
+    """
+    # Filter non-empty values, then dedupe preserving order, then count.
+    raw_values = [str(x) for x in (reason_items or []) if x not in (None, "")]
+    deduped = _dedupe(raw_values)
+    unique_count = len(deduped)
+    # _compact_items applies its own dedupe + truncation; pass the deduped
+    # list so it does not re-process, but the shared-helper contract is
+    # preserved (both report paths invoke _compact_items).
+    rendered = _compact_items(deduped, max_items=max_items)
+    if not rendered:
+        return ""
+    shown = min(max_items, unique_count)
+    if unique_count > max_items:
+        remaining = unique_count - shown
+        return f"重点原因（前 {shown} 项，另有 {remaining} 项）：{rendered}"
+    return rendered
 
 
 def _analysis_state_report_lines(state: dict[str, Any]) -> list[str]:

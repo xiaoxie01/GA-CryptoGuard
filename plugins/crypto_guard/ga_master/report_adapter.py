@@ -10,6 +10,10 @@ def latest_decision_summaries(repo: CryptoGuardRepository, *, limit: int = 80) -
     rows = repo.latest_ga_decisions_by_symbol(limit=limit)
     out: list[dict[str, Any]] = []
     for row in rows:
+        # Phase C (07-03): prefer rendered_summary (canonical) over
+        # final_summary for downstream consumers. rendered_summary is the
+        # deterministic canonical text; final_summary is kept as a fallback.
+        summary = row.get("rendered_summary") or row["final_summary"]
         out.append(
             {
                 "ga_decision_id": row["id"],
@@ -21,7 +25,9 @@ def latest_decision_summaries(repo: CryptoGuardRepository, *, limit: int = 80) -
                 "confidence": row["confidence"],
                 "market_bias": row["market_bias"],
                 "trend_stage": row["trend_stage"],
-                "final_summary": row["final_summary"],
+                "final_summary": summary,
+                "rendered_summary": row.get("rendered_summary"),
+                "raw_llm_summary": _raw(row).get("raw_llm_summary"),
                 "risk_check": _safe_json(row.get("risk_check_json"), {}),
                 "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
             }
