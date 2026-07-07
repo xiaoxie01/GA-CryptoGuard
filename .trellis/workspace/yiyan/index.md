@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 27
-- **Last Active**: 2026-07-02
+- **Total Sessions**: 28
+- **Last Active**: 2026-07-07
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~912 | Active |
+| `journal-1.md` | ~945 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 28 | 2026-07-07 | Hourly decision context continuity — R5→R14 final seal + commit | `ca5376b` | `main` |
 | 27 | 2026-07-02 | BTC#9 Trade Gate Final Seal — R3→R13 + Production Migration | `1092646b` | `main` |
 | 26 | 2026-06-28 | Fix hourly report accuracy R3: worker blocking, cross-batch query, emergency_down, deterministic summary | `ba134b6` | `main` |
 | 25 | 2026-06-28 | Fix hourly report accuracy: 15 review issues (P0-7, P1-5, P2-3) | `ba1a1a1` | `main` |

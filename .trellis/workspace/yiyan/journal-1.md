@@ -910,3 +910,36 @@ Completed 11 rounds of strict final-review fixes (R3-R13) for BTC#9 'down-pullba
 ### Next Steps
 
 - None - task complete
+
+
+## Session 28: Hourly decision context continuity — R5→R14 final seal + commit
+
+**Date**: 2026-07-07
+**Task**: Hourly decision context continuity — R5→R14 final seal + commit
+**Branch**: `main`
+
+### Summary
+
+Completed R5→R14 iterative independent review passes on the 07-05-hourly-decision-context-continuity task. R13 fixed a critical P0 regression where controller_decision_from_legacy was writing analysis_time_utc as integer (breaking 13+ SQL consumers in state_consistency.py that use datetime(replace(replace(...))) which returns NULL for integer input) — restored ISO string, added regression test exercising real controller→DB→SQL→diagnostic chain. R14 added replace(replace(...)) wrapper to remaining 2/18 state_consistency.py consumers, fixed fault injector raw_decision_json shape, added explicit parens for operator precedence, corrected misleading defense-in-depth rationale. Final state: P0=0, P1=0, P2=0, Recommended=0. Verification: full suite ×2 (953/953), fault injection 9/9, fresh DB diagnostics all ok=True. Committed as ca5376b. Production migration / marker write / service restart NOT done — to be handled separately via /trellis:crypto-guard-release.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ca5376b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
