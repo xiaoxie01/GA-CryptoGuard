@@ -86,8 +86,12 @@ def run_position_conflict_revalidation(
             latest_decision_row = None
 
         if latest_decision_row is None:
+            # R13 P1 defense-in-depth: order by ``analysis_time`` (INTEGER
+            # NOT NULL) instead of ``analysis_time_utc`` (TEXT) for the
+            # same reason as ``pending_order_manager.py:122`` — canonical
+            # chronological key, immune to ``analysis_time_utc`` regressions.
             latest_decision_row = repo.conn.execute(
-                "SELECT * FROM ga_decisions WHERE symbol=? ORDER BY analysis_time_utc DESC LIMIT 1",
+                "SELECT * FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
                 (trade_symbol,),
             ).fetchone()
 
@@ -350,10 +354,30 @@ def _count_consecutive_reverse_confirmations(
     except (ValueError, TypeError):
         return 0
 
+    # R13 P1 defense-in-depth: ``ORDER BY analysis_time DESC, id DESC``
+    # uses the INTEGER NOT NULL column (schema.sql:148) as the canonical
+    # chronological key, immune to any future regression in
+    # ``analysis_time_utc`` shape. R13 P0 ensures ``analysis_time_utc``
+    # is always an ISO string in production, but if a future regression
+    # writes an integer, the ``ORDER BY analysis_time_utc`` would
+    # misorder mixed populations (integer-text sorts AFTER ISO-text
+    # because ``'1' < '2'``).
+    #
+    # The ``replace(replace(analysis_time_utc, 'T', ' '), 'Z', ''))``
+    # wrapper on the ``WHERE`` clause matches the pattern used by 16+
+    # SQL consumers in ``diagnostics/state_consistency.py``. NOTE: this
+    # wrapper is NOT itself defense-in-depth against integer input —
+    # SQLite ``datetime(replace(replace('1750000000000', 'T', ' '),
+    # 'Z', ''))`` also returns NULL (verified by direct reproduction),
+    # so an integer ``analysis_time_utc`` would silently exclude rows
+    # from this WHERE clause regardless of the wrapper. The wrapper is
+    # retained purely for stylistic consistency with the rest of the
+    # codebase; the actual defense-in-depth is the ``ORDER BY
+    # analysis_time DESC`` change above.
     rows = repo.conn.execute(
         """SELECT market_bias, signal_grade, risk_check_json, trade_plan_json FROM ga_decisions
-           WHERE symbol=? AND datetime(analysis_time_utc) >= datetime(?)
-           ORDER BY analysis_time_utc DESC""",
+           WHERE symbol=? AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+           ORDER BY analysis_time DESC, id DESC""",
         (trade_symbol, created_at_iso),
     ).fetchall()
 

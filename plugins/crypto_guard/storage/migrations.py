@@ -78,6 +78,12 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
         # htf_countertrend_overconfidence, summary_structured_state_mismatch,
         # observation_reason_missing_market_context, no_edge_reason_coverage_mismatch).
         _ensure_hourly_market_semantic_accuracy_contract_marker(conn)
+        # Phase H (07-05): decision-context-continuity contract marker.
+        # Written AFTER the semantic-accuracy marker so all Phase A-G
+        # contract diagnostics can use a single independent cutoff. Rows
+        # persisted before this marker are demoted to legacy_info; rows
+        # after are evaluated against the full Phase A-G contract.
+        _ensure_hourly_decision_context_continuity_contract_marker(conn)
         conn.commit()
         return {"ok": True, "database_path": str(cfg.database_path)}
     finally:
@@ -1510,6 +1516,30 @@ def _ensure_hourly_market_semantic_accuracy_contract_marker(conn: sqlite3.Connec
     conn.execute(
         "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
         ("hourly_market_semantic_accuracy_contract_v1",),
+    )
+
+
+def _ensure_hourly_decision_context_continuity_contract_marker(conn: sqlite3.Connection) -> None:
+    """Phase H (07-05): Write the hourly_decision_context_continuity_contract_v1 marker.
+
+    Independent cutoff for the Phase A-G contract diagnostics
+    (missing_feature_pack, missing_analysis_continuity, withheld_without_blockers,
+    missing_candidate_on_llm_failure, oversized_feature_pack,
+    candidate_effective_plan_mismatch, batch_time_health_mismatch). Rows
+    persisted before this marker are demoted to ``legacy_info``; rows after
+    are evaluated against the full Phase A-G contract. INSERT OR IGNORE keeps
+    the marker idempotent — re-running initialize_database() never refreshes
+    the timestamp.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migration_state ("
+        "  key TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("hourly_decision_context_continuity_contract_v1",),
     )
 
 

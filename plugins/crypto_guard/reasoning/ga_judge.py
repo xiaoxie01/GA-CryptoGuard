@@ -17,6 +17,24 @@ def _get_min_risk_distance(entry: float) -> float:
     return entry * min_sl_pct
 
 
+def _snapshot_analysis_time_utc(snapshot: dict[str, Any]) -> int:
+    """Phase G (07-05): extract strict-positive-int analysis_time_utc from
+    the snapshot for the no_edge fallback. The schema requires
+    ``analysis_time_utc: integer, minimum=1``; passing 0 or a wall-clock
+    fallback would re-introduce the original defect (schema-invalid no_edge
+    fallback crashing the chain on the second validate_json call). When
+    the snapshot lacks a usable value, raise — the caller must fail-closed
+    rather than emit a wall-clock time, per PRD FR-7.
+    """
+    at = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
+    if at is None:
+        raise ValueError(
+            "no_edge_decision requires snapshot-authoritative analysis_time_utc; "
+            "snapshot lacks a strict positive int. PRD FR-7 forbids wall-clock fallbacks."
+        )
+    return at
+
+
 def _invalid_condition_buffer_pct() -> float:
     """BTC#9 fix: invalid_condition 与 stop_loss 之间的最小缓冲（比例 0-1）。
 
@@ -435,6 +453,11 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
             "market_bias": "unknown",
             "trend_stage": "unknown",
             "confidence": 0.3,
+            # Phase F (07-05): degraded decisions still carry raw_signal_grade
+            # / raw_score for audit parity. They equal the degraded values
+            # because no SOP scoring ran.
+            "raw_signal_grade": "C",
+            "raw_score": 0.3,
             "summary": f"{symbol} 行情数据不完整，分析降级，方向不可靠，仅记录本次分析。",
             "evidence": [],
             "counter_evidence": ["行情数据不完整，无法产生可靠方向判断"],
@@ -455,8 +478,16 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         ok, err = validate_json("ga_decision.schema.json", result)
         if not ok:
             # Schema validation failed — fall back to no_edge rather than
-            # raising; degraded decisions must still be recorded.
-            fallback = no_edge_decision(symbol, err or "degraded schema error")
+            # raising; degraded decisions must still be recorded. Phase G
+            # (07-05): pass snapshot-authoritative analysis_time_utc so the
+            # no_edge fallback is schema-valid on the second validate_json
+            # call (the schema requires analysis_time_utc: integer, minimum=1).
+            fallback = no_edge_decision(
+                symbol,
+                err or "degraded schema error",
+                analysis_time_utc=_snapshot_analysis_time_utc(snapshot),
+                timeframe_context=result.get("timeframe_context") or tf_ctx,
+            )
             ok2, err2 = validate_json("ga_decision.schema.json", fallback)
             if not ok2:
                 raise ValueError(f"no_edge fallback schema 校验失败: {err2}")
@@ -468,6 +499,15 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
     grade = scoring["signal_grade"]
     trend_stage = (snapshot["modules"].get("trend_stage") or {}).get("trend_stage", "unknown")
     bias = scoring["market_bias"]
+    # Phase F (07-05): capture raw_signal_grade / raw_score BEFORE any
+    # hysteresis, clamp, or risk gate adjustments run. These are the
+    # deterministic SOP's pre-gate conclusions and must be persisted
+    # alongside the effective (post-gate) grade/score so the report can
+    # render "原始评分 95% · 执行等级 B（评级迟滞 C→S 暂缓）" without
+    # losing the original signal strength. canonical signal_grade remains
+    # the effective grade for backward compatibility.
+    raw_signal_grade = grade
+    raw_score = round(float(scoring.get("score", 0.0)), 4)
     # Determine side: bias first, then momentum direction as fallback
     side = "LONG" if bias == "bullish" else "SHORT" if bias == "bearish" else None
     if side is None:
@@ -482,10 +522,79 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
     # Grade threshold (A>=0.72) already incorporates risk assessment
     trade_plan = _build_trade_plan(snapshot, side) if side and scoring["score"] >= 0.72 else None
 
+    # Phase D (07-05): deterministic continuity gate. If the prior round's
+    # next_triggers have been invalidated for the current side, withhold the
+    # trade plan and downgrade to wait_for_pullback. This prevents executing
+    # a candidate plan whose prior confirmation context has flipped against
+    # it. The LLM still sees the prior context (via analysis_continuity in
+    # _compact_snapshot) and can refine; the deterministic path fail-closes.
+    continuity = snapshot.get("analysis_continuity") or {}
+    delta = (continuity.get("delta") or {}) if continuity else {}
+    trigger_progress = delta.get("trigger_progress") or []
+    side_invalidated = False
+    side_str = ""
+    if trade_plan and trigger_progress:
+        side_str = str(trade_plan.get("side") or "")
+        for trig in trigger_progress:
+            ttype = str(trig.get("type") or "")
+            status = str(trig.get("status") or "")
+            if status != "invalidated":
+                continue
+            # breakout_confirm invalidated → bearish flip → invalidate LONG.
+            # breakdown_confirm invalidated → bullish flip → invalidate SHORT.
+            if side_str == "LONG" and ttype in {"breakout_confirm", "momentum_confirm"}:
+                side_invalidated = True
+                break
+            if side_str == "SHORT" and ttype in {"breakdown_confirm", "momentum_confirm"}:
+                side_invalidated = True
+                break
+    if side_invalidated:
+        # Downgrade to wait_for_pullback but preserve the candidate plan dict
+        # for audit (Phase E: candidate_trade_plan). Set structured
+        # plan_status / plan_blockers so downstream consumers (report,
+        # diagnostics) can distinguish "withheld due to invalidated prior
+        # trigger" from "no plan ever generated".
+        invalidated_plan = trade_plan
+        trade_plan = None
+        invalidated_reasons = [
+            f"前次 {side_str} 触发已被反转 invalidated（continuity gate）",
+        ]
+        # Re-route to wait_for_pullback so the watch list still tracks it.
+        decision = "wait_for_pullback"
+        suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
+        watch = {
+            "needed": True, "direction": side_str,
+            "reason": "前次触发已被反转，等待结构重新确认",
+            "conditions": ["等待回踩或突破后重新确认", "5m/15m 动能与结构同向"],
+            "invalid_condition": "结构反向突破", "expires_minutes": 240,
+        }
+        # Stash the invalidated candidate so the result carries it as
+        # candidate_trade_plan (Phase E contract).
+        result_invalidated_candidate = invalidated_plan
+        result_invalidated_reasons = invalidated_reasons
+        result_invalidated_blockers = [
+            {
+                "code": "continuity_trigger_invalidated",
+                "stage": "synthesis",
+                "detail": f"前次 {side_str} 触发已被反转 invalidated",
+            }
+        ]
+        result_invalidated_plan_status = "withheld"
+        result_invalidated_plan_source = "deterministic_sop"
+    else:
+        result_invalidated_candidate = None
+        result_invalidated_reasons = None
+        result_invalidated_blockers = None
+        result_invalidated_plan_status = None
+        result_invalidated_plan_source = None
+
     if trade_plan:
         decision = "trade_plan_available"
         suggested = ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore"]
         watch = {"needed": True, "direction": trade_plan["side"], "reason": "若限价未成交，可继续观察回踩条件", "conditions": [trade_plan["invalid_condition"]], "invalid_condition": trade_plan["invalid_condition"], "expires_minutes": 240}
+    elif result_invalidated_candidate is not None:
+        # side_invalidated branch already set decision/suggested/watch above.
+        pass
     elif scoring["score"] >= 0.65 and side:
         decision = "wait_for_pullback" if bias in ("bullish", "bearish") else "monitor_only"
         suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
@@ -506,6 +615,11 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         "market_bias": bias if bias in ("bullish", "bearish", "neutral", "mixed") else "mixed",
         "trend_stage": trend_stage if trend_stage in ("early", "middle", "late", "range", "transition") else "unknown",
         "confidence": round(scoring["score"], 4),
+        # Phase F (07-05): raw pre-gate grade/score. effective grade is
+        # canonical signal_grade (set by controller after hysteresis/clamp);
+        # raw_signal_grade / raw_score never change after this point.
+        "raw_signal_grade": raw_signal_grade,
+        "raw_score": raw_score,
         "summary": _summary(symbol, decision, grade, bias, trend_stage),
         "evidence": scoring.get("evidence", []),
         "counter_evidence": scoring.get("counter_evidence", []),
@@ -517,7 +631,29 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         "strategy_name": scoring["strategy_name"],
         "strategy_version": scoring["strategy_version"],
         "analysis_time_utc": snapshot.get("analysis_time_utc"),
+        "plan_status": "executable" if trade_plan else (
+            result_invalidated_plan_status if result_invalidated_plan_status else "no_plan"
+        ),
+        "plan_source": "deterministic_sop" if trade_plan else (
+            result_invalidated_plan_source if result_invalidated_plan_source else "deterministic_sop"
+        ),
+        "plan_blockers": list(result_invalidated_blockers) if result_invalidated_blockers else [],
     }
+    if trade_plan:
+        # Executable plan — also surface as candidate for audit parity.
+        result["candidate_trade_plan"] = trade_plan
+    elif result_invalidated_candidate is not None:
+        result["candidate_trade_plan"] = result_invalidated_candidate
+    # Phase D (07-05): if the continuity gate invalidated the candidate plan,
+    # surface the invalidated candidate and reason on the result so Phase E
+    # can formalize it as candidate_trade_plan. For now the audit fields
+    # allow downstream consumers (controller, report) to distinguish a
+    # withheld-due-to-invalidated-trigger plan from a never-generated one.
+    if result_invalidated_candidate is not None:
+        result["invalidated_candidate_plan"] = result_invalidated_candidate
+        notes = list(result.get("risk_notes") or [])
+        notes.extend(result_invalidated_reasons or [])
+        result["risk_notes"] = notes
     # Phase B (07-03): structured market-semantic normalization. Surfaces
     # timeframe_context/alignment/htf_conflict/market_reason_codes and applies
     # the bias+stage contract + htf_conflict confidence cap + grade downgrade.
@@ -536,7 +672,15 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
     result = normalize_market_semantics(result, snapshot, market_semantics_cfg)
     ok, err = validate_json("ga_decision.schema.json", result)
     if not ok:
-        fallback = no_edge_decision(symbol, err or "unknown schema error")
+        # Phase G (07-05): pass snapshot-authoritative analysis_time_utc so
+        # the no_edge fallback is schema-valid on the second validate_json
+        # call (the schema requires analysis_time_utc: integer, minimum=1).
+        fallback = no_edge_decision(
+            symbol,
+            err or "unknown schema error",
+            analysis_time_utc=_snapshot_analysis_time_utc(snapshot),
+            timeframe_context=result.get("timeframe_context") or snapshot.get("timeframe_context"),
+        )
         ok2, err2 = validate_json("ga_decision.schema.json", fallback)
         if not ok2:
             raise ValueError(f"no_edge fallback schema 校验失败: {err2}")

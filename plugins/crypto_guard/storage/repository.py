@@ -593,6 +593,64 @@ class CryptoGuardRepository:
             item["state"] = {}
         return item
 
+    def latest_analysis_state_for_continuity(
+        self,
+        symbol: str,
+        *,
+        analysis_time_utc: int,
+        exclude_batch_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Strict previous-state lookup for analysis continuity (Phase D, 07-05).
+
+        Returns the latest analysis_states row whose ``analysis_time`` is
+        strictly less than ``analysis_time_utc`` and whose corresponding
+        ``ga_decisions.batch_id`` is not the current batch. Enforces:
+          - same symbol (cross-symbol rejected);
+          - strict past (future/same-time rejected);
+          - not the same batch (same-batch rejected via LEFT JOIN to
+            ``ga_decisions`` on ``ga_decision_id``).
+
+        Returns ``None`` if no row qualifies. Caller is responsible for
+        stale-age checks (max age in bars/time).
+        """
+        if not symbol or analysis_time_utc is None or int(analysis_time_utc) <= 0:
+            return None
+        # P1-3 fix: JOIN ga_decisions.signal_grade so _compact_previous_state
+        # reads the actual signal_grade (S/A/B/C/D) from the prior decision,
+        # not a heuristic. The JOIN is LEFT so legacy rows without
+        # ga_decision_id still qualify.
+        if exclude_batch_id:
+            row = self.conn.execute(
+                """
+                SELECT s.*, g.signal_grade FROM analysis_states s
+                LEFT JOIN ga_decisions g ON s.ga_decision_id = g.id
+                WHERE s.symbol=? AND s.analysis_time < ?
+                  AND (g.batch_id IS NULL OR g.batch_id != ?)
+                ORDER BY s.analysis_time DESC, s.id DESC
+                LIMIT 1
+                """,
+                (symbol, int(analysis_time_utc), exclude_batch_id),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT s.*, g.signal_grade FROM analysis_states s
+                LEFT JOIN ga_decisions g ON s.ga_decision_id = g.id
+                WHERE s.symbol=? AND s.analysis_time < ?
+                ORDER BY s.analysis_time DESC, s.id DESC
+                LIMIT 1
+                """,
+                (symbol, int(analysis_time_utc)),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["state"] = json.loads(item.get("state_json") or "{}")
+        except Exception:
+            item["state"] = {}
+        return item
+
     def latest_analysis_states(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM analysis_states ORDER BY analysis_time DESC, id DESC LIMIT ?",
@@ -1131,7 +1189,28 @@ class CryptoGuardRepository:
             ).fetchall()
         ]
 
-    def recent_failed_jobs(self, limit: int = 5) -> list[dict[str, Any]]:
+    def recent_failed_jobs(self, limit: int = 5, *, days: int = 7) -> list[dict[str, Any]]:
+        """Return recent failed agent_jobs within the given day window.
+
+        P1-9 (07-05 final review): previously this query had NO time
+        window, so the hourly report kept surfacing failures from weeks
+        ago forever. The hourly report (``hourly_report.py:_agent_hourly_brief``)
+        reads this list to render "最近失败 N 个". Without a window, old
+        failures kept appearing in every hourly report, creating noise
+        instead of actionable alerts. Now bound to ``days`` (default 7)
+        so only recent failures show up. The diagnostic
+        ``_check_failed_jobs_outside_window`` separately classifies
+        pre-window failures as ``legacy_info`` for audit.
+
+        P2-NEW-2 (R2 reviewer): ``finished_at IS NULL`` bypassed the
+        7-day window for crashed/orphaned jobs that never set
+        ``finished_at``. Such a job would permanently appear in the
+        recent-failures list even months after the crash. The fix uses
+        ``COALESCE(finished_at, started_at)`` as the time reference, so
+        a NULL-finished_at job falls back to ``started_at`` for the
+        7-day window check. Jobs with both ``finished_at`` and
+        ``started_at`` older than the window are excluded.
+        """
         return [
             dict(r)
             for r in self.conn.execute(
@@ -1139,10 +1218,11 @@ class CryptoGuardRepository:
                 SELECT id, job_type, priority, session_id, error_message, finished_at
                 FROM agent_jobs
                 WHERE status='failed'
+                  AND datetime(COALESCE(finished_at, started_at)) >= datetime('now', ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (int(limit),),
+                (f"-{int(days)} days", int(limit)),
             ).fetchall()
         ]
 

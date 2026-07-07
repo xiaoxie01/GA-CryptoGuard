@@ -110,6 +110,12 @@ def build_market_state_snapshot(
 
     profiles: dict[str, Any] = {}
     primary_modules: dict[str, Any] = {}
+    # Phase C (07-05): retain per-TF compact modules so the
+    # MultiTimeframeFeaturePack builder can surface bias/structure/momentum/
+    # key_levels for ALL 5 timeframes into the LLM prompt, not just the
+    # primary TF. Previously ``primary_modules`` was overwritten with each
+    # TF's result (last wins, typically 5m), discarding per-TF detail.
+    timeframe_modules: dict[str, dict[str, Any]] = {}
     previous_analysis_state = repo.latest_analysis_state(symbol)
     for tf in tfs:
         # R1: per-TF read limit from analysis_window (DELETE hardcoded 120).
@@ -129,6 +135,9 @@ def build_market_state_snapshot(
         )
         # Set loaded_count in health (4-field split)
         health_by_tf[tf]["loaded_count"] = len(result["candles"])
+
+        # Phase C (07-05): retain per-TF modules for the feature pack.
+        timeframe_modules[tf] = result["modules"]
 
         profiles[tf] = {
             "candles_count": result["candles_count"],
@@ -203,6 +212,7 @@ def build_market_state_snapshot(
         "mode": mode,
         "profiles": profiles,
         "modules": primary_modules,
+        "timeframe_modules": timeframe_modules,
         "counter_evidence": build_counter_evidence(primary_modules),
         "data_quality": data_quality,
         "analysis_degraded": snapshot_analysis_degraded,

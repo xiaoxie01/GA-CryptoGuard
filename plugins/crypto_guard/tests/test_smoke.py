@@ -472,7 +472,10 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         from plugins.crypto_guard.reasoning.llm_agent_judge import _normalize_llm_decision
 
         snapshot = self._decision_snapshot(trend_stage="range")
-        fallback = no_edge_decision("BTCUSDT", "fallback")
+        fallback = no_edge_decision(
+            "BTCUSDT", "fallback",
+            analysis_time_utc=snapshot["analysis_time_utc"],
+        )
         candidate = {
             "decision": "monitor_only",
             "signal_grade": "C",
@@ -898,7 +901,10 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(grade_from_score(0.50), "C")
         self.assertEqual(grade_from_score(0.49), "D")
 
-        invalid = no_edge_decision("BTCUSDT", "schema test")
+        invalid = no_edge_decision(
+            "BTCUSDT", "schema test",
+            analysis_time_utc=self._decision_snapshot(trend_stage="range")["analysis_time_utc"],
+        )
         invalid["counter_evidence"] = []
         ok, _ = validate_json("ga_decision.schema.json", invalid)
         self.assertFalse(ok)
@@ -18166,8 +18172,16 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=?", (ga_id,)).fetchone()
         row = _decision_row(dict(raw))
         tier = _opportunity_classifier(row)
+        # Phase F (07-05): B belongs to observation only — never executable.
+        # The classifier returns observation with a grade=B_observation_only
+        # blocker (the confidence< blocker is no longer reached because B
+        # is short-circuited to observation regardless of confidence).
         self.assertEqual(tier["tier"], "observation")
-        self.assertTrue(any(b.startswith("confidence<") for b in tier["blockers"]))
+        self.assertTrue(
+            any(b.startswith("confidence<") for b in tier["blockers"])
+            or any("observation_only" in b for b in tier["blockers"]),
+            f"Phase F: B must be observation-only; got blockers={tier['blockers']}",
+        )
 
     # ── P0 test 7: conflicting summary text deterministic override ───────
 
@@ -18344,7 +18358,12 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             "_tier": "observation",
         }
         text = _format_opportunity_row(row, {}, tier_label="观察候选")
-        for needle in ("BTCUSDT", "B级", "69%", "继续观察", "方向偏多",
+        # Phase F (07-05): opportunity rows now render
+        # "原始评分 X% · 执行等级 Y" instead of "Y级 · X%". This prevents
+        # the report from showing "B 级 95%" (which implies a high-
+        # confidence executable B) when the raw score is high but the
+        # effective grade is B due to hysteresis/clamp.
+        for needle in ("BTCUSDT", "执行等级 B", "69%", "继续观察", "方向偏多",
                        "趋势初期", "交易计划尚未形成", "置信度未达到 72%"):
             self.assertIn(needle, text)
         for forbidden in ("analysis_time=", "age=", "batch_id=", "prev=",
@@ -33361,6 +33380,154 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             "market_reason_codes must propagate to ga_decision top level",
         )
 
+    # ── R13 P0: controller must write ISO string analysis_time_utc ────────
+    def test_r13_p0_controller_writes_iso_string_analysis_time_utc(self) -> None:
+        """R13 P0: ``controller_decision_from_legacy`` must write
+        ``analysis_time_utc`` as an ISO-8601 string (not an integer)
+        so the 13+ SQL consumers in
+        ``diagnostics/state_consistency.py`` that filter via
+        ``datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', ''))
+        >= datetime(?)`` do not silently drop the row.
+
+        Pre-R13 (Phase G of this task) the controller was changed to
+        write ``analysis_time_utc`` as a Unix-ms integer to satisfy
+        ``ga_decision.schema.json`` (``analysis_time_utc: integer,
+        minimum=1``). The schema validation happens on the in-memory
+        decision dict (in ``ga_judge.py:478, 491, 673, 684`` and
+        ``llm_agent_judge.py:38``) BEFORE ``controller_decision_from_legacy``
+        is called — so the controller's job is to produce the DB-persistence
+        shape, where ``analysis_time_utc TEXT NOT NULL`` (schema.sql:149)
+        is queried by SQL consumers that expect ISO strings. SQLite
+        ``datetime(replace(replace(...)))`` returns NULL for integer
+        input (verified by direct reproduction), causing post-fix rows
+        to be silently invisible to BTC#9 contract diagnostics.
+
+        This test exercises the real
+        ``controller_decision_from_legacy → repo.create_ga_decision →
+        _check_fallback_llm_failed_created_paper_order`` chain with the
+        BTC#9 marker present. Revert-fail: change
+        ``controller_decision_from_legacy`` to write
+        ``"analysis_time_utc": at_int`` (integer) — the SQL COUNT must
+        drop to 0 and the test must FAIL.
+        """
+        import json as _json
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            controller_decision_from_legacy,
+        )
+        from plugins.crypto_guard.diagnostics.state_consistency import (
+            diagnose_state_consistency,
+        )
+
+        # 1. Insert the BTC#9 marker so the cutoff-gated diagnostics run.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS _migration_state("
+            "key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
+            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+        )
+        self.conn.commit()
+
+        # 2. Build a real ga_decision via the production controller path.
+        # Use a unique analysis_time to avoid UNIQUE collisions.
+        analysis_time = 1_750_000_000_000
+        legacy = {
+            "symbol": "BTCUSDT",
+            "signal_grade": "B",
+            "confidence": 0.70,
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "decision": "create_paper_order",
+            "summary": "R13 P0 regression test",
+            "timeframe_context": {},
+            "alignment": None,
+            "htf_conflict": None,
+            "market_reason_codes": [],
+            "risk_check": {"ok": True},
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+            "llm_status": "failed",  # trigger the fallback diagnostic
+        }
+        ga_decision = controller_decision_from_legacy(
+            legacy=legacy,
+            decision_type="scheduled_analysis",
+            analysis_time=analysis_time,
+            skill_result_refs={},
+            feishu_actions=[],
+        )
+
+        # 3. Assert the in-dict shape: analysis_time_utc must be an ISO
+        # string matching ``\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z``.
+        # Pre-R13 this was an integer.
+        self.assertIsInstance(
+            ga_decision["analysis_time_utc"], str,
+            "R13 P0: analysis_time_utc must be a str (ISO 8601) for DB "
+            "persistence. Pre-R13 it was an int, which SQLite "
+            "datetime(replace(replace(...))) returns NULL for, silently "
+            "dropping the row from BTC#9 contract SQL filters.",
+        )
+        import re
+        self.assertRegex(
+            ga_decision["analysis_time_utc"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            "R13 P0: analysis_time_utc must match ISO 8601 format "
+            "(YYYY-MM-DDTHH:MM:SSZ).",
+        )
+        # analysis_time (integer column) must still be the int.
+        self.assertEqual(
+            ga_decision["analysis_time"], analysis_time,
+            "R13 P0: analysis_time (INTEGER column) must be the int.",
+        )
+
+        # 4. Persist via the real repo path.
+        ga_id = self.repo.create_ga_decision(ga_decision)
+
+        # 5. Insert a paper_order linked to this ga_decision so the
+        # _check_fallback_llm_failed_created_paper_order diagnostic has
+        # something to find.
+        self.conn.execute(
+            "INSERT INTO paper_orders (symbol, side, order_type, "
+            "entry_price, stop_loss, status, ga_decision_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("BTCUSDT", "LONG", "limit", 100.0, 95.0, "open", ga_id,
+             "2025-06-15T00:00:00Z"),
+        )
+        self.conn.commit()
+
+        # 6. Direct SQL assertion: the row must be findable by the same
+        # filter used in _check_fallback_llm_failed_created_paper_order.
+        row = self.conn.execute(
+            "SELECT gd.id, gd.analysis_time_utc FROM ga_decisions gd "
+            "WHERE gd.id = ? "
+            "AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), "
+            "'Z', '')) >= datetime(?)",
+            (ga_id, "2020-01-01 00:00:00"),
+        ).fetchone()
+        self.assertIsNotNone(
+            row,
+            "R13 P0: ga_decisions row must be findable by the BTC#9 "
+            "SQL filter. Pre-R13 (integer analysis_time_utc) this query "
+            "returns NULL via datetime(replace(replace(...))) and the "
+            "row is invisible to the diagnostic.",
+        )
+
+        # 7. End-to-end assertion: diagnose_state_consistency must fire
+        # fallback_llm_failed_created_paper_order for this row.
+        result = diagnose_state_consistency(self.repo)
+        issue_types = [i["type"] for i in result["issues"]]
+        self.assertIn(
+            "fallback_llm_failed_created_paper_order", issue_types,
+            "R13 P0: diagnose_state_consistency must fire "
+            "fallback_llm_failed_created_paper_order for the post-marker "
+            "row with llm_status=failed and a non-cancelled paper_order. "
+            "Pre-R13 the row was silently dropped by the SQL filter.",
+        )
+
     # ── R1-1) LLM candidate merge final normalization ────────────────────────
 
     def test_r1_1_llm_candidate_merge_final_normalization(self) -> None:
@@ -34663,6 +34830,3812 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             "htf_conflict_grade_downgraded", result.get("market_reason_codes") or [],
             "Pass 6 Fix #5: htf_conflict_grade_downgraded reason code must be present",
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase A (07-05): Hourly Decision Context Continuity & Plan Lifecycle baseline
+# failure tests. Five production facts derived from PRD §"Production Evidence"
+# and research/phase-bc-research.md / phase-dg-research.md. Each test MUST go
+# through real production entry points (GAMasterController.analyze_symbol ->
+# DecisionPersistence.save -> repo.create_ga_decision -> DB readback ->
+# render). Tests are written to FAIL against the unfixed production code so
+# Phase B-H can flip them green. No production logic is hand-copied.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPhaseA07_05BaselineFailures(unittest.TestCase):
+    """Phase A baseline failure tests for task 07-05.
+
+    Each test mirrors a production fact from PRD §"Production Evidence" and
+    asserts the post-fix contract. The tests are expected to FAIL against
+    the unfixed production code (Phase B-H will turn them green). Allowed
+    patches are limited to:
+      - ``_call_ga_llm`` (inject LLM JSON failure scenario)
+      - network helpers ``fetch_mark_price``/``fetch_candles`` (fixture data)
+      - time helpers ``latest_closed_close_time_ms``/``utc_ms`` (inject clock)
+    All tests route through ``GAMasterController(repo).analyze_symbol(...) ->
+    DecisionPersistence.save -> repo.create_ga_decision`` and read back via
+    ``repo.get_ga_decision(id)`` so the persistence and rendering contract is
+    exercised for real. No production ``if/else`` is hand-copied.
+    """
+
+    # analysis_time = 2026-07-05T19:59:59Z in ms (matches PRD batch 19:59:59).
+    # This is the close_time of the 19:45-20:00 15m candle.
+    _FACT1_BATCH_MS = 1_783_281_599_000  # 2026-07-05T19:59:59Z
+    # Report sent at 20:15:00Z (15 minutes 1 second after batch close)
+    _FACT1_REPORT_MS = 1_783_282_500_000  # 2026-07-05T20:15:00Z
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+        initialize_database()
+        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
+        self.repo = CryptoGuardRepository(self.conn)
+        # Seed a paper account so risk gates have an account to read.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+        )
+        self.conn.commit()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        if self._old_llm is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
+        self.tmp.cleanup()
+
+    # ── Phase A helper: build a minimal real snapshot via the fixture path ──
+    def _phase_a_helper_build_snapshot(
+        self,
+        *,
+        symbol: str,
+        analysis_time_ms: int,
+        bias: str = "bullish",
+        stage: str = "middle",
+        structure: str = "bullish",
+        momentum_dir: str = "bullish",
+        candles_count: int = 250,
+    ) -> dict:
+        """Build a schema-valid market_state_snapshot for the controller chain.
+
+        Mirrors the ``_build_snapshot_from_fixture`` shape used by
+        TestHourlyAnalysisSemanticAccuracy07_03 — uses the real
+        ``normalize_snapshot_semantics`` so the snapshot carries the required
+        ``timeframe_context``/``alignment``/``htf_conflict``/
+        ``market_reason_codes`` top-level fields. This is a *test fixture
+        builder*, not a copy of production if/else logic: it produces a snapshot
+        dict that the production code then consumes.
+        """
+        from plugins.crypto_guard.analysis.counter_evidence_engine import build_counter_evidence
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+        from plugins.crypto_guard.reasoning.market_semantics import (
+            normalize_snapshot_semantics,
+        )
+
+        # Use the same close-time offsets as the existing fixture builder so
+        # health_by_tf.ready = True. Last 15m close = analysis_time (closed).
+        close_1d = analysis_time_ms - 86_400_000  # 1 day earlier
+        close_4h = analysis_time_ms - 14_400_000  # 4h earlier
+        close_1h = analysis_time_ms - 3_600_000   # 1h earlier
+        close_15m = analysis_time_ms - 900_000    # 15m earlier
+
+        profiles = {
+            "1d": {
+                "candles_count": candles_count, "trend_stage": stage,
+                "market_structure": structure, "momentum": momentum_dir,
+                "role": "background_filter", "weight": 0.10,
+                "last_event": "", "range_status": "",
+            },
+            "4h": {
+                "candles_count": candles_count, "trend_stage": stage,
+                "market_structure": structure, "momentum": momentum_dir,
+                "role": "direction_filter", "weight": 0.35,
+                "last_event": "bullish_bos" if bias == "bullish" else "", "range_status": "",
+            },
+            "1h": {
+                "candles_count": candles_count, "trend_stage": stage,
+                "market_structure": structure, "momentum": momentum_dir,
+                "role": "trend_context", "weight": 0.25,
+                "last_event": "bullish_bos" if bias == "bullish" else "", "range_status": "",
+            },
+            "15m": {
+                "candles_count": 200, "trend_stage": stage,
+                "market_structure": structure, "momentum": momentum_dir,
+                "role": "setup_context", "weight": 0.20,
+                "last_event": "bullish_bos" if bias == "bullish" else "", "range_status": "",
+            },
+            "5m": {
+                "candles_count": 150, "trend_stage": stage,
+                "market_structure": structure, "momentum": momentum_dir,
+                "role": "entry_trigger", "weight": 0.15,
+                "last_event": "", "range_status": "",
+            },
+        }
+        primary_modules = {
+            "price_action": {
+                "market_structure": structure, "last_event": "bullish_bos" if bias == "bullish" else "",
+                "range_status": "breakout" if bias == "bullish" else "",
+                "key_levels": {"support": [100.0], "resistance": [120.0]},
+                "invalid_level": 95.0,
+            },
+            "momentum": {
+                "direction": momentum_dir, "quality": "healthy",
+                "momentum_score": 62, "rsi": 58, "divergence": False,
+            },
+            "trend_stage": {
+                "module": "trend_stage", "stage": stage, "trend_stage": stage,
+                "structure": structure, "main_risk": "test fixture",
+                "confidence": 0.62, "analysis_time_utc": analysis_time_ms,
+                "strategy_policy": "allow_watch_not_chase",
+                "multi_timeframe_stage": stage,
+                "multi_timeframe_structure": structure,
+                "htf_confirmation": "closed_4h_1h_15m_only",
+            },
+            "smc": {"setup": "none", "liquidity": {}, "fvg": {}},
+            "order_flow": {"flow_confirmation": "supports_long" if bias == "bullish" else "neutral"},
+            "chanlun": {"signal": None},
+        }
+        counter_evidence = build_counter_evidence(primary_modules)
+        dq = {
+            "status": "complete", "closed_candles_only": True,
+            "analysis_time_utc": analysis_time_ms,
+            "missing_timeframes": [], "low_sample_timeframes": [],
+            "note": "Phase A fixture: closed Binance USDⓈ-M Futures candles.",
+            "health": {
+                "1d": {"ready": True, "last_close_time": close_1d,
+                       "total_count": candles_count, "loaded_count": candles_count,
+                       "contiguous_count": candles_count, "required_count": 200,
+                       "reason": "", "gap_count": 0, "largest_gap_bars": 0,
+                       "expected_last_close_time": close_1d, "stale_bars": 0,
+                       "missing_ranges": [],
+                       "first_close_time": close_1d - 86400000 * (candles_count - 1),
+                       "total_closed_count": candles_count, "contiguous_tail_count": candles_count},
+                "4h": {"ready": True, "last_close_time": close_4h,
+                       "total_count": candles_count, "loaded_count": candles_count,
+                       "contiguous_count": candles_count, "required_count": 200,
+                       "reason": "", "gap_count": 0, "largest_gap_bars": 0,
+                       "expected_last_close_time": close_4h, "stale_bars": 0,
+                       "missing_ranges": [],
+                       "first_close_time": close_4h - 14400000 * (candles_count - 1),
+                       "total_closed_count": candles_count, "contiguous_tail_count": candles_count},
+                "1h": {"ready": True, "last_close_time": close_1h,
+                       "total_count": candles_count, "loaded_count": candles_count,
+                       "contiguous_count": candles_count, "required_count": 200,
+                       "reason": "", "gap_count": 0, "largest_gap_bars": 0,
+                       "expected_last_close_time": close_1h, "stale_bars": 0,
+                       "missing_ranges": [],
+                       "first_close_time": close_1h - 3600000 * (candles_count - 1),
+                       "total_closed_count": candles_count, "contiguous_tail_count": candles_count},
+                "15m": {"ready": True, "last_close_time": close_15m,
+                        "total_count": 200, "loaded_count": 200,
+                        "contiguous_count": 200, "required_count": 200,
+                        "reason": "", "gap_count": 0, "largest_gap_bars": 0,
+                        "expected_last_close_time": close_15m, "stale_bars": 0,
+                        "missing_ranges": [],
+                        "first_close_time": close_15m - 900000 * 199,
+                        "total_closed_count": 200, "contiguous_tail_count": 200},
+            },
+        }
+        snapshot = {
+            "symbol": symbol,
+            "analysis_time_utc": analysis_time_ms,
+            "mode": "scheduled",
+            "profiles": profiles,
+            "modules": primary_modules,
+            "counter_evidence": counter_evidence,
+            "data_quality": dq,
+            "analysis_degraded": False,
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "decision": "monitor_only",
+            "paper_context": {},
+            "previous_analysis_state": None,
+            "active_opportunity_watches": [],
+            "open_paper_orders": [],
+            "intraday_framework": {
+                "mode": "intraday", "background": ["1d", "4h"],
+                "direction": "4h", "trend": ["1h", "15m"],
+                "entry": ["15m", "5m"],
+                "weights": {"daily": 0.10, "4h": 0.35, "1h": 0.30, "15m": 0.25},
+                "default_intraday_weights": {"4h": 0.35, "1h": 0.30, "15m": 0.25, "5m": 0.10},
+                "rule": "顺大逆小",
+            },
+            "preprocessing_policy": {
+                "llm_geometry_allowed": False,
+                "geometry_conflict_resolution": "calculation_engine_wins",
+                "logic_resolution": "GA synthesizes deterministic evidence",
+            },
+            "global_context": {"time_policy": "UTC; closed candles only"},
+        }
+        normalize_snapshot_semantics(
+            snapshot, {},
+            health_by_tf=dq["health"],
+            analysis_time_utc=int(analysis_time_ms),
+        )
+        ok, err = validate_json("market_state_snapshot.schema.json", snapshot)
+        if not ok:
+            raise AssertionError(f"phase_a_helper: market_state_snapshot schema 校验失败: {err}")
+        return snapshot
+
+    # ── Fact 1: 19:59:59 batch must not be flagged stale at 20:15 report ──
+    def test_phase_a_fact1_batch_analysis_time_not_stale_at_report_time(self) -> None:
+        """PRD Fact 1: batch.analysis_time=19:59:59 must NOT be reported stale
+        when the hourly report renders at 20:15.
+
+        Current bug: ``_check_hourly_report_stale_decision`` at
+        ``plugins/crypto_guard/diagnostics/report_diagnostics.py:348-371``
+        computes ``cutoff = latest_closed_close_time_ms("15m", utc_ms())``
+        using the wall clock. At report time 20:15 the cutoff lands at
+        20:14:59.999, so ``age_ms = 20:14:59.999 - 19:59:59 = 15m1s > 15m``
+        and the decision is wrongly flagged stale.
+
+        Fix territory (Phase B): ``_check_hourly_report_stale_decision`` and
+        ``_fetch_market_data_quality`` (hourly_report.py:983) must anchor to
+        ``batch_state["analysis_time"]`` instead of the wall clock when a
+        batch is selected.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_hourly_report_stale_decision,
+            HOURLY_REPORT_STALE_DECISION,
+        )
+        from plugins.crypto_guard.utils import INTERVAL_MS
+
+        batch_close_ms = self._FACT1_BATCH_MS  # 19:59:59Z
+        report_now_ms = self._FACT1_REPORT_MS  # 20:15:00Z
+        batch_id = f"15m:{batch_close_ms}"
+
+        # Step 1: insert a real analysis_batches row marked completed.
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=batch_close_ms, enabled_symbols=["BTCUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        self.repo.finish_analysis_batch(batch_id=batch_id, status="success")
+
+        # Step 2: insert a ga_decisions row whose analysis_time matches the
+        # batch. Use the real create_ga_decision path so the row schema is
+        # production-shape.
+        decision_payload = {
+            "symbol": "BTCUSDT",
+            "decision": "monitor_only",
+            "decision_type": "scheduled_analysis",
+            "signal_grade": "C",
+            "confidence": 0.55,
+            "summary": "phase A fact1 baseline decision",
+            "final_summary": "phase A fact1 baseline decision",
+            "market_bias": "neutral",
+            "trend_stage": "range",
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "risk_check": {"ok": False, "reasons": ["test"]},
+            "evidence": [],
+            "counter_evidence": ["phase A fact1"],
+            "opportunity_watch": None,
+            "feishu_actions": [],
+            "analysis_time": batch_close_ms,
+            "analysis_time_utc": "2026-07-05T19:59:59Z",
+            "batch_id": batch_id,
+            "previous_grade": None,
+            "rendered_summary": "phase A fact1 baseline decision",
+        }
+        ga_decision_id = self.repo.create_ga_decision(decision_payload)
+
+        # Step 3: patch utc_ms to 20:15:00Z so the wall-clock cutoff lands at
+        # 20:14:59.999. The diagnostic imports utc_ms lazily inside the
+        # function body (report_diagnostics.py:345), so we patch the source
+        # module — both ``utils.utc_ms`` and ``latest_closed_close_time_ms``
+        # read the patched value when called via the lazy import.
+        from unittest.mock import patch
+        with patch("plugins.crypto_guard.utils.utc_ms", return_value=report_now_ms):
+            issues = _check_hourly_report_stale_decision(
+                self.repo, batch_id=batch_id,
+            )
+
+        stale_issues = [i for i in issues if i.get("type") == HOURLY_REPORT_STALE_DECISION]
+        # Phase A assertion (post-fix): no stale issue should be raised for
+        # the batch's own decisions when the batch is selected. The current
+        # implementation uses wall-clock cutoff and WILL flag the 19:59:59
+        # decision as stale at 20:15 — this assertion fails until Phase B
+        # anchors the cutoff to batch.analysis_time.
+        self.assertEqual(
+            stale_issues, [],
+            f"Phase A Fact 1: batch.analysis_time={batch_close_ms} (19:59:59Z) "
+            f"was flagged stale at report time 20:15Z; issues={stale_issues}. "
+            f"The diagnostic must use batch_state.analysis_time, not wall-clock "
+            f"latest_closed_close_time_ms. ga_decision_id={ga_decision_id}",
+        )
+
+    # ── Fact 2: per-TF compact modules must survive into snapshot/LLM prompt ─
+    def test_phase_a_fact2_multitimeframe_feature_pack_preserves_per_tf_modules(self) -> None:
+        """PRD Fact 2: each TF's 250/250/250/200/150 closed candles must
+        produce a per-TF compact module that survives into the snapshot and
+        the LLM prompt payload.
+
+        Current bug: ``market_state_builder.py:141-144`` overwrites
+        ``primary_modules`` with the LAST matching TF (typically 5m), so
+        per-TF detail for 1d/4h/1h/15m is computed and saved to DB but
+        dropped from ``snapshot["modules"]``. ``_compact_snapshot`` at
+        ``llm_agent_judge.py:501-517`` then only carries that single TF's
+        modules into the LLM prompt — there is no ``multi_timeframe_feature_pack``
+        block, no per-TF ``data_as_of`` / ``sample_count`` / ``bias`` /
+        ``structure``.
+
+        Fix territory (Phase C): ``market_state_builder`` must retain
+        ``timeframe_modules`` keyed by TF; ``_compact_snapshot`` must emit a
+        per-TF compact feature pack.
+        """
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _compact_snapshot
+
+        analysis_time_ms = self._FACT1_BATCH_MS
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=analysis_time_ms,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+        request = GAAnalysisRequest(
+            symbol="BTCUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot, snapshot_id=snapshot_id,
+            mode="scheduled", batch_id=f"15m:{analysis_time_ms}",
+        )
+        controller = GAMasterController(self.repo)
+        ga_decision = controller.analyze_symbol(request)
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id, 0, "Phase A Fact 2: ga_decision_id must be persisted")
+
+        # Assertion 1: snapshot["modules"] must carry per-TF compact modules
+        # (fix: market_state_builder retains timeframe_modules). Currently
+        # snapshot["modules"] only carries the primary TF (5m/15m) — the
+        # per-TF detail for 1d/4h/1h is computed and saved to DB but never
+        # surfaces in the LLM prompt. Look for either a ``timeframe_modules``
+        # top-level key (Phase C contract) or a ``multi_timeframe_feature_pack``
+        # block — both will fail to exist on the unfixed code.
+        # R5 P1-2: ``timeframe_modules`` was removed from the compacted LLM
+        # payload (was a duplicate of ``multi_timeframe_feature_pack.modules``).
+        # The fallback now reads ``multi_timeframe_feature_pack.modules``.
+        compact = _compact_snapshot(snapshot)
+        pack = compact.get("multi_timeframe_feature_pack")
+        per_tf_modules = (pack or {}).get("modules") or {}
+        self.assertIsNotNone(
+            per_tf_modules,
+            "Phase A Fact 2: _compact_snapshot must emit per-TF modules via "
+            "multi_timeframe_feature_pack.modules; got None. "
+            "market_state_builder.py:141-144 overwrites primary_modules with "
+            "the last TF (5m) and discards per-TF detail.",
+        )
+        # Each TF must carry data_as_of / sample_count / bias / structure.
+        for tf in ("1d", "4h", "1h", "15m", "5m"):
+            self.assertIn(
+                tf, per_tf_modules,
+                f"Phase A Fact 2: per-TF compact must include TF={tf}; "
+                f"keys={list(per_tf_modules.keys())}",
+            )
+
+        # Assertion 2: DB roundtrip must preserve the per-TF compact in
+        # raw_decision_json. The unfixed code only persists the primary-TF
+        # modules under raw_decision_json["deterministic_reference"]["modules"].
+        row = self.repo.get_ga_decision(ga_id)
+        raw = row.get("raw_decision_json") or {}
+        if isinstance(raw, str):
+            import json as _json
+            raw = _json.loads(raw)
+        snapshot_summary = raw.get("snapshot_summary") or raw.get("multi_timeframe_feature_pack") or raw.get("timeframe_modules")
+        self.assertIsNotNone(
+            snapshot_summary,
+            "Phase A Fact 2: raw_decision_json must preserve per-TF compact "
+            "(snapshot_summary / multi_timeframe_feature_pack / timeframe_modules); "
+            f"got top-level keys={list(raw.keys())[:20]}",
+        )
+
+    # ── Fact 3: previous_analysis_state must enter context/delta ────────────
+    def test_phase_a_fact3_previous_analysis_state_injected_to_llm_prompt(self) -> None:
+        """PRD Fact 3: previous_analysis_state must enter the current round's
+        context/delta, not just be a post-decision audit field.
+
+        Current bug: ``market_state_builder.py:214`` stores
+        ``previous_analysis_state`` on the snapshot, but:
+          - ``_compact_snapshot`` (llm_agent_judge.py:501-517) does NOT include
+            ``previous_analysis_state`` in the LLM prompt payload.
+          - ``analysis_state._trend_evolution`` (analysis_state.py:165-182) is
+            the ONLY consumer, and it reads only
+            ``previous.state.market_structure.structure_status`` — a single
+            string field.
+
+        Fix territory (Phase D): build an ``analysis_continuity_v1`` block
+        (previous_compact + delta) and inject it into ``_compact_snapshot``
+        so it reaches ``build_llm_decision_prompt``. Deterministic decision
+        logic must consume ``delta.trigger_progress`` (confirmed/invalidated).
+        """
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+
+        # Round 1: produce a real decision + analysis_state for "BTCUSDT".
+        at1 = self._FACT1_BATCH_MS  # 19:59:59Z
+        snapshot1 = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=at1,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        sid1 = self.repo.save_market_snapshot(snapshot1)
+        request1 = GAAnalysisRequest(
+            symbol="BTCUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot1, snapshot_id=sid1,
+            mode="scheduled", batch_id=f"15m:{at1}",
+        )
+        controller = GAMasterController(self.repo)
+        ga1 = controller.analyze_symbol(request1)
+        ga_id1 = int(ga1.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id1, 0, "Phase A Fact 3: round 1 ga_decision_id must persist")
+
+        # Round 2: one 15m close later. context_builder.reads
+        # repo.latest_analysis_state(symbol) → must return round 1's state.
+        at2 = at1 + 900_000  # 20:14:59Z (next 15m close)
+        snapshot2 = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=at2,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        sid2 = self.repo.save_market_snapshot(snapshot2)
+        request2 = GAAnalysisRequest(
+            symbol="BTCUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot2, snapshot_id=sid2,
+            mode="scheduled", batch_id=f"15m:{at2}",
+        )
+        ga2 = controller.analyze_symbol(request2)
+        ga_id2 = int(ga2.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id2, 0, "Phase A Fact 3: round 2 ga_decision_id must persist")
+
+        # Read back round 2's persisted decision.
+        row2 = self.repo.get_ga_decision(ga_id2)
+        raw2 = row2.get("raw_decision_json") or {}
+        if isinstance(raw2, str):
+            import json as _json
+            raw2 = _json.loads(raw2)
+
+        # Assertion 1: raw_decision_json must carry an analysis_continuity
+        # block (Phase D contract). Fix: _compact_snapshot + controller
+        # must populate previous_compact + delta. Currently absent.
+        continuity = raw2.get("analysis_continuity") or raw2.get("continuity_context")
+        self.assertIsNotNone(
+            continuity,
+            "Phase A Fact 3: raw_decision_json must carry analysis_continuity "
+            "(previous_compact + delta); top-level keys seen: "
+            f"{list(raw2.keys())[:20]}",
+        )
+
+        # Assertion 2: delta.trigger_progress must include at least one of
+        # confirmed/invalidated. Currently _trend_evolution only reads
+        # previous.state.market_structure.structure_status — no trigger
+        # progress tracking.
+        delta = (continuity or {}).get("delta") or {}
+        trigger_progress = delta.get("trigger_progress")
+        self.assertIsNotNone(
+            trigger_progress,
+            "Phase A Fact 3: analysis_continuity.delta.trigger_progress "
+            "must be populated (confirmed/invalidated entries); got None",
+        )
+        self.assertIsInstance(
+            trigger_progress, list,
+            "Phase A Fact 3: trigger_progress must be a list of {trigger_id, status}",
+        )
+
+    # ── Fact 4: DOGE LLM parse failure preserves candidate plan ─────────────
+    def test_phase_a_fact4_doge_llm_parse_failure_preserves_candidate_plan(self) -> None:
+        """PRD Fact 4: when the deterministic SOP generates a LONG candidate
+        plan and the LLM JSON parse then fails (control char), the report
+        must show "候选计划已生成但被 LLM failure + grade hysteresis 阻断"
+        rather than just "缺交易计划".
+
+        Current bug: ``run_agent_sop_decision`` (llm_agent_judge.py:42-49)
+        exception branch sets ``llm_status="failed"`` and reuses the
+        deterministic fallback. ``apply_risk_to_decision`` (risk_engine.py:28-43)
+        then sees ``llm_status="failed"`` and clears ``has_trade_plan=False``,
+        downgrades decision to ``monitor_only`` — but does NOT preserve the
+        candidate plan under a ``candidate_trade_plan`` field, does NOT set
+        ``plan_status`` / ``plan_blockers``, and ``risk_check.reasons``
+        collapses to ``["缺少完整 trade_plan", "llm_status=failed 降级，禁止开仓"]``.
+
+        Fix territory (Phase E + G): preserve ``candidate_trade_plan``
+        explicitly, add ``plan_status="withheld"`` + ``plan_blockers``
+        containing ``{"code": "llm_parse_failed", ...}`` (and grade_hysteresis
+        if applicable), and surface the structured blockers in the rendered
+        report text.
+        """
+        import json as _json
+        from unittest.mock import patch
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from plugins.crypto_guard.notify.hourly_report import (
+            render_ga_hourly_summary,
+        )
+
+        at_ms = self._FACT1_BATCH_MS
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="DOGEUSDT", analysis_time_ms=at_ms,
+            bias="bullish", stage="early", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+
+        # Enable LLM path so _call_ga_llm is invoked.
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "1"
+
+        # Malformed LLM response with raw \x00 control character — exactly
+        # the PRD scenario. json.loads raises "Invalid control character".
+        bad_llm_raw = (
+            '{"symbol": "DOGEUSDT",\x00 "decision": "trade_plan_available", '
+            '"signal_grade": "A", "market_bias": "bullish", '
+            '"trend_stage": "early", "confidence": 0.78, '
+            '"summary": "DOGE 反弹.", '
+            '"evidence": ["1H 反弹"], '
+            '"counter_evidence": ["1D 仍下行"], '
+            '"risk_notes": ["LLM 候选"], "has_trade_plan": true, '
+            '"trade_plan": {"side": "LONG", "entry_type": "limit", '
+            '"entry_price": 0.18, "stop_loss": 0.17, '
+            '"take_profits": [{"price": 0.20, "ratio": 1.0}], '
+            '"risk_percent": 0.5, "invalid_condition": "跌破 0.17"}, '
+            '"opportunity_watch": null, "suggested_actions": ["create_paper_order"]}'
+        )
+
+        request = GAAnalysisRequest(
+            symbol="DOGEUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot, snapshot_id=snapshot_id,
+            mode="scheduled", batch_id=f"15m:{at_ms}",
+        )
+        controller = GAMasterController(self.repo)
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            return_value=bad_llm_raw,
+        ):
+            ga_decision = controller.analyze_symbol(request)
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id, 0, "Phase A Fact 4: ga_decision_id must persist")
+
+        # Read back via the real get_ga_decision path.
+        row = self.repo.get_ga_decision(ga_id)
+        raw = row.get("raw_decision_json") or {}
+        if isinstance(raw, str):
+            raw = _json.loads(raw)
+        legacy = ga_decision.get("ga_decision") or ga_decision
+
+        # Assertion 1: llm_status must be "failed".
+        self.assertEqual(
+            str(raw.get("llm_status") or "").lower(), "failed",
+            f"Phase A Fact 4: llm_status must be 'failed'; got {raw.get('llm_status')}",
+        )
+
+        # Assertion 2: candidate_trade_plan must be non-empty (the deterministic
+        # plan preserved for audit). Fix: Phase E adds this field. Pre-fix
+        # the field does not exist.
+        candidate = raw.get("candidate_trade_plan")
+        self.assertIsInstance(
+            candidate, dict,
+            f"Phase A Fact 4: candidate_trade_plan must be a dict (the "
+            f"deterministic plan preserved for audit); got {type(candidate)}. "
+            f"Pre-fix: field is absent; apply_risk_to_decision strips the plan.",
+        )
+        self.assertIn(
+            "side", candidate,
+            "Phase A Fact 4: candidate_trade_plan must have side/entry/stop",
+        )
+
+        # Assertion 3: trade_plan must be None (fail-closed).
+        self.assertIsNone(
+            raw.get("trade_plan"),
+            "Phase A Fact 4: trade_plan must be None (fail-closed on LLM failure)",
+        )
+
+        # Assertion 4: plan_status must be "withheld" (or equivalent
+        # non-executable state). Pre-fix: field does not exist.
+        plan_status = raw.get("plan_status")
+        self.assertIsNotNone(
+            plan_status,
+            "Phase A Fact 4: plan_status must be set (withheld/blocked); "
+            "pre-fix field does not exist",
+        )
+        self.assertNotEqual(
+            plan_status, "executable",
+            "Phase A Fact 4: plan_status must not be executable on LLM failure",
+        )
+
+        # Assertion 5: plan_blockers must include llm_parse_failed.
+        blockers = raw.get("plan_blockers") or []
+        blocker_codes = [str(b.get("code") or "") for b in blockers if isinstance(b, dict)]
+        self.assertIn(
+            "llm_parse_failed", blocker_codes,
+            f"Phase A Fact 4: plan_blockers must include llm_parse_failed; "
+            f"got codes={blocker_codes}. Pre-fix: field does not exist.",
+        )
+
+        # Assertion 6: risk_check.reasons must NOT collapse to only
+        # ["缺少完整 trade_plan"] — it must carry the structured blocker.
+        reasons = (raw.get("risk_check") or {}).get("reasons") or []
+        reasons_text = " | ".join(reasons)
+        self.assertTrue(
+            any("llm" in r.lower() or "parse" in r.lower() or "失败" in r for r in reasons),
+            f"Phase A Fact 4: risk_check.reasons must reference LLM failure; "
+            f"got reasons={reasons}. Pre-fix: collapses to "
+            f"['缺少完整 trade_plan', 'llm_status=failed 降级...'].",
+        )
+
+        # Assertion 7: suggested_actions must NOT contain create_paper_order.
+        actions = raw.get("suggested_actions") or legacy.get("suggested_actions") or []
+        self.assertNotIn(
+            "create_paper_order", actions,
+            f"Phase A Fact 4: create_paper_order must be stripped; got {actions}",
+        )
+
+        # Assertion 8: rendered report must mention "候选计划已生成但被 LLM 失败阻断"
+        # or equivalent — NOT just "缺交易计划".
+        ga_decisions_row = {
+            "id": ga_id, "symbol": row["symbol"],
+            "signal_grade": row["signal_grade"],
+            "confidence": float(row["confidence"] or 0),
+            "decision": row["decision"],
+            "market_bias": row.get("market_bias"),
+            "trend_stage": row.get("trend_stage"),
+            "analysis_time": int(row.get("analysis_time") or 0),
+            "analysis_time_utc": row.get("analysis_time_utc"),
+            "batch_id": row.get("batch_id"),
+            "previous_grade": row.get("previous_grade"),
+            "trade_plan_json": row.get("trade_plan_json"),
+            "risk_check_json": row.get("risk_check_json"),
+            "feishu_actions_json": row.get("feishu_actions_json") or "[]",
+            "raw_decision_json": row.get("raw_decision_json") or "{}",
+            "final_summary": row.get("final_summary"),
+            "rendered_summary": row.get("rendered_summary"),
+            "created_at": row.get("created_at"),
+        }
+        from plugins.crypto_guard.utils import iso_utc_from_ms
+        now_iso = iso_utc_from_ms(self._FACT1_REPORT_MS)
+        ga_text = render_ga_hourly_summary(
+            now_iso, ["DOGEUSDT"], [ga_decisions_row], [], [], [],
+            {"pending_user": 0, "pending_background": 0, "running": 0},
+            batch_state={
+                "batch_id": ga_decision.get("batch_id") or request.batch_id,
+                "status": "success", "incomplete": False,
+                "enabled_symbols": ["DOGEUSDT"],
+                "completed_count": 1, "total_count": 1,
+                "analysis_time": at_ms, "failed_symbols": [],
+                "completed_symbols": ["DOGEUSDT"],
+                "missing_symbols": [], "still_running": [],
+            },
+        )
+        # The report must surface the candidate plan + LLM failure, not just
+        # "缺交易计划". Acceptable phrases include any of:
+        acceptable_phrases = (
+            "候选计划已生成", "LLM 失败", "LLM 解析失败", "解析失败",
+            "llm_parse_failed", "candidate_trade_plan", "候选计划",
+        )
+        self.assertTrue(
+            any(phrase in ga_text for phrase in acceptable_phrases),
+            f"Phase A Fact 4: rendered report must mention 候选计划 / LLM 失败; "
+            f"got text snippet:\n{ga_text[:600]}",
+        )
+        # The report must NOT collapse to only "缺交易计划".
+        self.assertNotIn(
+            "缺交易计划", ga_text,
+            "Phase A Fact 4: report must not collapse to '缺交易计划' only",
+        )
+
+    # ── Fact 5: no_edge fallback must be schema-valid with analysis_time_utc ─
+    def test_phase_a_fact5_no_edge_fallback_schema_valid_with_analysis_time(self) -> None:
+        """PRD Fact 5: no_edge fallback in the schema-failure path must
+        remain schema-valid, including a strict-positive-integer
+        ``analysis_time_utc``.
+
+        Current bug: ``decision_schema.py:28 no_edge_decision(symbol, reason)``
+        does NOT set ``analysis_time_utc``, but ``ga_decision.schema.json``
+        requires ``analysis_time_utc: integer, minimum=1``. When
+        ``run_ga_sop_decision`` (ga_judge.py:455-463 / 537-543) hits a
+        schema-validation failure, it builds a ``no_edge_decision`` fallback
+        and re-validates — which fails AGAIN because ``analysis_time_utc``
+        is missing. The ``ok2, err2 = validate_json(...)`` check then raises
+        ``ValueError``, killing the entire decision pipeline.
+
+        Fix territory (Phase G): change ``no_edge_decision`` signature to
+        ``no_edge_decision(symbol, reason, *, analysis_time_utc, ...)``
+        (keyword-only) and update both production callers to pass
+        ``snapshot["analysis_time_utc"]``. Add an AST guard test preventing
+        regression to the 2-arg form.
+
+        This test exercises two paths:
+        (a) Direct: ``no_edge_decision`` output validates against the schema.
+        (b) Real chain: ``GAMasterController.analyze_symbol`` with a snapshot
+            that triggers a schema-failure fallback, then DB roundtrip.
+        """
+        import ast
+        import pathlib
+        from plugins.crypto_guard.reasoning.decision_schema import (
+            no_edge_decision, validate_json,
+        )
+
+        # ── Path (a): direct schema validation ──
+        # Phase G (07-05): no_edge_decision now requires keyword-only
+        # analysis_time_utc. The 2-arg form is gone; the AST guard below
+        # enforces this invariant across the codebase.
+        decision = no_edge_decision(
+            "BTCUSDT", "phase_a_fact5_direct",
+            analysis_time_utc=1_783_276_799_000,
+        )
+
+        # Post-fix path: schema validation must pass.
+        ok, err = validate_json("ga_decision.schema.json", decision)
+        self.assertTrue(
+            ok,
+            f"Phase A Fact 5: no_edge_decision must be schema-valid; "
+            f"err={err}",
+        )
+        # analysis_time_utc must be a strict positive integer.
+        at = decision.get("analysis_time_utc")
+        self.assertIsInstance(at, int, "Phase A Fact 5: analysis_time_utc must be int")
+        self.assertGreater(at, 0, "Phase A Fact 5: analysis_time_utc must be > 0")
+        self.assertNotIsInstance(at, bool, "Phase A Fact 5: analysis_time_utc must not be bool")
+
+        # ── Path (b): real chain via GAMasterController.analyze_symbol ──
+        # Inject a schema failure by patching run_ga_sop_decision's internal
+        # schema validation to fail, forcing it down the no_edge fallback
+        # branch. The patch is fault injection (allowed): it forces the
+        # production code's except branch to fire. We do NOT modify the
+        # production function body — we replace validate_json inside the
+        # ga_judge module so the first schema check fails.
+        from unittest.mock import patch
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+
+        at_ms = self._FACT1_BATCH_MS
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=at_ms,
+            bias="neutral", stage="range", structure="range",
+            momentum_dir="neutral", candles_count=250,
+        )
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+
+        # Force the FIRST validate_json call inside run_ga_sop_decision to
+        # return (False, "phase_a_injected_schema_failure"). The function
+        # will then call no_edge_decision and re-validate — if the fallback
+        # is schema-valid, the chain continues; if not, ValueError is raised
+        # and the controller crashes. Phase G (07-05): only the first call
+        # is forced to fail; subsequent calls (on the no_edge fallback) use
+        # the real validator so a schema-valid fallback succeeds.
+        real_validate = validate_json
+        _inject_state = {"first_done": False}
+
+        def _inject_fail(name: str, payload: dict):
+            if name == "ga_decision.schema.json" and not _inject_state["first_done"]:
+                _inject_state["first_done"] = True
+                return False, "phase_a_injected_schema_failure"
+            return real_validate(name, payload)
+
+        request = GAAnalysisRequest(
+            symbol="BTCUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot, snapshot_id=snapshot_id,
+            mode="scheduled", batch_id=f"15m:{at_ms}",
+        )
+        controller = GAMasterController(self.repo)
+        with patch(
+            "plugins.crypto_guard.reasoning.ga_judge.validate_json",
+            side_effect=_inject_fail,
+        ):
+            try:
+                ga_decision = controller.analyze_symbol(request)
+            except ValueError as exc:
+                self.fail(
+                    "Phase A Fact 5: controller crashed when no_edge fallback "
+                    f"was triggered: {exc}. The fallback must be schema-valid "
+                    "so the chain does not crash. (Phase G fix required.)"
+                )
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id, 0, "Phase A Fact 5: ga_decision_id must persist")
+
+        row = self.repo.get_ga_decision(ga_id)
+        raw = row.get("raw_decision_json") or {}
+        if isinstance(raw, str):
+            import json as _json
+            raw = _json.loads(raw)
+        # The persisted decision must be no_edge (or monitor_only after risk
+        # normalization) and carry a strict-positive-int analysis_time_utc.
+        self.assertEqual(
+            str(raw.get("decision") or "").lower(), "no_edge",
+            f"Phase A Fact 5: decision must be 'no_edge'; got {raw.get('decision')}",
+        )
+        at_persisted = raw.get("analysis_time_utc")
+        # R13 P0: ``analysis_time_utc`` is persisted as an ISO 8601 string
+        # (e.g. ``"2026-07-05T19:59:59Z"``) to match what 13+ SQL consumers
+        # in ``diagnostics/state_consistency.py`` expect
+        # (``datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', ''))``).
+        # The schema-required integer is on the ``analysis_time`` column
+        # (INTEGER NOT NULL, schema.sql:148) — see
+        # ``ga_master/decision_schema.py:116`` for the canonical
+        # converter. Pre-R13 this task wrote an integer to
+        # ``analysis_time_utc`` which broke SQL consumers silently.
+        self.assertIsInstance(
+            at_persisted, str,
+            f"Phase A Fact 5: persisted analysis_time_utc must be ISO string; "
+            f"got {type(at_persisted).__name__}={at_persisted}",
+        )
+        import re as _re
+        self.assertRegex(
+            str(at_persisted), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            f"Phase A Fact 5: persisted analysis_time_utc must be ISO 8601; "
+            f"got {at_persisted}",
+        )
+        # ``analysis_time`` (int ms) is the canonical chronological key.
+        at_int_persisted = raw.get("analysis_time")
+        self.assertIsInstance(
+            at_int_persisted, int,
+            f"Phase A Fact 5: persisted analysis_time must be int; "
+            f"got {type(at_int_persisted).__name__}={at_int_persisted}",
+        )
+        self.assertGreater(
+            int(at_int_persisted), 0,
+            "Phase A Fact 5: persisted analysis_time must be > 0",
+        )
+        # Final schema validation on the no_edge fallback that was persisted
+        # as ``raw_legacy_decision``. The controller's ``ga_decision`` shape
+        # (with ``raw_legacy_decision`` / ``feishu_actions`` / etc.) is a
+        # superset of the GADecision schema; the schema-authoritative dict
+        # is the legacy decision captured under ``raw_legacy_decision``.
+        # Phase G (07-05): the no_edge fallback must remain schema-valid
+        # through the full controller → DB → readback chain.
+        legacy_persisted = raw.get("raw_legacy_decision") or {}
+        if not legacy_persisted:
+            # If the controller did not retain raw_legacy_decision, validate
+            # the legacy-shape fields propagated onto the controller output.
+            legacy_persisted = {
+                "symbol": raw.get("symbol"),
+                "analysis_time_utc": raw.get("analysis_time_utc"),
+                "decision": raw.get("legacy_decision") or raw.get("decision"),
+                "signal_grade": raw.get("signal_grade"),
+                "confidence": raw.get("confidence"),
+                "summary": raw.get("summary") or raw.get("final_summary"),
+                "counter_evidence": raw.get("counter_evidence") or [],
+                "has_trade_plan": bool(raw.get("trade_plan")),
+                "suggested_actions": raw.get("feishu_actions") or [],
+                "risk_notes": (raw.get("risk_check") or {}).get("reasons") or [],
+                "timeframe_context": raw.get("timeframe_context") or {},
+                "alignment": raw.get("alignment"),
+                "htf_conflict": raw.get("htf_conflict"),
+                "market_reason_codes": raw.get("market_reason_codes") or [],
+            }
+        ok2, err2 = validate_json("ga_decision.schema.json", legacy_persisted)
+        self.assertTrue(
+            ok2,
+            f"Phase A Fact 5: persisted legacy decision must be schema-valid; "
+            f"err={err2}",
+        )
+
+        # ── AST guard: all production no_edge_decision( call sites must use
+        #    the keyword analysis_time_utc= form. Mirrors the
+        #    test_r12_only_one_definition_of_strict_positive_int_ms pattern. ──
+        root = pathlib.Path(__file__).resolve().parent.parent  # plugins/crypto_guard/
+        violations: list[str] = []
+        for py_file in root.rglob("*.py"):
+            # Skip test files — tests may intentionally call the old
+            # signature to verify it raises TypeError.
+            if "tests" in py_file.parts:
+                continue
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id == "no_edge_decision":
+                        # Allow only calls that pass analysis_time_utc= as a
+                        # keyword. Positional args beyond the second are
+                        # forbidden (analysis_time_utc is keyword-only).
+                        kw_names = {kw.arg for kw in node.keywords if kw.arg}
+                        if "analysis_time_utc" not in kw_names:
+                            violations.append(
+                                f"{py_file}:{node.lineno}: no_edge_decision(...) "
+                                f"must pass analysis_time_utc= keyword"
+                            )
+        self.assertEqual(
+            violations, [],
+            f"Phase A Fact 5: AST guard — production no_edge_decision call "
+            f"sites must use the keyword analysis_time_utc= form. "
+            f"Violations: {violations}",
+        )
+
+
+class TestPhaseG07_05LLMFallbackContract(unittest.TestCase):
+    """Phase G (07-05): LLM fallback contract — bounded JSON extraction
+    with explicit error categories + ``no_edge_decision`` keyword-only
+    ``analysis_time_utc`` + AST guard against old signature regression.
+
+    Tests cover:
+    - Fenced JSON (```json...```) is extracted cleanly.
+    - Leading/trailing prose around JSON is extracted cleanly.
+    - Invalid control character (``\\x00``) FAILS parse (PRD Fact 4
+      contract — preserves deterministic candidate plan).
+    - Truncated JSON FAILS parse (cannot be reliably repaired).
+    - Schema-invalid JSON (after extraction) FAILS in the caller's
+      ``validate_json`` step.
+    - ``no_edge_decision`` requires keyword-only ``analysis_time_utc``;
+      positional 3-arg form raises ``TypeError``.
+    - ``no_edge_decision`` validates ``analysis_time_utc`` is strict
+      positive int (rejects 0, negative, bool, float).
+    - AST guard: no production ``no_edge_decision(...)`` call site
+      uses the old 2-arg signature.
+    """
+
+    def _build_snapshot(self, symbol: str = "BTCUSDT") -> dict[str, Any]:
+        """Reuse the Phase A helper via a minimal snapshot build."""
+        from plugins.crypto_guard.tests.test_smoke import TestPhaseA07_05BaselineFailures
+        helper = TestPhaseA07_05BaselineFailures()
+        return helper._phase_a_helper_build_snapshot(
+            symbol=symbol,
+            analysis_time_ms=helper._FACT1_BATCH_MS,
+            bias="neutral", stage="range", structure="range",
+            momentum_dir="neutral", candles_count=250,
+        )
+
+    def test_fenced_json_is_extracted(self) -> None:
+        """Fenced JSON (```json...```) is extracted and parsed cleanly."""
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _parse_json_object
+        raw = '```json\n{"symbol": "BTCUSDT", "decision": "no_edge"}\n```'
+        data = _parse_json_object(raw)
+        self.assertEqual(data["symbol"], "BTCUSDT")
+        self.assertEqual(data["decision"], "no_edge")
+        meta = data.get("_llm_parse_meta") or {}
+        self.assertTrue(meta.get("fenced"), f"fenced=True expected; meta={meta}")
+        self.assertIsNone(meta.get("error_category"))
+        self.assertEqual(meta.get("retry_count"), 0)
+
+    def test_prose_around_json_is_extracted(self) -> None:
+        """Leading/trailing prose around a JSON object is stripped via the
+        ``\\{[\\s\\S]*\\}`` regex extraction (one attempt)."""
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _parse_json_object
+        raw = (
+            "Here is the decision:\n"
+            '{"symbol": "ETHUSDT", "decision": "monitor_only"}\n'
+            "That's the final answer."
+        )
+        data = _parse_json_object(raw)
+        self.assertEqual(data["symbol"], "ETHUSDT")
+        self.assertEqual(data["decision"], "monitor_only")
+        meta = data.get("_llm_parse_meta") or {}
+        self.assertTrue(meta.get("extracted"), f"extracted=True expected; meta={meta}")
+        self.assertIsNotNone(meta.get("error_category"))
+
+    def test_invalid_control_character_fails_parse(self) -> None:
+        """PRD Fact 4 contract: invalid control character (``\\x00``) MUST
+        fail parse so the deterministic candidate plan is preserved under
+        ``candidate_trade_plan`` / ``plan_status="withheld"``. Phase G's
+        bounded repair intentionally does NOT strip control characters."""
+        import json
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _parse_json_object
+        # Use a real NUL byte (chr(0)), not the literal "\\x00" string.
+        # json.loads raises "Invalid control character" when it encounters
+        # raw NUL inside a JSON string body.
+        raw = (
+            '{"symbol": "DOGEUSDT",' + chr(0) + ' "decision": "trade_plan_available", '
+            '"signal_grade": "A"}'
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            _parse_json_object(raw)
+
+    def test_truncated_json_fails_parse(self) -> None:
+        """Truncated JSON cannot be reliably repaired — fail-closed."""
+        import json
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _parse_json_object
+        raw = '{"symbol": "BTCUSDT", "decision": "no_edge", "summary": "truncated'
+        with self.assertRaises(json.JSONDecodeError):
+            _parse_json_object(raw)
+
+    def test_schema_invalid_json_fails_in_caller(self) -> None:
+        """Schema-invalid JSON (e.g. invalid enum value) is parsed
+        successfully but rejected by the caller's ``validate_json`` step."""
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _parse_json_object
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+        raw = '{"symbol": "BTCUSDT", "signal_grade": "X"}'
+        data = _parse_json_object(raw)
+        # Parsed cleanly, but schema validation must fail.
+        ok, err = validate_json("ga_decision.schema.json", data)
+        self.assertFalse(ok, f"schema should reject invalid grade X; err={err}")
+
+    def test_no_edge_decision_keyword_only_analysis_time_utc(self) -> None:
+        """``no_edge_decision`` requires keyword-only ``analysis_time_utc``.
+        Positional 3-arg form raises ``TypeError`` (Python enforces this
+        via the ``*`` marker in the signature)."""
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision
+        with self.assertRaises(TypeError):
+            no_edge_decision("BTCUSDT", "reason", 1_783_281_599_000)  # type: ignore[misc]
+
+    def test_no_edge_decision_rejects_zero_analysis_time_utc(self) -> None:
+        """``analysis_time_utc=0`` must raise — the caller must pass a
+        snapshot-authoritative strict positive int (PRD FR-7 forbids
+        wall-clock fallbacks)."""
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision
+        with self.assertRaises(ValueError):
+            no_edge_decision("BTCUSDT", "reason", analysis_time_utc=0)
+
+    def test_no_edge_decision_rejects_negative_analysis_time_utc(self) -> None:
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision
+        with self.assertRaises(ValueError):
+            no_edge_decision("BTCUSDT", "reason", analysis_time_utc=-1)
+
+    def test_no_edge_decision_rejects_bool_analysis_time_utc(self) -> None:
+        """``True``/``False`` are technically ``int`` subclasses but must
+        be rejected — they are not snapshot-authoritative times."""
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision
+        with self.assertRaises(TypeError):
+            no_edge_decision("BTCUSDT", "reason", analysis_time_utc=True)  # type: ignore[arg-type]
+
+    def test_no_edge_decision_rejects_float_analysis_time_utc(self) -> None:
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision
+        with self.assertRaises(TypeError):
+            no_edge_decision("BTCUSDT", "reason", analysis_time_utc=1_783_281_599_000.0)  # type: ignore[arg-type]
+
+    def test_no_edge_decision_accepts_timeframe_context(self) -> None:
+        """When ``timeframe_context`` is supplied (snapshot-derived), the
+        no_edge fallback uses it verbatim instead of the unknown/closed=False
+        markers."""
+        from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision, validate_json
+        tf_ctx = {
+            "1d": {"bias": "bullish", "structure": "range", "closed": True, "close_time": 1_783_200_000_000},
+            "4h": {"bias": "neutral", "structure": "range", "closed": True, "close_time": 1_783_280_000_000},
+            "1h": {"bias": "neutral", "structure": "range", "closed": True, "close_time": 1_783_281_000_000},
+            "15m": {"bias": "neutral", "structure": "range", "closed": True, "close_time": 1_783_281_599_000},
+        }
+        decision = no_edge_decision(
+            "BTCUSDT", "schema test",
+            analysis_time_utc=1_783_281_599_000,
+            timeframe_context=tf_ctx,
+        )
+        self.assertEqual(decision["timeframe_context"], tf_ctx)
+        ok, err = validate_json("ga_decision.schema.json", decision)
+        self.assertTrue(ok, f"schema-valid fallback expected; err={err}")
+
+    def test_ast_guard_no_2_arg_no_edge_decision_in_production(self) -> None:
+        """AST guard: every ``no_edge_decision(...)`` call site in
+        ``plugins/crypto_guard/`` (excluding ``tests/``) must pass
+        ``analysis_time_utc=`` as a keyword. Mirrors the
+        test_r12_only_one_definition_of_strict_positive_int_ms pattern.
+        Prevents regression to the old 2-arg signature.
+        """
+        import ast
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent  # plugins/crypto_guard/
+        violations: list[str] = []
+        for py_file in root.rglob("*.py"):
+            # Skip test files — tests may intentionally call the old
+            # signature to verify it raises TypeError.
+            if "tests" in py_file.parts:
+                continue
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id == "no_edge_decision":
+                        kw_names = {kw.arg for kw in node.keywords if kw.arg}
+                        if "analysis_time_utc" not in kw_names:
+                            violations.append(
+                                f"{py_file}:{node.lineno}: no_edge_decision(...) "
+                                f"must pass analysis_time_utc= keyword"
+                            )
+        self.assertEqual(
+            violations, [],
+            f"Phase G: AST guard — production no_edge_decision call sites "
+            f"must use the keyword analysis_time_utc= form. "
+            f"Violations: {violations}",
+        )
+
+    def test_llm_parse_meta_propagates_to_decision(self) -> None:
+        """When ``_parse_json_object`` succeeds after extraction/repair,
+        the ``_llm_parse_meta`` namespace must be stripped from the
+        candidate before merge (it's not schema-allowed) but surfaced on
+        the final decision as ``llm_parse_meta`` for diagnostics."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+        snapshot = self._build_snapshot()
+        # LLM emits fenced JSON — extraction succeeds on first retry.
+        fenced_raw = (
+            '```json\n'
+            '{"symbol": "BTCUSDT", "decision": "no_edge", '
+            '"signal_grade": "D", "market_bias": "neutral", '
+            '"trend_stage": "unknown", "confidence": 0.0, '
+            '"summary": "test", "evidence": [], '
+            '"counter_evidence": ["none"], "risk_notes": [], '
+            '"has_trade_plan": false, "trade_plan": null, '
+            '"opportunity_watch": null, "suggested_actions": ["ignore"]}\n'
+            '```'
+        )
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            return_value=fenced_raw,
+        ):
+            decision = run_agent_sop_decision(snapshot, use_llm=True)
+        self.assertEqual(decision.get("llm_status"), "ok")
+        meta = decision.get("llm_parse_meta") or {}
+        self.assertTrue(meta.get("fenced"), f"fenced meta expected; meta={meta}")
+
+    def test_llm_parse_failure_preserves_candidate_plan(self) -> None:
+        """End-to-end: when LLM parse fails (control char), the deterministic
+        candidate plan is preserved under ``candidate_trade_plan`` and
+        ``plan_status`` is set to a non-executable state. Reuses Phase A
+        Fact 4's chain via ``GAMasterController.analyze_symbol``."""
+        import json as _json
+        import os
+        from unittest.mock import patch
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from plugins.crypto_guard.tests.test_smoke import TestPhaseA07_05BaselineFailures
+
+        helper = TestPhaseA07_05BaselineFailures()
+        helper.setUp()
+        try:
+            at_ms = helper._FACT1_BATCH_MS
+            snapshot = helper._phase_a_helper_build_snapshot(
+                symbol="DOGEUSDT", analysis_time_ms=at_ms,
+                bias="bullish", stage="early", structure="bullish",
+                momentum_dir="bullish", candles_count=250,
+            )
+            snapshot_id = helper.repo.save_market_snapshot(snapshot)
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "1"
+            bad_llm_raw = (
+                '{"symbol": "DOGEUSDT",\x00 "decision": "trade_plan_available", '
+                '"signal_grade": "A", "market_bias": "bullish", '
+                '"trend_stage": "early", "confidence": 0.78, '
+                '"summary": "DOGE 反弹.", '
+                '"evidence": ["1H 反弹"], '
+                '"counter_evidence": ["1D 仍下行"], '
+                '"risk_notes": ["LLM 候选"], "has_trade_plan": true, '
+                '"trade_plan": {"side": "LONG", "entry_type": "limit", '
+                '"entry_price": 0.18, "stop_loss": 0.17, '
+                '"take_profits": [{"price": 0.20, "ratio": 1.0}], '
+                '"risk_percent": 0.5, "invalid_condition": "跌破 0.17"}, '
+                '"opportunity_watch": null, "suggested_actions": ["create_paper_order"]}'
+            )
+            request = GAAnalysisRequest(
+                symbol="DOGEUSDT", decision_type="scheduled_analysis",
+                snapshot=snapshot, snapshot_id=snapshot_id,
+                mode="scheduled", batch_id=f"15m:{at_ms}",
+            )
+            controller = GAMasterController(helper.repo)
+            with patch(
+                "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+                return_value=bad_llm_raw,
+            ):
+                ga_decision = controller.analyze_symbol(request)
+            ga_id = int(ga_decision.get("ga_decision_id") or 0)
+            self.assertGreater(ga_id, 0)
+            row = helper.repo.get_ga_decision(ga_id)
+            raw = row.get("raw_decision_json") or {}
+            if isinstance(raw, str):
+                raw = _json.loads(raw)
+            self.assertEqual(str(raw.get("llm_status") or "").lower(), "failed")
+            candidate = raw.get("candidate_trade_plan")
+            self.assertIsInstance(candidate, dict)
+            self.assertIn("side", candidate)
+            self.assertIsNone(raw.get("trade_plan"))
+            blockers = raw.get("plan_blockers") or []
+            codes = [str(b.get("code") or "") for b in blockers if isinstance(b, dict)]
+            self.assertIn("llm_parse_failed", codes)
+        finally:
+            helper.tearDown()
+
+
+class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
+    """Phase H tests for task 07-05: diagnostics + report UX.
+
+    Each test seeds a fault on a fresh DB and asserts the corresponding
+    Phase H diagnostic catches it. The marker is deployed by
+    initialize_database() so post-marker severity (error/warning) is
+    exercised directly. Tests cover:
+      - missing_candidate_on_llm_failure (Phase E contract)
+      - withheld_without_blockers (Phase E contract)
+      - missing_analysis_continuity (Phase D contract)
+      - oversized_feature_pack (Phase C contract)
+      - candidate_effective_plan_mismatch (Phase E contract)
+      - plan_lifecycle_contract_marker_missing (deployment contract)
+      - failed_jobs_outside_window (PRD FR-8 recent window)
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+        initialize_database()
+        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
+        self.repo = CryptoGuardRepository(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        os.environ.pop("CRYPTO_GUARD_DB", None)
+        self.tmp.cleanup()
+
+    def _insert_decision(self, *, raw: dict, decision: str = "no_edge",
+                         grade: str = "D", confidence: float = 0.0,
+                         analysis_time: int = 1_783_281_599_000) -> int:
+        """Insert a ga_decisions row with a custom raw_decision_json.
+
+        ``created_at`` defaults to ``CURRENT_TIMESTAMP`` so the row is
+        always POST-marker (the continuity contract marker is written
+        at fresh-DB init with ``CURRENT_TIMESTAMP``; inserting with the
+        same default puts the row at or after the marker, keeping the
+        diagnostic severity at ``error`` rather than ``legacy_info``).
+        """
+        import json as _json
+        cur = self.conn.execute(
+            """
+            INSERT INTO ga_decisions(
+                symbol, analysis_time, analysis_time_utc, decision_type, signal_grade,
+                confidence, market_bias, trend_stage, decision, skill_result_refs_json,
+                evidence_json, counter_evidence_json, risk_check_json, trade_plan_json,
+                opportunity_watch_json, feishu_actions_json, final_summary, raw_decision_json,
+                created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', ?, CURRENT_TIMESTAMP)
+            """,
+            (raw.get("symbol", "BTCUSDT"), int(analysis_time),
+             "2026-07-05T19:59:59Z", "scheduled", grade, confidence,
+             raw.get("market_bias", "neutral"), raw.get("trend_stage", "unknown"),
+             decision, _json.dumps(raw, ensure_ascii=False)),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def test_missing_candidate_on_llm_failure_caught(self):
+        """Phase E contract: llm_status=failed without candidate_trade_plan."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, MISSING_CANDIDATE_ON_LLM_FAILURE,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "failed",
+            "plan_status": "withheld", "plan_blockers": [],
+            "has_trade_plan": False,
+            # candidate_trade_plan intentionally missing — this is the defect.
+        })
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(MISSING_CANDIDATE_ON_LLM_FAILURE, codes)
+        # Severity must be error (post-marker on the fresh DB).
+        severities = [i["severity"] for i in result["issues"]
+                      if i["type"] == MISSING_CANDIDATE_ON_LLM_FAILURE]
+        self.assertIn("error", severities)
+
+    def test_withheld_without_blockers_caught(self):
+        """Phase E contract: plan_status=withheld with empty plan_blockers."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, WITHHELD_WITHOUT_BLOCKERS,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "withheld", "plan_blockers": [],
+            "has_trade_plan": False,
+            "candidate_trade_plan": {"side": "LONG", "entry_price": 100.0,
+                                     "stop_loss": 95.0},
+        })
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(WITHHELD_WITHOUT_BLOCKERS, codes)
+        severities = [i["severity"] for i in result["issues"]
+                      if i["type"] == WITHHELD_WITHOUT_BLOCKERS]
+        self.assertIn("warning", severities)
+
+    def test_withheld_with_blockers_not_flagged(self):
+        """Negative test: plan_status=withheld WITH blockers is not flagged."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, WITHHELD_WITHOUT_BLOCKERS,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "withheld",
+            "plan_blockers": [{"code": "risk_rejected", "stage": "execution_gate"}],
+            "has_trade_plan": False,
+            "candidate_trade_plan": {"side": "LONG"},
+            "analysis_continuity": {"previous": None, "delta": {}},
+            "timeframe_context": {tf: {"bias": "unknown", "structure": "unknown",
+                                       "closed": False, "close_time": 0}
+                                  for tf in ("1d", "4h", "1h", "15m")},
+            "alignment": "unknown", "htf_conflict": False, "market_reason_codes": [],
+        })
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(WITHHELD_WITHOUT_BLOCKERS, codes)
+
+    def test_missing_analysis_continuity_caught(self):
+        """Phase D contract: decision missing analysis_continuity block."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, MISSING_ANALYSIS_CONTINUITY,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "no_plan", "plan_blockers": [],
+            "has_trade_plan": False,
+            # analysis_continuity intentionally missing — this is the defect.
+            "timeframe_context": {tf: {"bias": "unknown", "structure": "unknown",
+                                       "closed": False, "close_time": 0}
+                                  for tf in ("1d", "4h", "1h", "15m")},
+            "alignment": "unknown", "htf_conflict": False, "market_reason_codes": [],
+        })
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(MISSING_ANALYSIS_CONTINUITY, codes)
+
+    def test_oversized_feature_pack_caught(self):
+        """Phase C contract: feature pack exceeding 24 KiB budget."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, OVERSIZED_FEATURE_PACK,
+            FEATURE_PACK_SIZE_BUDGET_BYTES,
+        )
+        oversized = {
+            "contract_version": "mtf_feature_pack_v1",
+            "symbol": "BTCUSDT",
+            "timeframes": {tf: {"big_field": "X" * 5000}
+                           for tf in ("1d", "4h", "1h", "15m", "5m")},
+        }
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "no_plan", "plan_blockers": [],
+            "has_trade_plan": False,
+            "multi_timeframe_feature_pack": oversized,
+            "analysis_continuity": {"previous": None, "delta": {}},
+            "timeframe_context": {tf: {"bias": "unknown", "structure": "unknown",
+                                       "closed": False, "close_time": 0}
+                                  for tf in ("1d", "4h", "1h", "15m")},
+            "alignment": "unknown", "htf_conflict": False, "market_reason_codes": [],
+        })
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(OVERSIZED_FEATURE_PACK, codes)
+        # Confirm the size detail is recorded.
+        for issue in result["issues"]:
+            if issue["type"] == OVERSIZED_FEATURE_PACK:
+                self.assertGreater(issue["details"]["size_bytes"],
+                                   FEATURE_PACK_SIZE_BUDGET_BYTES)
+                self.assertEqual(issue["details"]["budget_bytes"],
+                                 FEATURE_PACK_SIZE_BUDGET_BYTES)
+
+    def test_candidate_effective_plan_mismatch_caught(self):
+        """Phase E contract: candidate and effective trade_plan side mismatch."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, CANDIDATE_EFFECTIVE_PLAN_MISMATCH,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "executable", "plan_blockers": [],
+            "has_trade_plan": True,
+            "candidate_trade_plan": {"side": "LONG", "entry_price": 100.0,
+                                     "stop_loss": 95.0},
+            "trade_plan": {"side": "SHORT", "entry_price": 100.0, "stop_loss": 95.0},
+            "analysis_continuity": {"previous": None, "delta": {}},
+            "timeframe_context": {tf: {"bias": "unknown", "structure": "unknown",
+                                       "closed": False, "close_time": 0}
+                                  for tf in ("1d", "4h", "1h", "15m")},
+            "alignment": "unknown", "htf_conflict": False, "market_reason_codes": [],
+        }, decision="trade_plan_available", grade="A", confidence=0.85)
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(CANDIDATE_EFFECTIVE_PLAN_MISMATCH, codes)
+
+    def test_candidate_effective_plan_match_not_flagged(self):
+        """Negative test: matching candidate/effective plan is not flagged."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, CANDIDATE_EFFECTIVE_PLAN_MISMATCH,
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "executable", "plan_blockers": [],
+            "has_trade_plan": True,
+            "candidate_trade_plan": {"side": "LONG", "entry_price": 100.0,
+                                     "stop_loss": 95.0},
+            "trade_plan": {"side": "LONG", "entry_price": 100.0, "stop_loss": 95.0},
+            "analysis_continuity": {"previous": None, "delta": {}},
+            "timeframe_context": {tf: {"bias": "unknown", "structure": "unknown",
+                                       "closed": False, "close_time": 0}
+                                  for tf in ("1d", "4h", "1h", "15m")},
+            "alignment": "unknown", "htf_conflict": False, "market_reason_codes": [],
+        }, decision="trade_plan_available", grade="A", confidence=0.85)
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(CANDIDATE_EFFECTIVE_PLAN_MISMATCH, codes)
+
+    def test_marker_present_on_fresh_db(self):
+        """Deployment contract: marker is written by initialize_database()."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING,
+            CONTINUITY_CONTRACT_MARKER_KEY,
+        )
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=?",
+            (CONTINUITY_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertTrue(row["applied_at"])
+        # Marker-missing check must NOT fire on a fresh DB.
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING, codes)
+
+    def test_failed_jobs_outside_window_classified_legacy_info(self):
+        """PRD FR-8: failed batches older than the window become legacy_info."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, FAILED_JOBS_OUTSIDE_WINDOW,
+            FAILED_JOBS_RECENT_WINDOW_DAYS,
+        )
+        # Insert a failed batch with started_at 30 days ago (outside the 7-day window).
+        old_started = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            """
+            INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time,
+                                          started_at, status, enabled_symbols_json,
+                                          completed_symbols_json, failed_symbols_json)
+            VALUES (?, '15m', ?, ?, 'failed', '[]', '[]', '["BTCUSDT"]')
+            """,
+            ("old_failed_batch", 1_783_281_599_000, old_started),
+        )
+        self.conn.commit()
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(FAILED_JOBS_OUTSIDE_WINDOW, codes)
+        for issue in result["issues"]:
+            if issue["type"] == FAILED_JOBS_OUTSIDE_WINDOW:
+                self.assertEqual(issue["severity"], "legacy_info")
+                self.assertEqual(issue["details"]["window_days"],
+                                 FAILED_JOBS_RECENT_WINDOW_DAYS)
+
+    def test_failed_jobs_within_window_not_flagged(self):
+        """Negative test: recent failed batches are not flagged as outside window."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, FAILED_JOBS_OUTSIDE_WINDOW,
+        )
+        recent_started = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            """
+            INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time,
+                                          started_at, status, enabled_symbols_json,
+                                          completed_symbols_json, failed_symbols_json)
+            VALUES (?, '15m', ?, ?, 'failed', '[]', '[]', '["BTCUSDT"]')
+            """,
+            ("recent_failed_batch", 1_783_281_599_000, recent_started),
+        )
+        self.conn.commit()
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(FAILED_JOBS_OUTSIDE_WINDOW, codes)
+
+    def test_pre_marker_row_demoted_to_legacy_info(self):
+        """Migration marker cutoff: pre-marker rows with Phase H issues are
+        demoted to legacy_info rather than error/warning."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, MISSING_ANALYSIS_CONTINUITY,
+            CONTINUITY_CONTRACT_MARKER_KEY,
+        )
+        # Move the marker forward by 1 hour so the seeded row is pre-marker.
+        self.conn.execute(
+            "UPDATE _migration_state SET applied_at=? WHERE key=?",
+            ("2026-07-05T21:00:00Z", CONTINUITY_CONTRACT_MARKER_KEY),
+        )
+        self._insert_decision(raw={
+            "symbol": "BTCUSDT", "llm_status": "ok",
+            "plan_status": "no_plan", "plan_blockers": [],
+            "has_trade_plan": False,
+            # analysis_continuity missing — would be warning post-marker.
+        })
+        # Set the row's created_at to before the marker.
+        self.conn.execute(
+            "UPDATE ga_decisions SET created_at=? WHERE id=(SELECT MAX(id) FROM ga_decisions)",
+            ("2026-07-05T19:30:00Z",),
+        )
+        self.conn.commit()
+        result = diagnose_report_accuracy(self.repo)
+        for issue in result["issues"]:
+            if issue["type"] == MISSING_ANALYSIS_CONTINUITY:
+                self.assertEqual(issue["severity"], "legacy_info",
+                                 f"Pre-marker row should be legacy_info, got {issue['severity']}")
+
+    def test_clean_db_has_zero_errors(self):
+        """Fresh DB with no ga_decisions rows: zero errors, zero warnings."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["error_count"], 0)
+        self.assertEqual(result["warning_count"], 0)
+
+    def test_summary_includes_phase_h_codes(self):
+        """Summary dict includes all 7 Phase H issue codes."""
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+            MISSING_CANDIDATE_ON_LLM_FAILURE, WITHHELD_WITHOUT_BLOCKERS,
+            MISSING_ANALYSIS_CONTINUITY, OVERSIZED_FEATURE_PACK,
+            CANDIDATE_EFFECTIVE_PLAN_MISMATCH, BATCH_TIME_HEALTH_MISMATCH,
+            FAILED_JOBS_OUTSIDE_WINDOW, PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        s = result["summary"]
+        for code in (MISSING_CANDIDATE_ON_LLM_FAILURE, WITHHELD_WITHOUT_BLOCKERS,
+                     MISSING_ANALYSIS_CONTINUITY, OVERSIZED_FEATURE_PACK,
+                     CANDIDATE_EFFECTIVE_PLAN_MISMATCH, BATCH_TIME_HEALTH_MISMATCH,
+                     FAILED_JOBS_OUTSIDE_WINDOW, PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING):
+            self.assertIn(code, s, f"summary missing Phase H code: {code}")
+
+
+class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
+    """Phase I (07-05) — verify Phase H diagnostics fire on REAL
+    controller-produced rows, not just hand-crafted raw_decision_json.
+
+    The crypto-guard-reviewer found P1-1: _check_missing_candidate_on_llm_failure
+    had ``and raw.get('has_trade_plan') is False`` which never matches on real
+    controller-produced rows because controller_decision_from_legacy does NOT
+    persist has_trade_plan at the top level of raw_decision_json. This class
+    seeds a real controller row, mutates it to trigger the fault, and verifies
+    the diagnostic catches it.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from plugins.crypto_guard.config import load_config
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+        self._tmp = Path(tempfile.mkdtemp(prefix="cg_phase_h_real_"))
+        db_path = self._tmp / "real.db"
+        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
+        self.cfg = load_config()
+        initialize_database(self.cfg)
+        self.conn = connect_db(self.cfg.database_path)
+        self.repo = CryptoGuardRepository(self.conn)
+
+    def tearDown(self) -> None:
+        import shutil
+        self.conn.close()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        os.environ.pop("CRYPTO_GUARD_DB", None)
+
+    def _phase_a_helper_build_snapshot(self, *, symbol, analysis_time_ms,
+                                        bias="bullish", stage="early",
+                                        structure="bullish", momentum_dir="bullish",
+                                        candles_count=250):
+        """Reuse the Phase A fixture builder to construct a real snapshot."""
+        from plugins.crypto_guard.tests.test_smoke import (
+            TestPhaseA07_05BaselineFailures,
+        )
+        helper = TestPhaseA07_05BaselineFailures("__init__")
+        return helper._phase_a_helper_build_snapshot(
+            symbol=symbol, analysis_time_ms=analysis_time_ms,
+            bias=bias, stage=stage, structure=structure,
+            momentum_dir=momentum_dir, candles_count=candles_count,
+        )
+
+    def test_missing_candidate_on_llm_failure_caught_via_real_controller(self) -> None:
+        """End-to-end: real controller produces llm_status=failed row with
+        candidate_trade_plan; delete the candidate; diagnostic must fire.
+
+        This catches the P1-1 defect: with ``and raw.get('has_trade_plan') is False``
+        the diagnostic would NOT fire on real controller rows because
+        controller_decision_from_legacy omits has_trade_plan at top level.
+        """
+        import json as _json
+        from unittest.mock import patch
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, MISSING_CANDIDATE_ON_LLM_FAILURE,
+        )
+
+        at_ms = 1_750_000_000_000
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="DOGEUSDT", analysis_time_ms=at_ms,
+            bias="bullish", stage="early", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "1"
+
+        bad_llm_raw = (
+            '{"symbol": "DOGEUSDT",\x00 "decision": "trade_plan_available", '
+            '"signal_grade": "A", "market_bias": "bullish", '
+            '"trend_stage": "early", "confidence": 0.78, '
+            '"summary": "DOGE 反弹.", '
+            '"evidence": ["1H 反弹"], '
+            '"counter_evidence": ["1D 仍下行"], '
+            '"risk_notes": ["LLM 候选"], "has_trade_plan": true, '
+            '"trade_plan": {"side": "LONG", "entry_type": "limit", '
+            '"entry_price": 0.18, "stop_loss": 0.17, '
+            '"take_profits": [{"price": 0.20, "ratio": 1.0}], '
+            '"risk_percent": 0.5, "invalid_condition": "跌破 0.17"}, '
+            '"opportunity_watch": null, "suggested_actions": ["create_paper_order"]}'
+        )
+        request = GAAnalysisRequest(
+            symbol="DOGEUSDT", decision_type="scheduled_analysis",
+            snapshot=snapshot, snapshot_id=snapshot_id,
+            mode="scheduled", batch_id=f"15m:{at_ms}",
+        )
+        controller = GAMasterController(self.repo)
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            return_value=bad_llm_raw,
+        ):
+            ga_decision = controller.analyze_symbol(request)
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id, 0)
+
+        # Read back via real repository path
+        row = self.repo.get_ga_decision(ga_id)
+        raw = row.get("raw_decision_json") or {}
+        if isinstance(raw, str):
+            raw = _json.loads(raw)
+
+        # Confirm baseline: real controller row has candidate_trade_plan
+        # AND llm_status=failed
+        self.assertEqual(str(raw.get("llm_status") or "").lower(), "failed")
+        self.assertIsInstance(raw.get("candidate_trade_plan"), dict)
+
+        # Confirm P1-1 root cause: has_trade_plan is NOT at top level
+        # of raw_decision_json for real controller rows (it lives in
+        # raw_legacy_decision). The old ``and raw.get('has_trade_plan') is False``
+        # condition therefore never matched.
+        self.assertNotIn(
+            "has_trade_plan", raw,
+            "Real controller rows must NOT have has_trade_plan at top level "
+            "(controller_decision_from_legacy omits it); the diagnostic must "
+            "not depend on this field.",
+        )
+
+        # Baseline: diagnostic does NOT fire on healthy real controller row
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(
+            MISSING_CANDIDATE_ON_LLM_FAILURE, codes,
+            "Healthy controller row with candidate_trade_plan must not trigger "
+            "the diagnostic.",
+        )
+
+        # Inject fault: delete candidate_trade_plan from the persisted row
+        raw.pop("candidate_trade_plan", None)
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json = ? WHERE id = ?",
+            (_json.dumps(raw), ga_id),
+        )
+        self.conn.commit()
+
+        # Diagnostic MUST fire on the mutated real-controller row
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertIn(
+            MISSING_CANDIDATE_ON_LLM_FAILURE, codes,
+            "After deleting candidate_trade_plan from a real llm_status=failed "
+            "row, the diagnostic MUST fire. Pre-fix (with has_trade_plan guard) "
+            "this would NOT fire because has_trade_plan is absent at top level.",
+        )
+
+
+class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
+    """Phase H R2 (07-05 final review): real market_state_builder ->
+    controller -> DB -> report content tests.
+
+    These tests verify ACTUAL CONTENT of the persisted raw_decision_json,
+    not just field existence. They cover the 11 defects the user found in
+    the first final-seal review:
+
+    - P0-1: data_as_of uses per-TF last_close_time (not global analysis_time)
+    - P0-2: feature pack carries RSI/MACD/ATR/SMC/order_flow/chanlun/health
+            and bias reads from market_structure (not momentum)
+    - P1-3: previous_grade reads from signal_grade (not trend_clarity.level)
+    - P1-4: previous executable plan identified structurally (not has_trade_plan flag)
+    - P1-5: trigger_progress uses trigger_price + last_close (not 15m/5m proxy)
+    - P1-6: continuity rebuilt AFTER all gates (delta reflects final grade)
+    - P1-7: batch_time_health diagnostic reads data_quality.health (production path)
+    - P1-8: no_plan + LLM failed + no candidate does NOT fire diagnostic
+    - P1-9: recent_failed_jobs honors 7-day window
+    - P1-10: report title says "S/A" (not "S/A/B"); trade_plan_summary
+            distinguishes no_plan vs withheld when LLM failed
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from plugins.crypto_guard.config import load_config
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+
+        self._tmp = Path(tempfile.mkdtemp(prefix="cg_phase_h_content_"))
+        db_path = self._tmp / "content.db"
+        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
+        self.cfg = load_config()
+        initialize_database(self.cfg)
+        self.conn = connect_db(self.cfg.database_path)
+        self.repo = CryptoGuardRepository(self.conn)
+
+    def tearDown(self) -> None:
+        import shutil
+        self.conn.close()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        os.environ.pop("CRYPTO_GUARD_DB", None)
+
+    def _phase_a_helper_build_snapshot(self, *, symbol, analysis_time_ms,
+                                        bias="bullish", stage="middle",
+                                        structure="bullish", momentum_dir="bullish",
+                                        candles_count=250):
+        from plugins.crypto_guard.tests.test_smoke import (
+            TestPhaseA07_05BaselineFailures,
+        )
+        helper = TestPhaseA07_05BaselineFailures("__init__")
+        return helper._phase_a_helper_build_snapshot(
+            symbol=symbol, analysis_time_ms=analysis_time_ms,
+            bias=bias, stage=stage, structure=structure,
+            momentum_dir=momentum_dir, candles_count=candles_count,
+        )
+
+    def _run_controller(self, snapshot, *, symbol="BTCUSDT",
+                        decision_type="scheduled_analysis", mode="scheduled"):
+        """Run the real controller and return the persisted ga_decision row."""
+        import json as _json
+        from plugins.crypto_guard.ga_master.controller import GAMasterController
+        from plugins.crypto_guard.ga_master.decision_schema import GAAnalysisRequest
+
+        snapshot_id = self.repo.save_market_snapshot(snapshot)
+        request = GAAnalysisRequest(
+            symbol=symbol, decision_type=decision_type,
+            snapshot=snapshot, snapshot_id=snapshot_id,
+            mode=mode, batch_id=f"15m:{snapshot.get('analysis_time_utc')}",
+        )
+        controller = GAMasterController(self.repo)
+        ga_decision = controller.analyze_symbol(request)
+        ga_id = int(ga_decision.get("ga_decision_id") or 0)
+        self.assertGreater(ga_id, 0)
+        row = self.repo.get_ga_decision(ga_id)
+        raw = row.get("raw_decision_json") or {}
+        if isinstance(raw, str):
+            raw = _json.loads(raw)
+        return ga_decision, raw
+
+    def test_p0_1_data_as_of_uses_per_tf_last_close_time(self) -> None:
+        """P0-1: multi_timeframe_feature_pack.data_as_of per-TF uses
+        last_close_time from health, NOT the global analysis_time_utc.
+
+        1D bars close once a day, 4H every 4 hours, etc. If all TFs share
+        analysis_time_utc, 1D disguised as same-time-as-15m — audit cannot
+        tell whether the 1D bias was computed before or after the day
+        rolled. The fix reads per-TF last_close_time from health.
+        """
+        at_ms = 1_750_000_000_000  # arbitrary fixed point
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=at_ms,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        _, raw = self._run_controller(snapshot, symbol="BTCUSDT")
+        pack = raw.get("multi_timeframe_feature_pack") or {}
+        # Pack shape: {schema_version, size_budget_bytes, analysis_time_utc,
+        # symbol, timeframes: [list of tf names], modules: {tf -> data}}.
+        per_tf = pack.get("modules") or {}
+        self.assertIsInstance(per_tf, dict, "pack.modules must be a dict keyed by TF")
+        # Each TF must have a data_as_of that matches its close time.
+        close_1d = at_ms - 86_400_000
+        close_4h = at_ms - 14_400_000
+        close_1h = at_ms - 3_600_000
+        close_15m = at_ms - 900_000
+        for tf, expected in [("1d", close_1d), ("4h", close_4h),
+                              ("1h", close_1h), ("15m", close_15m)]:
+            tf_data = per_tf.get(tf) or {}
+            actual = int(tf_data.get("data_as_of") or 0)
+            self.assertEqual(
+                actual, expected,
+                f"TF {tf} data_as_of must be {expected} (last_close), "
+                f"got {actual} (analysis_time={at_ms}). "
+                "P0-1: data_as_of must reflect per-TF close, not global analysis_time.",
+            )
+
+    def test_p0_2_feature_pack_carries_rich_modules_and_correct_bias(self) -> None:
+        """P0-2: feature pack must carry RSI/MACD/ATR/SMC/order_flow/
+        chanlun/health, and bias reads from market_structure (not momentum)."""
+        at_ms = 1_750_000_000_000
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=at_ms,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bearish",  # Intentionally different from structure
+            candles_count=250,
+        )
+        _, raw = self._run_controller(snapshot, symbol="BTCUSDT")
+        pack = raw.get("multi_timeframe_feature_pack") or {}
+        per_tf = pack.get("modules") or {}
+        tf_1h = per_tf.get("1h") or {}
+        # Bias MUST follow market_structure (bullish), not momentum (bearish).
+        self.assertEqual(
+            str(tf_1h.get("bias") or "").lower(), "bullish",
+            "P0-2: bias must read from market_structure (bullish), not "
+            "momentum (bearish). The two are different axes.",
+        )
+        # Indicators module must be present and carry RSI/MACD/ATR.
+        indicators = tf_1h.get("indicators") or {}
+        self.assertIn("rsi", indicators, "P0-2: indicators.rsi missing")
+        self.assertIn("macd_hist", indicators, "P0-2: indicators.macd_hist missing")
+        self.assertIn("atr_ratio", indicators, "P0-2: indicators.atr_ratio missing")
+        # SMC / order_flow / chanlun / health must be present.
+        self.assertIn("smc", tf_1h, "P0-2: smc module missing")
+        self.assertIn("order_flow", tf_1h, "P0-2: order_flow module missing")
+        self.assertIn("chanlun", tf_1h, "P0-2: chanlun module missing")
+        self.assertIn("health", tf_1h, "P0-2: health module missing")
+        # Health must carry ready + last_close_time.
+        health = tf_1h.get("health") or {}
+        self.assertIn("ready", health, "P0-2: health.ready missing")
+        self.assertIn("last_close_time", health, "P0-2: health.last_close_time missing")
+
+    def test_p1_8_no_plan_no_candidate_does_not_fire_diagnostic(self) -> None:
+        """P1-8: llm_status=failed + plan_status=no_plan + no candidate
+        must NOT trigger MISSING_CANDIDATE_ON_LLM_FAILURE.
+
+        Real controller repro: low-score / no-edge decision legitimately
+        has no deterministic candidate. The LLM had nothing to fail over.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy, MISSING_CANDIDATE_ON_LLM_FAILURE,
+        )
+        # Insert a row with plan_status=no_plan + llm_status=failed + no candidate
+        # via the repository to exercise the real diagnostic path.
+        import json as _json
+        raw = {
+            "symbol": "BTCUSDT", "decision": "no_edge",
+            "signal_grade": "D", "confidence": 0.2,
+            "analysis_time_utc": 1_750_000_000_000,
+            "llm_status": "failed",
+            "plan_status": "no_plan",
+            "plan_blockers": [],
+            "candidate_trade_plan": None,
+            "trade_plan": None,
+            "has_trade_plan": False,
+        }
+        self.conn.execute(
+            "INSERT INTO ga_decisions("
+            "  symbol, analysis_time, analysis_time_utc, decision_type,"
+            "  signal_grade, confidence, market_bias, trend_stage, decision,"
+            "  skill_result_refs_json, evidence_json, counter_evidence_json,"
+            "  risk_check_json, trade_plan_json, opportunity_watch_json,"
+            "  feishu_actions_json, final_summary, raw_decision_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', ?, CURRENT_TIMESTAMP)",
+            ("BTCUSDT", 1_750_000_000_000, "2026-07-05T19:59:59Z",
+             "scheduled", "D", 0.2, "neutral", "unknown", "no_edge",
+             _json.dumps(raw, ensure_ascii=False)),
+        )
+        self.conn.commit()
+        result = diagnose_report_accuracy(self.repo)
+        codes = [i["type"] for i in result["issues"]]
+        self.assertNotIn(
+            MISSING_CANDIDATE_ON_LLM_FAILURE, codes,
+            "P1-8: plan_status=no_plan + LLM failed + no candidate must NOT fire. "
+            "This is the legitimate no-edge path; the LLM had nothing to fail over.",
+        )
+
+    def test_p1_9_recent_failed_jobs_7day_window(self) -> None:
+        """P1-9: recent_failed_jobs honors a 7-day window.
+
+        Old failures (>7 days) must NOT appear in the list — otherwise the
+        hourly report keeps surfacing ancient failures forever.
+        """
+        # Insert one recent failure (finished_at = now) and one old failure
+        # (finished_at = 8 days ago).
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
+            "payload_json, status, started_at, finished_at, error_message) "
+            "VALUES ('test_recent', 5, 'test', 'session_recent', '{}', 'failed', "
+            "datetime('now', '-1 hour'), datetime('now', '-1 hour'), 'recent failure')"
+        )
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
+            "payload_json, status, started_at, finished_at, error_message) "
+            "VALUES ('test_old', 5, 'test', 'session_old', '{}', 'failed', "
+            "datetime('now', '-8 days'), datetime('now', '-8 days'), 'old failure')"
+        )
+        self.conn.commit()
+        recent = self.repo.recent_failed_jobs(limit=10)
+        # The recent failure must be in the list.
+        types = [r.get("job_type") for r in recent]
+        self.assertIn("test_recent", types,
+                      "P1-9: recent failure (1 hour ago) must be in recent_failed_jobs.")
+        # The old failure must NOT be in the list (outside 7-day window).
+        self.assertNotIn("test_old", types,
+                         "P1-9: old failure (8 days ago) must NOT be in "
+                         "recent_failed_jobs — it would keep surfacing in "
+                         "every hourly report forever.")
+
+    def test_p1_10_report_title_says_sa_only(self) -> None:
+        """P1-10: report title must say "S/A" (not "S/A/B"). B is observation-only."""
+        # The renderer is exercised via the _opportunity_classifier which
+        # already demotes B to observation via PAPER_ORDER_GRADES. The
+        # title at line 699 must match: "可执行机会（S/A 且通过执行门禁）".
+        # Read the source and assert.
+        from plugins.crypto_guard.notify import hourly_report
+        import inspect
+        src = inspect.getsource(hourly_report)
+        # The title must say S/A only, not S/A/B.
+        self.assertIn(
+            "（S/A 且通过执行门禁）", src,
+            "P1-10: report title must say 'S/A' only — B is observation-only "
+            "per PAPER_ORDER_GRADES = {'S', 'A'}.",
+        )
+        self.assertNotIn(
+            "（S/A/B 且通过执行门禁）", src,
+            "P1-10: old 'S/A/B' title must be removed — it promises a "
+            "B-grade executable section that never appears.",
+        )
+
+    def test_p1_10_trade_plan_summary_no_plan_no_candidate_text(self) -> None:
+        """P1-10: trade_plan_summary must say "LLM 失败但本轮无 deterministic
+        candidate" when plan_status=no_plan + llm_status=failed, NOT "候选计划已生成"."""
+        from plugins.crypto_guard.notify.hourly_report import _trade_plan_summary
+        decision = {
+            "trade_plan": None,
+            "has_trade_plan": False,
+            "candidate_trade_plan": None,
+            "plan_status": "no_plan",
+            "plan_blockers": [],
+            "llm_status": "failed",
+            "risk_check": {},
+        }
+        text = _trade_plan_summary(decision)
+        self.assertNotIn(
+            "候选计划已生成", text,
+            "P1-10: when plan_status=no_plan + no candidate, the text must "
+            "NOT say '候选计划已生成' — there is no candidate.",
+        )
+        self.assertIn(
+            "无 deterministic candidate", text,
+            "P1-10: text must surface that no deterministic candidate exists.",
+        )
+
+    def test_r2_p1_3_continuity_previous_grade_reads_actual_signal_grade(self) -> None:
+        """R2 P1-NEW-1: continuity block's previous.grade must read the actual
+        signal_grade from ga_decisions (S/A/B/C/D), not a heuristic fallback.
+
+        The data layer gap was: latest_analysis_state_for_continuity did
+        SELECT s.* without JOINing ga_decisions.signal_grade, so the previous
+        row never carried signal_grade and _compact_previous_state fell back
+        to a heuristic ("B"/"D"). This test verifies:
+        (1) the JOIN supplies the actual prior signal_grade column on the
+            returned row (data layer);
+        (2) _compact_previous_state (the consumer) reads signal_grade from
+            the row and emits it as continuity.previous.grade (no heuristic).
+        """
+        from plugins.crypto_guard.reasoning.decision_context import _compact_previous_state
+        # Insert a real analysis_states row + ga_decisions row with
+        # signal_grade='B', then verify latest_analysis_state_for_continuity
+        # returns a row that carries signal_grade (from the JOIN).
+        prior_ms = int((__import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).timestamp() * 1000)) - 3_600_000  # 1 hour ago
+        self.conn.execute(
+            "INSERT INTO ga_decisions(id, symbol, analysis_time, "
+            "analysis_time_utc, decision_type, signal_grade, confidence, "
+            "decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, "
+            "feishu_actions_json, final_summary, raw_decision_json, "
+            "batch_id, created_at) "
+            "VALUES (9001, 'BTCUSDT', ?, '2026-07-06T00:00:00Z', "
+            "'scheduled_analysis', 'B', 0.65, 'monitor_only', '{}', '[]', "
+            "'[]', '{}', '[]', 'summary', '{}', 'r2_p1_3_batch', "
+            "datetime('now', '-1 hour'))",
+            (prior_ms,)
+        )
+        self.conn.execute(
+            "INSERT INTO analysis_states(id, symbol, analysis_time, "
+            "analysis_time_utc, analysis_mode, timeframes, "
+            "market_structure_json, trend_clarity_json, "
+            "ga_decision_id, state_json, created_at) "
+            "VALUES (9001, 'BTCUSDT', ?, '2026-07-06T00:00:00Z', "
+            "'scheduled', '[\"15m\"]', '{}', '{}', "
+            "9001, '{}', datetime('now', '-1 hour'))",
+            (prior_ms,)
+        )
+        self.conn.commit()
+        # Look up the prior state. The current batch is "current_batch"
+        # (different from the prior's "r2_p1_3_batch"), so the exclude filter
+        # keeps the prior row in the result set.
+        first_state = self.repo.latest_analysis_state_for_continuity(
+            "BTCUSDT", analysis_time_utc=prior_ms + 1,
+            exclude_batch_id="current_batch",
+        )
+        self.assertIsNotNone(
+            first_state,
+            "R2 P1-3: latest_analysis_state_for_continuity must return the "
+            "prior row when one exists.",
+        )
+        # (1) Data layer: signal_grade must be present on the row (from JOIN).
+        self.assertIn(
+            "signal_grade", first_state,
+            "R2 P1-3: latest_analysis_state_for_continuity must JOIN "
+            "ga_decisions.signal_grade so the row carries the prior grade.",
+        )
+        self.assertEqual(
+            first_state.get("signal_grade"), "B",
+            "R2 P1-3: JOIN must surface the actual signal_grade='B' from "
+            "ga_decisions, not a heuristic.",
+        )
+        # (2) Consumer: _compact_previous_state must read signal_grade from
+        # the row and emit it as grade (no heuristic fallback).
+        compact = _compact_previous_state(first_state)
+        self.assertEqual(
+            compact.get("grade"), "B",
+            "R2 P1-3: _compact_previous_state must read signal_grade='B' from "
+            "the joined row and emit it as continuity.previous.grade. "
+            "Heuristic fallback ('D' for no-trade-plan rows) would fail this.",
+        )
+
+    def test_r2_p2_1_trigger_progress_uses_actual_candle_close(self) -> None:
+        """R2 P2-NEW-1: trigger_progress must use price_action.last_close
+        to verify trigger_price against the actual candle close, not a
+        heuristic proxy.
+
+        The dead-code path was: _latest_candle_close read
+        timeframe_modules[tf].price_action.last_close, but price_action_engine
+        did not produce last_close — so the fix path was unreachable. With
+        the fix, price_action_engine returns last_close, and the trigger
+        path is reachable in production.
+
+        This test verifies:
+        (1) Producer: analyze_price_action returns last_close (latest close).
+        (2) Consumer: _trigger_progress uses last_close to confirm/invalidated
+            a breakout_confirm trigger based on close vs trigger_price.
+        """
+        from plugins.crypto_guard.analysis.price_action_engine import analyze_price_action
+        from plugins.crypto_guard.reasoning.decision_context import _trigger_progress
+        # Need >= 8 candles for the engine to compute structure.
+        candles = [
+            {"open_time": i * 60000, "open": 100.0 + i * 0.5,
+             "high": 105.0 + i * 0.5, "low": 99.0 + i * 0.5,
+             "close": 102.5 + i * 0.5, "close_time": (i + 1) * 60000,
+             "volume": 1000.0}
+            for i in range(10)
+        ]
+        result = analyze_price_action(candles, timeframe="15m", analysis_time_utc=600000)
+        # (1) Producer: last_close must be present.
+        self.assertIn(
+            "last_close", result,
+            "R2 P2-1: price_action_engine must return last_close so "
+            "_latest_candle_close can read it for trigger_price verification.",
+        )
+        expected_close = 102.5 + 9 * 0.5  # last candle's close
+        self.assertEqual(
+            result["last_close"], expected_close,
+            "R2 P2-1: last_close must be the latest closed candle's close price.",
+        )
+        # (2) Consumer: _trigger_progress uses last_close to confirm/invalidated.
+        # Build a snapshot with timeframe_modules[15m].price_action.last_close.
+        snapshot = {
+            "timeframe_modules": {
+                "15m": {"price_action": {"last_close": expected_close}},
+            },
+            "profiles": {},
+            "modules": {},
+        }
+        # Case A: breakout_confirm with structured level below last_close → confirmed.
+        # R8 P0 fix: legacy rows without structured ``level`` now return
+        # ``pending`` (fail-closed via structural proxy only) instead of
+        # using the candidate ``trigger_price`` as the breakout boundary.
+        # So this test must supply a structured ``level`` (the actual
+        # breakout boundary) on the trigger. Pre-R8 the trigger lacked
+        # ``level`` and relied on ``previous_compact.trigger_price`` (the
+        # candidate entry price) — that was the bug R8 P0 fixes.
+        previous_triggers_confirmed = [
+            {"type": "breakout_confirm", "timeframe": "15m", "level": expected_close - 5.0, "operator": ">"},
+        ]
+        previous_compact = {"trigger_price": expected_close - 5.0, "side": "LONG"}
+        progress = _trigger_progress(
+            previous_triggers_confirmed,
+            current_snapshot=snapshot,
+            current_decision={},
+            previous_compact=previous_compact,
+        )
+        self.assertEqual(
+            progress[0]["status"], "confirmed",
+            "R2 P2-1: breakout_confirm must be 'confirmed' when last_close "
+            f"({expected_close}) > level ({expected_close - 5.0}).",
+        )
+        # Case B: breakout_confirm with structured level above last_close * 1.001
+        # → invalidated (close < level * (1 - tol)).
+        previous_triggers_invalidated = [
+            {"type": "breakout_confirm", "timeframe": "15m", "level": expected_close + 100.0, "operator": ">"},
+        ]
+        previous_compact_inv = {"trigger_price": expected_close + 100.0, "side": "LONG"}
+        progress_inv = _trigger_progress(
+            previous_triggers_invalidated,
+            current_snapshot=snapshot,
+            current_decision={},
+            previous_compact=previous_compact_inv,
+        )
+        self.assertEqual(
+            progress_inv[0]["status"], "invalidated",
+            "R2 P2-1: breakout_confirm must be 'invalidated' when last_close "
+            f"({expected_close}) < level * (1 - 0.001) "
+            f"({(expected_close + 100.0) * 0.999}).",
+        )
+
+    def test_r2_p2_2_recent_failed_jobs_null_finished_at_old_started_at_excluded(self) -> None:
+        """R2 P2-NEW-2: a failed job with finished_at=NULL and old started_at
+        must NOT appear in recent_failed_jobs (7-day window applies to
+        COALESCE(finished_at, started_at)).
+
+        Also verifies the positive case: a failed job with finished_at=NULL
+        and recent started_at (1 hour ago) MUST appear — this is the
+        false-negative direction. Without COALESCE, this job would be
+        silently dropped.
+        """
+        # Insert a job that crashed months ago: finished_at=NULL,
+        # started_at=8 days ago.
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
+            "payload_json, status, started_at, finished_at, error_message) "
+            "VALUES ('test_crashed_old', 5, 'test', 'session_crashed_old', '{}', "
+            "'failed', datetime('now', '-8 days'), NULL, 'crashed months ago')"
+        )
+        # Insert a job that crashed recently: finished_at=NULL,
+        # started_at=1 hour ago. Must be included.
+        self.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
+            "payload_json, status, started_at, finished_at, error_message) "
+            "VALUES ('test_crashed_recent', 5, 'test', 'session_crashed_recent', '{}', "
+            "'failed', datetime('now', '-1 hour'), NULL, 'crashed recently')"
+        )
+        self.conn.commit()
+        recent = self.repo.recent_failed_jobs(limit=10)
+        types = [r.get("job_type") for r in recent]
+        # Negative: old crashed job must NOT appear.
+        self.assertNotIn(
+            "test_crashed_old", types,
+            "R2 P2-2: a crashed job with finished_at=NULL and started_at older "
+            "than 7 days must NOT appear in recent_failed_jobs — the 7-day "
+            "window must apply to COALESCE(finished_at, started_at), not "
+            "finished_at alone.",
+        )
+        # Positive: recent crashed job MUST appear (false-negative direction).
+        self.assertIn(
+            "test_crashed_recent", types,
+            "R2 P2-2: a crashed job with finished_at=NULL and started_at 1 hour "
+            "ago MUST appear in recent_failed_jobs. Without COALESCE, this "
+            "would be silently dropped — a false negative in failure reporting.",
+        )
+
+    # ── R5 P0-1: chanlun fields + independent trend_stage/invalid_level ────
+    def test_r5_p0_1_compact_chanlun_reads_real_engine_fields(self) -> None:
+        """R5 P0-1: ``_compact_chanlun`` must read the real ``chanlun_engine``
+        output fields (``current_bi_direction`` / ``central_zone`` / ``signal``
+        / ``trend_direction`` / ``current_structure`` / ``divergence_candidate``)
+        — NOT the non-existent ``bi.direction`` / ``zd.level`` keys the
+        pre-R5 code read.
+
+        Pre-R5 production feature packs always carried ``None`` for every
+        chanlun field because the engine never produced ``bi``/``zd`` keys.
+        This test verifies:
+        (1) Producer: ``analyze_chanlun`` returns ``current_bi_direction`` /
+            ``central_zone`` / ``signal`` / etc. on a 20-candle series.
+        (2) Consumer: ``build_multi_timeframe_feature_pack`` surfaces those
+            real values on the per-TF compact module.
+        (3) Independent: ``trend_stage`` and ``invalid_level`` are top-level
+            fields on the per-TF compact (not buried inside ``modules``).
+        (4) Revert-fail: removing ``current_bi_direction`` from the engine
+            output makes the compact value ``None`` (proves the read path).
+        """
+        from plugins.crypto_guard.analysis.chanlun_engine import analyze_chanlun
+        from plugins.crypto_guard.reasoning.decision_context import (
+            _compact_chanlun,
+            build_multi_timeframe_feature_pack,
+        )
+
+        # (1) Producer: real engine output with 20 candles → real fields.
+        candles = [
+            {"open_time": i * 60000, "open": 100.0 + (i % 3) * 0.5,
+             "high": 105.0 + (i % 4) * 0.7, "low": 99.0 + (i % 2) * 0.3,
+             "close": 102.5 + (i % 3) * 0.4, "close_time": (i + 1) * 60000,
+             "volume": 1000.0}
+            for i in range(20)
+        ]
+        chanlun = analyze_chanlun(candles, analysis_time_utc=1_200_000)
+        self.assertIn(
+            "current_bi_direction", chanlun,
+            "R5 P0-1 producer: chanlun_engine must return current_bi_direction.",
+        )
+        self.assertIn(
+            "signal", chanlun,
+            "R5 P0-1 producer: chanlun_engine must return signal.",
+        )
+        # (2) Consumer: _compact_chanlun reads the real fields.
+        compact = _compact_chanlun(chanlun)
+        self.assertIn(
+            "current_bi_direction", compact,
+            "R5 P0-1 consumer: _compact_chanlun must surface current_bi_direction "
+            "(pre-R5 code read bi.direction which never existed).",
+        )
+        self.assertIn(
+            "signal", compact,
+            "R5 P0-1 consumer: _compact_chanlun must surface signal.",
+        )
+        self.assertIn(
+            "central_zone", compact,
+            "R5 P0-1 consumer: _compact_chanlun must surface central_zone.",
+        )
+        # R6 REC-R6-2: confidence + evidence_role must be surfaced so
+        # the LLM can distinguish high/low credibility chanlun signals.
+        self.assertIn(
+            "confidence", compact,
+            "R6 REC-R6-2: _compact_chanlun must surface confidence so the "
+            "LLM can weigh chanlun evidence credibility (PRD FR-2).",
+        )
+        self.assertIn(
+            "evidence_role", compact,
+            "R6 REC-R6-2: _compact_chanlun must surface evidence_role.",
+        )
+        # Revert-fail: removing current_bi_direction makes compact value None.
+        broken_chanlun = dict(chanlun)
+        broken_chanlun.pop("current_bi_direction")
+        broken_compact = _compact_chanlun(broken_chanlun)
+        self.assertIsNone(
+            broken_compact.get("current_bi_direction"),
+            "R5 P0-1 revert-fail: removing current_bi_direction from engine output "
+            "must make the compact value None — proves the read path is real.",
+        )
+        # Old keys must NOT be present (proves we removed them).
+        self.assertNotIn(
+            "bi_direction", compact,
+            "R5 P0-1: legacy bi_direction key must NOT be present (was reading "
+            "non-existent bi.direction).",
+        )
+        self.assertNotIn(
+            "zd_level", compact,
+            "R5 P0-1: legacy zd_level key must NOT be present.",
+        )
+        # (3) Independent trend_stage / invalid_level on the per-TF compact.
+        # Build a snapshot with modules containing chanlun + price_action +
+        # trend_stage, then check the feature pack surfaces trend_stage and
+        # invalid_level as top-level fields.
+        snapshot = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_200_000,
+            "mode": "scheduled",
+            "timeframes": ["15m"],
+            "profiles": {"15m": {"candles_count": 20, "market_structure": "bullish"}},
+            "timeframe_modules": {
+                "15m": {
+                    "price_action": {"invalid_level": 99.5, "market_structure": "bullish"},
+                    "trend_stage": {"trend_stage": "middle", "stage": "middle"},
+                    "chanlun": chanlun,
+                },
+            },
+            "data_quality": {"health": {"15m": {"ready": True, "last_close_time": 1_200_000}}},
+        }
+        pack = build_multi_timeframe_feature_pack(snapshot)
+        per_tf = (pack.get("modules") or {}).get("15m") or {}
+        self.assertEqual(
+            per_tf.get("trend_stage"), "middle",
+            "R5 P0-1: trend_stage must be a top-level field on the per-TF compact "
+            "(previously buried inside modules.trend_stage and never surfaced).",
+        )
+        self.assertEqual(
+            per_tf.get("invalid_level"), 99.5,
+            "R5 P0-1: invalid_level must be a top-level field on the per-TF compact "
+            "(previously buried inside modules.price_action).",
+        )
+
+    # ── R5 P0-2: withheld candidate survives cross-round ─────────────────
+    def test_r5_p0_2_withheld_candidate_survives_cross_round(self) -> None:
+        """R5 P0-2: a withheld A-grade candidate's trigger_price/side must
+        survive the round boundary so the next round's continuity can judge
+        whether the candidate is still alive.
+
+        Pre-R5 ``build_market_analysis_state`` only persisted ``trade_plan``
+        when ``has_trade_plan=True`` — withheld candidates (signal_grade=A
+        but blocked by risk/judge) had their trigger_price/side silently
+        dropped, so ``_compact_previous_state`` returned ``trigger_price=None``
+        for every withheld round. This test verifies:
+        (1) Persistence: when ``decision.candidate_trade_plan`` is set
+            (withheld), the analysis_states.state_json carries
+            ``candidate_trade_plan``.
+        (2) Recovery: ``_compact_previous_state`` reads the candidate and
+            returns its trigger_price/side with plan_status='withheld'.
+        (3) Revert-fail: removing candidate_trade_plan from state makes
+            trigger_price None — proves the read path is real.
+        """
+        import json as _json
+        from plugins.crypto_guard.reasoning.analysis_state import (
+            build_market_analysis_state,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            _compact_previous_state,
+        )
+
+        # Round 1: A-grade signal, withheld by risk (has_trade_plan=False,
+        # candidate_trade_plan populated).
+        snapshot = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_200_000,
+            "mode": "scheduled",
+            "timeframes": ["15m"],
+            "profiles": {"15m": {"market_structure": "bullish"}},
+            "modules": {
+                "price_action": {"market_structure": "bullish", "key_levels": {}},
+                "momentum": {},
+                "trend_stage": {"trend_stage": "middle"},
+            },
+        }
+        decision = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_200_000,
+            "timeframes": ["15m"],
+            "decision": "wait_for_breakout",
+            "signal_grade": "A",
+            "confidence": 0.78,
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "candidate_trade_plan": {
+                "side": "LONG",
+                "trigger_price": 100.0,
+                "entry_price": 100.5,
+                "stop_loss": 95.0,
+            },
+            "risk_check": {"ok": False, "reasons": ["RR_below_threshold"]},
+            "suggested_actions": ["create_opportunity_watch"],
+            "market_bias": "bullish",
+        }
+        state = build_market_analysis_state(snapshot=snapshot, decision=decision)
+        # (1) Persistence: state carries candidate_trade_plan.
+        self.assertIn(
+            "candidate_trade_plan", state,
+            "R5 P0-2: state must carry candidate_trade_plan so it persists "
+            "to analysis_states.state_json.",
+        )
+        self.assertEqual(
+            (state.get("candidate_trade_plan") or {}).get("side"), "LONG",
+            "R5 P0-2: candidate_trade_plan.side must survive build_market_analysis_state.",
+        )
+        # Simulate the row shape that latest_analysis_state_for_continuity
+        # returns: ``state`` is decoded from state_json.
+        previous_row = {
+            "id": 100,
+            "analysis_time": 1_200_000,
+            "signal_grade": "A",
+            "state": state,
+        }
+        # (2) Recovery: _compact_previous_state reads candidate.
+        compact = _compact_previous_state(previous_row)
+        self.assertEqual(
+            compact.get("plan_status"), "withheld",
+            "R5 P0-2: plan_status must be 'withheld' when no executable plan "
+            "but candidate exists.",
+        )
+        self.assertEqual(
+            compact.get("trigger_price"), 100.0,
+            "R5 P0-2: trigger_price must be recovered from candidate_trade_plan "
+            "(pre-R5 returned None for every withheld round).",
+        )
+        self.assertEqual(
+            compact.get("side"), "LONG",
+            "R5 P0-2: side must be recovered from candidate_trade_plan.",
+        )
+        # (3) Revert-fail: remove candidate → trigger_price becomes None.
+        state_no_candidate = dict(state)
+        state_no_candidate["candidate_trade_plan"] = {"has_candidate": False}
+        previous_row_no_candidate = dict(previous_row)
+        previous_row_no_candidate["state"] = state_no_candidate
+        compact_no_candidate = _compact_previous_state(previous_row_no_candidate)
+        self.assertIsNone(
+            compact_no_candidate.get("trigger_price"),
+            "R5 P0-2 revert-fail: removing candidate_trade_plan from state must "
+            "make trigger_price None — proves the read path is real.",
+        )
+
+    # ── R5 P1-1: stale-but-ready health caught ──────────────────────────
+    def test_r5_p1_1_stale_but_ready_health_caught(self) -> None:
+        """R5 P1-1: ``ready=True`` but stale ``last_close_time`` must fire
+        ``BATCH_TIME_HEALTH_MISMATCH`` — pre-R5 only checked
+        ``last_close <= batch_at`` and missed 12h-stale snapshots.
+
+        Also verifies the fail-closed behavior: missing snapshot,
+        malformed data_quality, and malformed health now record as
+        unhealthy (previously silently skipped).
+
+        R8 P1 update: the snapshot now must include ALL 5 required TFs
+        (``1d/4h/1h/15m/5m``) to be judged healthy. The stale-but-ready
+        case below uses the full TF set with ``1h`` stale and the other
+        4 TFs fresh — the stale 1h must still fire. The fresh revert-fail
+        case uses all 5 TFs fresh — must NOT fire.
+        """
+        import json as _json
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_batch_time_health_mismatch,
+            BATCH_TIME_HEALTH_MISMATCH,
+        )
+
+        batch_id = "BATCH_R5_STALE"
+        analysis_time = 2_000_000_000_000
+        # 1h interval = 3_600_000 ms. 12h stale = batch_at - 12 * 3_600_000.
+        stale_close_1h = analysis_time - 12 * 3_600_000
+        # Fresh closes for the other 4 required TFs (within 2 intervals).
+        fresh_close_1d = analysis_time - 86_400_000  # 1d earlier
+        fresh_close_4h = analysis_time - 14_400_000  # 4h earlier
+        fresh_close_15m = analysis_time - 900_000    # 15m earlier
+        fresh_close_5m = analysis_time - 300_000     # 5m earlier
+
+        # Insert successful batch + completed symbol.
+        self.conn.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, "1h", analysis_time, "success",
+             _json.dumps(["BTCUSDT"])),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            (batch_id, "BTCUSDT", "completed"),
+        )
+        # Stale-but-ready snapshot: 1h stale, other 4 TFs fresh.
+        self.conn.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time, "scheduled", "{}",
+             _json.dumps({"health": {
+                 "1d": {"ready": True, "last_close_time": fresh_close_1d},
+                 "4h": {"ready": True, "last_close_time": fresh_close_4h},
+                 "1h": {"ready": True, "last_close_time": stale_close_1h},
+                 "15m": {"ready": True, "last_close_time": fresh_close_15m},
+                 "5m": {"ready": True, "last_close_time": fresh_close_5m},
+             }})),
+        )
+        snap_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Insert ga_decisions row referencing the snapshot.
+        self.conn.execute(
+            "INSERT INTO ga_decisions (symbol, analysis_time, "
+            "analysis_time_utc, decision_type, signal_grade, confidence, "
+            "decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, "
+            "feishu_actions_json, final_summary, raw_decision_json, batch_id, "
+            "snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time, "2033-05-18T08:33:20Z", "scheduled",
+             "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
+             "{}", batch_id, snap_id),
+        )
+        self.conn.commit()
+
+        # Run the diagnostic — stale-but-ready must fire.
+        issues = _check_batch_time_health_mismatch(self.repo)
+        codes = [i["type"] for i in issues]
+        self.assertIn(
+            BATCH_TIME_HEALTH_MISMATCH, codes,
+            "R5 P1-1: ready=True but 12h-stale last_close_time must fire "
+            "BATCH_TIME_HEALTH_MISMATCH (pre-R5 missed this).",
+        )
+
+        # Revert-fail: fresh last_close_time (within 1 interval) for ALL
+        # 5 required TFs → no fire.
+        self.conn.execute(
+            "DELETE FROM market_snapshots WHERE id = ?", (snap_id,),
+        )
+        fresh_close_1h_new = analysis_time - 60_000  # 1 minute ago — fresh
+        self.conn.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time, "scheduled", "{}",
+             _json.dumps({"health": {
+                 "1d": {"ready": True, "last_close_time": fresh_close_1d},
+                 "4h": {"ready": True, "last_close_time": fresh_close_4h},
+                 "1h": {"ready": True, "last_close_time": fresh_close_1h_new},
+                 "15m": {"ready": True, "last_close_time": fresh_close_15m},
+                 "5m": {"ready": True, "last_close_time": fresh_close_5m},
+             }})),
+        )
+        snap_id2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "UPDATE ga_decisions SET snapshot_id = ? WHERE batch_id = ?",
+            (snap_id2, batch_id),
+        )
+        self.conn.commit()
+        issues_fresh = _check_batch_time_health_mismatch(self.repo)
+        codes_fresh = [i["type"] for i in issues_fresh]
+        self.assertNotIn(
+            BATCH_TIME_HEALTH_MISMATCH, codes_fresh,
+            "R5 P1-1 revert-fail: fresh last_close_time for ALL 5 required "
+            "TFs must NOT fire BATCH_TIME_HEALTH_MISMATCH — proves the stale "
+            "bound is real.",
+        )
+
+        # Fail-closed: missing snapshot recorded as unhealthy.
+        self.conn.execute(
+            "DELETE FROM market_snapshots WHERE id = ?", (snap_id2,),
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET snapshot_id = NULL WHERE batch_id = ?",
+            (batch_id,),
+        )
+        self.conn.commit()
+        issues_missing = _check_batch_time_health_mismatch(self.repo)
+        codes_missing = [i["type"] for i in issues_missing]
+        self.assertIn(
+            BATCH_TIME_HEALTH_MISMATCH, codes_missing,
+            "R5 P1-1: missing snapshot must be fail-closed (recorded as "
+            "unhealthy, not silently skipped).",
+        )
+
+    # ── R5 P1-2: LLM prompt no duplicate feature pack + total budget ────
+    def test_r5_p1_2_llm_prompt_no_duplicate_feature_pack(self) -> None:
+        """R5 P1-2: ``_compact_snapshot`` must NOT emit ``timeframe_modules``
+        (duplicate of ``multi_timeframe_feature_pack.modules``), and the
+        final LLM prompt must be bounded by ``MAX_PROMPT_BYTES`` (48 KiB).
+
+        Pre-R5 the payload carried both ``multi_timeframe_feature_pack`` and
+        ``timeframe_modules`` (= ``feature_pack.modules``), sending the same
+        per-TF data twice — doubling token cost without adding information.
+        Also, the 24 KiB feature pack budget only constrained one pack; the
+        full prompt (with modules/historical_memory/open_positions) could
+        blow past 48 KiB.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            _compact_snapshot,
+            build_llm_decision_prompt,
+        )
+
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=1_750_000_000_000,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        compact = _compact_snapshot(snapshot)
+        # (1) Duplicate ``timeframe_modules`` removed.
+        self.assertNotIn(
+            "timeframe_modules", compact,
+            "R5 P1-2: _compact_snapshot must NOT emit timeframe_modules "
+            "(was a duplicate of multi_timeframe_feature_pack.modules).",
+        )
+        # Sanity: the canonical fields are still present.
+        self.assertIn(
+            "multi_timeframe_feature_pack", compact,
+            "R5 P1-2: multi_timeframe_feature_pack must still be present.",
+        )
+        self.assertIn(
+            "modules", compact,
+            "R5 P1-2: primary-TF modules must still be present.",
+        )
+
+        # (2) Total prompt bounded by MAX_PROMPT_BYTES (48 KiB).
+        deterministic_decision = {
+            "decision": "monitor_only",
+            "signal_grade": "D",
+            "confidence": 0.3,
+            "market_bias": "neutral",
+            "trend_stage": "unknown",
+        }
+        prompt = build_llm_decision_prompt(
+            snapshot, deterministic_decision, context=None,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+        self.assertLess(
+            prompt_bytes, 48 * 1024,
+            f"R5 P1-2: prompt must be bounded by 48 KiB (got {prompt_bytes} bytes). "
+            "Pre-R5 the budget only constrained the feature pack, not the final prompt.",
+        )
+
+        # (3) Revert-fail: large historical_memory trimmed to budget.
+        # R6 P2-R6-1 fix: use fields _build_memory_section actually reads
+        # (skill_name/finding/suggested_adjustment_json/status) — the
+        # pre-R6 test passed {"feedback": "x"*60000} which was silently
+        # discarded by _build_memory_section's field mapping, so the
+        # trim path was never exercised and the assertion was vacuous.
+        # 20 skills × 8KB finding → ~160KB memory section → trim fires.
+        big_memory_items = [
+            {
+                "skill_name": f"skill_{i}",
+                "finding": "A" * 8000,
+                "suggested_adjustment_json": "",
+                "status": "active",
+            }
+            for i in range(20)
+        ]
+        prompt_big = build_llm_decision_prompt(
+            snapshot, deterministic_decision,
+            context={"skill_feedback_memory": big_memory_items},
+        )
+        prompt_big_bytes = len(prompt_big.encode("utf-8"))
+        self.assertLess(
+            prompt_big_bytes, 48 * 1024,
+            f"R5 P1-2: oversized prompt must be trimmed to 48 KiB "
+            f"(got {prompt_big_bytes} bytes) by dropping historical_memory first. "
+            "R6 P2-R6-1: pre-fix test used a 60KB 'feedback' field that "
+            "_build_memory_section silently discarded — the trim path was "
+            "never exercised and the assertion was vacuous.",
+        )
+
+        # (4) R6 REC-R6-1: oversized modules triggers last-resort trim.
+        # Build a snapshot with a 60KB modules dict that cannot be trimmed
+        # by historical_memory/open_positions/active_watches removal alone.
+        big_modules_snapshot = dict(snapshot)
+        big_modules_snapshot["modules"] = {
+            "price_action": {"big_blob": "B" * 60_000},
+        }
+        prompt_modules = build_llm_decision_prompt(
+            big_modules_snapshot, deterministic_decision, context=None,
+        )
+        prompt_modules_bytes = len(prompt_modules.encode("utf-8"))
+        self.assertLess(
+            prompt_modules_bytes, 48 * 1024,
+            f"R6 REC-R6-1: oversized modules dict must trigger the "
+            f"last-resort trim tier (drop modules) to stay under 48 KiB "
+            f"(got {prompt_modules_bytes} bytes). Pre-R6 the trim only "
+            "covered historical_memory/open_positions/active_watches and "
+            "could not reduce an oversized modules dict.",
+        )
+
+    # ── R7 P0: trigger price semantic mismatch ──────────────────────────
+    def test_r7_p0_trigger_level_not_candidate_entry(self) -> None:
+        """R7 P0: ``_trigger_progress`` must judge confirmation against the
+        trigger's *own* structured ``level`` (the breakout boundary, e.g.
+        110), NOT against the candidate trade_plan's ``trigger_price``
+        (the entry price, e.g. 100).
+
+        Pre-R7 the consumer read ``previous_compact.trigger_price``. With
+        last_close=105 the candidate entry (100) was breached so the
+        consumer returned ``confirmed`` — but the actual breakout
+        boundary (110) was NOT breached. This false ``confirmed`` is
+        consumed by the GA deterministic continuity gate and can wrongly
+        release or block a plan.
+
+        Fix: ``_next_triggers`` now persists ``level``/``operator`` on
+        each trigger; ``_trigger_progress`` prefers ``trig.level`` and
+        only falls back to ``previous_compact.trigger_price`` for legacy
+        rows that lack the structured field.
+        """
+        from plugins.crypto_guard.reasoning.analysis_state import (
+            _next_triggers,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            _trigger_progress,
+        )
+
+        # Boundary: upper=110, lower=90. Candidate entry=100.
+        key_levels = {
+            "breakout_boundary": {"upper": 110.0, "lower": 90.0},
+        }
+        momentum = {"direction": "neutral"}
+        decision = {
+            "trade_plan": {"side": "LONG"},
+            "market_bias": "bullish",
+            "opportunity_watch": {},
+        }
+        triggers = _next_triggers(decision, key_levels, momentum)
+        # The breakout_confirm trigger carries level=110, operator=">".
+        breakout = next(t for t in triggers if t["type"] == "breakout_confirm")
+        self.assertEqual(
+            breakout.get("level"), 110.0,
+            "R7 P0: _next_triggers must persist level=breakout_boundary.upper "
+            "(110), not the candidate entry price (100).",
+        )
+        self.assertEqual(
+            breakout.get("operator"), ">",
+            "R7 P0: breakout_confirm operator must be '>'.",
+        )
+
+        # last_close=105: above candidate entry (100) but below breakout
+        # boundary (110). Must be ``pending`` (not confirmed).
+        current_snapshot = {
+            "profiles": {
+                "15m": {
+                    "market_structure": "bullish",
+                    "last_close": 105.0,
+                },
+            },
+            "modules": {
+                "price_action": {"last_close": 105.0},
+                "momentum": {"direction": "neutral"},
+            },
+        }
+        previous_compact = {
+            "trigger_price": 100.0,  # candidate entry — must NOT be used
+            "side": "LONG",
+        }
+        progress = _trigger_progress(
+            previous_triggers=triggers,
+            current_snapshot=current_snapshot,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status = next(
+            p["status"] for p in progress if p["type"] == "breakout_confirm"
+        )
+        self.assertNotEqual(
+            breakout_status, "confirmed",
+            "R7 P0: last_close=105 is below breakout level=110 — must NOT be "
+            "'confirmed'. Pre-R7 used candidate trigger_price=100 and wrongly "
+            "returned 'confirmed' when last_close crossed the entry but not "
+            "the breakout boundary.",
+        )
+
+        # Revert-fail (R8 P0 update): without structured level, the
+        # consumer MUST NOT fall back to candidate trigger_price=100 —
+        # that was the R7 bug (using entry price as the breakout boundary).
+        # After R8 P0, legacy rows without ``level`` return ``pending``
+        # (fail-closed) via the structural proxy only. This proves the
+        # structured-level path is the one producing ``confirmed``/
+        # ``invalidated``; the legacy path no longer falls back to a
+        # known-wrong semantic. Pre-R8 this assertion expected
+        # ``confirmed`` because the legacy fallback used candidate price.
+        triggers_no_level = [
+            {k: v for k, v in t.items() if k not in ("level", "operator")}
+            for t in triggers
+        ]
+        progress_legacy = _trigger_progress(
+            previous_triggers=triggers_no_level,
+            current_snapshot=current_snapshot,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status_legacy = next(
+            p["status"] for p in progress_legacy if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status_legacy, "pending",
+            "R8 P0: legacy rows without structured ``level`` must return "
+            "'pending' (fail-closed via structural proxy only), NOT "
+            "'confirmed' via candidate trigger_price fallback. Pre-R8 the "
+            "fallback used the candidate entry price (100) as the breakout "
+            "boundary, repeating the R7 semantic error.",
+        )
+
+        # Positive: last_close=115 (above breakout 110) → confirmed.
+        current_snapshot_confirmed = {
+            "profiles": {"15m": {"market_structure": "bullish", "last_close": 115.0}},
+            "modules": {
+                "price_action": {"last_close": 115.0},
+                "momentum": {"direction": "neutral"},
+            },
+        }
+        progress_confirmed = _trigger_progress(
+            previous_triggers=triggers,
+            current_snapshot=current_snapshot_confirmed,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status_confirmed = next(
+            p["status"] for p in progress_confirmed if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status_confirmed, "confirmed",
+            "R7 P0: last_close=115 above breakout level=110 → confirmed.",
+        )
+
+    # ── R7 P1: empty/malformed health fail-closed ───────────────────────
+    def test_r7_p1_empty_or_malformed_health_fail_closed(self) -> None:
+        """R7 P1: empty health dict (``{}``, ``{"health": {}}``, malformed
+        JSON, ``{"health": {"1h": "broken"}}``) must fail-closed as
+        ``BATCH_TIME_HEALTH_MISMATCH`` — pre-R7 zero-iterated the loop
+        and was silently treated as healthy.
+        """
+        import json as _json
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_batch_time_health_mismatch,
+            BATCH_TIME_HEALTH_MISMATCH,
+        )
+
+        malformed_cases = [
+            ("empty_data_quality", "{}"),
+            ("empty_health", _json.dumps({"health": {}})),
+            ("malformed_tf_entry", _json.dumps({"health": {"1h": "broken"}})),
+        ]
+
+        for case_name, dq_json in malformed_cases:
+            # Fresh batch per case to avoid cross-contamination.
+            batch_id = f"BATCH_R7_{case_name}"
+            # Unique analysis_time per case (market_snapshots has UNIQUE on
+            # symbol+analysis_time+mode).
+            analysis_time = 2_000_000_000_000 + hash(case_name) % 1_000_000
+            self.conn.execute(
+                "INSERT INTO analysis_batches (batch_id, primary_interval, "
+                "analysis_time, status, enabled_symbols_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (batch_id, "1h", analysis_time, "success",
+                 _json.dumps(["BTCUSDT"])),
+            )
+            self.conn.execute(
+                "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+                "VALUES (?, ?, ?)",
+                (batch_id, "BTCUSDT", "completed"),
+            )
+            self.conn.execute(
+                "INSERT INTO market_snapshots "
+                "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("BTCUSDT", analysis_time, "scheduled", "{}", dq_json),
+            )
+            snap_id = self.conn.execute(
+                "SELECT last_insert_rowid()",
+            ).fetchone()[0]
+            self.conn.execute(
+                "INSERT INTO ga_decisions (symbol, analysis_time, "
+                "analysis_time_utc, decision_type, signal_grade, confidence, "
+                "decision, skill_result_refs_json, evidence_json, "
+                "counter_evidence_json, risk_check_json, "
+                "feishu_actions_json, final_summary, raw_decision_json, "
+                "batch_id, snapshot_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BTCUSDT", analysis_time, "2033-05-18T08:33:20Z", "scheduled",
+                 "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
+                 "{}", batch_id, snap_id),
+            )
+            self.conn.commit()
+
+            issues = _check_batch_time_health_mismatch(self.repo)
+            codes = [i["type"] for i in issues]
+            self.assertIn(
+                BATCH_TIME_HEALTH_MISMATCH, codes,
+                f"R7 P1 [{case_name}]: data_quality_json={dq_json} must "
+                "fail-closed as BATCH_TIME_HEALTH_MISMATCH (pre-R7 zero-"
+                "iterated the health loop and was silently treated as healthy).",
+            )
+
+            # Verify the unhealthy reason is recorded.
+            issues_for_batch = [
+                i for i in issues
+                if i.get("details", {}).get("batch_id") == batch_id
+            ]
+            unhealthy = (
+                issues_for_batch[0]["details"].get("unhealthy_symbols", [])
+                if issues_for_batch else []
+            )
+            self.assertTrue(
+                any("BTCUSDT" in s for s in unhealthy),
+                f"R7 P1 [{case_name}]: BTCUSDT must be recorded as unhealthy "
+                f"(got {unhealthy}).",
+            )
+
+    # ── R7 P1: 48 KiB hard cap with oversized feature pack ─────────────
+    def test_r7_p1_prompt_hard_cap_oversized_feature_pack(self) -> None:
+        """R7 P1: when ``market_snapshot.multi_timeframe_feature_pack`` itself
+        is oversized (e.g. 100 KB), the trim tiers (historical_memory /
+        open_positions / modules) cannot reduce it — the function must
+        replace the feature pack with a minimal stub so the final prompt
+        stays under 48 KiB.
+
+        Pre-R7 the function returned the oversized prompt as-is: a 100KB
+        feature pack produced a 103KB prompt, blowing past the 48KB cap
+        and the LLM context window.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            build_llm_decision_prompt,
+        )
+
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=1_750_000_000_000,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        # Inject a 100 KB feature pack directly into market_snapshot.
+        # ``_compact_snapshot`` reads ``snapshot.multi_timeframe_feature_pack``
+        # and copies it into the payload — so this 100 KB pack flows into
+        # the prompt unless the trim stubs it.
+        # R9 P2-4 fix: use the production structure ``m.health.ready``
+        # (not pre-R8 ``m.ready``). The R8 minimal stub reads
+        # ``m.health.ready`` (correct path — feature pack module's health
+        # is a sub-dict, not a top-level field). Pre-R9 this fixture used
+        # the pre-R8 ``m.ready`` structure, which silently returned None
+        # in production — creating fixture drift that could mislead future
+        # test authors.
+        big_blob = "X" * 100_000
+        snapshot["multi_timeframe_feature_pack"] = {
+            "symbol": "BTCUSDT",
+            "modules": {
+                "1h": {
+                    "bias": "bullish",
+                    # Production structure: health is a sub-dict.
+                    "health": {"ready": True, "reason": ""},
+                    "big_blob": big_blob,
+                },
+            },
+        }
+        deterministic_decision = {
+            "decision": "monitor_only",
+            "signal_grade": "D",
+            "confidence": 0.3,
+            "market_bias": "neutral",
+            "trend_stage": "unknown",
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_750_000_000_000,
+        }
+        prompt = build_llm_decision_prompt(
+            snapshot, deterministic_decision, context=None,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+        self.assertLess(
+            prompt_bytes, 48 * 1024,
+            f"R7 P1: oversized feature pack (100KB) must be stubbed by the "
+            f"final hard-cap tier to stay under 48 KiB (got {prompt_bytes} "
+            "bytes). Pre-R7 the function returned the oversized prompt "
+            "as-is — a 100KB feature pack produced a 103KB prompt.",
+        )
+        # Sanity: the trimmed prompt still carries decision-critical fields.
+        self.assertIn("BTCUSDT", prompt)
+        self.assertIn("hard_rules", prompt)
+        # R9 P2-4: verify the minimal stub reads m.health.ready (not
+        # m.ready). With the production structure, the stub should
+        # preserve ``"ready":true`` from ``modules.1h.health.ready``.
+        self.assertIn(
+            '"ready":true', prompt,
+            "R9 P2-4: minimal stub must read m.health.ready (production "
+            "structure). Pre-R9 the fixture used the pre-R8 m.ready "
+            "structure, which would silently return None in production.",
+        )
+
+    # ── R8 P0: legacy trigger fallback returns pending (not confirmed) ───
+    def test_r8_p0_legacy_trigger_fallback_returns_pending(self) -> None:
+        """R8 P0: legacy trigger rows without structured ``level`` must
+        return ``pending`` (fail-closed via structural proxy only), NOT
+        ``confirmed`` via the candidate trade_plan's ``trigger_price``.
+
+        Pre-R8 the fallback for legacy rows (without structured ``level``)
+        was ``previous_compact.trigger_price`` — but that is the
+        *candidate entry price*, not the breakout boundary, so it
+        repeated the exact semantic error R7 fixed. After the production
+        migration the first round may still read legacy rows; falling
+        back to a known-wrong semantic is unsafe.
+
+        Fix: legacy rows without structured ``level`` now return
+        ``pending`` instead of using the candidate entry as a proxy
+        boundary. ``previous_compact.trigger_price`` is still used for
+        ``momentum_confirm`` (which checks side alignment, not price
+        crossing) — that path is semantically safe.
+        """
+        from plugins.crypto_guard.reasoning.analysis_state import (
+            _next_triggers,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            _trigger_progress,
+        )
+
+        # Boundary: upper=110, lower=90. Candidate entry=100.
+        key_levels = {
+            "breakout_boundary": {"upper": 110.0, "lower": 90.0},
+        }
+        momentum = {"direction": "neutral"}
+        decision = {
+            "trade_plan": {"side": "LONG"},
+            "market_bias": "bullish",
+            "opportunity_watch": {},
+        }
+        triggers = _next_triggers(decision, key_levels, momentum)
+        # Strip the structured level/operator to simulate a legacy row
+        # written by a pre-R7 producer.
+        legacy_triggers = [
+            {k: v for k, v in t.items() if k not in ("level", "operator")}
+            for t in triggers
+        ]
+        # last_close=105: above candidate entry (100) but below breakout
+        # boundary (110). Pre-R8 the legacy fallback used candidate price
+        # (100) as the boundary → 105 > 100 → 'confirmed' (wrong).
+        # Post-R8: legacy row → 'pending' (fail-closed).
+        current_snapshot = {
+            "profiles": {
+                "15m": {
+                    "market_structure": "bullish",
+                    "last_close": 105.0,
+                },
+            },
+            "modules": {
+                "price_action": {"last_close": 105.0},
+                "momentum": {"direction": "neutral"},
+            },
+        }
+        previous_compact = {
+            "trigger_price": 100.0,  # candidate entry — must NOT be used
+            "side": "LONG",
+        }
+        progress = _trigger_progress(
+            previous_triggers=legacy_triggers,
+            current_snapshot=current_snapshot,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status = next(
+            p["status"] for p in progress if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status, "pending",
+            "R8 P0: legacy row without structured level must return 'pending' "
+            "(fail-closed via structural proxy only), NOT 'confirmed' via "
+            "candidate trigger_price=100 fallback. Pre-R8 the fallback used "
+            "the candidate entry price as the breakout boundary, repeating "
+            "the R7 semantic error.",
+        )
+
+        # Revert-fail: with structured level=110, last_close=105 is
+        # below level * (1 - tol) = 109.89 → 'invalidated'. This
+        # proves the structured-level path produces a *decisive* result
+        # (confirmed or invalidated) based on the actual boundary,
+        # whereas the legacy path (without level) returns 'pending'.
+        # The two paths disagree by design: the structured path has
+        # enough info to decide; the legacy path does not.
+        progress_structured = _trigger_progress(
+            previous_triggers=triggers,
+            current_snapshot=current_snapshot,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status_structured = next(
+            p["status"] for p in progress_structured if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status_structured, "invalidated",
+            "R8 P0 revert-fail: structured level=110 + last_close=105 is "
+            "below 110 * (1 - 0.001) = 109.89 → 'invalidated' (decisive "
+            "based on the actual boundary). The legacy path returned "
+            "'pending' — the disagreement proves the structured-level "
+            "path uses the real boundary while the legacy path no longer "
+            "falls back to candidate price.",
+        )
+
+        # Positive: structured level=110 + last_close=115 → 'confirmed'.
+        # This proves the structured path is still functional (the R8 fix
+        # only removed the legacy fallback, not the structured path).
+        current_snapshot_confirmed = {
+            "profiles": {"15m": {"market_structure": "bullish", "last_close": 115.0}},
+            "modules": {
+                "price_action": {"last_close": 115.0},
+                "momentum": {"direction": "neutral"},
+            },
+        }
+        progress_confirmed = _trigger_progress(
+            previous_triggers=triggers,
+            current_snapshot=current_snapshot_confirmed,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status_confirmed = next(
+            p["status"] for p in progress_confirmed if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status_confirmed, "confirmed",
+            "R8 P0 positive: structured level=110 + last_close=115 → 'confirmed' "
+            "(structured path still functional after R8 fix).",
+        )
+
+        # R9 P1-1: legacy row with bullish market_structure + bullish
+        # momentum must STILL return 'pending' (not 'confirmed' via the
+        # pre-R9 structural proxy). The pre-R9 structural proxy returned
+        # 'confirmed' for any legacy LONG candidate when momentum was
+        # bullish, even when the actual breakout boundary was NOT
+        # breached — repeating the R7/R8 semantic error. R9 removes the
+        # structural proxy entirely; legacy rows now fail-closed to
+        # 'pending' unconditionally.
+        current_snapshot_bullish = {
+            "profiles": {
+                "15m": {
+                    "market_structure": "bullish",
+                    "last_close": 105.0,  # < 110 boundary
+                },
+            },
+            "modules": {
+                "price_action": {"last_close": 105.0},
+                "momentum": {"direction": "bullish"},  # NOT neutral
+            },
+        }
+        progress_bullish = _trigger_progress(
+            previous_triggers=legacy_triggers,
+            current_snapshot=current_snapshot_bullish,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        breakout_status_bullish = next(
+            p["status"] for p in progress_bullish if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            breakout_status_bullish, "pending",
+            "R9 P1-1: legacy row without structured level must return 'pending' "
+            "even when market_structure=bullish and momentum=bullish. Pre-R9 the "
+            "structural proxy returned 'confirmed' in this case, repeating the R7/R8 "
+            "semantic error (candidate entry breached but breakout boundary not). "
+            "R9 removes the structural proxy; legacy rows fail-closed unconditionally.",
+        )
+
+        # R9 P2-1: structured level=0.0 (valid float, falsy in Python)
+        # must be treated as a structured level (not fall back to legacy).
+        # Pre-R9 the truthiness check `and trig_level` silently dropped
+        # 0.0, falling back to the legacy path. With level=0.0 and
+        # last_close=-1.0, the structured path should return 'invalidated'
+        # (-1.0 < 0.0 * (1 - tol) = -0.001).
+        legacy_triggers_zero_level = [
+            {"type": "breakout_confirm", "timeframe": "15m",
+             "level": 0.0, "operator": ">"},
+        ]
+        current_snapshot_zero = {
+            "profiles": {"15m": {"market_structure": "bullish", "last_close": -1.0}},
+            "modules": {
+                "price_action": {"last_close": -1.0},
+                "momentum": {"direction": "bullish"},
+            },
+        }
+        progress_zero = _trigger_progress(
+            previous_triggers=legacy_triggers_zero_level,
+            current_snapshot=current_snapshot_zero,
+            current_decision={"decision": "monitor_only", "suggested_actions": []},
+            previous_compact=previous_compact,
+        )
+        zero_status = next(
+            p["status"] for p in progress_zero if p["type"] == "breakout_confirm"
+        )
+        self.assertEqual(
+            zero_status, "invalidated",
+            "R9 P2-1: structured level=0.0 must be treated as a real level (not "
+            "falsy). Pre-R9 the truthiness check `and trig_level` silently dropped "
+            "0.0, falling back to the legacy path. With last_close=-1.0 the "
+            "structured path should return 'invalidated' (-1.0 < 0.0 * 0.999).",
+        )
+
+    # ── R8 P1: required timeframe set validation ───────────────────────
+    def test_r8_p1_missing_required_timeframes_fail_closed(self) -> None:
+        """R8 P1: a snapshot with only ``5m`` healthy (missing
+        ``1d/4h/1h/15m``) must fail-closed as ``BATCH_TIME_HEALTH_MISMATCH``.
+
+        Pre-R8 the check validated *each present* TF's readiness but not
+        the *required TF set*. A snapshot with only ``5m`` healthy was
+        judged healthy because the loop iterated only the TFs present in
+        ``tf_health``. The hourly report's multi-TF bias depends on all
+        five TFs being ready at ``batch.analysis_time`` — a partial set
+        means the LLM was missing major-TF context.
+        """
+        import json as _json
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_batch_time_health_mismatch,
+            BATCH_TIME_HEALTH_MISMATCH,
+        )
+
+        # Case A: only 5m healthy, missing 1d/4h/1h/15m.
+        # analysis_time uniquely scoped to avoid UNIQUE collisions.
+        analysis_time_a = 2_100_000_000_000
+        batch_id_a = "BATCH_R8_MISSING_TFS"
+        self.conn.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id_a, "1h", analysis_time_a, "success",
+             _json.dumps(["BTCUSDT"])),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            (batch_id_a, "BTCUSDT", "completed"),
+        )
+        # 5m only — healthy but missing 1d/4h/1h/15m.
+        dq_a = _json.dumps({
+            "health": {
+                "5m": {
+                    "ready": True,
+                    "last_close_time": analysis_time_a - 300_000,  # 5m earlier
+                },
+            }
+        })
+        self.conn.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time_a, "scheduled", "{}", dq_a),
+        )
+        snap_id_a = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO ga_decisions (symbol, analysis_time, "
+            "analysis_time_utc, decision_type, signal_grade, confidence, "
+            "decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, "
+            "feishu_actions_json, final_summary, raw_decision_json, "
+            "batch_id, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time_a, "2036-07-18T08:33:20Z", "scheduled",
+             "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
+             "{}", batch_id_a, snap_id_a),
+        )
+        self.conn.commit()
+
+        issues = _check_batch_time_health_mismatch(self.repo)
+        codes = [i["type"] for i in issues]
+        self.assertIn(
+            BATCH_TIME_HEALTH_MISMATCH, codes,
+            "R8 P1: snapshot with only 5m healthy (missing 1d/4h/1h/15m) "
+            "must fail-closed as BATCH_TIME_HEALTH_MISMATCH. Pre-R8 the loop "
+            "only iterated present TFs and judged the snapshot healthy.",
+        )
+
+        # Verify the unhealthy reason records the missing required TFs.
+        issues_for_batch = [
+            i for i in issues
+            if i.get("details", {}).get("batch_id") == batch_id_a
+        ]
+        unhealthy = (
+            issues_for_batch[0]["details"].get("unhealthy_symbols", [])
+            if issues_for_batch else []
+        )
+        self.assertTrue(
+            any("missing_required_tf" in s for s in unhealthy),
+            f"R8 P1: unhealthy_symbols must record 'missing_required_tf:...' "
+            f"(got {unhealthy}).",
+        )
+
+        # Case B: all 5 required TFs healthy → no issue.
+        analysis_time_b = 2_100_000_001_000
+        batch_id_b = "BATCH_R8_ALL_TFS_HEALTHY"
+        self.conn.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id_b, "1h", analysis_time_b, "success",
+             _json.dumps(["BTCUSDT"])),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            (batch_id_b, "BTCUSDT", "completed"),
+        )
+        dq_b = _json.dumps({
+            "health": {
+                "1d": {"ready": True, "last_close_time": analysis_time_b - 86_400_000},
+                "4h": {"ready": True, "last_close_time": analysis_time_b - 14_400_000},
+                "1h": {"ready": True, "last_close_time": analysis_time_b - 3_600_000},
+                "15m": {"ready": True, "last_close_time": analysis_time_b - 900_000},
+                "5m": {"ready": True, "last_close_time": analysis_time_b - 300_000},
+            }
+        })
+        self.conn.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time_b, "scheduled", "{}", dq_b),
+        )
+        snap_id_b = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO ga_decisions (symbol, analysis_time, "
+            "analysis_time_utc, decision_type, signal_grade, confidence, "
+            "decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, "
+            "feishu_actions_json, final_summary, raw_decision_json, "
+            "batch_id, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time_b, "2036-07-18T08:33:20Z", "scheduled",
+             "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
+             "{}", batch_id_b, snap_id_b),
+        )
+        self.conn.commit()
+
+        issues_b = _check_batch_time_health_mismatch(self.repo)
+        issues_for_b = [
+            i for i in issues_b
+            if i.get("details", {}).get("batch_id") == batch_id_b
+        ]
+        self.assertFalse(
+            issues_for_b,
+            "R8 P1 positive: all 5 required TFs healthy → no issue.",
+        )
+
+    # ── R12 REC: not_ready branch with full 5-TF set ────────────────────
+    def test_r12_rec_not_ready_branch_with_full_5tf_set(self) -> None:
+        """R12 REC: ``_check_batch_time_health_mismatch`` ``not_ready``
+        branch must be directly tested with a full 5-TF set where one
+        TF has ``ready=False``.
+
+        Pre-R12 the ``not_ready`` branch (report_diagnostics.py:2189-2191)
+        was only exercised by broken fault seeds that used
+        ``primary_interval="1h"`` with only ``1h`` in the health dict.
+        Because ``_required_timeframes_for_batch("1h")`` returns the
+        fallback 5-TF set, the diagnostic fired ``missing_required_tf``
+        instead of ``not_ready`` — so the ``not_ready`` branch was never
+        reached. A regression removing the ``not_ready`` check would still
+        pass the fault seed.
+
+        Fix: insert a snapshot with all 5 required TFs present, where
+        ``1h`` has ``ready=False``, and assert the diagnostic fires with
+        ``1h:not_ready`` in the unhealthy reason (not
+        ``missing_required_tf``).
+        """
+        import json as _json
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_batch_time_health_mismatch,
+            BATCH_TIME_HEALTH_MISMATCH,
+        )
+
+        analysis_time = 2_100_000_010_000
+        batch_id = "BATCH_R12_NOT_READY"
+        self.conn.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, "15m", analysis_time, "success",
+             _json.dumps(["BTCUSDT"])),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            (batch_id, "BTCUSDT", "completed"),
+        )
+        # All 5 required TFs present; ``1h`` has ``ready=False``.
+        dq = _json.dumps({
+            "health": {
+                "1d": {"ready": True, "last_close_time": analysis_time - 86_400_000},
+                "4h": {"ready": True, "last_close_time": analysis_time - 14_400_000},
+                "1h": {"ready": False, "last_close_time": 0},
+                "15m": {"ready": True, "last_close_time": analysis_time - 900_000},
+                "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
+            }
+        })
+        self.conn.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time, "scheduled", "{}", dq),
+        )
+        snap_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO ga_decisions (symbol, analysis_time, "
+            "analysis_time_utc, decision_type, signal_grade, confidence, "
+            "decision, skill_result_refs_json, evidence_json, "
+            "counter_evidence_json, risk_check_json, "
+            "feishu_actions_json, final_summary, raw_decision_json, "
+            "batch_id, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("BTCUSDT", analysis_time, "2036-07-18T08:33:20Z", "scheduled",
+             "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
+             "{}", batch_id, snap_id),
+        )
+        self.conn.commit()
+
+        issues = _check_batch_time_health_mismatch(self.repo)
+        issues_for_batch = [
+            i for i in issues
+            if i.get("details", {}).get("batch_id") == batch_id
+        ]
+        self.assertTrue(
+            issues_for_batch,
+            "R12 REC: 5-TF set with 1h not ready must fire "
+            "BATCH_TIME_HEALTH_MISMATCH.",
+        )
+        unhealthy = (
+            issues_for_batch[0]["details"].get("unhealthy_symbols", [])
+            if issues_for_batch else []
+        )
+        # Must contain ``1h:not_ready`` (NOT ``missing_required_tf``).
+        self.assertTrue(
+            any("1h:not_ready" in s for s in unhealthy),
+            f"R12 REC: unhealthy_symbols must contain '1h:not_ready' "
+            f"(got {unhealthy}). Pre-R12 the fault seed used "
+            f"primary_interval='1h' with only 1h in the health dict, "
+            f"causing the diagnostic to fire 'missing_required_tf' "
+            f"instead of 'not_ready' — so the not_ready branch was "
+            f"never exercised by fault injection.",
+        )
+        # Negative assertion: must NOT contain ``missing_required_tf``.
+        self.assertFalse(
+            any("missing_required_tf" in s for s in unhealthy),
+            f"R12 REC: unhealthy_symbols must NOT contain "
+            f"'missing_required_tf' (all 5 TFs are present). "
+            f"Got {unhealthy}.",
+        )
+
+    # ── R10 P2: config-driven required TF loading ──────────────────────
+    def test_r10_p2_required_timeframes_loaded_from_config(self) -> None:
+        """R10 P2: ``_required_timeframes_for_batch`` must load from
+        ``scheduler.yaml`` keyed by ``primary_interval``, not return a
+        hardcoded literal.
+
+        Pre-R10 the existing R8 P1 test used ``primary_interval="1h"``
+        which doesn't match any job in ``scheduler.yaml`` (only
+        ``primary_interval="15m"`` matches). The fallback was always
+        used, so the config-driven path was never exercised. A regression
+        that broke config loading entirely would still pass the existing
+        test because the fallback returns the same 5-TF set.
+
+        Fix: add a test case with ``primary_interval="15m"`` that matches
+        ``scheduler.yaml:analyze_market_15m.timeframes`` and verify the
+        returned set equals the config value. Add a revert-fail: mock
+        ``load_config`` to return a config with a different TF set for
+        ``primary_interval="15m"`` and verify the function returns the
+        mocked set (proving it's config-driven, not hardcoded).
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _required_timeframes_for_batch,
+            _REQUIRED_TIMEFRAMES_FALLBACK,
+        )
+
+        # Case A (baseline sanity check, NOT a revert-fail): with the
+        # REAL scheduler.yaml, ``primary_interval="15m"`` must return the
+        # 5-TF set. This is a sanity check that the function works on the
+        # real config. It cannot distinguish config-driven from fallback
+        # because the fallback set is identical to the config set — that
+        # distinguishing assertion is the mock block at the bottom.
+        result_15m = _required_timeframes_for_batch("15m")
+        self.assertEqual(
+            result_15m,
+            frozenset({"1d", "4h", "1h", "15m", "5m"}),
+            "R10 P2 baseline: primary_interval='15m' must load from "
+            "scheduler.yaml (config-driven path). Pre-R10 the function "
+            "returned the fallback for any primary_interval that didn't "
+            "match — but '15m' matches analyze_market_15m.",
+        )
+
+        # Case B: ``primary_interval="1h"`` does NOT match any job. The
+        # function must return the fallback (defensive behavior).
+        result_1h = _required_timeframes_for_batch("1h")
+        self.assertEqual(
+            result_1h,
+            _REQUIRED_TIMEFRAMES_FALLBACK,
+            "R10 P2: primary_interval='1h' (no matching job) must return "
+            "the fallback set.",
+        )
+
+        # Case C: ``primary_interval=None`` must return the fallback.
+        result_none = _required_timeframes_for_batch(None)
+        self.assertEqual(
+            result_none,
+            _REQUIRED_TIMEFRAMES_FALLBACK,
+            "R10 P2: primary_interval=None must return the fallback set.",
+        )
+
+        # Revert-fail: mock ``load_config`` to return a config with a
+        # DIFFERENT TF set for ``primary_interval="15m"``. If the
+        # function is truly config-driven (not hardcoded), it must
+        # return the mocked set. A regression that hardcodes the
+        # fallback would fail this assertion.
+        from unittest.mock import patch as _mock_patch
+        from plugins.crypto_guard.config.loader import CryptoGuardConfig
+
+        # Build a minimal config with a custom TF set for primary_interval="15m".
+        # Use a 3-TF set that's clearly different from the default 5-TF set.
+        custom_tfs = ["1d", "4h", "1h"]  # missing 15m, 5m
+        from pathlib import Path as _Path
+        custom_cfg = CryptoGuardConfig(
+            trading_mode={},
+            symbols={},
+            scheduler={
+                "jobs": {
+                    "analyze_market_15m": {
+                        "task": "analyze_market",
+                        "params": {
+                            "primary_interval": "15m",
+                            "timeframes": custom_tfs,
+                        },
+                    },
+                },
+            },
+            strategies={},
+            database_path=_Path("dummy"),
+        )
+
+        # Revert-fail (stronger than Case A above): mock ``load_config``
+        # to return a config with a DIFFERENT TF set. If the function is
+        # truly config-driven (not hardcoded), it must return the mocked
+        # set. Case A only verifies set equality with the real
+        # scheduler.yaml — but the fallback set is identical to the
+        # config set, so Case A cannot distinguish config-driven from
+        # fallback. This mock block is the actual revert-fail.
+        import plugins.crypto_guard.config.loader as loader_mod
+
+        def _fake_load_config(*args, **kwargs):
+            return custom_cfg
+
+        with _mock_patch.object(loader_mod, "load_config", _fake_load_config):
+            result_custom = _required_timeframes_for_batch("15m")
+        self.assertEqual(
+            result_custom,
+            frozenset(custom_tfs),
+            "R10 P2 revert-fail: when load_config returns a config with "
+            "timeframes=['1d','4h','1h'] for primary_interval='15m', the "
+            "function must return frozenset({'1d','4h','1h'}) — proving it's "
+            "config-driven. A regression that hardcodes the fallback would "
+            "return the 5-TF default set instead.",
+        )
+
+    # ── R8 P1: stub ready path + analysis_continuity trim + final cap ──
+    def test_r8_p1_stub_ready_path_and_oversized_continuity(self) -> None:
+        """R8 P1: three sub-fixes for the LLM prompt size trim ladder.
+
+        1. **Stub ready path**: minimal stub must read ``m.health.ready``
+           (correct path — feature pack module's health is a sub-dict,
+           not a top-level field). Pre-R8 the stub read ``m.ready`` which
+           is always ``None`` in production, hiding the real readiness
+           state behind a silent None.
+
+        2. **analysis_continuity trim tier**: an oversized
+           ``analysis_continuity`` block (whose own 12 KiB budget is
+           per-block, not per-prompt) can combine with other sections
+           to push the prompt past 48 KiB. Pre-R8 the trim ladder never
+           touched it. Now drop it before falling back to the minimal
+           stub.
+
+        3. **Final hard cap**: if every trim tier fails to bring the
+           prompt under budget, replace the payload with a minimal safe
+           fallback (decision-critical fields only) so the prompt is
+           guaranteed under budget. Pre-R8 the function returned the
+           oversized prompt as a last resort.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            build_llm_decision_prompt,
+        )
+
+        # ── Sub-fix 1: stub ready path uses m.health.ready ──
+        # Build a snapshot whose feature pack has health.ready=true. The
+        # oversized feature pack (100KB) forces the minimal stub path.
+        big_blob = "X" * 100_000
+        snapshot = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=1_750_000_000_000,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        snapshot["multi_timeframe_feature_pack"] = {
+            "symbol": "BTCUSDT",
+            "modules": {
+                "1h": {
+                    "bias": "bullish",
+                    # Real production structure: health is a sub-dict.
+                    "health": {"ready": True, "reason": ""},
+                    "big_blob": big_blob,
+                },
+            },
+        }
+        deterministic_decision = {
+            "decision": "monitor_only",
+            "signal_grade": "D",
+            "confidence": 0.3,
+            "market_bias": "neutral",
+            "trend_stage": "unknown",
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_750_000_000_000,
+        }
+        prompt = build_llm_decision_prompt(
+            snapshot, deterministic_decision, context=None,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+        self.assertLess(
+            prompt_bytes, 48 * 1024,
+            f"R8 P1: oversized feature pack (100KB) must be stubbed and stay "
+            f"under 48 KiB (got {prompt_bytes} bytes).",
+        )
+        # The minimal stub preserves the ready field from m.health.ready.
+        # Pre-R8 the stub read m.ready (top-level) which is None in
+        # production — so the stub would NOT contain "ready":true.
+        # Post-R8 the stub reads m.health.ready correctly.
+        # Note: the stub only includes modules that have a small enough
+        # big_blob to fit. With 100KB big_blob in modules.1h, the stub
+        # only keeps ready/bias (drops big_blob), so "ready":true appears.
+        self.assertIn(
+            '"ready":true', prompt,
+            "R8 P1: minimal stub must read m.health.ready (correct path). "
+            "Pre-R8 the stub read m.ready (top-level, always None in "
+            "production) — so 'ready':true would NOT appear in the stub. "
+            "Post-R8 it reads m.health.ready correctly.",
+        )
+
+        # ── Sub-fix 2: analysis_continuity trim tier ──
+        # Build a snapshot with an oversized analysis_continuity (50KB).
+        # The trim ladder must drop analysis_continuity before modules.
+        snapshot_b = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=1_750_000_000_000,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        big_continuity = "Y" * 50_000
+        snapshot_b["analysis_continuity"] = {
+            "contract_version": "analysis_continuity_v1",
+            "schema_version": 1,
+            "continuity_status": "ok",
+            "previous": {"big_blob": big_continuity},
+            "delta": {},
+            "size_budget_bytes": 12288,
+        }
+        prompt_b = build_llm_decision_prompt(
+            snapshot_b, deterministic_decision, context=None,
+        )
+        prompt_b_bytes = len(prompt_b.encode("utf-8"))
+        self.assertLess(
+            prompt_b_bytes, 48 * 1024,
+            f"R8 P1: oversized analysis_continuity (50KB) must be trimmed "
+            f"and stay under 48 KiB (got {prompt_b_bytes} bytes). Pre-R8 the "
+            "trim ladder never touched analysis_continuity.",
+        )
+        # Confirm analysis_continuity was trimmed (not present in prompt).
+        # The trim tier drops it entirely, so "analysis_continuity" should
+        # NOT appear in the prompt body (or appears as a stub from the
+        # lazy build_multi_timeframe_feature_pack fallback — but in this
+        # case the snapshot's analysis_continuity is dropped by the trim).
+        # We check the prompt body size to confirm trim happened.
+        # Note: if the snapshot's analysis_continuity was dropped, the
+        # prompt should be much smaller than the untrimmed size.
+        untrimmed_size_hint = len(big_continuity)  # 50_000
+        self.assertLess(
+            prompt_b_bytes, untrimmed_size_hint,
+            "R8 P1: analysis_continuity must be trimmed (prompt must be "
+            "smaller than the 50KB continuity blob).",
+        )
+        # R9 P2-3: assert that ``modules`` content is still present in
+        # the trimmed prompt — proving ``analysis_continuity`` was trimmed
+        # BEFORE ``modules`` (not the other way around). Pre-R9 the test
+        # only checked the prompt was under 48 KiB, which a regression that
+        # swapped the trim order (modules first, then analysis_continuity)
+        # would also pass — silently losing primary-TF indicator detail
+        # (price_action/momentum/smc/chanlun) before losing continuity
+        # context. The trim order is correct in source (analysis_continuity
+        # trimmed at line 207, modules at line 212) but not asserted in
+        # tests. We now assert that the price_action module content (which
+        # only lives in ``modules``, not in the compact feature pack
+        # stub) is still in the prompt.
+        self.assertIn(
+            "price_action", prompt_b,
+            "R9 P2-3: modules.price_action must be retained when "
+            "analysis_continuity is trimmed. The trim order is "
+            "analysis_continuity → modules — a regression swapping the "
+            "order would trim modules first (losing price_action detail) "
+            "and pass the size check anyway. Asserting price_action is "
+            "still present proves the order is correct.",
+        )
+
+        # ── Sub-fix 3: final hard cap (defensive guard) ──
+        # The safe_payload fallback is a defensive guard for the case where
+        # every trim tier fails. R9 P2-2 fix: ``MAX_PROMPT_BYTES`` is now
+        # a module-level constant so we can monkey-patch it to a very small
+        # value (10 bytes) — this forces the trim ladder to never get under
+        # budget, so the final safe_payload fallback engages. We then
+        # assert the prompt is under the patched cap AND contains the
+        # ``_trim_note`` marker AND the minimal payload fields only.
+        import plugins.crypto_guard.reasoning.llm_agent_judge as judge_mod
+        from unittest.mock import patch as _mock_patch
+
+        snapshot_c = self._phase_a_helper_build_snapshot(
+            symbol="BTCUSDT", analysis_time_ms=1_750_000_000_000,
+            bias="bullish", stage="middle", structure="bullish",
+            momentum_dir="bullish", candles_count=250,
+        )
+        deterministic_decision_c = {
+            "decision": "monitor_only",
+            "signal_grade": "D",
+            "confidence": 0.3,
+            "market_bias": "neutral",
+            "trend_stage": "unknown",
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_750_000_000_000,
+            # R11 P2 / R12 P2-1: strategy_name/strategy_version are
+            # required by ``output_requirements.must_keep`` and are
+            # carried by ``deterministic_decision`` in production (set
+            # by ``ga_judge.py:631-632``). Pre-R12 the test fixture
+            # omitted these fields, so ``safe_dr.get()`` returned None
+            # either way and the R11 P2 source fix was never revert-fail
+            # tested. Add them here so the assertions below are
+            # meaningful.
+            "strategy_name": "ga_sop_degraded",
+            "strategy_version": "1.0",
+        }
+        # Build the prompt normally first to confirm it's under 48 KiB.
+        prompt_c_normal = build_llm_decision_prompt(
+            snapshot_c, deterministic_decision_c, context=None,
+        )
+        self.assertLess(
+            len(prompt_c_normal.encode("utf-8")), 48 * 1024,
+            "Baseline: normal-sized prompt must already be under 48 KiB.",
+        )
+        # Monkey-patch ``MAX_PROMPT_BYTES`` to 10 bytes — smaller than
+        # even SYSTEM_PROMPT alone. Every trim tier will fail to bring
+        # the prompt under 10 bytes, so the final safe_payload fallback
+        # must engage. The safe_payload path constructs a minimal dict
+        # with only decision-critical fields.
+        with _mock_patch.object(judge_mod, "MAX_PROMPT_BYTES", 10):
+            prompt_c = build_llm_decision_prompt(
+                snapshot_c, deterministic_decision_c, context=None,
+            )
+        prompt_c_bytes = len(prompt_c.encode("utf-8"))
+        # The safe_payload is still prefixed by SYSTEM_PROMPT (which is
+        # much larger than 10 bytes), so the prompt will NOT be under 10
+        # bytes — but it will be the minimal safe_payload (no modules,
+        # no market_snapshot, no historical_memory, etc.).
+        # Assert the safe_payload marker is in the prompt (behavioral
+        # evidence that the fallback fired — not just a source string
+        # match).
+        self.assertIn(
+            '"_trim_note":"prompt_over_budget_minimal_fallback"',
+            prompt_c,
+            "R9 P2-2: safe_payload fallback must fire when MAX_PROMPT_BYTES "
+            "is patched to an unreachable value. The prompt must contain the "
+            "'prompt_over_budget_minimal_fallback' trim note (behavioral "
+            "evidence, not just source-level string match). Pre-R9 the test "
+            "only checked source code for the string, which a regression that "
+            "removed the construction but kept the marker in a comment would "
+            "silently pass.",
+        )
+        # Assert the minimal payload fields are present.
+        self.assertIn(
+            '"symbol":"BTCUSDT"', prompt_c,
+            "R9 P2-2: safe_payload must include symbol field.",
+        )
+        self.assertIn(
+            '"decision":"monitor_only"', prompt_c,
+            "R9 P2-2: safe_payload must include deterministic_reference.decision.",
+        )
+        # Assert that non-safe fields are NOT present (proving the
+        # safe_payload path was taken, not the normal path).
+        self.assertNotIn(
+            '"multi_timeframe_feature_pack"',
+            prompt_c,
+            "R9 P2-2: safe_payload must NOT include multi_timeframe_feature_pack "
+            "(it should be dropped in the minimal fallback).",
+        )
+        # R10 P1: parse the safe_payload JSON and assert top-level
+        # ``symbol`` and ``analysis_time_utc`` are non-null. Pre-R10 the
+        # code read ``payload.get("symbol")`` which returned None —
+        # ``symbol`` lives inside ``payload["market_snapshot"]``. The
+        # existing assertion ``'"symbol":"BTCUSDT"' in prompt_c`` passes
+        # vacuously because ``deterministic_reference.symbol`` serializes
+        # to the same string. A stricter JSON parse catches the bug.
+        # Extract the JSON payload from the prompt (after the SYSTEM_PROMPT
+        # header and ``输入：`` separator).
+        json_start = prompt_c.find("\n输入：\n")
+        self.assertGreater(
+            json_start, -1,
+            "R10 P1: prompt must contain the ``输入：`` separator before the JSON payload.",
+        )
+        json_str = prompt_c[json_start + len("\n输入：\n"):]
+        safe_payload_parsed = json.loads(json_str)
+        self.assertEqual(
+            safe_payload_parsed.get("symbol"), "BTCUSDT",
+            "R10 P1: safe_payload top-level symbol must be 'BTCUSDT' (not null). "
+            "Pre-R10 the code read payload.get('symbol') which returned None because "
+            "symbol lives inside payload['market_snapshot']. The existing string "
+            "assertion passes vacuously because deterministic_reference.symbol "
+            "serializes to the same string.",
+        )
+        self.assertEqual(
+            safe_payload_parsed.get("analysis_time_utc"), 1_750_000_000_000,
+            "R10 P1: safe_payload top-level analysis_time_utc must be "
+            "1750000000000 (not null). Pre-R10 the code read "
+            "payload.get('analysis_time_utc') which returned None.",
+        )
+        # R11 P2 / R12 P2-1: assert strategy_name/strategy_version are
+        # surfaced in the safe_payload (both top-level and inside
+        # ``deterministic_reference``). Pre-R11 the safe_payload included
+        # ``output_requirements.must_keep`` demanding these fields but
+        # never provided them — a self-contradicting prompt payload. The
+        # R11 fix added them to the key lists, but the test fixture
+        # (modified above) and assertions (added here) are what make the
+        # fix revert-fail. Revert: drop ``strategy_name`` /
+        # ``strategy_version`` from the safe_payload key lists in
+        # ``llm_agent_judge.py`` (both the safe_payload fallback and the
+        # earlier trim tier) — these assertions must FAIL.
+        self.assertEqual(
+            safe_payload_parsed.get("strategy_name"), "ga_sop_degraded",
+            "R11 P2: safe_payload top-level strategy_name must be "
+            "'ga_sop_degraded' (not null). Pre-R11 the safe_payload "
+            "omitted this field even though output_requirements.must_keep "
+            "demanded it.",
+        )
+        self.assertEqual(
+            safe_payload_parsed.get("strategy_version"), "1.0",
+            "R11 P2: safe_payload top-level strategy_version must be '1.0' "
+            "(not null). Pre-R11 the safe_payload omitted this field even "
+            "though output_requirements.must_keep demanded it.",
+        )
+        safe_dr_ref = safe_payload_parsed.get("deterministic_reference") or {}
+        self.assertEqual(
+            safe_dr_ref.get("strategy_name"), "ga_sop_degraded",
+            "R11 P2: safe_payload deterministic_reference.strategy_name "
+            "must be 'ga_sop_degraded'. Pre-R11 the key list filtered it "
+            "out via ``if k in safe_dr``.",
+        )
+        self.assertEqual(
+            safe_dr_ref.get("strategy_version"), "1.0",
+            "R11 P2: safe_payload deterministic_reference.strategy_version "
+            "must be '1.0'. Pre-R11 the key list filtered it out.",
+        )
+
 
 
 if __name__ == "__main__":

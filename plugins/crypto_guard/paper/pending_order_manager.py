@@ -118,8 +118,16 @@ def cancel_conflict_pending_orders(repo: CryptoGuardRepository) -> dict[str, Any
         side = str(order["side"] or "").upper()
 
         # Get the latest GA decision for this symbol
+        # R13 P1 defense-in-depth: order by ``analysis_time`` (INTEGER NOT NULL,
+        # schema.sql:148) instead of ``analysis_time_utc`` (TEXT). Although
+        # R13 P0 ensures ``analysis_time_utc`` is always an ISO string (and
+        # ISO strings sort lexicographically the same as chronological
+        # order), the integer column is the canonical chronological key
+        # and is unaffected by any future regression that might re-introduce
+        # mixed integer/ISO-text population. ``id DESC`` as a tiebreaker
+        # for rows inserted within the same millisecond.
         latest_decision = repo.conn.execute(
-            "SELECT id, market_bias, signal_grade FROM ga_decisions WHERE symbol=? ORDER BY analysis_time_utc DESC LIMIT 1",
+            "SELECT id, market_bias, signal_grade FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
             (symbol,),
         ).fetchone()
 

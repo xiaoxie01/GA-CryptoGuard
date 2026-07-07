@@ -1809,7 +1809,7 @@ def _check_htf_support_reason_inconsistent(repo: CryptoGuardRepository) -> list[
         SELECT id, symbol, risk_check_json, analysis_time_utc
         FROM ga_decisions
         WHERE risk_check_json IS NOT NULL
-          AND datetime(analysis_time_utc) >= datetime(?)
+          AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
         ORDER BY id DESC
         LIMIT 500
         """,
@@ -1859,7 +1859,7 @@ def _check_chop_regime_boosted(repo: CryptoGuardRepository) -> list[dict[str, An
         SELECT id, symbol, market_regime_gate_json, analysis_time_utc
         FROM ga_decisions
         WHERE market_regime_gate_json IS NOT NULL
-          AND datetime(analysis_time_utc) >= datetime(?)
+          AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
         ORDER BY id DESC
         LIMIT 500
         """,

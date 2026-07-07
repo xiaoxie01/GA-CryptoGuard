@@ -145,7 +145,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     market_regime_gate = _fetch_market_regime_gate_stats(repo)
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=batches_reported)
-    market_data_quality = _fetch_market_data_quality(repo)
+    market_data_quality = _fetch_market_data_quality(repo, analysis_time_utc=batch_state.get("analysis_time"))
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -696,7 +696,12 @@ def render_ga_hourly_summary(
                 win_rate = short["wins"] / short["count"] * 100 if short["count"] > 0 else 0
                 lines.append(f"- SHORT：{short['count']} 笔，胜率 {win_rate:.0f}%，avg R={short['avg_r']:.2f}")
 
-    lines.extend(["", "**三、可执行机会（S/A/B 且通过执行门禁）**"])
+    # P1-10 (07-05 final review): title previously said "S/A/B" but
+    # ``_opportunity_classifier`` already demotes B to observation via
+    # ``PAPER_ORDER_GRADES = {"S", "A"}`` (see strategy/grade_config.py).
+    # The title must match the executable gate policy so the report does
+    # not promise a B-grade executable section that never appears.
+    lines.extend(["", "**三、可执行机会（S/A 且通过执行门禁）**"])
     if not executable:
         lines.append("- 暂无可执行机会")
     # Index open orders by symbol for position-aware display
@@ -959,7 +964,7 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         return {"error": str(exc), "real_pnl_count": 0, "pseudo_r_count": 0}
 
 
-def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
+def _fetch_market_data_quality(repo: CryptoGuardRepository, *, analysis_time_utc: int | None = None) -> dict[str, Any]:
     """P0-5: Fetch market data quality for the hourly report.
 
     Aggregates per-symbol per-TF health using assess_health. Returns a dict
@@ -967,6 +972,12 @@ def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
     and ``deferred_analyses`` (list). When the config or DB is unavailable,
     returns ``degraded=False`` with empty symbols (fail-open for the report
     text path — the generation layer fail-closed is handled elsewhere).
+
+    Phase B (07-05): ``analysis_time_utc`` anchors the health assessment to
+    the same batch cutoff the report is rendering. When ``None``, falls back
+    to ``latest_closed_close_time_ms("15m", utc_ms())`` (wall-clock). The
+    chosen analysis_time is surfaced in the returned dict under
+    ``analysis_time`` so the renderer and diagnostics can reference it.
     """
     try:
         from plugins.crypto_guard.config.loader import load_config
@@ -978,9 +989,14 @@ def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         required_samples = market_data_cfg.get("required_samples", {})
         tfs = list(market_data_cfg.get("analysis_window", {}).keys()) or ["1d", "4h", "1h", "15m", "5m"]
 
-        # Determine the analysis time for health assessment — use the latest
-        # closed 15m candle close_time as the canonical reference.
-        analysis_time = latest_closed_close_time_ms("15m", utc_ms())
+        # Phase B (07-05): use the batch's analysis_time when provided so the
+        # health check is anchored to the same batch cutoff as the rest of the
+        # report. Fall back to the wall-clock latest 15m close only when the
+        # caller did not supply a batch analysis_time (e.g. ad-hoc invocations).
+        if analysis_time_utc is not None:
+            analysis_time = int(analysis_time_utc)
+        else:
+            analysis_time = latest_closed_close_time_ms("15m", utc_ms())
 
         # Get active symbols from the repo
         symbols = repo.active_analysis_symbols()
@@ -1016,6 +1032,7 @@ def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
             "degraded": any_degraded,
             "symbols": symbols_md,
             "deferred_analyses": deferred,
+            "analysis_time": analysis_time,
         }
     except Exception as exc:
         LOGGER.warning("_fetch_market_data_quality failed: %s", exc)
@@ -1027,6 +1044,7 @@ def _fetch_market_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
             "degraded": True,
             "symbols": {},
             "deferred_analyses": [],
+            "analysis_time": int(analysis_time_utc) if analysis_time_utc is not None else None,
             "error": str(exc),
             "fail_closed": True,
         }
@@ -1693,6 +1711,29 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "risk_check": _safe_json(row.get("risk_check_json"), {}),
         "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
         "trade_plan": trade_plan,
+        # Phase E (07-05): plan lifecycle fields. candidate_trade_plan is
+        # the deterministic plan preserved for audit even when execution is
+        # blocked (LLM failure / risk rejection / continuity invalidated).
+        # plan_status / plan_source / plan_blockers carry the structured
+        # reason so the report can surface the actual blocking stage
+        # instead of collapsing to "缺交易计划".
+        "candidate_trade_plan": raw.get("candidate_trade_plan"),
+        "plan_status": raw.get("plan_status"),
+        "plan_source": raw.get("plan_source"),
+        "plan_blockers": raw.get("plan_blockers") or [],
+        "llm_status": raw.get("llm_status"),
+        "llm_error": raw.get("llm_error"),
+        # Phase F (07-05): raw vs effective grade/score. raw_signal_grade
+        # / raw_score are the deterministic SOP's pre-gate conclusions.
+        # effective_signal_grade / effective_execution_confidence are the
+        # post-gate canonical values. grade_adjustments records every
+        # downgrade with reason code so the report can surface the
+        # hysteresis/clamp/LLM failure reason.
+        "raw_signal_grade": raw.get("raw_signal_grade"),
+        "raw_score": raw.get("raw_score"),
+        "effective_signal_grade": raw.get("effective_signal_grade"),
+        "effective_execution_confidence": raw.get("effective_execution_confidence"),
+        "grade_adjustments": raw.get("grade_adjustments") or [],
         # P0 latency fields exposed for render helpers.
         "analysis_time": int(row.get("analysis_time") or 0),
         "created_at": row.get("created_at"),
@@ -1737,6 +1778,13 @@ def _opportunity_classifier(row: dict[str, Any]) -> dict[str, Any]:
 
     if grade not in {"S", "A", "B"}:
         return {"tier": "no_edge", "blockers": [f"grade={grade}"]}
+
+    # Phase F (07-05): B belongs to observation only — never executable.
+    # Uses PAPER_ORDER_GRADES from the single grade configuration source
+    # so the controller and report share one policy.
+    from plugins.crypto_guard.strategy.grade_config import PAPER_ORDER_GRADES
+    if grade not in PAPER_ORDER_GRADES:
+        return {"tier": "observation", "blockers": [f"grade={grade}_observation_only"]}
 
     if confidence < MIN_CONFIDENCE_FOR_PAPER_ORDER:
         blockers.append(f"confidence<{MIN_CONFIDENCE_FOR_PAPER_ORDER:.2f}")
@@ -1783,6 +1831,37 @@ def _format_opportunity_row(
     confidence = float(row.get("confidence") or 0)
     analysis_time = int(row.get("analysis_time") or 0)
     created_at = row.get("created_at")
+    # Phase F (07-05): render raw vs effective grade. When raw_signal_grade
+    # differs from canonical signal_grade (post-gate), show "原始评分 X%
+    # · 执行等级 Y" so B/95% never reads as a high-confidence executable.
+    raw_signal_grade = str(row.get("raw_signal_grade") or "").upper()
+    raw_score = row.get("raw_score")
+    try:
+        raw_score_text = f"{float(raw_score) * 100:.0f}%" if raw_score is not None else f"{confidence * 100:.0f}%"
+    except (TypeError, ValueError):
+        raw_score_text = f"{confidence * 100:.0f}%"
+    grade_adjustments = row.get("grade_adjustments") or []
+    # Summarize grade_adjustments into a short reason code list.
+    adj_texts: list[str] = []
+    for adj in grade_adjustments:
+        if not isinstance(adj, dict):
+            continue
+        code = str(adj.get("code") or "")
+        if code == "hysteresis":
+            adj_texts.append("评级迟滞")
+        elif code == "clamp_sa_evidence":
+            adj_texts.append("S/A 证据不足")
+        elif code == "llm_parse_failed":
+            adj_texts.append("LLM 解析失败")
+        elif code == "llm_disabled":
+            adj_texts.append("LLM 已禁用")
+        elif code == "performance_gate_degraded":
+            adj_texts.append("Performance 降级")
+        elif code == "performance_gate_watch_only":
+            adj_texts.append("Performance 阻断")
+        elif code:
+            adj_texts.append(code)
+    adj_suffix = f"（{'；'.join(adj_texts)}）" if adj_texts else ""
     # P2-13: age based on analysis_time (market time), not created_at (DB insert time)
     age_min = ""
     if analysis_time > 0:
@@ -1810,6 +1889,15 @@ def _format_opportunity_row(
     details = [bias, stage, pos_status, age_text]
     details_text = " · ".join(x for x in details if x)
     reason = _humanize_gate_blockers(blockers, row)
+    # Phase F (07-05): build the grade display. When grade is B/C/D and
+    # raw_score is high, show "原始评分 X% · 执行等级 Y{suffix}" so it
+    # never reads as "B 级 95%" (which implies a high-confidence
+    # executable B). For S/A, keep the legacy "等级 X · 置信度 Y%" format
+    # but append the suffix if adjustments exist.
+    if grade in {"B", "C", "D"} or adj_suffix:
+        grade_line = f"原始评分 {raw_score_text} · 执行等级 {grade}{adj_suffix}"
+    else:
+        grade_line = f"{grade}级 · {confidence * 100:.0f}%{adj_suffix}"
     # Phase D (07-03): for observation rows, append the structured
     # 市场/门禁 reason block so the user sees multi-TF context before
     # gate terminology. This ensures "交易计划尚未形成" is never the
@@ -1822,18 +1910,29 @@ def _format_opportunity_row(
     # block is appended for them.
     if tier_label == "可执行":
         result = (
-            f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
+            f"- **{symbol}** · {grade_line} · **{status_text}**\n"
             f"  {details_text}\n"
             f"  条件：{reason}"
         )
     else:
         result = (
-            f"- **{symbol}** · {grade}级 · {confidence * 100:.0f}% · **{status_text}**\n"
+            f"- **{symbol}** · {grade_line} · **{status_text}**\n"
             f"  {details_text}"
         )
         market_gate_lines = _format_observation_market_and_gate_reasons(row)
         if market_gate_lines:
             result += "\n  " + "\n  ".join(market_gate_lines)
+    # Phase E (07-05): when candidate_trade_plan exists with structured
+    # blockers (LLM failure / risk rejection / continuity invalidated),
+    # append the candidate summary so the operator sees the deterministic
+    # path produced a plan that was then blocked. This is required by
+    # Phase A Fact 4 — the report must mention "候选计划已生成" / "LLM 失败".
+    candidate = row.get("candidate_trade_plan")
+    plan_blockers = row.get("plan_blockers") or []
+    if isinstance(candidate, dict) and plan_blockers:
+        candidate_summary = _trade_plan_summary(row)
+        if candidate_summary and candidate_summary not in result:
+            result += f"\n  {candidate_summary}"
     return result
 
 
@@ -2140,8 +2239,62 @@ def _signal_report_lines(symbol: str, signal: dict[str, Any], open_orders: list[
     trend = decision.get("trend_stage") or signal.get("trend_stage") or "-"
     bias = decision.get("market_bias") or signal.get("direction") or "-"
     conclusion = _analysis_conclusion(symbol, decision)
+    # Phase F (07-05): render raw vs effective grade. When raw_signal_grade
+    # differs from the canonical signal_grade (post-gate), show both so the
+    # operator can see the original signal strength and the downgrade reason.
+    # Format: "等级 B（原始评分 95%）" when raw_score >= 0.80 but effective
+    # grade is B due to hysteresis/clamp. Also surface grade_adjustments
+    # reason parenthetically when present.
+    raw_signal_grade = str(decision.get("raw_signal_grade") or "").upper()
+    raw_score = decision.get("raw_score")
+    effective_signal_grade = str(decision.get("effective_signal_grade") or grade or "").upper()
+    grade_adjustments = decision.get("grade_adjustments") or []
+    raw_score_text = ""
+    if raw_score is not None:
+        try:
+            raw_score_text = f"{float(raw_score) * 100:.0f}%"
+        except (TypeError, ValueError):
+            raw_score_text = ""
+    # Build the grade display.
+    grade_display = str(grade or "-")
+    grade_suffix_parts: list[str] = []
+    if raw_signal_grade and raw_signal_grade != str(grade).upper() and raw_score_text:
+        grade_suffix_parts.append(f"原始评分 {raw_score_text}")
+    # Summarize grade_adjustments into a short reason code list.
+    if grade_adjustments:
+        adj_texts: list[str] = []
+        for adj in grade_adjustments:
+            if not isinstance(adj, dict):
+                continue
+            code = str(adj.get("code") or "")
+            if code == "hysteresis":
+                adj_texts.append("评级迟滞")
+            elif code == "clamp_sa_evidence":
+                adj_texts.append("S/A 证据不足")
+            elif code == "llm_parse_failed":
+                adj_texts.append("LLM 解析失败")
+            elif code == "llm_disabled":
+                adj_texts.append("LLM 已禁用")
+            elif code == "performance_gate_degraded":
+                adj_texts.append("Performance 降级")
+            elif code == "performance_gate_watch_only":
+                adj_texts.append("Performance 阻断")
+            elif code:
+                adj_texts.append(code)
+        if adj_texts:
+            grade_suffix_parts.append("；".join(adj_texts))
+    grade_suffix = f"（{'；'.join(grade_suffix_parts)}）" if grade_suffix_parts else ""
+    # Compose the headline. When grade is B/C/D and raw_score is high, show
+    # "原始评分 95% · 执行等级 B" so it never reads as "B 级 95%" (which
+    # would imply a high-confidence executable B).
+    if raw_score_text and (str(grade).upper() in {"B", "C", "D"} or grade_suffix):
+        headline_grade = f"原始评分 {raw_score_text} · 执行等级 {grade_display}{grade_suffix}"
+    else:
+        headline_grade = f"等级 {grade_display}，置信度 {confidence_text}"
+        if grade_suffix:
+            headline_grade = f"{headline_grade}{grade_suffix}"
     lines = [
-        f"- **{symbol}**：{decision_name}，等级 {grade}，置信度 {confidence_text}",
+        f"- **{symbol}**：{decision_name}，{headline_grade}",
         f"  - 研判来源：{_analysis_source_text(decision)}",
         f"  - 趋势状态：{trend}；市场倾向：{bias}",
         f"  - GA 分析结论：{conclusion}",
@@ -2172,6 +2325,58 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
     if decision.get("has_trade_plan") and isinstance(plan, dict):
         tps = _compact_items([tp.get("price") for tp in plan.get("take_profits", []) if isinstance(tp, dict)], max_items=3)
         return f"{plan.get('side')} {plan.get('entry_type')}，入场 {plan.get('entry_price') or plan.get('trigger_price')}，止损 {plan.get('stop_loss')}，止盈 {tps or '-'}，风控={'通过' if risk.get('ok') else '未通过'}"
+    # Phase E (07-05): plan lifecycle separation. Surface the candidate
+    # plan and the structured blocker (LLM failure / risk rejection /
+    # continuity invalidated) rather than collapsing to "缺交易计划". This
+    # is required by Phase A Fact 4 — the report must mention
+    # "候选计划已生成" / "LLM 失败" so the operator can see the
+    # deterministic path produced a candidate that was then blocked.
+    candidate = decision.get("candidate_trade_plan")
+    plan_status = str(decision.get("plan_status") or "")
+    blockers = decision.get("plan_blockers") or []
+    llm_status = str(decision.get("llm_status") or "").lower()
+    if isinstance(candidate, dict):
+        # Build a human-readable blocker summary.
+        blocker_texts: list[str] = []
+        for b in blockers:
+            if isinstance(b, dict):
+                code = str(b.get("code") or "")
+                stage = str(b.get("stage") or "")
+                detail = str(b.get("detail") or "")
+                if code == "llm_parse_failed":
+                    blocker_texts.append("LLM 解析失败")
+                elif code == "llm_disabled":
+                    blocker_texts.append("LLM 已禁用")
+                elif code == "risk_rejected":
+                    blocker_texts.append(f"风控未通过（{detail}）")
+                elif code == "continuity_trigger_invalidated":
+                    blocker_texts.append("前次触发已被反转")
+                elif code:
+                    blocker_texts.append(f"{code}（{stage}）")
+        # Assemble the summary text.
+        side = candidate.get("side") or ""
+        entry = candidate.get("entry_price") or candidate.get("trigger_price") or "-"
+        stop = candidate.get("stop_loss") or "-"
+        if blocker_texts:
+            blockers_text = "；".join(blocker_texts)
+            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被 {blockers_text} 阻断执行。"
+        if llm_status in {"failed", "disabled"}:
+            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被 LLM 失败阻断执行。"
+        if plan_status == "withheld":
+            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被阻断执行。"
+    if llm_status in {"failed", "disabled"}:
+        # P1-10 (07-05 final review): if a candidate was expected
+        # (plan_status=withheld/executable) but is missing, surface that
+        # as the root cause. If plan_status=no_plan, the deterministic
+        # path did not produce a candidate — the LLM had nothing to
+        # fail over, so do NOT claim "候选计划已生成". The previous
+        # text "候选计划已生成，但被 LLM 失败阻断执行" was wrong for
+        # low-score / no-edge decisions where no candidate exists.
+        if plan_status == "no_plan":
+            return "LLM 失败但本轮无 deterministic candidate（no-edge / 低分路径）。"
+        if plan_status in {"withheld", "executable"}:
+            return "候选计划已生成，但被 LLM 失败阻断执行。"
+        return "LLM 失败阻断本轮分析。"
     if risk.get("reasons"):
         return "无可执行模拟盘计划；风控原因：" + "；".join(str(x) for x in risk.get("reasons", [])[:2])
     return "暂无完整交易计划。"

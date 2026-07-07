@@ -25,15 +25,41 @@ def validate_json(name: str, payload: dict[str, Any]) -> tuple[bool, str | None]
         return False, str(exc)
 
 
-def no_edge_decision(symbol: str, reason: str) -> dict[str, Any]:
+def no_edge_decision(
+    symbol: str,
+    reason: str,
+    *,
+    analysis_time_utc: int,
+    timeframe_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Phase G (07-05): ``analysis_time_utc`` is keyword-only and required so
+    # callers cannot silently drop the snapshot-authoritative analysis time.
+    # The schema requires ``analysis_time_utc: integer, minimum=1`` — passing
+    # 0 or a wall-clock fallback would re-introduce the original defect
+    # (schema-invalid no_edge fallback crashing the chain on the second
+    # validate_json call). Callers must source this from snapshot.
+    if not isinstance(analysis_time_utc, int) or isinstance(analysis_time_utc, bool):
+        raise TypeError(
+            "no_edge_decision requires a strict positive integer analysis_time_utc"
+        )
+    if analysis_time_utc <= 0:
+        raise ValueError(
+            "no_edge_decision requires analysis_time_utc > 0; got "
+            f"{analysis_time_utc}. The caller must pass snapshot-authoritative "
+            "time; wall-clock fallbacks are forbidden."
+        )
     # R1-3 (07-03 final review): include the structured fields required by
     # the tightened ga_decision.schema.json so the no_edge fallback is
-    # schema-valid. All TFs are marked unknown/closed=False because the
-    # decision was produced without a valid snapshot.
-    tf_ctx = {
-        tf: {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0}
-        for tf in ("1d", "4h", "1h", "15m")
-    }
+    # schema-valid. When timeframe_context is supplied (snapshot-derived),
+    # use it verbatim; otherwise fall back to unknown/closed=False markers
+    # for each required TF so schema validation still passes.
+    if timeframe_context is not None:
+        tf_ctx = dict(timeframe_context)
+    else:
+        tf_ctx = {
+            tf: {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0}
+            for tf in ("1d", "4h", "1h", "15m")
+        }
     return {
         "symbol": symbol,
         "decision": "no_edge",
@@ -49,6 +75,7 @@ def no_edge_decision(symbol: str, reason: str) -> dict[str, Any]:
         "trade_plan": None,
         "opportunity_watch": None,
         "suggested_actions": ["ignore"],
+        "analysis_time_utc": int(analysis_time_utc),
         "timeframe_context": tf_ctx,
         "alignment": "unknown",
         "htf_conflict": False,

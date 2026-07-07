@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.utils import INTERVAL_MS
 
 # Known issue codes — kept in sync with PRD ## P2 diagnostics.
 HOURLY_REPORT_INCOMPLETE_BATCH = "hourly_report_incomplete_batch"
@@ -53,6 +54,20 @@ SEMANTIC_CONTRACT_MARKER_MISSING = "semantic_contract_marker_missing"
 MISSING_STRUCTURED_FIELD = "missing_structured_field"
 CANONICAL_SUMMARY_DRIFT = "canonical_summary_drift"
 RENDERED_SUMMARY_DRIFT = "rendered_summary_drift"
+
+# Phase H (07-05): decision-context-continuity contract issue codes. Each
+# code corresponds to a Phase A-G contract that must hold for post-marker
+# rows. Pre-marker rows are demoted to legacy_info by
+# _apply_continuity_marker_cutoff so historical audit findings remain
+# visible without failing the diagnostic.
+PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING = "plan_lifecycle_contract_marker_missing"
+MISSING_CANDIDATE_ON_LLM_FAILURE = "missing_candidate_on_llm_failure"
+WITHHELD_WITHOUT_BLOCKERS = "withheld_without_blockers"
+MISSING_ANALYSIS_CONTINUITY = "missing_analysis_continuity"
+OVERSIZED_FEATURE_PACK = "oversized_feature_pack"
+CANDIDATE_EFFECTIVE_PLAN_MISMATCH = "candidate_effective_plan_mismatch"
+BATCH_TIME_HEALTH_MISMATCH = "batch_time_health_mismatch"
+FAILED_JOBS_OUTSIDE_WINDOW = "failed_jobs_outside_window"
 
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
@@ -92,6 +107,20 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_summary_structured_state_mismatch(repo))
     issues.extend(_check_observation_reason_missing_market_context(repo))
     issues.extend(_check_no_edge_reason_coverage_mismatch(repo))
+    # Phase H (07-05): seven new decision-context-continuity contract
+    # checks. These use the independent
+    # ``hourly_decision_context_continuity_contract_v1`` marker as the
+    # cutoff, applied below via _apply_continuity_marker_cutoff. The
+    # marker-missing check runs first so a missing contract is explicitly
+    # surfaced even when all other checks would otherwise pass.
+    issues.extend(_check_plan_lifecycle_contract_markers_missing(repo))
+    issues.extend(_check_missing_candidate_on_llm_failure(repo))
+    issues.extend(_check_withheld_without_blockers(repo))
+    issues.extend(_check_missing_analysis_continuity(repo))
+    issues.extend(_check_oversized_feature_pack(repo))
+    issues.extend(_check_candidate_effective_plan_mismatch(repo))
+    issues.extend(_check_batch_time_health_mismatch(repo))
+    issues.extend(_check_failed_jobs_outside_window(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -111,6 +140,12 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # five new semantic checks. Decisions created before the semantic marker
     # are demoted to legacy_info; post-marker errors stay error/warning.
     _apply_semantic_marker_cutoff(repo, issues)
+
+    # Phase H: apply the independent continuity-contract marker cutoff to
+    # the seven new Phase A-G contract checks. Decisions created before
+    # the continuity marker are demoted to legacy_info; post-marker
+    # errors stay error/warning.
+    _apply_continuity_marker_cutoff(repo, issues)
 
     error_count = sum(1 for i in issues if i["severity"] == "error")
     warning_count = sum(1 for i in issues if i["severity"] == "warning")
@@ -133,6 +168,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         OBSERVATION_REASON_MISSING_MARKET_CONTEXT: _count(issues, OBSERVATION_REASON_MISSING_MARKET_CONTEXT),
         NO_EDGE_REASON_COVERAGE_MISMATCH: _count(issues, NO_EDGE_REASON_COVERAGE_MISMATCH),
         SEMANTIC_CONTRACT_MARKER_MISSING: _count(issues, SEMANTIC_CONTRACT_MARKER_MISSING),
+        PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING: _count(issues, PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING),
+        MISSING_CANDIDATE_ON_LLM_FAILURE: _count(issues, MISSING_CANDIDATE_ON_LLM_FAILURE),
+        WITHHELD_WITHOUT_BLOCKERS: _count(issues, WITHHELD_WITHOUT_BLOCKERS),
+        MISSING_ANALYSIS_CONTINUITY: _count(issues, MISSING_ANALYSIS_CONTINUITY),
+        OVERSIZED_FEATURE_PACK: _count(issues, OVERSIZED_FEATURE_PACK),
+        CANDIDATE_EFFECTIVE_PLAN_MISMATCH: _count(issues, CANDIDATE_EFFECTIVE_PLAN_MISMATCH),
+        BATCH_TIME_HEALTH_MISMATCH: _count(issues, BATCH_TIME_HEALTH_MISMATCH),
+        FAILED_JOBS_OUTSIDE_WINDOW: _count(issues, FAILED_JOBS_OUTSIDE_WINDOW),
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
@@ -161,6 +204,27 @@ R4_CONTRACT_MARKER_KEY = "hourly_report_accuracy_r4_contract_v1"
 # ``legacy_info`` (pre-marker) and ``error`` / ``warning`` (post-marker).
 SEMANTIC_ACCURACY_MARKER_KEY = "hourly_market_semantic_accuracy_contract_v1"
 
+# Phase H (07-05): independent decision-context-continuity contract marker.
+# The seven new Phase A-G contract diagnostics
+# (missing_candidate_on_llm_failure, withheld_without_blockers,
+# missing_analysis_continuity, oversized_feature_pack,
+# candidate_effective_plan_mismatch, batch_time_health_mismatch,
+# failed_jobs_outside_window) use this cutoff, not the R4 or semantic-accuracy
+# boundary. ``applied_at`` is the cutoff between ``legacy_info`` (pre-marker)
+# and ``error`` / ``warning`` (post-marker).
+CONTINUITY_CONTRACT_MARKER_KEY = "hourly_decision_context_continuity_contract_v1"
+
+# Phase H (07-05): default serialized size budget for the
+# MultiTimeframeFeaturePack. The builder enforces 24 KiB at construction
+# time; this diagnostic re-checks the persisted payload so historical rows
+# or a regression in the builder's budget enforcement are surfaced.
+FEATURE_PACK_SIZE_BUDGET_BYTES = 24 * 1024
+
+# Phase H (07-05): default window for "recent failed jobs" diagnostics. The
+# PRD forbids permanently repeating historical errors in the recent-failures
+# list — limit to the last 7 days so legacy failures age out.
+FAILED_JOBS_RECENT_WINDOW_DAYS = 7
+
 # The set of issue types that fall under the semantic-accuracy contract.
 # Used by _apply_semantic_marker_cutoff to demote pre-marker findings.
 # R2-8 (07-03 final review P1): includes the three new diagnostic types
@@ -175,6 +239,20 @@ _SEMANTIC_ISSUE_TYPES: frozenset[str] = frozenset({
     MISSING_STRUCTURED_FIELD,
     CANONICAL_SUMMARY_DRIFT,
     RENDERED_SUMMARY_DRIFT,
+})
+
+# Phase H (07-05): the set of issue types that fall under the
+# decision-context-continuity contract. Used by
+# _apply_continuity_marker_cutoff to demote pre-marker findings to
+# legacy_info. Excludes the marker-missing code (always error) and the
+# failed-jobs-outside-window code (already windowed by query).
+_CONTINUITY_ISSUE_TYPES: frozenset[str] = frozenset({
+    MISSING_CANDIDATE_ON_LLM_FAILURE,
+    WITHHELD_WITHOUT_BLOCKERS,
+    MISSING_ANALYSIS_CONTINUITY,
+    OVERSIZED_FEATURE_PACK,
+    CANDIDATE_EFFECTIVE_PLAN_MISMATCH,
+    BATCH_TIME_HEALTH_MISMATCH,
 })
 
 
@@ -210,6 +288,60 @@ def _get_semantic_accuracy_marker_ts(repo: CryptoGuardRepository) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _get_continuity_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
+    """Phase H: return the decision-context-continuity marker's applied_at, or None.
+
+    None means the marker has not been deployed — callers (the seven new
+    Phase A-G contract checks) skip themselves in that case so historical
+    data is not flagged with ``error`` severity against a contract that has
+    not yet been initialized. The marker-missing check
+    (_check_plan_lifecycle_contract_markers_missing) separately surfaces
+    the absence as an error.
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=?",
+            (CONTINUITY_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        return None
+    return None
+
+
+def _apply_continuity_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
+    """Phase H: demote pre-marker continuity-contract findings to legacy_info.
+
+    Mirrors the R4 / semantic-accuracy marker cutoff pattern but scoped to
+    the seven new Phase A-G contract issue types. When the marker is absent
+    the function is a no-op — the marker-missing check
+    (_check_plan_lifecycle_contract_markers_missing) already surfaces the
+    absence as an error.
+    """
+    marker_ts = _get_continuity_contract_marker_ts(repo)
+    if marker_ts is None:
+        return
+    for issue in issues:
+        if issue.get("type") not in _CONTINUITY_ISSUE_TYPES:
+            continue
+        decision_id = (issue.get("details") or {}).get("decision_id")
+        if decision_id is None:
+            at_ms = (issue.get("details") or {}).get("analysis_time")
+            if at_ms is not None:
+                try:
+                    dt = datetime.fromtimestamp(int(at_ms) / 1000, tz=timezone.utc)
+                    decision_ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError, OSError):
+                    continue
+            else:
+                continue
+        else:
+            decision_ts = _get_decision_created_ts(repo, decision_id)
+        if decision_ts is not None and decision_ts < marker_ts:
+            issue["severity"] = "legacy_info"
 
 
 def _apply_semantic_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
@@ -339,14 +471,43 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository, *, batch_id
 
     P1-11a: only scan decisions matching the current report batch, not the
     most recent 120 historical records.
+
+    Phase B (07-05): anchor the stale cutoff to ``batch.analysis_time`` when a
+    ``batch_id`` is provided so a report rendered at 20:15 for the 19:59:59
+    batch does not flag the batch's own decisions as stale. Wall-clock
+    ``latest_closed_close_time_ms("15m", utc_ms())`` is only used as a fallback
+    when ``batch_id`` is ``None`` or the batch row is absent.
     """
     issues: list[dict[str, Any]] = []
     try:
         from plugins.crypto_guard.utils import latest_closed_close_time_ms, INTERVAL_MS, utc_ms
     except Exception:  # pragma: no cover
         return issues
-    now_ms = utc_ms()
-    cutoff = latest_closed_close_time_ms("15m", now_ms)
+
+    # Phase B (07-05): when a batch_id is supplied, anchor the cutoff to the
+    # batch's own analysis_time (the authoritative close-time of the 15m
+    # candle the report is about). This avoids the "假 stale" bug where a
+    # report rendered at 20:15 for the 19:59:59 batch would compute
+    # cutoff = 20:14:59.999 from utc_ms() and flag the 19:59:59 decision as
+    # 15m1s stale. Only fall back to the wall-clock cutoff when batch_id is
+    # None or the batch row cannot be loaded.
+    cutoff: int | None = None
+    if batch_id:
+        try:
+            batch_row = repo.conn.execute(
+                "SELECT analysis_time FROM analysis_batches WHERE batch_id=? LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+        except Exception:
+            batch_row = None
+        if batch_row is not None and batch_row["analysis_time"] is not None:
+            try:
+                cutoff = int(batch_row["analysis_time"])
+            except (TypeError, ValueError):
+                cutoff = None
+    if cutoff is None:
+        now_ms = utc_ms()
+        cutoff = latest_closed_close_time_ms("15m", now_ms)
     span = INTERVAL_MS["15m"]
     # P1-11a: filter by batch_id if available; otherwise fall back to time window
     if batch_id:
@@ -375,6 +536,7 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository, *, batch_id
                     "decision_id": int(r["id"]), "symbol": r["symbol"],
                     "analysis_time": at, "age_minutes": age_ms // 60000,
                     "grade": r["signal_grade"], "batch_id": r["batch_id"],
+                    "cutoff": cutoff,
                 },
                 "该决策超过一个分析周期；不得进入可执行机会分类",
             ))
@@ -627,6 +789,73 @@ _STRUCTURAL_BREAK_TYPES = frozenset({
 _SUPPORTED_TIMEFRAMES = frozenset({
     "1m", "5m", "15m", "1h", "4h", "1d",
 })
+
+# R8 P1 fix: required timeframes for an analysis batch. From
+# ``config/scheduler.yaml:analyze_market_15m.timeframes``. A success batch
+# whose snapshots only have ``5m`` healthy (missing ``1d/4h/1h/15m``)
+# must NOT be judged healthy — the hourly report's multi-TF bias depends
+# on all five TFs being ready at ``batch.analysis_time``.
+# R9 P2-5 fix: previously this was a hardcoded literal. Now it's loaded
+# from config keyed by ``primary_interval`` (with a fallback to the
+# 15m default) so changes to ``scheduler.yaml`` propagate automatically.
+# A future batch type with a different TF set (e.g. ``primary_interval='1h'``
+# with ``timeframes=['1d','4h','1h','15m']``) will use its own required
+# set instead of being incorrectly flagged as missing ``5m``.
+_REQUIRED_TIMEFRAMES_FALLBACK = frozenset({"1d", "4h", "1h", "15m", "5m"})
+
+
+def _required_timeframes_for_batch(primary_interval: str | None) -> frozenset[str]:
+    """R9 P2-5: load required TFs from ``scheduler.yaml`` keyed by
+    ``primary_interval``. Falls back to ``_REQUIRED_TIMEFRAMES_FALLBACK``
+    if config is unavailable or the job is not found.
+
+    Why: ``_REQUIRED_TIMEFRAMES_FOR_BATCH`` was a hardcoded literal that
+    could drift from ``scheduler.yaml``. If someone changes the config
+    to add/remove a TF, the diagnostic would silently become stale.
+    Loading from config ensures the diagnostic stays in sync with the
+    actual production batch definition.
+
+    R10 Rec fix: narrowed the ``except`` clause from ``Exception`` to
+    ``(KeyError, TypeError, AttributeError)`` so a real config error
+    (e.g. YAML syntax error, missing file) is NOT silently swallowed.
+    Pre-R10 the broad ``except Exception`` could mask a config loading
+    failure — the diagnostic would fall back to the hardcoded default
+    instead of surfacing the config error at startup. The narrowed
+    clause still prevents crashes from expected shapes (missing keys,
+    wrong types) but lets unexpected exceptions propagate so they can
+    be diagnosed.
+    """
+    if not primary_interval:
+        return _REQUIRED_TIMEFRAMES_FALLBACK
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        cfg = load_config()
+        jobs = cfg.scheduler.get("jobs") or {}
+        # scheduler.yaml top-level is ``jobs:`` mapping (loader wraps the
+        # full YAML — check both the wrapped and unwrapped shapes for
+        # robustness).
+        if not jobs:
+            jobs = cfg.scheduler.get("analyze_market_15m") or {}
+            if jobs:
+                jobs = {"analyze_market_15m": jobs}
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            if job.get("task") != "analyze_market":
+                continue
+            params = job.get("params") or {}
+            if params.get("primary_interval") != primary_interval:
+                continue
+            tfs = params.get("timeframes")
+            if isinstance(tfs, list) and tfs:
+                return frozenset(str(t) for t in tfs)
+        # Fallback: if no matching job found, try the 15m default.
+        return _REQUIRED_TIMEFRAMES_FALLBACK
+    except (KeyError, TypeError, AttributeError):
+        # Defensive: expected-shape errors (missing keys, wrong types)
+        # fall back to the default. Unexpected exceptions (e.g. YAML
+        # syntax error) propagate so they can be diagnosed at startup.
+        return _REQUIRED_TIMEFRAMES_FALLBACK
 
 
 def _has_structured_confirmation(
@@ -1495,3 +1724,545 @@ def _bias_side(bias: str | None) -> str | None:
     if b in ("bearish", "short", "空"):
         return "SHORT"
     return None
+
+
+# ── Phase H (07-05): decision-context-continuity contract diagnostics ──
+
+
+def _check_plan_lifecycle_contract_markers_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H: flag missing decision-context-continuity contract marker.
+
+    Mirrors the semantic-accuracy marker-missing check. The marker
+    ``hourly_decision_context_continuity_contract_v1`` must exist in
+    ``_migration_state``. If absent, emit an ``error`` issue so callers
+    can detect the missing contract rather than receiving a silently-
+    healthy report. When the marker is absent, the seven Phase A-G
+    contract checks skip themselves (no historical data is flagged).
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+            (CONTINUITY_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if not row or not row["applied_at"]:
+        issues.append(_issue(
+            PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING, "error",
+            {
+                "marker_key": CONTINUITY_CONTRACT_MARKER_KEY,
+                "contract": "decision-context-continuity",
+                "issue": "marker_absent",
+            },
+            "decision-context-continuity contract marker 未部署。运行 "
+            "initialize_database() 部署 marker；marker 缺失时 Phase A-G "
+            "契约诊断被跳过，可能导致假绿。",
+        ))
+    return issues
+
+
+def _check_missing_candidate_on_llm_failure(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase E contract): flag ga_decisions where
+    ``llm_status="failed"`` but ``candidate_trade_plan`` is missing.
+
+    Per PRD FR-4 / Phase E, when the LLM fails the deterministic candidate
+    plan must be preserved under ``candidate_trade_plan`` for audit. The
+    controller's fail-closed path sets ``plan_status="withheld"`` and
+    stashes the candidate. A missing candidate on LLM failure means the
+    audit trail is broken — the report cannot display "候选计划已生成但被
+    LLM failure + grade hysteresis 阻断" (PRD Fact 4).
+
+    Detection parses ``raw_decision_json`` for the top-level
+    ``candidate_trade_plan`` and ``llm_status`` fields. Severity:
+    ``error`` post-marker, ``legacy_info`` pre-marker.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 500
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        llm_status = str(raw.get("llm_status") or "ok").lower()
+        if llm_status not in {"failed", "disabled"}:
+            continue
+        # P1-8 (07-05 final review): the previous logic fired whenever
+        # LLM failed AND candidate_trade_plan was missing, but in the
+        # real production path a low-score / no-edge decision legitimately
+        # has NO deterministic candidate (``plan_status="no_plan"``) — the
+        # LLM never had anything to fail over. Only ``plan_status="withheld"``
+        # means "we had a candidate and blocked it", which requires
+        # candidate_trade_plan to be present for audit. ``plan_status="no_plan"``
+        # is the legitimate no-candidate path; do not flag it.
+        plan_status = str(raw.get("plan_status") or "").lower()
+        if plan_status == "no_plan":
+            # Low-score / no-edge decision: deterministic SOP did not
+            # produce a candidate. LLM failure is irrelevant here.
+            continue
+        if plan_status not in {"withheld", "executable"}:
+            # Unknown / legacy plan_status — be conservative and skip.
+            # Re-evaluate if a new plan_status value is added.
+            continue
+        candidate = raw.get("candidate_trade_plan")
+        if candidate is None:
+            # PRD FR-4: when LLM fails AND a candidate was expected
+            # (plan_status=withheld or executable), the deterministic
+            # candidate plan MUST be preserved under candidate_trade_plan
+            # for audit. controller_decision_from_legacy does not persist
+            # has_trade_plan at the top level, so we cannot rely on it
+            # here. The candidate alone is the audit anchor.
+            issues.append(_issue(
+                MISSING_CANDIDATE_ON_LLM_FAILURE, "error",
+                {
+                    "decision_id": int(r["id"]), "symbol": r["symbol"],
+                    "grade": r["signal_grade"], "decision": r["decision"],
+                    "llm_status": llm_status,
+                    "plan_status": plan_status,
+                },
+                "LLM 失败且 plan_status=" + plan_status + " 但 candidate_trade_plan 缺失："
+                "候选计划未保留为审计字段；controller 必须在 fail-closed 路径保留 deterministic candidate。",
+            ))
+    return issues
+
+
+def _check_withheld_without_blockers(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase E contract): flag ga_decisions where
+    ``plan_status="withheld"`` but ``plan_blockers`` is empty.
+
+    Per PRD FR-4 / Phase E, a withheld plan must carry structured
+    ``plan_blockers`` so the report can identify the real blocking stage
+    (LLM parse / grade hysteresis / risk rejection / continuity
+    invalidated). An empty blockers list means the report cannot fulfill
+    PRD FR-8 ("观察项不得统一退化为'交易计划尚未形成'").
+
+    Detection parses ``raw_decision_json`` for the top-level
+    ``plan_status`` and ``plan_blockers`` fields. Severity: ``warning``
+    post-marker (the plan is correctly withheld, but the reason is missing),
+    ``legacy_info`` pre-marker.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 500
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        plan_status = str(raw.get("plan_status") or "").lower()
+        if plan_status != "withheld":
+            continue
+        blockers = raw.get("plan_blockers")
+        if isinstance(blockers, list) and len(blockers) > 0:
+            continue
+        issues.append(_issue(
+            WITHHELD_WITHOUT_BLOCKERS, "warning",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "decision": r["decision"],
+                "plan_status": plan_status,
+            },
+            "plan_status=withheld 但 plan_blockers 为空：报告无法指明真实阻断阶段；"
+            "必须填入 llm_parse_failed / grade_hysteresis / risk_rejected / "
+            "continuity_invalidated 等 reason code。",
+        ))
+    return issues
+
+
+def _check_missing_analysis_continuity(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase D contract): flag ga_decisions that lack the
+    ``analysis_continuity`` block on the persisted raw_decision_json.
+
+    Per PRD FR-3 / Phase D, every decision must carry the previous-round
+    compact state and the structured delta (grade/bias/stage change,
+    trigger_progress). A missing continuity block means the LLM prompt
+    lacked prior context and the deterministic continuity gate could not
+    consume confirmed/invalidated trigger status.
+
+    Detection parses ``raw_decision_json`` for the top-level
+    ``analysis_continuity`` field. The check skips the very first analysis
+    of a symbol (no prior row exists) by joining against analysis_states
+    — but for simplicity here, any row missing the block is flagged;
+    the controller always sets a sentinel ``analysis_continuity.previous=None``
+    when no prior state exists, so absence is always a defect.
+
+    Severity: ``warning`` post-marker (the decision may still be correct,
+    but the audit trail is incomplete), ``legacy_info`` pre-marker.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json,
+               analysis_time, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 500
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        continuity = raw.get("analysis_continuity")
+        if isinstance(continuity, dict) and continuity:
+            continue
+        issues.append(_issue(
+            MISSING_ANALYSIS_CONTINUITY, "warning",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "decision": r["decision"],
+                "analysis_time": int(r["analysis_time"] or 0),
+            },
+            "analysis_continuity 块缺失：上一轮状态与 delta 未进入本轮审计；"
+            "controller 必须在 persistence 前调用 build_analysis_continuity。",
+        ))
+    return issues
+
+
+def _check_oversized_feature_pack(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase C contract): flag ga_decisions where the persisted
+    ``multi_timeframe_feature_pack`` exceeds the size budget.
+
+    Per PRD FR-2 / Phase C, the feature pack is bounded to 24 KiB by the
+    builder. The persisted payload may exceed this if the builder regresses
+    or a downstream consumer attaches extra fields. An oversized pack
+    means the LLM prompt may have received more than the budgeted context,
+    violating the "no raw candle arrays to LLM" constraint.
+
+    Detection parses ``raw_decision_json`` for the top-level
+    ``multi_timeframe_feature_pack`` and measures its serialized JSON size.
+    Severity: ``error`` post-marker, ``legacy_info`` pre-marker.
+    """
+    import json as _json
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 500
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        pack = raw.get("multi_timeframe_feature_pack")
+        if pack is None:
+            # Phase C not yet deployed on this row — skip, not a defect.
+            continue
+        try:
+            serialized = _json.dumps(pack, ensure_ascii=False)
+        except (TypeError, ValueError):
+            continue
+        size_bytes = len(serialized.encode("utf-8"))
+        if size_bytes <= FEATURE_PACK_SIZE_BUDGET_BYTES:
+            continue
+        issues.append(_issue(
+            OVERSIZED_FEATURE_PACK, "error",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "decision": r["decision"],
+                "size_bytes": size_bytes,
+                "budget_bytes": FEATURE_PACK_SIZE_BUDGET_BYTES,
+            },
+            f"multi_timeframe_feature_pack 体积超预算：{size_bytes} > "
+            f"{FEATURE_PACK_SIZE_BUDGET_BYTES} bytes；builder 必须在 24 KiB 内"
+            "裁剪 verbose 文本，禁止 raw candle arrays 进入 LLM prompt。",
+        ))
+    return issues
+
+
+def _check_candidate_effective_plan_mismatch(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase E contract): flag ga_decisions where the candidate
+    plan and the effective trade_plan disagree on side/entry/stop.
+
+    Per PRD FR-4 / Phase E, the candidate is the deterministic geometry
+    output; the effective trade_plan is the candidate after passing all
+    execution gates. When both are present they MUST agree on side,
+    entry price, stop loss, and take profit — otherwise the audit trail
+    is inconsistent and the report cannot explain "候选计划 vs 执行计划".
+
+    Detection parses ``raw_decision_json`` for the top-level
+    ``candidate_trade_plan`` and ``trade_plan`` fields and compares the
+    key fields. Severity: ``error`` post-marker, ``legacy_info`` pre-marker.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 500
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        candidate = raw.get("candidate_trade_plan")
+        effective = raw.get("trade_plan")
+        if not isinstance(candidate, dict) or not isinstance(effective, dict):
+            continue
+        # Both must be present for the mismatch check to apply. If only
+        # the candidate is present (withheld), no mismatch is possible —
+        # the effective trade_plan is correctly None.
+        c_side = str(candidate.get("side") or "").upper()
+        e_side = str(effective.get("side") or "").upper()
+        c_entry = candidate.get("entry_price") or candidate.get("entry")
+        e_entry = effective.get("entry_price") or effective.get("entry")
+        c_stop = candidate.get("stop_loss") or candidate.get("stop")
+        e_stop = effective.get("stop_loss") or effective.get("stop")
+        mismatch_fields: list[str] = []
+        if c_side and e_side and c_side != e_side:
+            mismatch_fields.append("side")
+        if c_entry is not None and e_entry is not None and float(c_entry) != float(e_entry):
+            mismatch_fields.append("entry_price")
+        if c_stop is not None and e_stop is not None and float(c_stop) != float(e_stop):
+            mismatch_fields.append("stop_loss")
+        if not mismatch_fields:
+            continue
+        issues.append(_issue(
+            CANDIDATE_EFFECTIVE_PLAN_MISMATCH, "error",
+            {
+                "decision_id": int(r["id"]), "symbol": r["symbol"],
+                "grade": r["signal_grade"], "decision": r["decision"],
+                "candidate_side": c_side, "effective_side": e_side,
+                "mismatch_fields": mismatch_fields,
+            },
+            "candidate_trade_plan 与 trade_plan 关键字段不一致："
+            f"{','.join(mismatch_fields)}；执行门禁不得修改 side/entry/stop，"
+            "只能整体接受或拒绝。",
+        ))
+    return issues
+
+
+def _check_batch_time_health_mismatch(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (Phase B contract): flag analysis_batches marked
+    ``status='success'`` but whose symbols' market-data-quality is not
+    "ready" pinned to ``batch.analysis_time``.
+
+    Per PRD FR-1 / Phase B, the hourly report's data quality must use the
+    selected batch's ``analysis_time``, not the report send wall-clock.
+    A success batch whose symbols are not "ready" at the batch time means
+    the report's stale/gap checks were evaluated against the wrong time
+    and the batch may have been marked complete with unhealthy data.
+
+    Detection joins ``analysis_batches`` to ``batch_symbol_status`` and
+    ``market_snapshots`` via snapshot_id (when present). For each success
+    batch, sample up to 50 completed symbols and verify the snapshot's
+    data_quality_json has all TFs ``ready=True`` at ``analysis_time``.
+    Severity: ``error`` post-marker, ``legacy_info`` pre-marker.
+
+    R5 P1-1 fix: previously the check had four fail-open paths and only
+    sampled 5 symbols — a ``ready=True`` but 12h-stale snapshot would
+    pass silently. Now:
+      - Sample 50 completed symbols (up from 5) for broader coverage.
+      - Missing snapshot / malformed data_quality / malformed health
+        are fail-closed (recorded as unhealthy, not skipped).
+      - ``last_close`` must be within ``2 * INTERVAL_MS[tf]`` of
+        ``batch.analysis_time`` — i.e. the most recent bar plus one
+        tolerance interval. Stale-but-ready snapshots now flag.
+
+    R8 P1 fix: previously the check validated *each present* TF's
+    readiness but not the *required TF set*. A snapshot with only
+    ``5m`` healthy (missing ``1d/4h/1h/15m``) was judged healthy
+    because the loop iterated only the TFs present in ``tf_health``.
+    Now require all five required TFs (``1d/4h/1h/15m/5m`` per
+    ``config/scheduler.yaml:analyze_market_15m.timeframes``) to be
+    present — otherwise fail-closed with ``missing_required_tf:<list>``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT ab.batch_id, ab.primary_interval, ab.analysis_time,
+               ab.status, ab.enabled_symbols_json
+        FROM analysis_batches ab
+        WHERE ab.status = 'success'
+        ORDER BY ab.started_at DESC LIMIT 20
+        """
+    ).fetchall()
+    for ab in rows:
+        bid = ab["batch_id"] if ab["batch_id"] else None
+        if not bid:
+            continue
+        # R5 P1-1: sample 50 (up from 5) for broader coverage.
+        completed = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status "
+                "WHERE batch_id=? AND status='completed' LIMIT 50",
+                (bid,),
+            ).fetchall()
+        ]
+        if not completed:
+            continue
+        unhealthy_syms: list[str] = []
+        for sym in completed:
+            snap_row = repo.conn.execute(
+                """
+                SELECT ms.data_quality_json, ms.analysis_time AS snapshot_time
+                FROM market_snapshots ms
+                JOIN ga_decisions gd ON gd.snapshot_id = ms.id
+                WHERE gd.batch_id=? AND gd.symbol=?
+                LIMIT 1
+                """,
+                (bid, sym),
+            ).fetchone()
+            # R5 P1-1: fail-closed — missing snapshot is a real gap,
+            # not a skip.
+            if not snap_row:
+                unhealthy_syms.append(f"{sym} (missing_snapshot)")
+                continue
+            dq_raw = snap_row["data_quality_json"]
+            dq = _safe_json(dq_raw) or {}
+            # R5 P1-1: fail-closed — malformed data_quality is a real gap.
+            if not isinstance(dq, dict):
+                unhealthy_syms.append(f"{sym} (malformed_data_quality)")
+                continue
+            # P1-7 (07-05 final review): production market_state_builder
+            # persists per-TF health under ``data_quality.health[tf]`` (see
+            # market_state_builder.py:_data_quality). The previous code read
+            # ``timeframes`` / ``health_by_tf``, which do not exist in
+            # production — fault injection seeded the wrong shape and so
+            # 7/7 was a false positive. Read the production path first,
+            # keep the legacy paths as fallbacks for older rows.
+            tf_health = dq.get("health") or dq.get("timeframes") or dq.get("health_by_tf") or {}
+            # R5 P1-1: fail-closed — malformed health is a real gap.
+            if not isinstance(tf_health, dict):
+                unhealthy_syms.append(f"{sym} (malformed_health)")
+                continue
+            # R7 P1 fix: empty health dict is a real gap, not "healthy".
+            # Pre-R7 an empty ``{}`` (or ``{"health": {}}`` / ``{"health":
+            # {"1h": "broken"}}`` with non-dict TF entries) zero-iterated
+            # the loop below and was silently treated as healthy. Now
+            # require a non-empty dict and that every TF entry is itself
+            # a dict — otherwise fail-closed.
+            if not tf_health:
+                unhealthy_syms.append(f"{sym} (empty_health)")
+                continue
+            # R8 P1 fix: validate the *required* timeframe set, not just
+            # "any non-empty health". Pre-R8 a snapshot with only ``5m``
+            # healthy (missing ``1d/4h/1h/15m``) passed because the loop
+            # only iterated present TFs. The hourly report's multi-TF
+            # bias depends on all five TFs being ready at
+            # ``batch.analysis_time`` — a partial set means the LLM
+            # was missing major-TF context.
+            # R9 P2-5 fix: load required TFs from config keyed by
+            # ``primary_interval`` (no longer a hardcoded literal).
+            required_tfs = _required_timeframes_for_batch(
+                ab["primary_interval"] if "primary_interval" in ab.keys() else None
+            )
+            present_tfs = set(tf_health.keys())
+            missing_required = required_tfs - present_tfs
+            if missing_required:
+                # Missing required TFs → fail-closed. Sort for stable
+                # issue text.
+                missing_sorted = sorted(missing_required)
+                unhealthy_syms.append(
+                    f"{sym} (missing_required_tf:{','.join(missing_sorted)})"
+                )
+                continue
+            batch_at = int(ab["analysis_time"] or 0)
+            unhealthy = False
+            stale_reason = ""
+            for tf_key, tf_info in tf_health.items():
+                # R7 P1 fix: non-dict TF entry is malformed, fail-closed.
+                if not isinstance(tf_info, dict):
+                    unhealthy = True
+                    stale_reason = f"{tf_key}:malformed_entry"
+                    break
+                ready = bool(tf_info.get("ready"))
+                last_close = int(tf_info.get("last_close_time") or 0)
+                # Phase B contract: ready=True AND last_close <= batch_at
+                # AND last_close within 1 interval of batch_at (not stale).
+                if not ready:
+                    unhealthy = True
+                    stale_reason = f"{tf_key}:not_ready"
+                    break
+                if last_close <= 0 or last_close > batch_at:
+                    unhealthy = True
+                    stale_reason = f"{tf_key}:future_close"
+                    break
+                # R5 P1-1 fix: stale lower bound. ``ready=True`` but
+                # stale-by-12h data was passing because only ``last_close
+                # <= batch_at`` was checked. Require ``last_close`` to be
+                # within 2 intervals of ``batch_at`` (1 just-closed bar +
+                # 1 tolerance bar). For 1h, tolerance = 2 * 3_600_000 =
+                # 7_200_000 ms = 2h — so a 12h-stale snapshot now fails.
+                tf_ms = INTERVAL_MS.get(str(tf_key))
+                if tf_ms and last_close < batch_at - 2 * tf_ms:
+                    unhealthy = True
+                    stale_reason = f"{tf_key}:stale_by_{(batch_at - last_close) // tf_ms}_bars"
+                    break
+            if unhealthy:
+                unhealthy_syms.append(f"{sym} ({stale_reason})" if stale_reason else sym)
+        if unhealthy_syms:
+            issues.append(_issue(
+                BATCH_TIME_HEALTH_MISMATCH, "error",
+                {
+                    "batch_id": bid,
+                    "primary_interval": ab["primary_interval"],
+                    "analysis_time": int(ab["analysis_time"] or 0),
+                    "unhealthy_symbols": unhealthy_syms,
+                    "checked_symbols": completed,
+                },
+                "成功批次的品种在 batch.analysis_time 健康检查未通过："
+                "Phase B 要求小时报告使用批次时间而非墙钟；"
+                "检查 _fetch_market_data_quality 是否传入 batch.analysis_time。",
+            ))
+    return issues
+
+
+def _check_failed_jobs_outside_window(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase H (PRD FR-8): flag failed analysis_batches older than the
+    documented recent window so they do not permanently repeat as
+    "current risk" in the hourly report.
+
+    Per PRD FR-8, "最近失败任务"应有明确时间窗口；历史失败不得永久
+    重复冒充当前风险. The default window is 7 days
+    (FAILED_JOBS_RECENT_WINDOW_DAYS). Batches older than the window that
+    are still in ``status='failed'`` are surfaced as ``legacy_info`` so
+    they remain visible for audit but do not count against current risk.
+
+    Detection queries ``analysis_batches`` with
+    ``status='failed'`` AND ``started_at`` older than the window. Each
+    batch becomes a single issue. Severity: ``legacy_info`` (always —
+    these are by definition historical and not current).
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, started_at, status
+        FROM analysis_batches
+        WHERE status = 'failed'
+          AND datetime(started_at) < datetime('now', ?)
+        ORDER BY started_at DESC LIMIT 50
+        """,
+        (f"-{FAILED_JOBS_RECENT_WINDOW_DAYS} days",),
+    ).fetchall()
+    for r in rows:
+        issues.append(_issue(
+            FAILED_JOBS_OUTSIDE_WINDOW, "legacy_info",
+            {
+                "batch_id": r["batch_id"] if r["batch_id"] else "",
+                "primary_interval": r["primary_interval"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "started_at": r["started_at"],
+                "window_days": FAILED_JOBS_RECENT_WINDOW_DAYS,
+            },
+            f"失败批次超出 {FAILED_JOBS_RECENT_WINDOW_DAYS} 天窗口："
+            "归类为 legacy_info，不计入当前风险；"
+            "诊断必须区分当前问题、warning 和 legacy history。",
+        ))
+    return issues

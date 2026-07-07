@@ -246,7 +246,29 @@ def _ga_context(ga_decision: dict[str, Any]) -> str:
     grade = ga_decision.get("signal_grade", "?")
     bias = ga_decision.get("market_bias", "?")
     conf = ga_decision.get("confidence", 0)
-    ts = str(ga_decision.get("analysis_time_utc", ""))[:16]
+    # R13 P1 defense-in-depth: ``analysis_time_utc`` is always an ISO
+    # string in production (R13 P0 fix in
+    # ``ga_master/decision_schema.py:116``), so ``str(...)[:16]``
+    # correctly extracts ``YYYY-MM-DDTHH:MM``. But if a future regression
+    # writes an integer, ``str(1750000000000)[:16]`` would yield
+    # ``"1750000000000000"`` — a non-date prefix. Guard against this by
+    # detecting integer input and falling back to ``analysis_time`` (the
+    # INTEGER NOT NULL column at schema.sql:148) via ``iso_from_ms``.
+    ts_raw = ga_decision.get("analysis_time_utc", "")
+    ts_str = str(ts_raw) if ts_raw is not None else ""
+    # R14 REC-1: explicit parentheses for operator precedence clarity
+    # (``and`` binds tighter than ``or``). Without parens the expression
+    # is correct but reads ambiguously.
+    if (not ts_str) or (not ts_str.startswith(("20", "19")) and ts_raw is not None):
+        # Likely integer or malformed — fall back to ``analysis_time`` ms.
+        at_ms = ga_decision.get("analysis_time")
+        if at_ms:
+            try:
+                from plugins.crypto_guard.ga_master.decision_schema import iso_from_ms
+                ts_str = iso_from_ms(int(at_ms))
+            except (TypeError, ValueError):
+                pass
+    ts = ts_str[:16]
     return f"GA#{ga_id} {grade}级 {bias} conf={conf:.2f} @ {ts}"
 
 

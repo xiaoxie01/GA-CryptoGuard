@@ -26,8 +26,30 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
     llm_status = str(result.get("llm_status") or "").lower()
     fallback_blocked = block_fallback and llm_status in {"failed", "disabled"}
     if fallback_blocked and result.get("has_trade_plan") and result.get("trade_plan"):
+        # Phase E (07-05): Plan lifecycle separation. Preserve the
+        # deterministic candidate plan as ``candidate_trade_plan`` BEFORE
+        # clearing has_trade_plan so audit can see what the deterministic
+        # path produced. Set structured plan_status / plan_blockers so
+        # downstream consumers (report, diagnostics) can distinguish
+        # "withheld due to LLM failure" from "no plan ever generated".
+        candidate_plan = result.get("trade_plan")
+        if candidate_plan and isinstance(candidate_plan, dict):
+            result["candidate_trade_plan"] = candidate_plan
         result["has_trade_plan"] = False
+        result["trade_plan"] = None
         result["decision"] = "monitor_only"
+        result["plan_status"] = "withheld"
+        result["plan_source"] = "deterministic_sop"
+        result["plan_blockers"] = [
+            {
+                "code": "llm_parse_failed" if llm_status == "failed" else "llm_disabled",
+                "stage": "synthesis",
+                "detail": (
+                    f"llm_status={llm_status}, "
+                    f"fallback_llm_failed_blocks_paper_order=true"
+                ),
+            }
+        ]
         # BTC#9 P2-2: audit fields for fallback downgrade
         result["fallback_trade_plan_blocked"] = True
         result["fallback_block_reason"] = f"llm_status={llm_status}, fallback_llm_failed_blocks_paper_order=true"
@@ -36,15 +58,36 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
         notes = list(result.get("risk_notes") or [])
         notes.append(f"LLM 状态为 {llm_status}，降级为 opportunity_watch，不创建模拟盘订单")
         result["risk_notes"] = notes
-        # 让 risk_check 也反映降级
+        # 让 risk_check 也反映降级 — 引用真实阻断阶段（LLM failure），
+        # 不再 collapse 到 "缺少完整 trade_plan"
         risk = dict(risk)
         risk["ok"] = False
-        risk["reasons"] = list(risk.get("reasons") or []) + [f"llm_status={llm_status} 降级，禁止开仓"]
+        risk["reasons"] = list(risk.get("reasons") or []) + [
+            f"llm_status={llm_status} 降级，禁止开仓（候选计划已保留为 candidate_trade_plan）",
+        ]
         result["risk_check"] = risk
 
     if result.get("has_trade_plan") and result.get("trade_plan") and not risk["ok"]:
+        # Phase E (07-05): risk gate rejected the executable plan. Preserve
+        # the candidate as candidate_trade_plan for audit and set structured
+        # plan_status / plan_blockers so the report can surface the actual
+        # blocking stage (RR/confidence/HTF/etc.) instead of collapsing to
+        # "缺交易计划".
+        rejected_plan = result.get("trade_plan")
+        if rejected_plan and isinstance(rejected_plan, dict) and not result.get("candidate_trade_plan"):
+            result["candidate_trade_plan"] = rejected_plan
         result["has_trade_plan"] = False
+        result["trade_plan"] = None
         result["decision"] = "monitor_only"
+        result["plan_status"] = "risk_rejected"
+        result["plan_source"] = "deterministic_sop"
+        result["plan_blockers"] = [
+            {
+                "code": "risk_rejected",
+                "stage": "risk_gate",
+                "detail": "；".join(risk["reasons"][:6]) if risk.get("reasons") else "risk gate rejected",
+            }
+        ]
         notes = list(result.get("risk_notes") or [])
         notes.append("模拟盘风控未通过：" + "；".join(risk["reasons"]))
         result["risk_notes"] = notes

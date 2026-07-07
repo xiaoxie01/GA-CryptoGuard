@@ -122,6 +122,12 @@ def analyze_price_action(
     # FS-1: pass the latest closed candle's close_time so structure_events
     # carry the real candle close time, not the module analysis_time.
     source_close_time = candles[-1].get("close_time") if candles else None
+    # P1-5 fix: surface the latest closed candle's close price so the
+    # continuity delta's trigger_progress can verify trigger_price against
+    # the actual candle close (not a heuristic proxy). Without this field,
+    # _latest_candle_close in decision_context returns None and the
+    # trigger_price + close confirmation path is dead code.
+    last_close_price = float(candles[-1].get("close")) if candles else None
     return {
         "module": "price_action",
         "market_structure": structure,
@@ -143,6 +149,7 @@ def analyze_price_action(
         "explanation": explain_structure(last_event, structure, invalid_level),
         "confidence": confidence,
         "analysis_time_utc": analysis_time_utc,
+        "last_close": last_close_price,
     }
 
 

@@ -88,6 +88,16 @@ def run_agent_json_task(
         return result
 
 
+# R9 P2-2 fix: module-level constant so the final hard-cap fallback
+# can be exercised behaviorally in tests via ``unittest.mock.patch``.
+# Pre-R9 ``MAX_PROMPT_BYTES`` was a function-local variable, making the
+# defensive safe_payload path effectively unreachable in tests — the
+# only way to force it was to make SYSTEM_PROMPT itself huge, which is
+# not possible from a test. With this constant at module scope, tests
+# can patch it to a small value to fire the safe_payload path.
+MAX_PROMPT_BYTES = 48 * 1024  # 2x feature pack budget
+
+
 def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: dict[str, Any], *, context: dict[str, Any] | None = None) -> str:
     from plugins.crypto_guard.config.loader import load_config
     scoring = score_snapshot(snapshot)
@@ -159,7 +169,191 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
                 for w in watches[:5]
             ]
 
-    return SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # R5 P1-2 fix: bound the final prompt size. The 24 KiB feature pack
+    # budget only constrains ``multi_timeframe_feature_pack``; the full
+    # prompt (with ``modules``, ``historical_memory``, ``open_positions``,
+    # ``active_watches``, ``analysis_continuity``) can blow past 48 KiB
+    # and exceed the LLM context window. Trim ``historical_memory``
+    # first (least actionable), then ``open_positions``/``active_watches``
+    # (context-only), then ``analysis_continuity`` (decision-useful but
+    # redundant with market_snapshot), then ``modules`` (primary-TF detail
+    # — last resort because it carries decision-critical indicator
+    # values). Never trim ``market_snapshot.multi_timeframe_feature_pack``
+    # or ``deterministic_reference`` here — those are decision-critical
+    # and have their own bounded budgets.
+    # R6 REC-R6-1: added ``modules`` as a final trim tier so an oversized
+    # primary-TF modules dict cannot silently push the prompt past budget.
+    # R8 P1 fix:
+    #   - Added ``analysis_continuity`` as a trim tier (after
+    #     open_positions/active_watches, before modules). Pre-R8 an
+    #     oversized ``analysis_continuity`` (whose own 12 KiB budget is
+    #     per-block, not per-prompt) could combine with other sections
+    #     to push the prompt past 48 KiB, but the trim ladder never
+    #     touched it. Now drop it before falling back to the minimal
+    #     stub.
+    #   - Final hard assertion: if every trim tier fails to bring the
+    #     prompt under budget, replace the payload with a minimal safe
+    #     fallback (symbol + analysis_time + hard_rules + deterministic
+    #     decision only). Pre-R8 the function returned the oversized
+    #     prompt as a last resort, blowing past the cap.
+    #   - Minimal stub ready-path: read ``m.health.ready`` (correct
+    #     path — feature pack module's health is a sub-dict, not a
+    #     top-level field). Pre-R8 the stub read ``m.ready`` which is
+    #     always ``None`` in production, hiding real readiness state
+    #     behind a silent None.
+    # R9 P2-2 fix: ``MAX_PROMPT_BYTES`` is now a module-level constant
+    # so the safe_payload fallback can be exercised behaviorally in
+    # tests via ``unittest.mock.patch``.
+    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        payload.pop("historical_memory", None)
+        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            payload.pop("open_positions", None)
+            payload.pop("active_watches", None)
+            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            # R8 P1 fix: trim analysis_continuity before modules. The
+            # continuity block is decision-useful but redundant with
+            # market_snapshot's per-TF view; modules carry unique
+            # primary-TF indicator values.
+            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                market_snapshot = payload.get("market_snapshot")
+                if isinstance(market_snapshot, dict):
+                    market_snapshot.pop("analysis_continuity", None)
+                prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                    # Last-resort trim: drop primary-TF modules. The
+                    # multi_timeframe_feature_pack already carries per-TF
+                    # compact views, so the LLM still has TF context.
+                    # R6 REC-R6-1 fix: ``modules`` is nested under
+                    # ``market_snapshot`` (set by ``_compact_snapshot``),
+                    # not at the payload top level. A top-level
+                    # ``payload.pop("modules")`` was a silent no-op and the
+                    # oversized prompt leaked past the budget.
+                    if isinstance(market_snapshot, dict):
+                        market_snapshot.pop("modules", None)
+                    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    # R7 P1 fix: final hard cap. If the prompt is STILL over
+                    # budget after every trim tier, the oversized payload is
+                    # ``market_snapshot.multi_timeframe_feature_pack`` or
+                    # ``deterministic_reference`` — neither was trimmed above
+                    # because both are decision-critical. Replace the
+                    # feature pack with a minimal stub (symbol + per-TF
+                    # ready flag only) and the deterministic_reference with
+                    # a one-line summary. This guarantees the prompt stays
+                    # under the LLM context window even when the upstream
+                    # producer emits a pathological payload. Pre-R7 the
+                    # function just returned the oversized prompt — a 100KB
+                    # feature pack produced a 103KB prompt, blowing past
+                    # the 48KB cap.
+                    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                        if isinstance(market_snapshot, dict):
+                            mtfp = market_snapshot.get("multi_timeframe_feature_pack")
+                            if isinstance(mtfp, dict):
+                                # Replace with a minimal stub: keep only
+                                # symbol + per-TF ready/bias (decision-critical
+                                # minimum), drop all indicator details.
+                                # R8 P1 fix: ready path is ``m.health.ready``,
+                                # NOT ``m.ready``. Feature pack module
+                                # structure (decision_context.py:263):
+                                # ``m = {"health": _compact_health(health),
+                                #         "bias": ..., ...}``. Pre-R8 the stub
+                                # read ``m.ready`` which is always None in
+                                # production, hiding the real readiness
+                                # state behind a silent None.
+                                minimal_mtfp = {"symbol": mtfp.get("symbol")}
+                                modules = mtfp.get("modules") or {}
+                                if isinstance(modules, dict):
+                                    minimal_mtfp["modules"] = {
+                                        tf: {
+                                            "ready": (
+                                                (m.get("health") or {}).get("ready")
+                                                if isinstance(m, dict) else None
+                                            ),
+                                            "bias": (m.get("bias") if isinstance(m, dict) else None),
+                                        }
+                                        for tf, m in modules.items()
+                                    }
+                                market_snapshot["multi_timeframe_feature_pack"] = minimal_mtfp
+                        # Deterministic reference: trim to decision-critical
+                        # fields only.
+                        dr = payload.get("deterministic_reference")
+                        if isinstance(dr, dict):
+                            payload["deterministic_reference"] = {
+                                k: dr.get(k)
+                                for k in (
+                                    "decision", "signal_grade", "confidence",
+                                    "market_bias", "trend_stage", "symbol",
+                                    "analysis_time_utc",
+                                    "strategy_name", "strategy_version",
+                                )
+                                if k in dr
+                            }
+                        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        # Final assertion: if STILL over, drop historical_memory
+                        # was already tried — drop deterministic_reference
+                        # entirely (LLM still has market_snapshot + hard_rules).
+                        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                            payload.pop("deterministic_reference", None)
+                            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                            # R8 P1 fix: final hard assertion. If EVERY
+                            # trim tier failed, replace the payload with
+                            # a minimal safe fallback (decision-critical
+                            # fields only) so the prompt is guaranteed
+                            # under budget. Pre-R8 the function returned
+                            # the oversized prompt as a last resort.
+                            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                                safe_dr = deterministic_decision or {}
+                                # R10 P1 fix: read symbol/analysis_time_utc
+                                # from ``market_snapshot`` (the actual
+                                # location) or ``deterministic_decision``,
+                                # NOT from payload top level. Pre-R10 the
+                                # code read ``payload.get("symbol")`` which
+                                # returned None — ``symbol`` and
+                                # ``analysis_time_utc`` live inside
+                                # ``payload["market_snapshot"]`` (set by
+                                # ``_compact_snapshot``). This caused the
+                                # safe_payload to emit
+                                # ``{"symbol": null, "analysis_time_utc": null}``
+                                # at the top level, violating
+                                # ``output_requirements.must_keep`` and
+                                # losing the symbol context precisely when
+                                # the prompt is under extreme budget
+                                # pressure.
+                                # R11 P2 fix: also surface
+                                # ``strategy_name``/``strategy_version``
+                                # from ``deterministic_decision`` (set by
+                                # ``ga_judge.py:631-632``). Pre-R11 the
+                                # safe_payload included
+                                # ``output_requirements.must_keep``
+                                # demanding these fields but never
+                                # provided them — a self-contradicting
+                                # prompt payload that the LLM could not
+                                # satisfy.
+                                safe_ms = payload.get("market_snapshot") or {}
+                                safe_payload = {
+                                    "symbol": safe_ms.get("symbol") or safe_dr.get("symbol"),
+                                    "analysis_time_utc": safe_ms.get("analysis_time_utc") or safe_dr.get("analysis_time_utc"),
+                                    "strategy_name": safe_dr.get("strategy_name"),
+                                    "strategy_version": safe_dr.get("strategy_version"),
+                                    "hard_rules": payload.get("hard_rules"),
+                                    "deterministic_reference": {
+                                        k: safe_dr.get(k)
+                                        for k in (
+                                            "decision", "signal_grade", "confidence",
+                                            "market_bias", "trend_stage", "symbol",
+                                            "analysis_time_utc",
+                                            "strategy_name", "strategy_version",
+                                        )
+                                        if k in safe_dr
+                                    },
+                                    "output_requirements": payload.get("output_requirements"),
+                                    "_trim_note": "prompt_over_budget_minimal_fallback",
+                                }
+                                prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(
+                                    safe_payload, ensure_ascii=False, separators=(",", ":"),
+                                )
+    return prompt
 
 
 def _build_memory_section(context: dict[str, Any]) -> dict[str, Any] | None:
@@ -281,23 +475,134 @@ def _resolve_llm_config_name() -> str:
 
 
 def _parse_json_object(raw: str) -> dict[str, Any]:
+    """Phase G (07-05): bounded JSON extraction with explicit error
+    categories. The LLM occasionally emits responses that ``json.loads``
+    cannot parse directly: Markdown fences, leading/trailing prose, or
+    raw control characters (``\\x00`` from tool output). The PRD Fact 4
+    scenario (DOGE) was caused by ``Invalid control character`` —
+    ``json.loads`` raised and the chain collapsed to "缺交易计划" instead
+    of preserving the deterministic candidate plan.
+
+    Contract (PRD FR-6 / design.md §8):
+    - Strip Markdown fences (one attempt).
+    - Extract exactly one JSON object via ``\\{[\\s\\S]*\\}`` regex
+      (one attempt) when the direct parse fails.
+    - Record error category and retry count on the returned dict via
+      ``_llm_parse_meta`` so diagnostics can distinguish "extracted"
+      from "clean parse".
+    - Never accept repaired output without schema + semantic validation
+      (the caller ``run_agent_sop_decision`` runs ``validate_json``
+      after this function returns).
+
+    Out of scope (intentionally NOT repaired — fail-closed):
+    - Invalid control characters (``\\x00``-``\\x1f``) — per PRD Fact 4,
+      these MUST fail parse so the deterministic candidate plan is
+      preserved under ``candidate_trade_plan`` / ``plan_status="withheld"``.
+    - Truncated JSON — cannot be reliably repaired; fail-closed.
+    - Schema-invalid JSON — semantic validation in the caller catches this.
+
+    When parse fails, re-raise ``JSONDecodeError`` so the caller's
+    except branch fail-closes the decision.
+    """
     text = raw.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
+    # Step 1: strip Markdown fences (one attempt).
+    fenced = False
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+        fenced = True
+    else:
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    # Step 2: direct parse (clean path).
+    retry_count = 0
+    error_category: str | None = None
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise
-        data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("LLM response is not a JSON object")
-    return data
+        if not isinstance(data, dict):
+            raise ValueError("LLM response is not a JSON object")
+        _attach_parse_meta(data, retry_count=retry_count, error_category=None, fenced=fenced)
+        return data
+    except json.JSONDecodeError as exc:
+        error_category = _classify_json_error(exc, text)
+
+    # Step 3: extract exactly one JSON object via regex (one attempt).
+    # This handles leading/trailing prose around a valid JSON object.
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        retry_count += 1
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                _attach_parse_meta(
+                    data, retry_count=retry_count, error_category=error_category,
+                    fenced=fenced, extracted=True,
+                )
+                return data
+        except json.JSONDecodeError:
+            pass  # fall through to fail-closed
+
+    # Step 4: fail-closed — could not recover. Re-raise so the caller's
+    # except branch records llm_status="failed" and preserves the
+    # deterministic candidate plan (PRD Fact 4 / FR-4 / FR-6).
+    err = json.JSONDecodeError(
+        f"LLM JSON parse failed (category={error_category}, retries={retry_count})",
+        text, 0,
+    )
+    raise err
+
+
+def _classify_json_error(exc: json.JSONDecodeError, text: str) -> str:
+    """Classify a JSONDecodeError into a stable error category for diagnostics."""
+    msg = str(exc).lower()
+    if "control character" in msg or "\\x00" in text:
+        return "invalid_control_character"
+    if "unterminated string" in msg or "end of json" in msg or "eof" in msg:
+        return "truncated_json"
+    if "expecting" in msg and "delimiter" in msg:
+        return "malformed_delimiter"
+    if "unescaped" in msg or "invalid \\escape" in msg:
+        return "invalid_escape"
+    return "malformed_json"
+
+
+def _attach_parse_meta(
+    data: dict[str, Any],
+    *,
+    retry_count: int,
+    error_category: str | None,
+    fenced: bool = False,
+    extracted: bool = False,
+    repaired: bool = False,
+) -> None:
+    """Attach parse-time metadata to the parsed dict so diagnostics can
+    reason about LLM output quality. The metadata is namespaced under
+    ``_llm_parse_meta`` and stripped by ``_normalize_llm_decision`` before
+    the candidate merges with the deterministic fallback (the schema does
+    not allow these keys).
+    """
+    data["_llm_parse_meta"] = {
+        "retry_count": retry_count,
+        "error_category": error_category,
+        "fenced": fenced,
+        "extracted": extracted,
+        "repaired": repaired,
+    }
 
 
 def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     decision = dict(fallback)
+    # Phase F (07-05): capture raw_signal_grade / raw_score from the
+    # deterministic fallback BEFORE the LLM candidate merges. These are
+    # the pre-LLM, pre-gate deterministic conclusions and must persist
+    # for audit/report so "原始评分 X% · 执行等级 Y" can be rendered
+    # even when the LLM upgrades or downgrades the grade. canonical
+    # signal_grade remains the effective (post-LLM, post-gate) grade.
+    raw_signal_grade = fallback.get("raw_signal_grade") or fallback.get("signal_grade") or "D"
+    raw_score = float(fallback.get("raw_score") if fallback.get("raw_score") is not None else fallback.get("confidence") or 0.0)
+    decision["raw_signal_grade"] = raw_signal_grade
+    decision["raw_score"] = round(raw_score, 4)
     # Pass 7 P1 #2: strip internal marker fields from the LLM candidate before
     # merge. ``_htf_conflict_original_grade`` and ``_htf_conflict_grade_downgraded``
     # are internal idempotency markers owned by ``market_semantics.normalize_market_semantics``
@@ -315,11 +620,25 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     # writing them.
     INTERNAL_FIELD_PREFIX = "_"
     if isinstance(candidate, dict):
+        # Phase G (07-05): capture parse-time metadata before stripping so
+        # diagnostics can reason about LLM output quality (fenced/extracted/
+        # repaired + error_category + retry_count). The metadata is namespaced
+        # under ``_llm_parse_meta`` by ``_parse_json_object``.
+        llm_parse_meta = candidate.get("_llm_parse_meta")
         candidate = {
             k: v for k, v in candidate.items()
             if not (isinstance(k, str) and k.startswith(INTERNAL_FIELD_PREFIX))
         }
+    else:
+        llm_parse_meta = None
     decision.update(candidate)
+    if llm_parse_meta is not None:
+        # Surface parse metadata on the decision for downstream diagnostics.
+        # ``llm_parse_meta`` is not in the ga_decision schema; it is stripped
+        # before persistence by the controller (which only persists
+        # schema-allowed keys plus raw_decision_json). Use a non-conflicting
+        # key so it does not collide with schema fields.
+        decision["llm_parse_meta"] = llm_parse_meta
     decision["symbol"] = snapshot["symbol"]
     # R11-6: snapshot.analysis_time_utc must be a strict positive int, else fail-closed
     _snap_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
@@ -330,6 +649,19 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     decision.setdefault("strategy_version", fallback.get("strategy_version", "1.0"))
     decision["analysis_source"] = "llm_agent"
     decision["llm_status"] = "ok"
+    # Persisted audit reference (NOT the prompt payload path). The same
+    # key name ``deterministic_reference`` is used in two paths:
+    # (1) here — persisted on the decision row for audit/debugging;
+    # (2) in ``build_llm_decision_prompt`` trim tier + safe_payload
+    #     fallback — included in the LLM prompt payload, where
+    #     ``output_requirements.must_keep`` requires
+    #     ``strategy_name``/``strategy_version`` to be surfaced.
+    # This audit-path dict intentionally omits ``strategy_name``/
+    # ``strategy_version`` because they are already on the parent
+    # ``decision`` dict (lines 648-649 above). Adding them here would
+    # be redundant and could confuse downstream consumers about which
+    # dict is authoritative. Do NOT add them here without updating
+    # ``decision_schema.py`` and ``feishu_cards.py``.
     decision["deterministic_reference"] = {
         "decision": fallback.get("decision"),
         "signal_grade": fallback.get("signal_grade"),
@@ -352,6 +684,10 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         decision["market_bias"] = "unknown"
         decision["signal_grade"] = "C"
         decision["confidence"] = min(float(decision.get("confidence") or 0.3), 0.3)
+        # Phase F (07-05): preserve raw_signal_grade / raw_score set at
+        # the top of _normalize_llm_decision so the report can still
+        # surface "原始评分 X%" even in degraded mode. raw_score reflects
+        # the deterministic fallback's score, not the degraded 0.3 cap.
         decision["has_trade_plan"] = False
         decision["trade_plan"] = None
         decision["decision"] = "monitor_only"
@@ -505,12 +841,53 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         value = modules.get(name)
         if isinstance(value, dict):
             keep_modules[name] = value
+    # Phase C (07-05): surface a bounded MultiTimeframeFeaturePack so the LLM
+    # sees per-TF compact modules (sample_count, data_as_of, bias, structure,
+    # momentum, key_levels) for ALL 5 timeframes — not just the primary TF.
+    # The pack is built lazily here so snapshots constructed by tests or
+    # fixtures (which may not call attach_feature_pack_to_snapshot) still
+    # surface the pack to the LLM prompt. Raw candle arrays, full swing
+    # histories, skill prompts, and logs are excluded by the builder's
+    # size budget.
+    from plugins.crypto_guard.reasoning.decision_context import (
+        build_multi_timeframe_feature_pack,
+    )
+    feature_pack = snapshot.get("multi_timeframe_feature_pack") or build_multi_timeframe_feature_pack(snapshot)
+    # Phase D (07-05): surface the analysis_continuity block (previous_compact
+    # + delta with trigger_progress) so the LLM sees prior grade/bias/stage/
+    # key_levels/next_triggers and confirmed/invalidated trigger status. The
+    # block is built lazily here so snapshots constructed without an explicit
+    # attach call still surface continuity to the LLM. When no previous row
+    # is available, the block carries continuity_status="missing" and an empty
+    # delta — the LLM still gets a structured signal that this is a first-round.
+    continuity = snapshot.get("analysis_continuity")
+    if continuity is None:
+        # Best-effort: build with no previous row (continuity_status="missing").
+        # The controller is responsible for attaching a real previous row
+        # before the LLM prompt is built.
+        try:
+            from plugins.crypto_guard.reasoning.decision_context import (
+                build_analysis_continuity,
+            )
+            continuity = build_analysis_continuity(
+                snapshot, previous_row=None,
+                current_batch_id=None, current_decision=None,
+            )
+        except Exception:
+            continuity = None
     return {
         "symbol": snapshot.get("symbol"),
         "analysis_time_utc": snapshot.get("analysis_time_utc"),
         "mode": snapshot.get("mode"),
         "profiles": snapshot.get("profiles") or {},
         "modules": keep_modules,
+        "multi_timeframe_feature_pack": feature_pack,
+        # R5 P1-2 fix: ``timeframe_modules`` was a duplicate of
+        # ``feature_pack.get("modules")`` — sending the same per-TF data
+        # twice to the LLM, doubling token cost without adding any new
+        # information. Removed; downstream consumers read
+        # ``multi_timeframe_feature_pack.modules`` directly.
+        "analysis_continuity": continuity,
         "counter_evidence": snapshot.get("counter_evidence") or {},
         "data_quality": snapshot.get("data_quality") or {},
         "global_context": snapshot.get("global_context") or {},

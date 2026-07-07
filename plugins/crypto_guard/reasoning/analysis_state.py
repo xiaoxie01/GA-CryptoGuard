@@ -20,6 +20,13 @@ def build_market_analysis_state(
     trend = modules.get("trend_stage") or {}
     risk = decision.get("risk_check") or {}
     trade_plan = decision.get("trade_plan") if decision.get("has_trade_plan") else None
+    # R5 P0-2 fix: persist the withheld candidate (A-grade signal that
+    # failed risk check or was withheld by judge) so the next round's
+    # continuity can recover trigger_price/side and judge whether the
+    # candidate is still alive. Without this, a withheld candidate's
+    # trigger_price/side are silently dropped and the next round starts
+    # from scratch — breaking PRD FR-3 cross-round continuity.
+    candidate_trade_plan = decision.get("candidate_trade_plan") or None
     key_levels = _key_levels(pa, profiles)
     no_trade = _no_trade_reason(decision, risk)
     paper_allowed = bool(decision.get("has_trade_plan") and trade_plan and risk.get("ok"))
@@ -60,6 +67,7 @@ def build_market_analysis_state(
         },
         "opportunity_watch_recommended": bool("create_opportunity_watch" in (decision.get("suggested_actions") or [])),
         "trade_plan": trade_plan or {"has_trade_plan": False},
+        "candidate_trade_plan": candidate_trade_plan or {"has_candidate": False},
         "trend_evolution": _trend_evolution(snapshot, decision, previous_state),
     }
     return state
@@ -137,16 +145,57 @@ def _no_trade_reason(decision: dict[str, Any], risk: dict[str, Any]) -> dict[str
 
 
 def _next_triggers(decision: dict[str, Any], key_levels: dict[str, Any], momentum: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the next-trigger list for the upcoming round.
+
+    R7 P0 fix: each trigger now carries a structured ``level`` (the price
+    boundary that must be crossed) and ``operator`` (``>`` / ``<``) so the
+    next-round consumer (``_trigger_progress``) can judge confirmation
+    against the trigger's *own* boundary, not against the candidate
+    trade_plan's ``trigger_price``/``entry_price``. Pre-R7 the consumer
+    read ``previous_compact.trigger_price`` (candidate entry, e.g. 100)
+    while the actual breakout boundary lived only in the ``condition``
+    text (e.g. "15M 收盘站上 110"). With last_close=105 the candidate
+    entry was breached but the breakout was not — pre-R7 returned
+    ``confirmed`` erroneously. The structured fields are optional
+    (``None`` for non-price triggers like momentum_confirm) so older
+    consumers that only read ``condition`` keep working.
+    """
     triggers: list[dict[str, Any]] = []
     boundary = key_levels.get("breakout_boundary") or {}
-    if boundary.get("upper") is not None:
-        triggers.append({"type": "breakout_confirm", "timeframe": "15m", "condition": f"15M 收盘站上 {boundary['upper']}"})
-    if boundary.get("lower") is not None:
-        triggers.append({"type": "breakdown_confirm", "timeframe": "15m", "condition": f"15M 收盘跌破 {boundary['lower']}"})
-    triggers.append({"type": "momentum_confirm", "timeframe": "5m", "condition": f"动能方向从 {momentum.get('direction', 'neutral')} 转为与 4H 一致"})
+    upper = boundary.get("upper")
+    lower = boundary.get("lower")
+    if upper is not None:
+        triggers.append({
+            "type": "breakout_confirm",
+            "timeframe": "15m",
+            "level": upper,
+            "operator": ">",
+            "condition": f"15M 收盘站上 {upper}",
+        })
+    if lower is not None:
+        triggers.append({
+            "type": "breakdown_confirm",
+            "timeframe": "15m",
+            "level": lower,
+            "operator": "<",
+            "condition": f"15M 收盘跌破 {lower}",
+        })
+    triggers.append({
+        "type": "momentum_confirm",
+        "timeframe": "5m",
+        "level": None,
+        "operator": None,
+        "condition": f"动能方向从 {momentum.get('direction', 'neutral')} 转为与 4H 一致",
+    })
     watch = decision.get("opportunity_watch") or {}
     for condition in (watch.get("conditions") or [])[:2]:
-        triggers.append({"type": "opportunity_watch", "timeframe": "5m", "condition": str(condition)})
+        triggers.append({
+            "type": "opportunity_watch",
+            "timeframe": "5m",
+            "level": None,
+            "operator": None,
+            "condition": str(condition),
+        })
     return triggers[:5]
 
 

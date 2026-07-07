@@ -17,6 +17,10 @@ from plugins.crypto_guard.paper.shadow_virtual_trade_updater import DEFAULT_MAX_
 from plugins.crypto_guard.paper.sizing import compute_position_size
 import json
 
+from plugins.crypto_guard.logging_utils import get_logger
+
+LOGGER = get_logger("crypto_guard.ga_master")
+
 
 def _find_shadow_candidates(repo: CryptoGuardRepository, strategy_name: str) -> list[dict[str, Any]]:
     """Return ALL shadow_testing versions for a strategy, newest first.
@@ -172,7 +176,6 @@ def _create_virtual_trade_for_candidate(
         )
         return vt_id
     except Exception:
-        LOGGER = __import__("plugins.crypto_guard.logging_utils", fromlist=["get_logger"]).get_logger("crypto_guard.ga_master")
         LOGGER.exception("shadow_virtual_trade_create_failed: candidate=%s ga_decision=%s", candidate_version, ga_decision_id)
         return None
 
@@ -383,6 +386,53 @@ class GAMasterController:
         context = self.context_builder.build(request)
         snapshot = context["snapshot"]
 
+        # Phase D (07-05): strict previous-state lookup for analysis continuity.
+        # The loose ``latest_analysis_state`` returns the latest row for the
+        # symbol without filtering by analysis_time or batch_id, so it can
+        # return a same-batch or future row in pathological cases. The
+        # continuity builder requires a strictly-prior, cross-batch, same-
+        # symbol row; everything else is audit-only.
+        previous_row_strict = None
+        try:
+            previous_row_strict = self.repo.latest_analysis_state_for_continuity(
+                str(snapshot.get("symbol") or request.symbol),
+                analysis_time_utc=int(snapshot.get("analysis_time_utc") or 0),
+                exclude_batch_id=request.batch_id,
+            )
+        except Exception:
+            LOGGER.warning(
+                "latest_analysis_state_for_continuity failed for %s; falling back to None",
+                snapshot.get("symbol"),
+                exc_info=True,
+            )
+        # Persist the strict row on the context for build_market_analysis_state
+        # (which still reads the loose row from context["previous_analysis_state"]
+        # for backward compat — the strict row is the audit-grade source).
+        context["previous_analysis_state_strict"] = previous_row_strict
+
+        # Attach a pre-decision continuity block (delta without current_decision
+        # — trigger_progress uses snapshot-only heuristics). The LLM prompt
+        # path reads this from _compact_snapshot. After the decision is
+        # finalized we rebuild the block with the actual current_decision so
+        # delta.trigger_progress and thesis_status reflect what the decision
+        # actually concluded.
+        try:
+            from plugins.crypto_guard.reasoning.decision_context import (
+                attach_analysis_continuity_to_snapshot,
+            )
+            attach_analysis_continuity_to_snapshot(
+                snapshot,
+                previous_row=previous_row_strict,
+                current_batch_id=request.batch_id,
+                current_decision=None,
+            )
+        except Exception:
+            LOGGER.warning(
+                "attach_analysis_continuity_to_snapshot (pre-decision) failed for %s",
+                snapshot.get("symbol"),
+                exc_info=True,
+            )
+
         # Hourly Report Accuracy: previous grade + hysteresis + clampgate
         from plugins.crypto_guard.strategy.grade_config import (
             grade_with_hysteresis, clamp_grade, grade_delta, SA_MAX_COUNTER_EVIDENCE,
@@ -397,6 +447,34 @@ class GAMasterController:
         legacy["analysis_source"] = "ga_master_controller"
         legacy["batch_id"] = request.batch_id
         legacy["previous_grade"] = previous_grade if previous_grade else legacy.get("previous_grade")
+
+        # Phase F (07-05): capture raw_signal_grade / raw_score BEFORE
+        # risk_gate / hysteresis / clamp run. These are the pre-gate
+        # deterministic conclusions and must persist for audit/report so
+        # the hourly report can render "原始评分 X% · 执行等级 Y" with
+        # the original signal strength even when hysteresis or clamp
+        # later downgrade the grade. The LLM judge already set these on
+        # the legacy dict via _normalize_llm_decision; capture them here
+        # as a stable snapshot before any further mutation.
+        raw_signal_grade_capture = str(legacy.get("raw_signal_grade") or legacy.get("signal_grade") or "D").upper()
+        raw_score_capture = float(legacy.get("raw_score") if legacy.get("raw_score") is not None else legacy.get("confidence") or 0.0)
+        legacy["raw_signal_grade"] = raw_signal_grade_capture
+        legacy["raw_score"] = round(raw_score_capture, 4)
+        # grade_adjustments records every post-gate downgrade with its
+        # reason code. Populated as hysteresis/clamp/perf_gate run.
+        grade_adjustments: list[dict[str, Any]] = []
+
+        # P1-6 (07-05 final review): the post-decision continuity rebuild
+        # previously ran here (before risk_gate / hysteresis / clamp /
+        # performance_gate), so the persisted delta reflected a pre-gate
+        # decision that could still be downgraded or watch-only'd by the
+        # gates below. That contradicted the "finalized decision" claim
+        # in the persisted block. The rebuild now happens AFTER all gates
+        # complete (around line 746, just before persistence), reading
+        # the final effective_signal_grade / has_trade_plan / decision
+        # so the delta and trigger_progress reflect the actual persisted
+        # state. The LLM prompt still receives a pre-decision continuity
+        # block via the snapshot built earlier in build_market_state_snapshot.
 
         # P0-3 (Round 3): run risk_gate FIRST so emergency_down can use
         # the account_risk result (hard_risk_off / daily_loss_pause).
@@ -420,6 +498,14 @@ class GAMasterController:
                 notes = list(legacy.get("risk_notes") or [])
                 if hys_reason:
                     notes.append(hys_reason)
+                    # Phase F (07-05): record the downgrade for audit.
+                    grade_adjustments.append({
+                        "code": "hysteresis",
+                        "stage": "grade_gate",
+                        "from": str(prev_for_hys),
+                        "to": str(effective_grade),
+                        "detail": hys_reason,
+                    })
                 legacy["risk_notes"] = notes
         if legacy.get("has_trade_plan") and legacy.get("trade_plan") and not risk.get("ok"):
             legacy["has_trade_plan"] = False
@@ -457,10 +543,19 @@ class GAMasterController:
             counter_evidence_count=counter_count,
         )
         if clamped_grade != legacy.get("signal_grade"):
+            pre_clamp_grade = str(legacy.get("signal_grade") or "D")
             legacy["signal_grade"] = clamped_grade
             notes = list(legacy.get("risk_notes") or [])
             if clamp_reason:
                 notes.append(clamp_reason)
+                # Phase F (07-05): record the clamp downgrade for audit.
+                grade_adjustments.append({
+                    "code": "clamp_sa_evidence",
+                    "stage": "grade_gate",
+                    "from": pre_clamp_grade,
+                    "to": str(clamped_grade),
+                    "detail": clamp_reason,
+                })
             legacy["risk_notes"] = notes
 
         # Account risk_off state — visible in ga_decisions for monitoring
@@ -506,16 +601,58 @@ class GAMasterController:
             notes = list(legacy.get("risk_notes") or [])
             notes.append("Performance gate 降级：" + "；".join(perf_gate.get("reasons") or []))
             legacy["risk_notes"] = notes
+            # Phase F (07-05): record performance gate downgrade.
+            grade_adjustments.append({
+                "code": "performance_gate_watch_only",
+                "stage": "performance_gate",
+                "from": str(legacy.get("signal_grade") or "D"),
+                "to": str(legacy.get("signal_grade") or "D"),
+                "detail": "；".join(perf_gate.get("reasons") or []) or "performance gate watch-only",
+            })
         elif perf_gate.get("performance_degraded"):
             # Update grade if degraded
+            pre_perf_grade = str(legacy.get("signal_grade") or "D")
             legacy["signal_grade"] = perf_gate.get("effective_grade", signal_grade)
             notes = list(legacy.get("risk_notes") or [])
             notes.append(f"信号降级：{signal_grade}→{perf_gate.get('effective_grade')}")
             legacy["risk_notes"] = notes
+            # Phase F (07-05): record performance gate grade downgrade.
+            grade_adjustments.append({
+                "code": "performance_gate_degraded",
+                "stage": "performance_gate",
+                "from": pre_perf_grade,
+                "to": str(perf_gate.get("effective_grade") or pre_perf_grade),
+                "detail": f"信号降级：{pre_perf_grade}→{perf_gate.get('effective_grade')}",
+            })
 
         # Apply confidence adjustment if any
         if perf_gate.get("confidence_adjustment", 0) < 0:
             legacy["confidence"] = perf_gate.get("effective_confidence", confidence)
+
+        # Phase F (07-05): set effective_signal_grade / effective_execution_confidence
+        # / grade_adjustments AFTER all gates (risk, hysteresis, clamp, perf) have
+        # run. effective_signal_grade equals the canonical signal_grade (post-gate);
+        # effective_execution_confidence equals the canonical confidence (post-gate).
+        # raw_signal_grade / raw_score are the pre-gate deterministic conclusions
+        # captured at the top of analyze_symbol and never mutate after that.
+        legacy["effective_signal_grade"] = str(legacy.get("signal_grade") or "D").upper()
+        legacy["effective_execution_confidence"] = round(float(legacy.get("confidence") or 0.0), 4)
+        legacy["grade_adjustments"] = list(grade_adjustments)
+        # If LLM failed/disabled, record a grade_adjustment entry so the report
+        # can surface "LLM 失败" as a downgrade reason alongside hysteresis/clamp.
+        llm_status = str(legacy.get("llm_status") or "").lower()
+        if llm_status in {"failed", "disabled"} and not any(
+            str(adj.get("code") or "") in {"llm_parse_failed", "llm_disabled"}
+            for adj in grade_adjustments
+        ):
+            grade_adjustments.append({
+                "code": "llm_parse_failed" if llm_status == "failed" else "llm_disabled",
+                "stage": "synthesis",
+                "from": str(raw_signal_grade_capture),
+                "to": str(legacy.get("signal_grade") or "D"),
+                "detail": f"llm_status={llm_status} 触发 fail-closed，候选计划保留为 candidate_trade_plan",
+            })
+            legacy["grade_adjustments"] = list(grade_adjustments)
 
         feishu_actions = build_feishu_actions(legacy, risk)
         legacy["suggested_actions"] = feishu_actions
@@ -567,6 +704,57 @@ class GAMasterController:
             # Also keep a copy in the nested raw_legacy_decision for
             # legacy_decision_from_ga_decision consumers that read from there.
             raw_json.setdefault("raw_llm_summary", _original_llm_summary)
+        # Phase C (07-05): attach the MultiTimeframeFeaturePack to the
+        # persisted decision so raw_decision_json preserves per-TF compact
+        # modules (sample_count, data_as_of, bias, structure, momentum,
+        # key_levels) for ALL 5 timeframes. Previously only the primary-TF
+        # modules survived into raw_decision_json, hiding 1d/4h/1h/15m
+        # structure from audit. The pack is bounded to 24 KiB by the
+        # builder; raw candle arrays are never included.
+        try:
+            from plugins.crypto_guard.reasoning.decision_context import (
+                build_multi_timeframe_feature_pack,
+            )
+            feature_pack = build_multi_timeframe_feature_pack(snapshot)
+            ga_decision["multi_timeframe_feature_pack"] = feature_pack
+            if isinstance(raw_json, dict):
+                raw_json["multi_timeframe_feature_pack"] = feature_pack
+        except Exception:
+            LOGGER.warning(
+                "multi_timeframe_feature_pack build failed for %s; omitting",
+                snapshot.get("symbol"),
+                exc_info=True,
+            )
+        # Phase D (07-05) + P1-6 (final review): attach the
+        # analysis_continuity block (previous compact + delta with
+        # trigger_progress) to the persisted decision. This rebuild runs
+        # AFTER all gates (risk / hysteresis / clamp / performance_gate)
+        # have finalized ``legacy`` — so delta.current_grade,
+        # delta.has_trade_plan, delta.decision and trigger_progress
+        # statuses reflect the actual persisted state, not a pre-gate
+        # snapshot. The pre-decision block attached at line ~420 (with
+        # current_decision=None) served only the LLM prompt; we always
+        # rebuild here from the finalized legacy dict rather than reusing
+        # that pre-decision block.
+        try:
+            from plugins.crypto_guard.reasoning.decision_context import (
+                build_analysis_continuity,
+            )
+            continuity_block = build_analysis_continuity(
+                snapshot,
+                previous_row=context.get("previous_analysis_state_strict"),
+                current_batch_id=request.batch_id,
+                current_decision=legacy,
+            )
+            ga_decision["analysis_continuity"] = continuity_block
+            if isinstance(raw_json, dict):
+                raw_json["analysis_continuity"] = continuity_block
+        except Exception:
+            LOGGER.warning(
+                "analysis_continuity persist attach failed for %s; omitting",
+                snapshot.get("symbol"),
+                exc_info=True,
+            )
         # rewrite_inconsistent_summary still runs first as a secondary defense
         # (blacklist stripping + deterministic rendered summary when the gate
         # is not passed). Its output is then unified with the canonical

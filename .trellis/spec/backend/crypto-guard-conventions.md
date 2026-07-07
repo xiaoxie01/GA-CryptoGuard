@@ -1977,3 +1977,80 @@ ga_decision = controller_decision_from_legacy(legacy=legacy_judge_output, ...)
 ---
 
 **Last updated**: 2026-07-03 (07-03 hourly analysis semantic accuracy final seal — Sections 38.1-38.10 added for multi-TF semantics, bias-stage contract, HTF conflict cap, canonical summary, observation reason, C/D top-N labeling, 5 diagnostics + marker, data/time contract, acceptance tests, migration idempotency)
+
+---
+
+## 39. Hourly Decision Context Continuity Contracts (07-05)
+
+Task `07-05-hourly-decision-context-continuity` introduces the decision-context-continuity contract: every hourly decision must carry a bounded multi-timeframe feature pack, the previous-round analysis state and structured delta, a separated candidate/effective plan lifecycle, schema-valid LLM-failure fallback, and batch-pinned data-quality. Pre-marker rows are demoted to `legacy_info`; post-marker rows are evaluated against the full contract.
+
+### Contract 39.1: MultiTimeframeFeaturePack (Phase C)
+
+**What**: The controller persists a `multi_timeframe_feature_pack` block on `raw_decision_json` containing per-TF compact modules (sample_count, data_as_of, bias, structure, momentum, key_levels). Raw candle arrays / OHLCV / full swing histories / skill prompt text / logs are forbidden. The serialized pack MUST fit within `FEATURE_PACK_SIZE_BUDGET_BYTES` (24 KiB default).
+
+**Why**: Sending raw K lines to the LLM violates the highest constraint. The feature pack is the bounded-facts carrier — the LLM receives structure events, momentum scores, and key levels, never geometry. Without a size budget, downstream consumers (or a builder regression) could attach verbose text and blow past the prompt token limit.
+
+**Diagnostic**: `_check_oversized_feature_pack` flags any row whose serialized pack exceeds the budget (`OVERSIZED_FEATURE_PACK`, severity=error post-marker).
+
+### Contract 39.2: Analysis Continuity (Phase D)
+
+**What**: Every decision carries an `analysis_continuity` block with the previous-round compact state and a structured delta (grade/bias/stage change, trigger_progress, new/cleared reason codes). The controller calls `build_analysis_continuity` before persistence. The deterministic continuity gate consumes `confirmed`/`invalidated` trigger status — never just records the previous id.
+
+**Why**: Without continuity, each analysis is an island. The LLM cannot see prior thesis, and the deterministic gate cannot detect a confirmed/invalidated trigger. Recording only the previous id (as before Phase D) is audit-only and provides no decision value.
+
+**Diagnostic**: `_check_missing_analysis_continuity` flags any row lacking the block (`MISSING_ANALYSIS_CONTINUITY`, severity=warning post-marker).
+
+### Contract 39.3: Plan Lifecycle Separation (Phase E)
+
+**What**: Decisions carry `candidate_trade_plan` (deterministic geometry output), `trade_plan` (post-gate executable plan), `plan_status` (`not_generated` / `candidate` / `executable` / `withheld` / `invalidated`), and `plan_blockers` (structured reason codes). On LLM failure, the candidate is preserved; `trade_plan=None`; `plan_status="withheld"`; `plan_blockers` includes `llm_parse_failed`.
+
+**Why**: Before Phase E, an LLM parse failure collapsed to "缺交易计划" — the audit trail was lost. The report could not distinguish "no candidate generated" from "candidate withheld by gate". PRD Fact 4 requires the report to surface "候选计划已生成但被 LLM failure + grade hysteresis 阻断".
+
+**Diagnostics**:
+- `_check_missing_candidate_on_llm_failure` flags `llm_status=failed` rows without `candidate_trade_plan` (`MISSING_CANDIDATE_ON_LLM_FAILURE`, severity=error).
+- `_check_withheld_without_blockers` flags `plan_status=withheld` rows with empty `plan_blockers` (`WITHHELD_WITHOUT_BLOCKERS`, severity=warning).
+- `_check_candidate_effective_plan_mismatch` flags candidate/effective plan disagreements on side/entry/stop (`CANDIDATE_EFFECTIVE_PLAN_MISMATCH`, severity=error).
+
+### Contract 39.4: LLM Fallback Contract (Phase G)
+
+**What**: `no_edge_decision(symbol, reason, *, analysis_time_utc, timeframe_context=None)` requires keyword-only strict-positive-int `analysis_time_utc`. The bounded JSON extractor (`_parse_json_object`) strips Markdown fences and extracts exactly one JSON object; control characters intentionally FAIL parse so the deterministic candidate plan is preserved. `_llm_parse_meta` (retry_count, error_category, fenced, extracted) propagates to the persisted decision for diagnostics.
+
+**Why**: PRD Fact 5 — the no_edge fallback must be schema-valid even when triggered by a schema-invalid upstream payload. PRD Fact 4 — control-character failures must NOT be repaired away, otherwise the candidate plan is silently discarded.
+
+**AST guard**: `_check_no_2_arg_no_edge_decision_in_production` (in test_smoke.py) walks the production AST and fails if any production caller passes `analysis_time_utc` positionally.
+
+### Contract 39.5: Batch-Pinned Health (Phase B)
+
+**What**: The hourly report's market-data-quality rendering uses `batch.analysis_time`, never the wall-clock. A success batch must have all completed symbols `ready=True` at the batch time. Stale/gap/insufficient failures still surface fail-closed.
+
+**Why**: PRD Fact 1 — a batch ending at 19:59:59 reported at 20:15 was incorrectly flagged stale because the report compared the batch close to the wall-clock 20:14:59.
+
+**Diagnostic**: `_check_batch_time_health_mismatch` flags success batches whose symbols are not `ready=True` pinned to `batch.analysis_time` (`BATCH_TIME_HEALTH_MISMATCH`, severity=error post-marker).
+
+### Contract 39.6: Recent-Failed-Jobs Window (PRD FR-8)
+
+**What**: Failed `analysis_batches` older than `FAILED_JOBS_RECENT_WINDOW_DAYS` (default 7) are surfaced as `legacy_info`, not `error`. The diagnostic distinguishes current errors, warnings, and legacy history.
+
+**Why**: PRD FR-8 — historical failures must not permanently repeat as "current risk" in the hourly report. The window forces aging-out.
+
+**Diagnostic**: `_check_failed_jobs_outside_window` (`FAILED_JOBS_OUTSIDE_WINDOW`, severity=legacy_info always).
+
+### Contract 39.7: Marker and Cutoff (Phase H deployment)
+
+**What**: `_ensure_hourly_decision_context_continuity_contract_marker` writes `hourly_decision_context_continuity_contract_v1` into `_migration_state` after `check_schema_health()` passes. The marker is independent of the R4 and semantic-accuracy markers. `_apply_continuity_marker_cutoff` demotes pre-marker findings to `legacy_info`. The marker-missing check (`PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING`) surfaces the absence as an error.
+
+**Why**: A single cutoff for all seven Phase A-G contract diagnostics avoids cross-contamination with prior fix windows. Without the marker, every legacy row would fail every Phase A-G check, drowning the signal.
+
+**Test coverage**: `TestPhaseH07_05DiagnosticsAndReportUX` (13 tests) covers each diagnostic's positive and negative cases plus the marker deployment and pre-marker demotion.
+
+### Contract 39.8: Report UX — Explicit Plan Blockers and LLM Status (Phase E + Phase H)
+
+**What**: The hourly report renders explicit plan blocker summaries from `plan_blockers` (LLM 解析失败 / 风控未通过（…）/ 前次触发已被反转 / etc.) and surfaces LLM status as "候选计划已生成但被 LLM 失败阻断执行。" rather than collapsing to "缺交易计划".
+
+**Why**: PRD FR-8 — observation items must not uniformly degrade to "交易计划尚未形成". The operator must see the real blocking stage to act.
+
+**Implementation**: `plugins/crypto_guard/notify/hourly_report.py:_format_decision_card_for_audit` (and the `_format_opportunity_row` path) consume `candidate_trade_plan` + `plan_blockers` + `llm_status` directly from `raw_decision_json`.
+
+---
+
+**Last updated**: 2026-07-05 (07-05 hourly decision context continuity — Sections 39.1-39.8 added for multi-TF feature pack, analysis continuity, plan lifecycle separation, LLM fallback, batch-pinned health, recent-failed-jobs window, marker/cutoff, and report UX)
