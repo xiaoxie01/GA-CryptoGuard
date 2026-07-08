@@ -536,6 +536,27 @@ def normalize_market_semantics(
             if not result["suggested_actions"]:
                 result["suggested_actions"] = ["add_to_watchlist", "ignore"]
 
+    # ── Step 4b/4c/4d: HTF-alignment raw grade caps (Phase D, 07-07) ────────
+    # Per design §7.1. Each cap is an independent grade downgrade applied to
+    # the raw signal_grade BEFORE hysteresis / clamp_grade run in the
+    # controller. Idempotency: the helper records the original pre-cap grade
+    # in ``_htf_cap_original_grade`` on the first cap and never overwrites it
+    # on subsequent calls, so repeated normalize calls do not double-downgrade.
+    # Config flag ``htf_alignment_cap_enabled`` (default True) disables all
+    # three caps for rollback (design §13.2).
+    if bool(cfg.get("htf_alignment_cap_enabled", True)) and not bool(
+        snap.get("analysis_degraded")
+    ):
+        _apply_htf_alignment_caps(result, snap)
+        # Merge cap reason codes into the local reason_codes list so they
+        # survive the final dedup-rewrite of result["market_reason_codes"].
+        # _cap_grade writes directly to result["market_reason_codes"] for
+        # immediate visibility; we re-read it here and append any new codes
+        # to the local list so the dedup step at the end preserves them.
+        for code in (result.get("market_reason_codes") or []):
+            if code not in reason_codes:
+                reason_codes.append(code)
+
     # ── Step 5: late + overextended追价风险 reason code ────────────────────
     if str(result.get("trend_stage") or "").lower() == "late":
         reason_codes.append("overextended")
@@ -549,6 +570,115 @@ def normalize_market_semantics(
             deduped.append(code)
     result["market_reason_codes"] = deduped
     return result
+
+
+def _cap_grade(decision: dict[str, Any], *, max_grade: str, reason: str) -> bool:
+    """Downgrade ``signal_grade`` to ``max_grade`` if it exceeds.
+
+    Idempotent: the original pre-cap grade is recorded once in
+    ``_htf_cap_original_grade`` and never overwritten on subsequent calls,
+    so repeated normalize calls do not double-downgrade. The ``reason`` code
+    is appended to ``decision["market_reason_codes"]`` (dedup-safe: only
+    appends if not already present). Returns True if the grade was capped.
+    """
+    current = str(decision.get("signal_grade") or "D").upper()
+    if current not in GRADE_ORDER:
+        current = "D"
+    target = str(max_grade or "D").upper()
+    if target not in GRADE_ORDER:
+        return False
+    # Use GRADE_ORDER dict values (not .index()) — GRADE_ORDER is a dict.
+    if GRADE_ORDER[current] > GRADE_ORDER[target]:
+        # Record the original grade only on the first cap (idempotency).
+        if not decision.get("_htf_cap_original_grade"):
+            decision["_htf_cap_original_grade"] = current
+        decision["signal_grade"] = target
+        codes = list(decision.get("market_reason_codes") or [])
+        if reason not in codes:
+            codes.append(reason)
+        decision["market_reason_codes"] = codes
+        return True
+    return False
+
+
+def _apply_htf_alignment_caps(result: dict[str, Any], snap: dict[str, Any]) -> None:
+    """Apply Step 4b/4c/4d HTF-alignment raw grade caps.
+
+    Per design §7.1. Each cap is an independent grade downgrade:
+
+    - Step 4b (htf_countertrend_cap): 1D AND 4H both opposite to candidate
+      side → max B.
+    - Step 4b (htf_4h_nondirectional_cap): 4H bias in {neutral, mixed,
+      unknown, ""} → max B.
+    - Step 4d (mtf_misalignment_cap): 1H AND 15M both not aligned with
+      candidate side → max B.
+    - Step 4d (low_tf_rebound_only_cap): only 5M supports the candidate
+      side while 4H and 1H don't → max C, plus trend_stage remap
+      early→transition and ``low_tf_rebound_only`` reason code.
+
+    The candidate side is derived from ``market_bias``: bullish→LONG,
+    bearish→SHORT. When market_bias is non-directional, no caps apply
+    (nothing to be "opposite" to).
+
+    5M bias is read from ``snapshot.profiles["5m"].momentum`` because 5M
+    is excluded from ``TIMEFRAME_CONTEXT_TFS`` (data-only per convention).
+    """
+    ctx = result.get("timeframe_context") or {}
+    bias_1d = str((ctx.get("1d") or {}).get("bias") or "").lower()
+    bias_4h = str((ctx.get("4h") or {}).get("bias") or "").lower()
+    bias_1h = str((ctx.get("1h") or {}).get("bias") or "").lower()
+    bias_15m = str((ctx.get("15m") or {}).get("bias") or "").lower()
+    profile_5m = (snap.get("profiles") or {}).get("5m") or {}
+    bias_5m = str(profile_5m.get("momentum") or "").lower()
+
+    # Surface 5M momentum on a top-level ``m5_bias`` field so downstream
+    # consumers (diagnostics, reports) can read it without re-fetching
+    # snapshot.profiles. The ga_decision.schema.json only allows
+    # 1d/4h/1h/15m under timeframe_context (5M is data-only), so we expose
+    # 5M bias as a separate top-level extension field. The top-level
+    # schema object has no additionalProperties:false, so this is valid.
+    if bias_5m:
+        result["m5_bias"] = bias_5m
+
+    market_bias = str(result.get("market_bias") or "").lower()
+    if market_bias == "bullish":
+        candidate_side = "LONG"
+        candidate_side_lower = "bullish"
+    elif market_bias == "bearish":
+        candidate_side = "SHORT"
+        candidate_side_lower = "bearish"
+    else:
+        # Non-directional bias: nothing to be "opposite" to. No caps apply.
+        return
+
+    opposite = "bearish" if candidate_side == "LONG" else "bullish"
+
+    # Step 4b Cap 1: 1D and 4H both opposite to candidate → max B
+    if bias_1d == opposite and bias_4h == opposite:
+        _cap_grade(result, max_grade="B", reason="htf_countertrend_cap")
+
+    # Step 4c: 4H non-directional (range/transition/mixed/unknown) → max B
+    if bias_4h in ("", "neutral", "mixed", "unknown"):
+        _cap_grade(result, max_grade="B", reason="htf_4h_nondirectional_cap")
+
+    # Step 4d Cap 3: 1H and 15M both not aligned with candidate → max B
+    if bias_1h != candidate_side_lower and bias_15m != candidate_side_lower:
+        _cap_grade(result, max_grade="B", reason="mtf_misalignment_cap")
+
+    # Step 4d Cap 4: only 5M supports, 4H and 1H don't → max C + trend_stage remap
+    if (
+        bias_5m == candidate_side_lower
+        and bias_4h != candidate_side_lower
+        and bias_1h != candidate_side_lower
+    ):
+        _cap_grade(result, max_grade="C", reason="low_tf_rebound_only_cap")
+        # trend_stage remap: early → transition (no schema enum addition)
+        if str(result.get("trend_stage") or "").lower() == "early":
+            result["trend_stage"] = "transition"
+            codes = list(result.get("market_reason_codes") or [])
+            if "low_tf_rebound_only" not in codes:
+                codes.append("low_tf_rebound_only")
+            result["market_reason_codes"] = codes
 
 
 def normalize_snapshot_semantics(

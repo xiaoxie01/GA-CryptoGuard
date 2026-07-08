@@ -38637,6 +38637,1520 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         )
 
 
+class TestPhaseB07_07LLMRetryAndBreaker(unittest.TestCase):
+    """Phase B (07-07): LLM retry + circuit breaker + wall-clock budget.
 
-if __name__ == "__main__":
-    unittest.main()
+    Covers AC1-AC8 + AC7b per task
+    `.trellis/tasks/07-07-llm-retry-analysis-accuracy-repair/implement.md` B10.
+    """
+
+    def _decision_snapshot(self) -> dict[str, object]:
+        # Reuse a minimal bullish snapshot aligned with 4 TFs.
+        return {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": 1_700_000_000_000,
+            "mode": "scheduled",
+            "profiles": {
+                "1d": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "4h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "1h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "15m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
+            },
+            "modules": {
+                "price_action": {
+                    "market_structure": "bullish",
+                    "key_levels": {"support": [100.0], "resistance": [120.0]},
+                    "invalid_level": 95.0,
+                },
+                "momentum": {"direction": "bullish"},
+                "trend_stage": {"trend_stage": "early"},
+            },
+            "counter_evidence": {
+                "bullish_evidence": ["价格结构偏多"],
+                "bearish_evidence": [],
+                "neutral_or_risk_evidence": ["仍需等待价格确认"],
+                "contradiction_level": "low",
+            },
+            "data_quality": {
+                "closed_candles_only": True, "status": "complete",
+                "analysis_time_utc": 1_700_000_000_000,
+                "missing_timeframes": [], "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": 1_699_991_360_000},
+                    "4h": {"ready": True, "last_close_time": 1_699_997_200_000},
+                    "1h": {"ready": True, "last_close_time": 1_699_999_600_000},
+                    "15m": {"ready": True, "last_close_time": 1_700_000_000_000},
+                },
+            },
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_991_360_000},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_997_200_000},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_699_999_600_000},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": 1_700_000_000_000},
+            },
+            "alignment": "aligned",
+            "htf_conflict": False,
+            "market_reason_codes": [],
+        }
+
+    def _make_breaker(self) -> "CircuitBreaker":
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+        return CircuitBreaker(
+            consecutive_threshold=3,
+            rate_threshold=0.5,
+            rate_window=10,
+        )
+
+    def _make_budgets(self, *, wall_seconds: float = 90.0, retry_calls: int = 9):
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            BatchRetryBudget, BatchWallClockBudget,
+        )
+        return (
+            BatchRetryBudget(max_batch_retry_calls=retry_calls),
+            BatchWallClockBudget(budget_seconds=wall_seconds),
+        )
+
+    def _ctx_with(self, breaker, retry_budget, wall_budget) -> dict[str, object]:
+        return {
+            "llm_breaker": breaker,
+            "llm_retry_budget": retry_budget,
+            "llm_wall_clock_budget": wall_budget,
+        }
+
+    # AC1: HTTP 422 invalid_model_error -> llm_config_error, no retry, breaker opens
+    def test_07_07_http_422_classifies_as_config_error_and_skips_retry(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            _classify_llm_failure, run_agent_sop_decision,
+        )
+        category = _classify_llm_failure(
+            None,
+            "!!!Error: HTTP 422 invalid_model_error: model not found: xopglm52",
+            "call",
+        )
+        self.assertEqual(
+            category, "llm_config_error",
+            "AC1: HTTP 422 invalid_model_error must classify as llm_config_error",
+        )
+
+        breaker = self._make_breaker()
+        retry_budget, wall_budget = self._make_budgets()
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            # Real ``_call_ga_llm`` raises RuntimeError on ``!!!Error``
+            # responses (see llm_agent_judge.py line 913-914). The mock must
+            # replicate that so the classifier sees the call-stage error
+            # rather than a parse-stage JSONDecodeError.
+            raise RuntimeError("!!!Error: HTTP 422 invalid_model_error: model not found: xopglm52")
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        # Non-retryable: exactly one LLM call (Attempt 1), no retries.
+        self.assertEqual(
+            call_count["n"], 1,
+            "AC1/AC8: non-retryable llm_config_error must NOT consume retry quota",
+        )
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(decision["llm_error_category"], "llm_config_error")
+        self.assertEqual(decision["llm_error_stage"], "call")
+        self.assertEqual(
+            decision["llm_fallback_reason"], "non_retryable_error",
+            "AC1: non-retryable config error fails closed with non_retryable_error",
+        )
+        # Breaker must be open after a config error.
+        self.assertEqual(breaker.state, "open")
+        # attempt count reflects single call (non-retryable).
+        self.assertEqual(decision["llm_attempt_count"], 1)
+
+    # AC2: empty response retries up to 3 times then fails closed.
+    def test_07_07_empty_response_retries_three_times_then_fail_closed(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        breaker = self._make_breaker()
+        retry_budget, wall_budget = self._make_budgets()
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            return ""  # empty response — retryable
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        # 3 attempts: normal, strict JSON, minimal safe.
+        self.assertEqual(
+            call_count["n"], 3,
+            "AC2: empty response must be retried up to 3 attempts",
+        )
+        self.assertEqual(decision["llm_status"], "failed")
+        # Empty string reaches the parser as "" which raises JSONDecodeError,
+        # so the category is reported as llm_json_parse_failed at the parse
+        # stage. The retry policy still treats it as retryable.
+        self.assertEqual(
+            decision["llm_error_category"], "llm_json_parse_failed",
+        )
+        self.assertEqual(
+            decision["llm_fallback_reason"], "retry_exhausted",
+            "AC2: after 3 attempts exhausted, fail-closed with retry_exhausted",
+        )
+
+    # AC3: malformed JSON uses strict JSON prompt on retry.
+    def test_07_07_malformed_json_uses_strict_json_retry(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        breaker = self._make_breaker()
+        retry_budget, wall_budget = self._make_budgets()
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        prompts_seen: list[str] = []
+
+        def fake_call(prompt: str) -> str:
+            prompts_seen.append(prompt)
+            # Always return malformed JSON so all 3 attempts fail.
+            return "{not valid json"
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        # Attempt 1 normal, Attempt 2 strict JSON, Attempt 3 minimal safe.
+        self.assertGreaterEqual(
+            len(prompts_seen), 2,
+            "AC3: malformed JSON must trigger at least strict-JSON retry",
+        )
+        # The strict JSON prompt should appear (contains the strict system prompt).
+        from plugins.crypto_guard.reasoning.llm_agent_judge import SYSTEM_PROMPT_STRICT_JSON
+        self.assertTrue(
+            any(SYSTEM_PROMPT_STRICT_JSON in p for p in prompts_seen[1:]),
+            "AC3: retry Attempt 2+ must use SYSTEM_PROMPT_STRICT_JSON",
+        )
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(
+            decision["llm_error_category"], "llm_json_parse_failed",
+        )
+
+    # AC4: schema validation failure -> llm_schema_validation_failed, non-retryable.
+    def test_07_07_schema_validation_failure_classified_correctly(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            _classify_llm_failure,
+        )
+        self.assertEqual(
+            _classify_llm_failure(None, "", "schema"),
+            "llm_schema_validation_failed",
+            "AC4: schema stage must map to llm_schema_validation_failed",
+        )
+
+    # AC5: 3 consecutive infra errors -> breaker opens.
+    def test_07_07_three_consecutive_infra_errors_open_breaker(self) -> None:
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        self.assertEqual(breaker.state, "closed")
+        self.assertTrue(breaker.should_call())
+
+        breaker.record_attempt(category="llm_transport_error", ok=False)
+        self.assertEqual(breaker.state, "closed")
+        breaker.record_attempt(category="llm_transport_error", ok=False)
+        self.assertEqual(breaker.state, "closed")
+        breaker.record_attempt(category="llm_transport_error", ok=False)
+        self.assertEqual(
+            breaker.state, "open",
+            "AC5: 3 consecutive infra errors must open breaker",
+        )
+        self.assertFalse(breaker.should_call())
+
+    # AC6: breaker open -> subsequent symbols skip LLM.
+    def test_07_07_breaker_open_skips_llm_call(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        # Force-open the breaker by recording 3 consecutive failures.
+        for _ in range(3):
+            breaker.record_attempt(category="llm_transport_error", ok=False)
+        self.assertEqual(breaker.state, "open")
+
+        retry_budget, wall_budget = self._make_budgets()
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            return ""
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        self.assertEqual(
+            call_count["n"], 0,
+            "AC6: breaker open must skip ALL LLM calls for remaining symbols",
+        )
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(
+            decision["llm_fallback_reason"], "circuit_breaker_open",
+        )
+        self.assertEqual(decision["llm_attempt_count"], 0)
+
+    # AC7: retry budget exhaustion -> retry_budget_exhausted.
+    def test_07_07_retry_budget_exhausted_when_nine_calls_consumed(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        breaker = self._make_breaker()
+        # Pre-consume 9 retry budget calls so the next retry can't consume.
+        retry_budget, wall_budget = self._make_budgets(retry_calls=9)
+        for _ in range(9):
+            self.assertTrue(retry_budget.consume())
+        # Now budget is exhausted.
+        self.assertEqual(retry_budget.remaining(), 0)
+
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            return ""  # empty — would normally retry
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        # Attempt 1 happens (no retry budget needed for Attempt 1).
+        self.assertEqual(call_count["n"], 1)
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(
+            decision["llm_fallback_reason"], "retry_budget_exhausted",
+            "AC7: retry budget exhausted must produce retry_budget_exhausted",
+        )
+
+    # AC7b: wall-clock budget exhausted BEFORE Attempt 1 -> fail-closed with
+    # wall_clock_budget_exhausted, no LLM call made at all.
+    def test_07_07_wall_clock_budget_exhausted_before_attempt_one(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            BatchWallClockBudget,
+        )
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        breaker = self._make_breaker()
+        retry_budget = type("B", (), {"remaining": lambda self: 9, "consume": lambda self: True})()
+        # Wall-clock budget set to 0ms remaining — exhausted.
+        wall_budget = BatchWallClockBudget(budget_seconds=0.0)
+        # Force the remaining to be 0 even if the constructor clamps it.
+        wall_budget._budget_ms = 0  # type: ignore[attr-defined]
+        wall_budget._start_ms = 0  # type: ignore[attr-defined]
+
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            return ""
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        self.assertEqual(
+            call_count["n"], 0,
+            "AC7b: wall-clock budget exhausted must short-circuit BEFORE Attempt 1",
+        )
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(
+            decision["llm_fallback_reason"], "wall_clock_budget_exhausted",
+            "AC7b: wall-clock exhaustion must use wall_clock_budget_exhausted",
+        )
+        self.assertEqual(decision["llm_attempt_count"], 0)
+
+    # AC8: non-retryable errors don't consume retry budget.
+    def test_07_07_non_retryable_error_does_not_consume_retry_budget(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+
+        breaker = self._make_breaker()
+        retry_budget, wall_budget = self._make_budgets()
+        ctx = self._ctx_with(breaker, retry_budget, wall_budget)
+        snapshot = self._decision_snapshot()
+
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            # 401 Unauthorized — non-retryable config error
+            raise RuntimeError("!!!Error: HTTP 401 Unauthorized: invalid api key")
+
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+            side_effect=fake_call,
+        ):
+            decision = run_agent_sop_decision(
+                snapshot, use_llm=True, context=ctx,
+            )
+
+        # Only Attempt 1 fired — non-retryable, no retries.
+        self.assertEqual(call_count["n"], 1)
+        self.assertEqual(decision["llm_status"], "failed")
+        self.assertEqual(
+            decision["llm_error_category"], "llm_config_error",
+        )
+        # Retry budget untouched (still 9 remaining).
+        self.assertEqual(
+            retry_budget.remaining(), 9,
+            "AC8: non-retryable config error must NOT consume retry budget",
+        )
+
+
+class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
+    """Phase C (07-07): plan_execution_state × plan_origin rendering.
+
+    Covers AC9 (deterministic candidate rendered as unconfirmed) and AC10
+    (renderer label branches) per task
+    `.trellis/tasks/07-07-llm-retry-analysis-accuracy-repair/implement.md` C4.
+    """
+
+    def _row(self, **overrides: object) -> dict[str, object]:
+        """Build a minimal decision row for the renderer.
+
+        The renderer reads ``plan_execution_state`` and ``plan_origin`` from
+        the top-level dict (these are surfaced on ``raw_decision_json`` by
+        ``controller_decision_from_legacy``). Defaults produce the
+        ``no_candidate`` branch; tests override specific fields to exercise
+        each branch.
+        """
+        base: dict[str, object] = {
+            "symbol": "BTCUSDT",
+            "signal_grade": "B",
+            "confidence": 0.55,
+            "has_trade_plan": False,
+            "trade_plan": None,
+            "candidate_trade_plan": None,
+            "plan_status": "no_plan",
+            "plan_blockers": [],
+            "llm_status": "ok",
+            "plan_origin": None,
+            "plan_execution_state": "no_candidate",
+            "risk_check": {"ok": False, "reasons": []},
+        }
+        base.update(overrides)
+        return base
+
+    # AC10: each plan_execution_state × plan_origin combination produces the
+    # expected wording per design §6.5.
+    def test_07_07_render_plan_state_label_branches(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import (
+            _render_plan_state_label,
+        )
+
+        # Branch 1: confirmed + llm_confirmed
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="confirmed",
+                plan_origin="llm_confirmed",
+                has_trade_plan=True,
+            )),
+            "候选计划已生成（LLM 已确认）",
+            "AC10 branch 1: confirmed+llm_confirmed wording",
+        )
+
+        # Branch 2: unconfirmed + deterministic_fallback
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="unconfirmed",
+                plan_origin="deterministic_fallback",
+                candidate_trade_plan={"side": "LONG"},
+            )),
+            "规则候选计划已生成，LLM 未确认，禁止执行",
+            "AC10 branch 2: unconfirmed+deterministic_fallback wording",
+        )
+
+        # Branch 3: risk_rejected
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="risk_rejected",
+                plan_origin="llm_confirmed",
+                candidate_trade_plan={"side": "LONG"},
+            )),
+            "候选计划已生成，但风控未通过",
+            "AC10 branch 3: risk_rejected wording",
+        )
+
+        # Branch 4: invalidated
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="invalidated",
+                plan_origin="llm_confirmed",
+                candidate_trade_plan={"side": "LONG"},
+            )),
+            "候选计划已生成，但前次触发已反转",
+            "AC10 branch 4: invalidated wording",
+        )
+
+        # Branch 5: no_candidate
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="no_candidate",
+                plan_origin=None,
+            )),
+            "无候选计划，本轮仅观察",
+            "AC10 branch 5: no_candidate wording",
+        )
+
+        # Additional branch: confirmed + deterministic_sop (LLM disabled)
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state="confirmed",
+                plan_origin="deterministic_sop",
+                has_trade_plan=True,
+                llm_status="disabled",
+            )),
+            "规则候选计划已生成（LLM 已禁用，SOP 确认）",
+            "AC10 extra: confirmed+deterministic_sop wording",
+        )
+
+        # Fallback: unknown combination -> no_candidate wording
+        self.assertEqual(
+            _render_plan_state_label(self._row(
+                plan_execution_state=None,
+                plan_origin=None,
+            )),
+            "无候选计划，本轮仅观察",
+            "AC10 fallback: unknown combination defaults to no_candidate wording",
+        )
+
+    # AC9: deterministic candidate (LLM failed) is rendered as unconfirmed,
+    # has_trade_plan=False, candidate preserved in candidate_trade_plan.
+    def test_07_07_deterministic_candidate_rendered_as_unconfirmed(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import (
+            _render_plan_state_label,
+            _format_opportunity_row,
+        )
+
+        # Simulate a decision row where LLM failed, deterministic fallback
+        # produced a candidate, but it's marked unconfirmed (not executable).
+        row = self._row(
+            plan_execution_state="unconfirmed",
+            plan_origin="deterministic_fallback",
+            llm_status="failed",
+            has_trade_plan=False,
+            candidate_trade_plan={
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": 100.0,
+                "stop_loss": 95.0,
+                "take_profits": [{"price": 120.0}],
+            },
+            plan_status="withheld",
+            plan_blockers=[
+                {
+                    "code": "llm_parse_failed",
+                    "stage": "synthesis",
+                    "detail": "llm_status=failed, fallback_llm_failed_blocks_paper_order=true",
+                }
+            ],
+            risk_check={"ok": False, "reasons": ["llm_status=failed 降级"]},
+        )
+
+        # AC9: the renderer must produce the "规则候选计划已生成，LLM 未确认，禁止执行"
+        # label, not "候选计划已生成" (the old ambiguous wording).
+        label = _render_plan_state_label(row)
+        self.assertEqual(
+            label,
+            "规则候选计划已生成，LLM 未确认，禁止执行",
+            "AC9: deterministic fallback candidate must render as unconfirmed with 禁止执行",
+        )
+
+        # AC9: the full opportunity row must include the state label so the
+        # operator sees the "禁止执行" wording in the rendered report.
+        rendered = _format_opportunity_row(
+            row, open_by_symbol={}, tier_label="观察候选",
+        )
+        self.assertIn(
+            "规则候选计划已生成，LLM 未确认，禁止执行",
+            rendered,
+            "AC9: rendered opportunity row must include the unconfirmed label",
+        )
+        # The candidate plan details (side/entry/stop) should also appear
+        # via _trade_plan_summary, but WITHOUT the old "候选计划已生成"
+        # prefix (which is now handled by the state label).
+        self.assertIn(
+            "候选计划详情",
+            rendered,
+            "AC9: candidate plan details should appear with 候选计划详情 prefix",
+        )
+        self.assertNotIn(
+            "候选计划已生成（LONG 入场",
+            rendered,
+            "AC9: old '候选计划已生成' prefix must not appear in candidate details",
+        )
+
+    # AC9 revert-fail: if plan_execution_state is not set (legacy decision),
+    # the renderer falls back to the "no_candidate" wording rather than
+    # claiming a candidate exists. This ensures old decisions without the
+    # new fields render safely.
+    def test_07_07_render_plan_state_label_legacy_decision_falls_back(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import (
+            _render_plan_state_label,
+        )
+
+        # Legacy decision: no plan_execution_state, no plan_origin.
+        legacy = self._row()
+        legacy.pop("plan_execution_state")
+        legacy.pop("plan_origin")
+        self.assertEqual(
+            _render_plan_state_label(legacy),
+            "无候选计划，本轮仅观察",
+            "Legacy decision without plan_execution_state must fall back to no_candidate wording",
+        )
+
+
+class TestPhaseD07_07RawGradeCaps(unittest.TestCase):
+    """Phase D (07-07): raw HTF-alignment grade caps.
+
+    Covers AC11-AC14 per task
+    `.trellis/tasks/07-07-llm-retry-analysis-accuracy-repair/implement.md` D4.
+
+    Each test calls ``normalize_market_semantics`` directly with a crafted
+    snapshot that exercises one of the Step 4b/4c/4d caps. The caps apply
+    to ``signal_grade`` BEFORE the controller's hysteresis/clamp_grade run.
+    """
+
+    def _base_config(self) -> dict[str, object]:
+        """market_semantics config with HTF caps enabled (default)."""
+        return {
+            "htf_alignment_cap_enabled": True,
+            "enforce_bias_stage_contract": True,
+            "strict_timeframe_closed_check": True,
+        }
+
+    def _base_decision(self, **overrides: object) -> dict[str, object]:
+        """A raw S-grade bullish decision that will trigger caps when the
+        snapshot's timeframe_context opposes the candidate side."""
+        base: dict[str, object] = {
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "early",
+            "confidence": 0.85,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+        }
+        base.update(overrides)
+        return base
+
+    def _snapshot_with_tfs(
+        self,
+        *,
+        bias_1d: str = "bullish",
+        bias_4h: str = "bullish",
+        bias_1h: str = "bullish",
+        bias_15m: str = "bullish",
+        momentum_5m: str = "bullish",
+        market_structure_4h: str = "uptrend",
+    ) -> dict[str, object]:
+        """Build a snapshot whose timeframe_context will be recomputed by
+        ``normalize_market_semantics`` Step 0 from the given per-TF biases.
+
+        The ``timeframe_context`` field in the snapshot is intentionally
+        omitted - Step 0 recomputes it from ``profiles`` + ``health_by_tf``.
+        """
+        analysis_time = 1_700_000_000_000
+        return {
+            "symbol": "TESTUSDT",
+            "analysis_time_utc": analysis_time,
+            "profiles": {
+                "1d": {"market_structure": bias_1d, "trend_stage": "middle", "momentum": bias_1d, "candles_count": 80},
+                "4h": {"market_structure": market_structure_4h, "trend_stage": "middle", "momentum": bias_4h, "candles_count": 80},
+                "1h": {"market_structure": bias_1h, "trend_stage": "middle", "momentum": bias_1h, "candles_count": 80},
+                "15m": {"market_structure": bias_15m, "trend_stage": "early", "momentum": bias_15m, "candles_count": 80},
+                "5m": {"market_structure": momentum_5m, "trend_stage": "early", "momentum": momentum_5m, "candles_count": 80},
+            },
+            "data_quality": {
+                "closed_candles_only": True,
+                "status": "complete",
+                "analysis_time_utc": analysis_time,
+                "missing_timeframes": [],
+                "low_sample_timeframes": [],
+                "health_by_tf": {
+                    "1d": {"ready": True, "last_close_time": analysis_time - 100_000},
+                    "4h": {"ready": True, "last_close_time": analysis_time - 50_000},
+                    "1h": {"ready": True, "last_close_time": analysis_time - 10_000},
+                    "15m": {"ready": True, "last_close_time": analysis_time - 1_000},
+                },
+            },
+        }
+
+    # AC11: DOGE-style - 1D bearish, 1H/15M bearish (opposite to bullish
+    # candidate), 5M range. Raw S must be capped to B by htf_countertrend_cap.
+    def test_07_07_dogeusdt_raw_grade_cap(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = self._base_decision(signal_grade="S", market_bias="bullish")
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bearish",
+            bias_4h="bearish",
+            bias_1h="bearish",
+            bias_15m="bearish",
+            momentum_5m="neutral",
+        )
+        cfg = self._base_config()
+        result = normalize_market_semantics(decision, snapshot, cfg)
+
+        # Cap 1 (htf_countertrend_cap): 1D and 4H both opposite -> max B.
+        self.assertLessEqual(
+            result.get("signal_grade"), "B",
+            "AC11: raw S with 1D+4H opposite must be capped to B or lower",
+        )
+        codes = result.get("market_reason_codes") or []
+        self.assertIn(
+            "htf_countertrend_cap", codes,
+            "AC11: htf_countertrend_cap reason code must be present",
+        )
+        # Idempotency: second call must not double-downgrade.
+        result2 = normalize_market_semantics(result, snapshot, cfg)
+        self.assertEqual(
+            result2.get("signal_grade"), result.get("signal_grade"),
+            "AC11: second normalize call must not double-downgrade",
+        )
+        # Original grade recorded.
+        self.assertEqual(
+            result.get("_htf_cap_original_grade"), "S",
+            "AC11: original grade S must be recorded in _htf_cap_original_grade",
+        )
+
+    # AC12: AVAX-style - 4H transition (non-directional), 1H/15M range.
+    # Raw S must be capped to B by htf_4h_nondirectional_cap.
+    def test_07_07_avaxusdt_raw_grade_cap(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = self._base_decision(signal_grade="S", market_bias="bullish")
+        # 4H transition -> _derive_tf_bias returns directional momentum if
+        # structure=transition and momentum is directional. To get a
+        # non-directional 4H bias, use structure=range with neutral momentum.
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bullish",
+            bias_4h="neutral",
+            bias_1h="neutral",
+            bias_15m="neutral",
+            momentum_5m="neutral",
+            market_structure_4h="range",
+        )
+        cfg = self._base_config()
+        result = normalize_market_semantics(decision, snapshot, cfg)
+
+        # Cap: 4H non-directional -> max B.
+        self.assertLessEqual(
+            result.get("signal_grade"), "B",
+            "AC12: raw S with 4H non-directional must be capped to B or lower",
+        )
+        codes = result.get("market_reason_codes") or []
+        self.assertIn(
+            "htf_4h_nondirectional_cap", codes,
+            "AC12: htf_4h_nondirectional_cap reason code must be present",
+        )
+
+    # AC13: BTC-style - 4H recovering but 1H mixed, 15M/5M range.
+    # Raw S must be capped; A grade needs stronger evidence.
+    def test_07_07_btcusdt_raw_grade_cap(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = self._base_decision(signal_grade="S", market_bias="bullish")
+        # 4H bullish (recovering) but 1H mixed, 15M range -> 1H and 15M
+        # both not aligned with candidate (bullish) -> mtf_misalignment_cap.
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bullish",
+            bias_4h="bullish",
+            bias_1h="neutral",
+            bias_15m="neutral",
+            momentum_5m="neutral",
+        )
+        cfg = self._base_config()
+        result = normalize_market_semantics(decision, snapshot, cfg)
+
+        # Cap: 1H and 15M both not aligned -> max B.
+        self.assertLessEqual(
+            result.get("signal_grade"), "B",
+            "AC13: raw S with 1H+15M not aligned must be capped to B or lower",
+        )
+        codes = result.get("market_reason_codes") or []
+        self.assertIn(
+            "mtf_misalignment_cap", codes,
+            "AC13: mtf_misalignment_cap reason code must be present",
+        )
+
+    # AC14: only 5M supports the candidate direction while 4H and 1H don't.
+    # Raw grade must be capped to C, trend_stage early->transition, and the
+    # low_tf_rebound_only reason code must be present.
+    def test_07_07_low_tf_rebound_only(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = self._base_decision(signal_grade="S", market_bias="bullish", trend_stage="early")
+        # 4H bearish (not bullish), 1H bearish (not bullish), 5M bullish.
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bearish",
+            bias_4h="bearish",
+            bias_1h="bearish",
+            bias_15m="bearish",
+            momentum_5m="bullish",
+        )
+        cfg = self._base_config()
+        result = normalize_market_semantics(decision, snapshot, cfg)
+
+        # Cap: only 5M supports -> max C.
+        self.assertLessEqual(
+            result.get("signal_grade"), "C",
+            "AC14: raw S with only 5M support must be capped to C or lower",
+        )
+        codes = result.get("market_reason_codes") or []
+        self.assertIn(
+            "low_tf_rebound_only_cap", codes,
+            "AC14: low_tf_rebound_only_cap reason code must be present",
+        )
+        # trend_stage early -> transition remap.
+        self.assertEqual(
+            result.get("trend_stage"), "transition",
+            "AC14: trend_stage early must be remapped to transition for 5M-only rebound",
+        )
+        self.assertIn(
+            "low_tf_rebound_only", codes,
+            "AC14: low_tf_rebound_only reason code must be present after trend_stage remap",
+        )
+
+    # Revert-fail: when caps are disabled via config, raw S must survive.
+    def test_07_07_htf_cap_disabled_preserves_raw_grade(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+
+        decision = self._base_decision(signal_grade="S", market_bias="bullish")
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bearish",
+            bias_4h="bearish",
+            bias_1h="bearish",
+            bias_15m="bearish",
+            momentum_5m="neutral",
+        )
+        cfg = self._base_config()
+        cfg["htf_alignment_cap_enabled"] = False
+        result = normalize_market_semantics(decision, snapshot, cfg)
+
+        # With caps disabled, raw S should survive (though htf_conflict may
+        # still downgrade via the existing Step 4 mechanism). The key assertion
+        # is that htf_countertrend_cap reason code is NOT present.
+        codes = result.get("market_reason_codes") or []
+        self.assertNotIn(
+            "htf_countertrend_cap", codes,
+            "Revert-fail: htf_countertrend_cap must NOT fire when caps disabled",
+        )
+        self.assertNotIn(
+            "htf_4h_nondirectional_cap", codes,
+            "Revert-fail: htf_4h_nondirectional_cap must NOT fire when caps disabled",
+        )
+        self.assertNotIn(
+            "mtf_misalignment_cap", codes,
+            "Revert-fail: mtf_misalignment_cap must NOT fire when caps disabled",
+        )
+
+    # R6 reviewer evidence gap 1: unit test for the diagnostic Cap 4
+    # (low_tf_rebound_only). Verifies that when a decision row has
+    # ``raw_signal_grade=S`` but only 5M supports (4H and 1H don't), the
+    # ``_check_raw_grade_exceeds_htf_cap`` diagnostic fires with the
+    # ``low_tf_rebound_only_cap`` reason. The m5_bias field is surfaced
+    # on the top-level raw_decision_json (not under timeframe_context,
+    # which is schema-restricted to 1d/4h/1h/15m).
+    def test_07_07_r6_raw_grade_cap4_low_tf_rebound_only_diagnostic(self) -> None:
+        import tempfile
+        import os as _os
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            from plugins.crypto_guard.diagnostics.report_diagnostics import (
+                _check_raw_grade_exceeds_htf_cap,
+                RAW_GRADE_EXCEEDS_HTF_CAP,
+            )
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+            # Insert a ga_decisions row whose raw_decision_json encodes:
+            # - raw_signal_grade=S, market_bias=bullish (candidate_side=LONG)
+            # - timeframe_context: 1d=bullish, 4h=bearish, 1h=bearish, 15m=bearish
+            # - top-level m5_bias=bullish (5M supports, but 4H/1H don't)
+            # Cap 4 conditions met: 5M == candidate_side, 4H != candidate_side,
+            # 1H != candidate_side -> max_allowed=C. raw S exceeds C -> issue.
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            raw_decision = {
+                "symbol": "BTCUSDT",
+                "analysis_time": now_ms,
+                "raw_signal_grade": "S",
+                "market_bias": "bullish",
+                "timeframe_context": {
+                    "1d": {"bias": "bullish"},
+                    "4h": {"bias": "bearish"},
+                    "1h": {"bias": "bearish"},
+                    "15m": {"bias": "bearish"},
+                },
+                "m5_bias": "bullish",
+            }
+            conn.execute(
+                "INSERT INTO ga_decisions ("
+                "  symbol, analysis_time, analysis_time_utc, decision_type,"
+                "  signal_grade, confidence, market_bias, trend_stage, decision,"
+                "  skill_result_refs_json, evidence_json, counter_evidence_json,"
+                "  risk_check_json, feishu_actions_json, final_summary,"
+                "  raw_decision_json, batch_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BTCUSDT", now_ms, "2026-07-08T00:00:00Z", "scheduled_analysis",
+                 "S", 0.85, "bullish", "early", "trade_plan_available",
+                 "[]", "[]", "[]", '{"ok":true}', "[]", "summary",
+                 json.dumps(raw_decision), None),
+            )
+            conn.commit()
+            issues = _check_raw_grade_exceeds_htf_cap(repo)
+            codes = [i.get("type") for i in issues]
+            self.assertIn(
+                RAW_GRADE_EXCEEDS_HTF_CAP, codes,
+                "R6 evidence gap 1: Cap 4 (low_tf_rebound_only) must be caught "
+                "by _check_raw_grade_exceeds_htf_cap when 5M==candidate_side "
+                "but 4H/1H don't align",
+            )
+            cap_issue = next(
+                i for i in issues if i.get("type") == RAW_GRADE_EXCEEDS_HTF_CAP
+            )
+            self.assertEqual(
+                cap_issue.get("details", {}).get("max_allowed_grade"), "C",
+                "R6 evidence gap 1: max_allowed_grade must be C for Cap 4",
+            )
+            self.assertIn(
+                "low_tf_rebound_only_cap",
+                cap_issue.get("details", {}).get("applied_cap_reasons", []),
+                "R6 evidence gap 1: applied_cap_reasons must contain low_tf_rebound_only_cap",
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()
+
+    # R6 reviewer evidence gap 3: integration test proving m5_bias reaches
+    # raw_decision_json top-level through the full controller -> persistence
+    # path. Verifies that normalize_market_semantics sets m5_bias, and that
+    # controller_decision_from_legacy propagates it to the DB-persisted dict.
+    def test_07_07_r6_m5_bias_propagates_to_raw_decision_json(self) -> None:
+        from plugins.crypto_guard.reasoning.market_semantics import normalize_market_semantics
+        from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy
+
+        # Step 1: normalize_market_semantics must surface m5_bias at top level
+        # when snapshot has 5M momentum=bullish.
+        decision = self._base_decision(signal_grade="S", market_bias="bullish")
+        snapshot = self._snapshot_with_tfs(
+            bias_1d="bearish",
+            bias_4h="bearish",
+            bias_1h="bearish",
+            bias_15m="bearish",
+            momentum_5m="bullish",
+        )
+        cfg = self._base_config()
+        normalized = normalize_market_semantics(decision, snapshot, cfg)
+        self.assertEqual(
+            normalized.get("m5_bias"), "bullish",
+            "R6 evidence gap 3: normalize_market_semantics must set m5_bias "
+            "at top level when 5M momentum is bullish",
+        )
+        # Step 2: controller_decision_from_legacy must propagate m5_bias to
+        # the DB-persisted decision shape (so raw_decision_json.m5_bias is
+        # populated when ga_judge reads it back).
+        skill_result_refs: dict[str, int] = {}
+        legacy = dict(normalized)
+        legacy["symbol"] = "BTCUSDT"
+        legacy["has_trade_plan"] = False
+        persisted = controller_decision_from_legacy(
+            legacy=legacy,
+            decision_type="scheduled_analysis",
+            analysis_time=1_700_000_000_000,
+            skill_result_refs=skill_result_refs,
+            feishu_actions=[],
+        )
+        self.assertEqual(
+            persisted.get("m5_bias"), "bullish",
+            "R6 evidence gap 3: controller_decision_from_legacy must propagate "
+            "m5_bias from legacy to the DB-persisted decision dict",
+        )
+        # Revert-fail: if m5_bias is missing in legacy, persisted must NOT
+        # invent it (must be None, not "").
+        legacy_no_m5 = dict(legacy)
+        legacy_no_m5.pop("m5_bias", None)
+        persisted_no_m5 = controller_decision_from_legacy(
+            legacy=legacy_no_m5,
+            decision_type="scheduled_analysis",
+            analysis_time=1_700_000_000_000,
+            skill_result_refs=skill_result_refs,
+            feishu_actions=[],
+        )
+        self.assertIsNone(
+            persisted_no_m5.get("m5_bias"),
+            "R6 evidence gap 3 revert-fail: m5_bias must be None when legacy lacks it",
+        )
+
+
+class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
+    """Phase E (07-07): hourly report rendering + batch consistency.
+
+    Covers AC15 (success_batch_missing_completed_symbols diagnosed),
+    AC15b (finish_analysis_batch materializes completed_symbols_json),
+    AC16 (hourly_report rejects partial/running batch via
+    _select_latest_complete_batch), and AC17 (old failures filtered from
+    recent section) per task
+    `.trellis/tasks/07-07-llm-retry-analysis-accuracy-repair/implement.md` E5.
+    """
+
+    def setUp(self) -> None:
+        """Each test gets a fresh in-memory repo with the schema initialized."""
+        import tempfile
+        import os as _os
+        self.tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(self.tmp.name, "crypto_guard.sqlite3")
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        initialize_database()
+        self.conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+        self.repo = CryptoGuardRepository(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import os as _os
+        _os.environ.pop("CRYPTO_GUARD_DB", None)
+        self.tmp.cleanup()
+
+    def _seed_running_batch(
+        self, *, batch_id: str = "BATCH_RUNNING_1", symbols: list[str] | None = None,
+    ) -> str:
+        """Seed a batch in ``running`` state with enabled symbols registered
+        but no completions. Returns the batch_id."""
+        syms = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=1_700_000_000_000, enabled_symbols=syms,
+        )
+        return batch_id
+
+    def _seed_complete_batch(
+        self,
+        *,
+        batch_id: str = "BATCH_OK_1",
+        symbols: list[str] | None = None,
+        analysis_time: int = 1_700_000_000_000,
+        with_decisions: bool = True,
+        summary: dict | None = None,
+    ) -> str:
+        """Seed a batch in ``success`` state with all symbols completed and
+        matching ga_decisions rows. Returns the batch_id."""
+        syms = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=analysis_time, enabled_symbols=syms,
+        )
+        for sym in syms:
+            self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym)
+        # finish_analysis_batch materializes completed_symbols_json (E4 fix).
+        self.repo.finish_analysis_batch(
+            batch_id=batch_id, status="success", summary=summary,
+        )
+        if with_decisions:
+            for sym in syms:
+                self.conn.execute(
+                    "INSERT INTO ga_decisions ("
+                    "  symbol, analysis_time, analysis_time_utc, decision_type,"
+                    "  signal_grade, confidence, market_bias, trend_stage, decision,"
+                    "  skill_result_refs_json, evidence_json, counter_evidence_json,"
+                    "  risk_check_json, feishu_actions_json, final_summary,"
+                    "  raw_decision_json, batch_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (sym, analysis_time, "2023-11-14T00:00:00Z", "scheduled_analysis",
+                     "A", 0.75, "bullish", "middle", "trade_plan_available",
+                     "[]", "[]", "[]",
+                     '{"ok":true}', "[]", "summary text",
+                     '{"plan_execution_state":"confirmed"}', batch_id),
+                )
+            self.conn.commit()
+        return batch_id
+
+    # AC15: a ``status=success`` batch with empty raw
+    # ``completed_symbols_json`` column must be caught by the
+    # ``SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS`` diagnostic.
+    def test_07_07_success_batch_missing_completed_symbols_diagnosed(self) -> None:
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_success_batch_missing_completed_symbols,
+            SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS,
+        )
+
+        # Seed a batch directly with status=success but raw
+        # completed_symbols_json=[] (the write-link gap). Plant a live
+        # completed entry in batch_symbol_status to prove the column is stale.
+        # R7 P2-1: use a recent analysis_time (within 24h) so the 24h cutoff
+        # does not filter it out.
+        recent_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        self.conn.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+            ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
+            ("BATCH_GAP_1", "15m", recent_ms, "success",
+             '["BTCUSDT","ETHUSDT"]', "[]", "[]"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            ("BATCH_GAP_1", "BTCUSDT", "completed"),
+        )
+        self.conn.commit()
+
+        issues = _check_success_batch_missing_completed_symbols(self.repo)
+        codes = [i.get("type") for i in issues]
+        self.assertIn(
+            SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, codes,
+            "AC15: status=success batch with empty completed_symbols_json raw column "
+            "must be flagged by SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS diagnostic",
+        )
+        # The flagged issue should reference the gap batch.
+        gap_issue = next(i for i in issues if i.get("type") == SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS)
+        self.assertEqual(
+            gap_issue.get("details", {}).get("batch_id"), "BATCH_GAP_1",
+            "AC15: the flagged batch_id must match the gap batch",
+        )
+
+    # R7 P2-1 regression: 24h cutoff on _check_success_batch_missing_completed_symbols.
+    # A pre-fix historical batch (analysis_time older than 24h) with status=success
+    # and empty completed_symbols_json must NOT fire - design §11 mandates the
+    # 24h cutoff for all 07-07 diagnostics.
+    def test_07_07_r7_success_batch_missing_completed_symbols_24h_cutoff(self) -> None:
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_success_batch_missing_completed_symbols,
+            SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS,
+        )
+
+        # Seed a batch with analysis_time 48h ago - outside the 24h cutoff.
+        old_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 48 * 3600 * 1000
+        self.conn.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+            ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
+            ("BATCH_OLD_GAP", "15m", old_ms, "success",
+             '["BTCUSDT"]', "[]", "[]"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (?, ?, ?)",
+            ("BATCH_OLD_GAP", "BTCUSDT", "completed"),
+        )
+        self.conn.commit()
+        issues = _check_success_batch_missing_completed_symbols(self.repo)
+        codes = [i.get("type") for i in issues]
+        self.assertNotIn(
+            SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, codes,
+            "R7 P2-1: status=success batch with analysis_time > 24h old must NOT "
+            "be flagged (24h cutoff mandated by design §11)",
+        )
+
+    # AC15b: ``finish_analysis_batch`` must materialize
+    # ``completed_symbols_json`` / ``failed_symbols_json`` from
+    # ``batch_symbol_status`` (E4 fix). The raw columns must be populated
+    # after the call (not left empty as in the pre-fix implementation).
+    def test_07_07_finish_batch_materializes_completed_symbols(self) -> None:
+        # Seed a batch with 3 completed + 1 failed symbol.
+        batch_id = "BATCH_MATERIALIZE_1"
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=1_700_000_000_000, enabled_symbols=symbols,
+        )
+        for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym)
+        self.repo.mark_batch_symbol_completed(
+            batch_id=batch_id, symbol="DOGEUSDT", failed=True,
+        )
+
+        # Before finish_analysis_batch: raw columns are empty (default).
+        pre = self.conn.execute(
+            "SELECT completed_symbols_json, failed_symbols_json "
+            "FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        self.assertEqual(
+            pre["completed_symbols_json"], "[]",
+            "AC15b setup: completed_symbols_json must be empty before finish_analysis_batch",
+        )
+
+        # Call finish_analysis_batch - the E4 fix materializes the columns.
+        self.repo.finish_analysis_batch(
+            batch_id=batch_id, status="partial_failed",
+            summary={"llm_health": {"breaker_state": "closed"}},
+        )
+
+        # After finish: raw columns must be populated from batch_symbol_status.
+        post = self.conn.execute(
+            "SELECT completed_symbols_json, failed_symbols_json, status, summary_json "
+            "FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        import json
+        completed = json.loads(post["completed_symbols_json"])
+        failed = json.loads(post["failed_symbols_json"])
+        # Symbols are sorted (ORDER BY symbol in the materialization query).
+        self.assertEqual(
+            completed, ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            "AC15b: finish_analysis_batch must materialize completed_symbols_json "
+            "from batch_symbol_status (sorted)",
+        )
+        self.assertEqual(
+            failed, ["DOGEUSDT"],
+            "AC15b: finish_analysis_batch must materialize failed_symbols_json "
+            "from batch_symbol_status (sorted)",
+        )
+        self.assertEqual(
+            post["status"], "partial_failed",
+            "AC15b: status must be written as passed",
+        )
+        # summary_json must also be preserved.
+        summary = json.loads(post["summary_json"])
+        self.assertEqual(
+            summary.get("llm_health", {}).get("breaker_state"), "closed",
+            "AC15b: summary_json must be preserved by finish_analysis_batch",
+        )
+
+        # get_analysis_batch should see the materialized columns agree with
+        # the live batch_symbol_status query (no read-time compensation needed).
+        batch = self.repo.get_analysis_batch(batch_id)
+        self.assertIsNotNone(batch, "AC15b: get_analysis_batch must return the batch")
+        self.assertEqual(
+            sorted(batch.get("completed_symbols") or []), ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            "AC15b: get_analysis_batch completed_symbols must match materialized column",
+        )
+        self.assertEqual(
+            sorted(batch.get("failed_symbols") or []), ["DOGEUSDT"],
+            "AC15b: get_analysis_batch failed_symbols must match materialized column",
+        )
+
+    # AC16: ``_select_latest_complete_batch`` must reject partial/running
+    # batches and only return a batch with status=success AND
+    # completed_count==enabled_count AND matching GA decision count.
+    def test_07_07_hourly_report_rejects_partial_running_batch(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import (
+            _select_latest_complete_batch,
+        )
+
+        # Case 1: only a running batch exists -> must return None.
+        self._seed_running_batch(batch_id="BATCH_RUNNING_1")
+        result = _select_latest_complete_batch(self.repo, now_ms=1_700_000_000_000)
+        self.assertIsNone(
+            result,
+            "AC16 case 1: running batch must be rejected - return None",
+        )
+
+        # Case 2: a running batch (latest) + an earlier complete batch ->
+        # must return the complete batch (not the running one).
+        self._seed_complete_batch(
+            batch_id="BATCH_OK_EARLIER", analysis_time=1_699_999_990_000,
+        )
+        result = _select_latest_complete_batch(self.repo, now_ms=1_700_000_000_000)
+        self.assertIsNotNone(
+            result,
+            "AC16 case 2: must find the complete batch even when a running batch is latest",
+        )
+        self.assertEqual(
+            result.get("batch_id"), "BATCH_OK_EARLIER",
+            "AC16 case 2: must return the complete batch, not the running one",
+        )
+
+        # Case 3: a success batch with completed_symbols but missing GA
+        # decisions -> must be rejected (decision count != enabled count).
+        self._seed_complete_batch(
+            batch_id="BATCH_NO_DECISIONS", analysis_time=1_699_999_980_000,
+            with_decisions=False,
+        )
+        # Remove the decisions that _seed_complete_batch didn't create - but
+        # _seed_complete_batch(with_decisions=False) already skips decision
+        # insertion. Verify the batch is rejected.
+        result = _select_latest_complete_batch(self.repo, now_ms=1_700_000_000_000)
+        # The latest complete batch should still be BATCH_OK_EARLIER (the one
+        # with matching decisions), not BATCH_NO_DECISIONS.
+        self.assertEqual(
+            result.get("batch_id"), "BATCH_OK_EARLIER",
+            "AC16 case 3: batch with missing GA decisions must be rejected",
+        )
+
+    # AC17: ``_render_recent_failures`` must filter out failures older than
+    # the 24h window. Old failures remain in the audit trail (DB rows) but
+    # are hidden from the hourly report's recent-failure section.
+    def test_07_07_old_failures_filtered_from_recent(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import _render_recent_failures
+
+        now_ms = 10_000_000_000_000  # fixed now for deterministic test
+        window_ms = 24 * 3600 * 1000  # 24h
+        cutoff = now_ms - window_ms
+
+        decisions = [
+            # Recent failure (within 24h) - must appear.
+            {
+                "symbol": "BTCUSDT", "llm_status": "failed",
+                "analysis_time": now_ms - 3600 * 1000,  # 1h ago
+                "llm_error_category": "llm_empty_response",
+                "llm_error": "empty response body",
+            },
+            # Old failure (>24h) - must NOT appear.
+            {
+                "symbol": "ETHUSDT", "llm_status": "failed",
+                "analysis_time": cutoff - 1000,  # just before 24h cutoff
+                "llm_error_category": "llm_config_error",
+                "llm_error": "model not found",
+            },
+            # Very old failure (7+ days) - must NOT appear.
+            {
+                "symbol": "SOLUSDT", "llm_status": "failed",
+                "analysis_time": now_ms - 8 * 24 * 3600 * 1000,  # 8 days ago
+                "llm_error_category": "llm_transport_error",
+                "llm_error": "timeout",
+            },
+            # Recent success - must NOT appear (not a failure).
+            {
+                "symbol": "XRPUSDT", "llm_status": "ok",
+                "analysis_time": now_ms - 1800 * 1000,  # 30m ago
+            },
+            # Recent failure with analysis_time=0 (malformed) - must NOT appear.
+            {
+                "symbol": "ADAUSDT", "llm_status": "failed",
+                "analysis_time": 0,
+                "llm_error_category": "llm_json_parse_failed",
+                "llm_error": "malformed json",
+            },
+        ]
+
+        recent = _render_recent_failures(decisions, now_ms=now_ms, window_ms=window_ms)
+        symbols = [d.get("symbol") for d in recent]
+
+        # Only BTCUSDT (recent failure within 24h) should appear.
+        self.assertEqual(
+            len(recent), 1,
+            "AC17: only 1 failure (BTCUSDT) falls within the 24h window",
+        )
+        self.assertIn(
+            "BTCUSDT", symbols,
+            "AC17: recent failure (BTCUSDT, 1h ago) must appear in recent section",
+        )
+        self.assertNotIn(
+            "ETHUSDT", symbols,
+            "AC17: old failure (ETHUSDT, >24h) must NOT appear in recent section",
+        )
+        self.assertNotIn(
+            "SOLUSDT", symbols,
+            "AC17: very old failure (SOLUSDT, 8 days) must NOT appear in recent section",
+        )
+        self.assertNotIn(
+            "XRPUSDT", symbols,
+            "AC17: non-failure (XRPUSDT, llm_status=ok) must NOT appear in recent section",
+        )
+        self.assertNotIn(
+            "ADAUSDT", symbols,
+            "AC17: malformed failure (ADAUSDT, analysis_time=0) must NOT appear in recent section",
+        )
+
+        # Edge case: failure exactly at the cutoff boundary must appear.
+        boundary_decisions = [
+            {
+                "symbol": "DOTUSDT", "llm_status": "failed",
+                "analysis_time": cutoff,  # exactly at cutoff
+                "llm_error_category": "llm_rate_limited",
+                "llm_error": "429",
+            },
+        ]
+        recent_boundary = _render_recent_failures(
+            boundary_decisions, now_ms=now_ms, window_ms=window_ms,
+        )
+        self.assertEqual(
+            len(recent_boundary), 1,
+            "AC17 boundary: failure exactly at cutoff must appear (inclusive)",
+        )
+
+    # R6 reviewer evidence gap 2: unit test for the diagnostic
+    # ``_check_hourly_report_used_partial_running_batch`` itself (not the
+    # fault seed). Verifies that when latest batch is running AND an
+    # hourly_summary alert was created AFTER the running batch started,
+    # the diagnostic emits a ``warning``. Also verifies the false-negative
+    # path: when the alert was created BEFORE the running batch started,
+    # the diagnostic correctly returns no issue (renderer used a previous
+    # complete batch).
+    def test_07_07_r6_hourly_report_used_running_batch_diagnostic(self) -> None:
+        import tempfile
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            from plugins.crypto_guard.diagnostics.report_diagnostics import (
+                _check_hourly_report_used_partial_running_batch,
+                HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
+            )
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+
+            # Case 1: latest batch is running, hourly alert created AFTER
+            # running batch started -> must emit warning.
+            running_started = _dt.now(_tz.utc).replace(microsecond=0) - _td(minutes=10)
+            alert_created = _dt.now(_tz.utc).replace(microsecond=0) - _td(minutes=5)
+            conn.execute(
+                "INSERT INTO analysis_batches ("
+                "  batch_id, primary_interval, analysis_time, status, started_at,"
+                "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BATCH_R6_RUNNING", "15m", 1_700_000_000_000, "running",
+                 running_started.isoformat().replace("+00:00", "Z"),
+                 '["BTCUSDT"]', "[]", "[]"),
+            )
+            conn.execute(
+                "INSERT INTO alert_outbox ("
+                "  alert_type, payload_json, status, created_at, retry_count"
+                ") VALUES (?, ?, ?, ?, ?)",
+                ("hourly_summary", "{}", "sent",
+                 alert_created.isoformat().replace("+00:00", "Z"), 0),
+            )
+            conn.commit()
+            issues = _check_hourly_report_used_partial_running_batch(repo)
+            codes = [i.get("type") for i in issues]
+            self.assertIn(
+                HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, codes,
+                "R6 evidence gap 2 case 1: latest batch running AND hourly alert "
+                "created AFTER running started must trigger warning",
+            )
+            warn_issue = next(
+                i for i in issues if i.get("type") == HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH
+            )
+            self.assertEqual(
+                warn_issue.get("severity"), "warning",
+                "R6 evidence gap 2: severity must be warning (downgraded from error)",
+            )
+            self.assertEqual(
+                warn_issue.get("details", {}).get("batch_id"), "BATCH_R6_RUNNING",
+                "R6 evidence gap 2: batch_id must match the running batch",
+            )
+
+            # Case 2: alert created BEFORE the running batch started ->
+            # renderer correctly used a previous complete batch, not a defect.
+            conn.execute("DELETE FROM alert_outbox")
+            conn.execute("DELETE FROM analysis_batches")
+            # running_started = now - 25min; alert_created = now - 30min
+            # (alert is 5min BEFORE running started -> no issue)
+            earlier_started = _dt.now(_tz.utc).replace(microsecond=0) - _td(minutes=25)
+            earlier_alert = _dt.now(_tz.utc).replace(microsecond=0) - _td(minutes=30)
+            conn.execute(
+                "INSERT INTO analysis_batches ("
+                "  batch_id, primary_interval, analysis_time, status, started_at,"
+                "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BATCH_R6_RUNNING_2", "15m", 1_700_000_000_000, "running",
+                 earlier_started.isoformat().replace("+00:00", "Z"),
+                 '["BTCUSDT"]', "[]", "[]"),
+            )
+            conn.execute(
+                "INSERT INTO alert_outbox ("
+                "  alert_type, payload_json, status, created_at, retry_count"
+                ") VALUES (?, ?, ?, ?, ?)",
+                ("hourly_summary", "{}", "sent",
+                 earlier_alert.isoformat().replace("+00:00", "Z"), 0),
+            )
+            conn.commit()
+            issues2 = _check_hourly_report_used_partial_running_batch(repo)
+            codes2 = [i.get("type") for i in issues2]
+            self.assertNotIn(
+                HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, codes2,
+                "R6 evidence gap 2 case 2: alert created BEFORE running started "
+                "must NOT trigger (renderer used a previous complete batch)",
+            )
+
+            # Case 3: latest batch is success (not running) -> no issue.
+            conn.execute("DELETE FROM alert_outbox")
+            conn.execute("DELETE FROM analysis_batches")
+            conn.execute(
+                "INSERT INTO analysis_batches ("
+                "  batch_id, primary_interval, analysis_time, status, started_at,"
+                "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BATCH_R6_SUCCESS", "15m", 1_700_000_000_000, "success",
+                 _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"),
+                 '["BTCUSDT"]', '["BTCUSDT"]', "[]"),
+            )
+            conn.execute(
+                "INSERT INTO alert_outbox ("
+                "  alert_type, payload_json, status, created_at, retry_count"
+                ") VALUES (?, ?, ?, ?, ?)",
+                ("hourly_summary", "{}", "sent",
+                 _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"), 0),
+            )
+            conn.commit()
+            issues3 = _check_hourly_report_used_partial_running_batch(repo)
+            codes3 = [i.get("type") for i in issues3]
+            self.assertNotIn(
+                HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, codes3,
+                "R6 evidence gap 2 case 3: latest batch success must NOT trigger",
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()

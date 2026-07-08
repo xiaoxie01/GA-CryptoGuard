@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 
 from plugins.crypto_guard.reasoning.decision_schema import validate_json
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
@@ -18,9 +19,47 @@ SYSTEM_PROMPT = """你是 GA CryptoGuard 的市场研究 Agent。
 只输出一个符合 GADecision schema 的 JSON 对象，不要 Markdown，不要额外解释。
 """
 
+SYSTEM_PROMPT_STRICT_JSON = """你是 GA CryptoGuard 的市场研究 Agent。
+只输出一个符合 GADecision schema 的 JSON 对象。
+禁止 Markdown。禁止代码块。禁止自然语言解释。禁止前导文字。
+第一个字符必须是 {。最后一个字符必须是 }。
+"""
+
+# LLM error taxonomy (design §3.1, §3.2)
+LLM_ERROR_CATEGORIES = (
+    "llm_config_error",
+    "llm_transport_error",
+    "llm_rate_limited",
+    "llm_empty_response",
+    "llm_json_parse_failed",
+    "llm_schema_validation_failed",
+    "llm_semantic_validation_failed",
+)
+
+LLM_ERROR_STAGES = ("call", "parse", "schema", "semantic", "retry_exhausted")
+
+# Retryable categories (design §4.1.2)
+_RETRYABLE_CATEGORIES = frozenset({
+    "llm_transport_error",
+    "llm_rate_limited",
+    "llm_empty_response",
+    "llm_json_parse_failed",
+})
+_NON_RETRYABLE_CATEGORIES = frozenset({
+    "llm_config_error",
+    "llm_schema_validation_failed",
+    "llm_semantic_validation_failed",
+})
+
 
 def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = None, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Run the LLM/GA SOP decision path, falling back to deterministic SOP if needed."""
+    """Run the LLM/GA SOP decision path, falling back to deterministic SOP if needed.
+
+    Phase B (07-07): integrated with circuit breaker, bounded retry, and
+    wall-clock budget. The breaker is obtained from context["llm_breaker"]
+    (set by the controller per-batch). When absent, a _NullBreaker is used
+    (backward compat for tests and non-controller callers).
+    """
 
     fallback = run_ga_sop_decision(snapshot)
     if use_llm is None:
@@ -28,25 +67,82 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     if not use_llm:
         fallback["analysis_source"] = "deterministic_sop"
         fallback["llm_status"] = "disabled"
+        fallback["plan_origin"] = "deterministic_sop"
+        fallback["plan_execution_state"] = "no_candidate" if not fallback.get("has_trade_plan") else "confirmed"
+        fallback["llm_fallback_reason"] = "llm_disabled"
+        fallback["llm_attempt_count"] = 0
         return apply_risk_to_decision(fallback, snapshot)
 
-    try:
-        prompt = build_llm_decision_prompt(snapshot, fallback, context=context)
-        raw = _call_ga_llm(prompt)
-        candidate = _parse_json_object(raw)
-        decision = _normalize_llm_decision(candidate, snapshot, fallback)
-        ok, err = validate_json("ga_decision.schema.json", decision)
-        if not ok:
-            raise ValueError(err or "schema validation failed")
-        return apply_risk_to_decision(decision, snapshot)
-    except Exception as exc:
+    # Resolve breaker from context (controller wires it per-batch)
+    from plugins.crypto_guard.reasoning.llm_breaker import _NullBreaker
+    breaker = (context or {}).get("llm_breaker") or _NullBreaker()
+
+    # Check breaker state before attempting LLM
+    if not breaker.should_call():
+        breaker.record_skip()
         fallback["analysis_source"] = "deterministic_fallback"
         fallback["llm_status"] = "failed"
-        fallback["llm_error"] = str(exc)[:300]
+        fallback["llm_error_category"] = None  # no call was made
+        fallback["llm_error_stage"] = None
+        fallback["llm_error"] = "circuit breaker open; LLM call skipped"
+        fallback["llm_fallback_reason"] = "circuit_breaker_open"
+        fallback["llm_attempt_count"] = 0
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
+        notes = list(fallback.get("risk_notes") or [])
+        notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
+        fallback["risk_notes"] = notes
+        return apply_risk_to_decision(fallback, snapshot)
+
+    # Attempt LLM with retry wrapper
+    candidate, attempt_meta = _call_ga_llm_with_retry(
+        snapshot=snapshot,
+        fallback=fallback,
+        context=context,
+        breaker=breaker,
+        prompt_builders=(build_llm_decision_prompt, build_llm_strict_json_prompt, build_llm_minimal_safe_prompt),
+    )
+
+    if candidate is None:
+        # Fail-closed: use deterministic fallback with attempt metadata
+        fallback["analysis_source"] = "deterministic_fallback"
+        fallback["llm_status"] = "failed"
+        fallback.update(attempt_meta)
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
         notes = list(fallback.get("risk_notes") or [])
         notes.append("LLM/GA 研判失败，本次使用规则 SOP 降级结果。")
         fallback["risk_notes"] = notes
         return apply_risk_to_decision(fallback, snapshot)
+
+    # LLM returned a candidate — normalize and validate
+    decision = _normalize_llm_decision(candidate, snapshot, fallback)
+    ok, err = validate_json("ga_decision.schema.json", decision)
+    if not ok:
+        # Schema validation failure — non-retryable, fail-closed
+        breaker.record_attempt(category="llm_schema_validation_failed", ok=False)
+        fallback["analysis_source"] = "deterministic_fallback"
+        fallback["llm_status"] = "failed"
+        fallback["llm_error_category"] = "llm_schema_validation_failed"
+        fallback["llm_error_stage"] = "schema"
+        fallback["llm_error"] = str(err)[:300]
+        fallback["llm_attempt_count"] = attempt_meta.get("llm_attempt_count", 1)
+        fallback["llm_retry_round"] = attempt_meta.get("llm_retry_round")
+        fallback["llm_config_name"] = attempt_meta.get("llm_config_name")
+        fallback["llm_model"] = attempt_meta.get("llm_model")
+        fallback["llm_fallback_reason"] = "schema_validation_failed"
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
+        notes = list(fallback.get("risk_notes") or [])
+        notes.append("LLM/GA 研判失败（schema 校验未通过），本次使用规则 SOP 降级结果。")
+        fallback["risk_notes"] = notes
+        return apply_risk_to_decision(fallback, snapshot)
+
+    # Success path
+    decision["plan_origin"] = "llm_confirmed"
+    decision["plan_execution_state"] = "confirmed"  # may be overridden by risk_gate later
+    breaker.record_attempt(category=None, ok=True)
+    return apply_risk_to_decision(decision, snapshot)
 
 
 def run_agent_json_task(
@@ -86,6 +182,386 @@ def run_agent_json_task(
         result["llm_status"] = "failed"
         result["llm_error"] = str(exc)[:300]
         return result
+
+
+# ---------------------------------------------------------------------------
+# B2: LLM failure classification (design §3.3)
+# ---------------------------------------------------------------------------
+
+def _classify_llm_failure(exc: BaseException | None, raw: str | None, stage: str) -> str:
+    """Classify an LLM failure into a stable error category.
+
+    Pure function, no side effects. Maps exception / raw response / stage
+    to one of LLM_ERROR_CATEGORIES.
+
+    Secret hygiene: never persist API keys, headers, full response bodies
+    beyond the first 300 chars of error text.
+    """
+    raw_text = str(raw or "")[:300]
+    raw_lower = raw_text.lower()
+    exc_msg = str(exc or "")[:300].lower()
+
+    if stage == "call":
+        # Config errors: model not found, auth, invalid request
+        if raw_text.startswith("!!!Error"):
+            if any(tok in raw_lower for tok in ("model not found", "invalid_model_error", "401", "403", "invalid api key")):
+                return "llm_config_error"
+            # Rate limited
+            if any(tok in raw_lower for tok in ("429", "quota", "overload")):
+                return "llm_rate_limited"
+            # Transport errors: timeout, connection, gateway
+            if any(tok in raw_lower for tok in ("timeout", "connection reset", "502", "503", "504")):
+                return "llm_transport_error"
+            # Default for unknown gateway errors
+            return "llm_transport_error"
+
+        # When ``raw`` is None/empty but the exception carries the gateway
+        # error text (RuntimeError raised by ``_call_ga_llm`` for
+        # ``!!!Error`` responses), classify from the exception message so
+        # config errors are not misclassified as ``llm_empty_response``.
+        if not raw_text.strip() and exc_msg.startswith("!!!error"):
+            if any(tok in exc_msg for tok in ("model not found", "invalid_model_error", "401", "403", "invalid api key")):
+                return "llm_config_error"
+            if any(tok in exc_msg for tok in ("429", "quota", "overload")):
+                return "llm_rate_limited"
+            if any(tok in exc_msg for tok in ("timeout", "connection reset", "502", "503", "504")):
+                return "llm_transport_error"
+            return "llm_transport_error"
+
+        # Empty response
+        if not raw_text.strip():
+            return "llm_empty_response"
+
+        # Exception-based classification for call stage
+        if any(tok in exc_msg for tok in ("timeout", "timed out")):
+            return "llm_transport_error"
+        if any(tok in exc_msg for tok in ("connection", "reset", "refused")):
+            return "llm_transport_error"
+        if any(tok in exc_msg for tok in ("429", "quota", "overload")):
+            return "llm_rate_limited"
+        if any(tok in exc_msg for tok in ("model not found", "invalid_model", "401", "403")):
+            return "llm_config_error"
+        # Generic call failure
+        return "llm_transport_error"
+
+    if stage == "parse":
+        # Map _classify_json_error categories to LLM error categories
+        return "llm_json_parse_failed"
+
+    if stage == "schema":
+        return "llm_schema_validation_failed"
+
+    if stage == "semantic":
+        return "llm_semantic_validation_failed"
+
+    # Fallback
+    return "llm_transport_error"
+
+
+# ---------------------------------------------------------------------------
+# B3: Strict JSON and minimal safe prompt builders (design §8.2, §8.3)
+# ---------------------------------------------------------------------------
+
+def build_llm_strict_json_prompt(
+    snapshot: dict[str, Any],
+    deterministic_decision: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Build a strict JSON-only prompt for retry attempt 2.
+
+    Reuses build_llm_decision_prompt's payload but overrides SYSTEM_PROMPT
+    with SYSTEM_PROMPT_STRICT_JSON to force pure JSON output.
+    """
+    # Build the normal prompt first to get the payload, then replace
+    # the system prompt prefix.
+    normal_prompt = build_llm_decision_prompt(snapshot, deterministic_decision, context=context)
+    # The normal prompt is: SYSTEM_PROMPT + "\n\n输入：\n" + json_payload
+    # Replace the system prompt prefix
+    if normal_prompt.startswith(SYSTEM_PROMPT):
+        json_part = normal_prompt[len(SYSTEM_PROMPT):]
+        return SYSTEM_PROMPT_STRICT_JSON + json_part
+    # Fallback: just prepend strict prompt
+    return SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + normal_prompt
+
+
+def build_llm_minimal_safe_prompt(
+    snapshot: dict[str, Any],
+    deterministic_decision: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Build a minimal safe prompt for retry attempt 3.
+
+    Reuses the R8 P1 safe_payload fallback path: symbol + analysis_time +
+    hard_rules + deterministic_reference + minimal output_requirements.
+    No market_snapshot, no modules, no multi_timeframe_feature_pack.
+    """
+    from plugins.crypto_guard.config.loader import load_config
+    risk_cfg = load_config().trading_mode.get("risk", {})
+    min_rr = risk_cfg.get("min_rr", 1.5)
+    min_conf = risk_cfg.get("min_confidence", 0.72)
+    safe_dr = deterministic_decision or {}
+    safe_ms = _compact_snapshot(snapshot) if snapshot else {}
+    payload = {
+        "symbol": safe_ms.get("symbol") or safe_dr.get("symbol"),
+        "analysis_time_utc": safe_ms.get("analysis_time_utc") or safe_dr.get("analysis_time_utc"),
+        "strategy_name": safe_dr.get("strategy_name"),
+        "strategy_version": safe_dr.get("strategy_version"),
+        "hard_rules": [
+            "不得输出实盘交易或真实下单能力",
+            f"创建模拟盘必须经过风控：RR>={min_rr}、confidence>={min_conf}",
+            "只输出一个 JSON 对象，禁止 Markdown",
+        ],
+        "deterministic_reference": {
+            k: safe_dr.get(k)
+            for k in (
+                "decision", "signal_grade", "confidence",
+                "market_bias", "trend_stage", "symbol",
+                "analysis_time_utc",
+                "strategy_name", "strategy_version",
+            )
+            if k in safe_dr
+        },
+        "output_requirements": {
+            "format": "JSON object only",
+            "language": "Chinese for summary/evidence/risk_notes",
+            "must_keep": ["symbol", "analysis_time_utc", "strategy_name", "strategy_version"],
+        },
+        "_trim_note": "prompt_over_budget_minimal_fallback",
+    }
+    return SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# B4: LLM call wrapper with retry (design §4.1)
+# ---------------------------------------------------------------------------
+
+def _call_ga_llm_with_retry(
+    *,
+    snapshot: dict[str, Any],
+    fallback: dict[str, Any],
+    context: dict[str, Any] | None,
+    breaker: Any,  # CircuitBreaker | _NullBreaker
+    prompt_builders: tuple[
+        Callable[[dict, dict, Any], str],  # normal
+        Callable[[dict, dict, Any], str],  # strict JSON
+        Callable[[dict, dict, Any], str],  # minimal safe
+    ],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Per-symbol retry wrapper. Returns (candidate_dict_or_None, attempt_meta).
+
+    The wrapper checks (in order, BEFORE every LLM call including Attempt 1):
+    1. breaker.should_call() — if False, skip LLM.
+    2. batch_wall_clock_budget.remaining_ms() > estimated_call_ms + jitter_ms
+       — if not, skip call with wall_clock_budget_exhausted.
+    3. For retry attempts only (Attempt 2/3): batch_retry_budget.remaining() > 0
+       — if 0, skip retry with retry_budget_exhausted.
+
+    The wrapper does NOT raise — fail-closed is the caller's job.
+    """
+    from plugins.crypto_guard.reasoning.llm_breaker import (
+        BatchRetryBudget,
+        BatchWallClockBudget,
+    )
+    from plugins.crypto_guard.config.loader import load_config
+
+    # Load LLM config
+    llm_cfg = load_config().trading_mode.get("llm", {})
+    retry_cfg = llm_cfg.get("retry", {})
+    retry_enabled = retry_cfg.get("enabled", True)
+    max_attempts = retry_cfg.get("max_attempts_per_symbol", 3) if retry_enabled else 1
+    jitter_min = retry_cfg.get("jitter_seconds_min", 2)
+    jitter_max = retry_cfg.get("jitter_seconds_max", 20)
+
+    # Resolve config name and model (cached on breaker)
+    cfg_name = breaker.llm_config_name
+    if cfg_name is None:
+        try:
+            cfg_name = _resolve_llm_config_name()
+            breaker.llm_config_name = cfg_name
+        except Exception:
+            cfg_name = "unknown"
+            breaker.llm_config_name = cfg_name
+
+    model_name = breaker.llm_model
+    if model_name is None:
+        model_name = _resolve_llm_model(cfg_name)
+        breaker.llm_model = model_name
+
+    # Resolve budgets from context (set by controller per-batch)
+    retry_budget = (context or {}).get("llm_retry_budget") or BatchRetryBudget(
+        max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),
+    )
+    wall_clock_budget = (context or {}).get("llm_wall_clock_budget") or BatchWallClockBudget(
+        budget_seconds=retry_cfg.get("batch_wall_clock_budget_seconds", 90),
+    )
+
+    # Estimated call time: 30s for normal, 30s for strict, 30s for minimal
+    ESTIMATED_CALL_MS = 30_000
+
+    attempt_meta: dict[str, Any] = {
+        "llm_status": "failed",
+        "llm_error_category": None,
+        "llm_error_stage": None,
+        "llm_error": None,
+        "llm_attempt_count": 0,
+        "llm_retry_round": None,
+        "llm_config_name": cfg_name,
+        "llm_model": model_name,
+        "llm_fallback_reason": None,
+    }
+
+    last_category: str | None = None
+    last_error: str | None = None
+    last_stage: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        # --- Pre-call checks (before EVERY call including Attempt 1) ---
+
+        # Check 1: breaker
+        if not breaker.should_call():
+            breaker.record_skip()
+            attempt_meta["llm_fallback_reason"] = "circuit_breaker_open"
+            attempt_meta["llm_attempt_count"] = attempt - 1
+            attempt_meta["llm_error_category"] = last_category
+            attempt_meta["llm_error_stage"] = last_stage
+            attempt_meta["llm_error"] = last_error or "circuit breaker open; LLM call skipped"
+            return None, attempt_meta
+
+        # Check 2: wall-clock budget (PRIMARY safeguard)
+        jitter_ms = 0
+        if attempt > 1:
+            jitter_ms = int((jitter_min + (jitter_max - jitter_min) * (attempt / max_attempts)) * 1000)
+        if wall_clock_budget.remaining_ms() < ESTIMATED_CALL_MS + jitter_ms:
+            attempt_meta["llm_fallback_reason"] = "wall_clock_budget_exhausted"
+            attempt_meta["llm_attempt_count"] = attempt - 1
+            attempt_meta["llm_error_category"] = last_category
+            attempt_meta["llm_error_stage"] = last_stage
+            attempt_meta["llm_error"] = last_error or "batch wall-clock budget exhausted"
+            return None, attempt_meta
+
+        # Check 3: retry budget (only for Attempt 2/3)
+        if attempt > 1:
+            if not retry_budget.consume():
+                attempt_meta["llm_fallback_reason"] = "retry_budget_exhausted"
+                attempt_meta["llm_attempt_count"] = attempt - 1
+                attempt_meta["llm_error_category"] = last_category
+                attempt_meta["llm_error_stage"] = last_stage
+                attempt_meta["llm_error"] = last_error or "batch retry budget exhausted"
+                return None, attempt_meta
+            breaker.record_retry()
+
+        # --- Jitter sleep for retry attempts ---
+        if attempt > 1 and jitter_ms > 0:
+            import random
+            actual_jitter = random.randint(
+                int(jitter_min * 1000),
+                min(jitter_ms, int(jitter_max * 1000)),
+            )
+            time.sleep(actual_jitter / 1000.0)
+
+        # --- Build prompt and call LLM ---
+        builder_idx = min(attempt - 1, len(prompt_builders) - 1)
+        # For attempt 2 with json_parse_failed, use strict JSON builder
+        # For attempt 3, use minimal safe builder
+        if attempt == 2 and last_category == "llm_json_parse_failed":
+            builder_idx = 1  # strict JSON
+        elif attempt >= 3:
+            builder_idx = 2  # minimal safe
+
+        prompt_builder = prompt_builders[builder_idx]
+        prompt = prompt_builder(snapshot, fallback, context=context)
+
+        raw: str | None = None
+        category: str | None = None
+        try:
+            raw = _call_ga_llm(prompt)
+            candidate = _parse_json_object(raw)
+            # Success!
+            attempt_meta["llm_status"] = "ok"
+            attempt_meta["llm_attempt_count"] = attempt
+            attempt_meta["llm_retry_round"] = attempt
+            attempt_meta["llm_error_category"] = None
+            attempt_meta["llm_error_stage"] = None
+            attempt_meta["llm_error"] = None
+            attempt_meta["llm_fallback_reason"] = None
+            return candidate, attempt_meta
+        except json.JSONDecodeError as exc:
+            category = _classify_llm_failure(exc, raw, "parse")
+            last_category = category
+            last_error = str(exc)[:300]
+            last_stage = "parse"
+        except ValueError as exc:
+            # Schema validation error from _parse_json_object or downstream
+            err_msg = str(exc)[:300]
+            if "not a JSON object" in err_msg:
+                category = "llm_json_parse_failed"
+            else:
+                category = "llm_schema_validation_failed"
+            last_category = category
+            last_error = err_msg
+            last_stage = "schema"
+        except RuntimeError as exc:
+            category = _classify_llm_failure(exc, raw, "call")
+            last_category = category
+            last_error = str(exc)[:300]
+            last_stage = "call"
+        except Exception as exc:
+            category = _classify_llm_failure(exc, raw, "call")
+            last_category = category
+            last_error = str(exc)[:300]
+            last_stage = "call"
+
+        # Record the failed attempt with the breaker
+        breaker.record_attempt(category=category, ok=False)
+
+        # Check if the error is non-retryable
+        if category in _NON_RETRYABLE_CATEGORIES:
+            attempt_meta["llm_fallback_reason"] = "non_retryable_error"
+            attempt_meta["llm_attempt_count"] = attempt
+            attempt_meta["llm_error_category"] = category
+            attempt_meta["llm_error_stage"] = last_stage
+            attempt_meta["llm_error"] = last_error
+            return None, attempt_meta
+
+        # Special case: json_parse_failed on strict JSON attempt -> allow
+        # attempt 3 with minimal safe only if the failure is empty/transport
+        if attempt == 2 and category == "llm_json_parse_failed":
+            # Strict JSON didn't help; allow attempt 3 with minimal safe
+            # (smaller payload may avoid token-limit truncation)
+            pass
+
+        # Continue to next attempt if retryable and budget allows
+
+    # All attempts exhausted
+    attempt_meta["llm_fallback_reason"] = "retry_exhausted"
+    attempt_meta["llm_attempt_count"] = max_attempts
+    attempt_meta["llm_error_category"] = last_category
+    attempt_meta["llm_error_stage"] = "retry_exhausted"
+    attempt_meta["llm_error"] = last_error
+    return None, attempt_meta
+
+
+def _resolve_llm_model(cfg_name: str) -> str:
+    """Best-effort resolution of the LLM model name from the config."""
+    try:
+        import llmcore
+        session = llmcore.resolve_session(cfg_name)
+        # Try common attribute paths for model name
+        for attr in ("model", "model_name", "config"):
+            val = getattr(session, attr, None)
+            if val:
+                if isinstance(val, str):
+                    return val
+                if isinstance(val, dict) and val.get("model"):
+                    return str(val["model"])
+        # Fallback: return the config name itself
+        return cfg_name
+    except Exception:
+        return cfg_name
 
 
 # R9 P2-2 fix: module-level constant so the final hard-cap fallback

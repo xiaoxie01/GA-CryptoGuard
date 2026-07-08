@@ -16,6 +16,7 @@ Each checker returns a list of issue dicts with:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -69,6 +70,18 @@ CANDIDATE_EFFECTIVE_PLAN_MISMATCH = "candidate_effective_plan_mismatch"
 BATCH_TIME_HEALTH_MISMATCH = "batch_time_health_mismatch"
 FAILED_JOBS_OUTSIDE_WINDOW = "failed_jobs_outside_window"
 
+# Phase I (07-07): LLM retry + hourly accuracy repair diagnostic codes. Each
+# code corresponds to a Phase B-E contract. These are runtime diagnostics,
+# NOT migration gates — markers are NOT written to _migration_state for them.
+LLM_FAILURE_RATE_HIGH = "llm_failure_rate_high"
+LLM_CONFIG_ERROR_DETECTED = "llm_config_error_detected"
+LLM_RETRY_EXHAUSTED = "llm_retry_exhausted"
+LLM_CIRCUIT_BREAKER_OPEN = "llm_circuit_breaker_open"
+DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN = "deterministic_candidate_reported_as_trade_plan"
+RAW_GRADE_EXCEEDS_HTF_CAP = "raw_grade_exceeds_htf_cap"
+SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS = "success_batch_missing_completed_symbols"
+HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH = "hourly_report_used_partial_running_batch"
+
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
     """Run all hourly-report-accuracy diagnostics.
@@ -121,6 +134,18 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_candidate_effective_plan_mismatch(repo))
     issues.extend(_check_batch_time_health_mismatch(repo))
     issues.extend(_check_failed_jobs_outside_window(repo))
+
+    # Phase I (07-07): LLM retry + hourly accuracy repair diagnostics. These
+    # are runtime diagnostics without a marker cutoff — they fire on any
+    # matching data in the latest 24h / latest batch. See PRD AC18.
+    issues.extend(_check_llm_failure_rate_high(repo))
+    issues.extend(_check_llm_config_error_detected(repo))
+    issues.extend(_check_llm_retry_exhausted(repo))
+    issues.extend(_check_llm_circuit_breaker_open(repo))
+    issues.extend(_check_deterministic_candidate_reported_as_trade_plan(repo))
+    issues.extend(_check_raw_grade_exceeds_htf_cap(repo))
+    issues.extend(_check_success_batch_missing_completed_symbols(repo))
+    issues.extend(_check_hourly_report_used_partial_running_batch(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -176,6 +201,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         CANDIDATE_EFFECTIVE_PLAN_MISMATCH: _count(issues, CANDIDATE_EFFECTIVE_PLAN_MISMATCH),
         BATCH_TIME_HEALTH_MISMATCH: _count(issues, BATCH_TIME_HEALTH_MISMATCH),
         FAILED_JOBS_OUTSIDE_WINDOW: _count(issues, FAILED_JOBS_OUTSIDE_WINDOW),
+        LLM_FAILURE_RATE_HIGH: _count(issues, LLM_FAILURE_RATE_HIGH),
+        LLM_CONFIG_ERROR_DETECTED: _count(issues, LLM_CONFIG_ERROR_DETECTED),
+        LLM_RETRY_EXHAUSTED: _count(issues, LLM_RETRY_EXHAUSTED),
+        LLM_CIRCUIT_BREAKER_OPEN: _count(issues, LLM_CIRCUIT_BREAKER_OPEN),
+        DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN: _count(issues, DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN),
+        RAW_GRADE_EXCEEDS_HTF_CAP: _count(issues, RAW_GRADE_EXCEEDS_HTF_CAP),
+        SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS: _count(issues, SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS),
+        HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH: _count(issues, HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH),
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
@@ -2265,4 +2298,552 @@ def _check_failed_jobs_outside_window(repo: CryptoGuardRepository) -> list[dict[
             "归类为 legacy_info，不计入当前风险；"
             "诊断必须区分当前问题、warning 和 legacy history。",
         ))
+    return issues
+
+
+# ── Phase I (07-07): LLM retry + hourly accuracy repair diagnostics ──────────
+# Each function returns a list of issue dicts. These are runtime diagnostics
+# — they do NOT write markers to _migration_state and they do NOT use the
+# continuity/semantic marker cutoff (they fire on any matching data in the
+# latest 24h / latest batch). See PRD AC18 and design §11.
+
+# 24h lookback window for LLM-related diagnostics (ms).
+_LLM_DIAGNOSTIC_WINDOW_MS = 24 * 3600 * 1000
+
+
+def _check_llm_failure_rate_high(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag batches whose LLM failure rate >= 50% over the latest 10 calls.
+
+    Per PRD AC18 / R3, the batch-level circuit breaker opens when the failure
+    rate exceeds 50% over the latest 10 LLM calls. This diagnostic surfaces
+    that condition post-hoc so operators can see breaker-quality failures
+    even when the breaker itself was not queried (e.g., legacy batches).
+
+    Detection reads ``analysis_batches.summary_json.llm_health`` from the
+    latest 5 batches. If ``recent_10_failure_rate >= 0.5`` (the breaker-open
+    condition over the latest 10 LLM calls), emit ``error``. Falls back to
+    whole-batch rate only when ``recent_10_failure_rate`` is missing
+    (legacy batches pre-Phase-I) AND ``total_attempts >= 10``.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, status, summary_json
+        FROM analysis_batches
+        WHERE analysis_time >= ?
+        ORDER BY started_at DESC LIMIT 5
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        summary = _safe_json(r["summary_json"]) or {}
+        if not isinstance(summary, dict):
+            continue
+        health = summary.get("llm_health") or {}
+        if not isinstance(health, dict):
+            continue
+        total = int(health.get("total_attempts") or 0)
+        failed = int(health.get("failed") or 0)
+        recent_10_calls = int(health.get("recent_10_calls") or 0)
+        recent_10_failed = int(health.get("recent_10_failed") or 0)
+        recent_10_rate = float(health.get("recent_10_failure_rate") or 0.0)
+        # Primary: latest-10 failure rate (matches breaker-open condition).
+        # Fallback: whole-batch rate for legacy batches missing recent_10_*
+        # fields, only when total >= 10.
+        if recent_10_calls >= 3 and recent_10_rate >= 0.5:
+            rate = recent_10_rate
+            window = f"latest {recent_10_calls} calls"
+        elif total >= 10:
+            rate = failed / total
+            window = f"whole batch ({total} calls, legacy)"
+            if rate < 0.5:
+                continue
+        else:
+            continue  # not enough samples to evaluate
+        issues.append(_issue(
+            LLM_FAILURE_RATE_HIGH, "error",
+            {
+                "batch_id": r["batch_id"] if r["batch_id"] else "",
+                "primary_interval": r["primary_interval"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "total_attempts": total,
+                "failed": failed,
+                "failure_rate": round(rate, 3),
+                "window": window,
+                "dominant_error_category": health.get("dominant_error_category") or "",
+            },
+            "LLM 失败率 ≥ 50%：检查 LLM 配置、网关、模型可用性；"
+            "如已熔断，确认 breaker_state=open 并验证后续 symbol 走 deterministic fallback。",
+        ))
+    return issues
+
+
+def _check_llm_config_error_detected(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag any ga_decisions row with ``llm_error_category=llm_config_error``.
+
+    Per PRD AC18 / R1, ``llm_config_error`` is the HTTP 422 / model-not-found
+    / auth-failure category — it is non-retryable and triggers an immediate
+    breaker open. Any occurrence in the last 24h is an ``error``.
+
+    Detection parses ``raw_decision_json.llm_error_category`` from the latest
+    200 ga_decisions rows created in the last 24h.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND analysis_time >= ?
+        ORDER BY id DESC LIMIT 200
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("llm_error_category") or "") != "llm_config_error":
+            continue
+        issues.append(_issue(
+            LLM_CONFIG_ERROR_DETECTED, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_error": str(raw.get("llm_error") or "")[:300],
+                "llm_config_name": str(raw.get("llm_config_name") or ""),
+                "llm_model": str(raw.get("llm_model") or ""),
+            },
+            "LLM 配置错误（model not found / auth / invalid request）："
+            "不可重试，breaker 必须 open；检查 llm_config 解析、model 名称拼写、apikey 有效性。",
+        ))
+    return issues
+
+
+def _check_llm_retry_exhausted(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag ga_decisions rows with ``llm_fallback_reason=retry_exhausted``.
+
+    Per PRD AC18 / R2, when all 3 retry attempts fail with retryable
+    categories, ``llm_fallback_reason=retry_exhausted`` is recorded. Any
+    occurrence in the last 24h is a ``warning`` (not error — retry-exhausted
+    is expected behavior under degraded LLM service, not a contract violation).
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND analysis_time >= ?
+        ORDER BY id DESC LIMIT 200
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("llm_fallback_reason") or "") != "retry_exhausted":
+            continue
+        issues.append(_issue(
+            LLM_RETRY_EXHAUSTED, "warning",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_attempt_count": int(raw.get("llm_attempt_count") or 0),
+                "llm_error_category": str(raw.get("llm_error_category") or ""),
+                "llm_error": str(raw.get("llm_error") or "")[:300],
+            },
+            "LLM retry 配额耗尽（3 次尝试均失败）："
+            "确认 fail-closed 路径生效，candidate_trade_plan 已保留并标记 plan_execution_state=unconfirmed。",
+        ))
+    return issues
+
+
+def _check_llm_circuit_breaker_open(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag batches whose ``summary_json.llm_health.breaker_state=open``.
+
+    Per PRD AC18 / R3, breaker open is a batch-level signal — once open, all
+    remaining symbols in that batch must use deterministic fallback. Any
+    batch in the latest 5 with ``breaker_state=open`` is an ``error`` (the
+    underlying config/transport issue must be addressed).
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, status, summary_json
+        FROM analysis_batches
+        WHERE analysis_time >= ?
+        ORDER BY started_at DESC LIMIT 5
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        summary = _safe_json(r["summary_json"]) or {}
+        if not isinstance(summary, dict):
+            continue
+        health = summary.get("llm_health") or {}
+        if not isinstance(health, dict):
+            continue
+        if str(health.get("breaker_state") or "") != "open":
+            continue
+        issues.append(_issue(
+            LLM_CIRCUIT_BREAKER_OPEN, "error",
+            {
+                "batch_id": r["batch_id"] if r["batch_id"] else "",
+                "primary_interval": r["primary_interval"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "total_attempts": int(health.get("total_attempts") or 0),
+                "successful": int(health.get("successful") or 0),
+                "failed": int(health.get("failed") or 0),
+                "dominant_error_category": str(health.get("dominant_error_category") or ""),
+            },
+            "LLM 熔断器已 open：本批剩余 symbol 应走 deterministic fallback，"
+            "禁止自动执行候选计划；检查 LLM 配置/网关并修复根因后等待下一批 breaker reset。",
+        ))
+    return issues
+
+
+def _check_deterministic_candidate_reported_as_trade_plan(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """Flag decisions that have a rule candidate but ``plan_execution_state``
+    is NOT ``confirmed`` and NOT ``no_candidate`` — i.e., the candidate is
+    being held but not confirmed, which the hourly report must NOT render as
+    "候选计划已生成（LLM 已确认）".
+
+    Per PRD AC18 / R4 and design §11.1, this diagnostic is data-driven: it
+    reads ``ga_decisions.raw_decision_json`` fields directly, NOT rendered
+    report text. Rendered text correctness is verified separately by the
+    renderer unit test on ``_render_plan_state_label``.
+
+    Conditions for the diagnostic to fire (all must hold):
+    - ``candidate_trade_plan`` is a non-empty dict (rule SOP produced a
+      candidate).
+    - ``has_trade_plan`` is False (no executable plan was confirmed).
+    - ``plan_execution_state`` is not None, not ``confirmed``, not
+      ``no_candidate`` (i.e., the decision is in ``unconfirmed`` /
+      ``risk_rejected`` / ``invalidated`` state).
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND analysis_time >= ?
+        ORDER BY id DESC LIMIT 200
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        candidate = raw.get("candidate_trade_plan")
+        if not isinstance(candidate, dict) or not candidate:
+            continue
+        if raw.get("has_trade_plan"):
+            continue  # has a confirmed plan, not a deterministic-only candidate
+        state = str(raw.get("plan_execution_state") or "")
+        if state in ("", "confirmed", "no_candidate"):
+            continue
+        issues.append(_issue(
+            DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "plan_execution_state": state,
+                "plan_origin": str(raw.get("plan_origin") or ""),
+                "has_trade_plan": False,
+                "candidate_trade_plan_present": True,
+            },
+            "规则候选计划存在但 plan_execution_state={state}："
+            "小时报告必须渲染为 '规则候选计划已生成，LLM 未确认，禁止执行' 而非 '候选计划已生成（LLM 已确认）'。"
+            f" (state={state})",
+        ))
+    return issues
+
+
+def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag ga_decisions whose ``raw_signal_grade`` exceeds the HTF-alignment
+    cap allowed by Step 4b/4c/4d rules.
+
+    Per PRD AC18 / R5 and design §7.1, the caps are:
+    - Step 4b Cap 1: 1D and 4H both opposite to candidate → max B.
+    - Step 4b Cap 2: 4H range/transition/mixed/unknown → max B.
+    - Step 4b Cap 3: 1H and 15M both not aligned with candidate → max B.
+    - Step 4b Cap 4: only 5M supports, 4H and 1H don't → max C.
+
+    Detection recomputes the cap from ``raw_decision_json.timeframe_context``
+    and asserts ``raw_signal_grade`` does not exceed. The GRADE_ORDER is
+    ``S > A > B > C > D``.
+    """
+    issues: list[dict[str, Any]] = []
+    grade_rank = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND analysis_time >= ?
+        ORDER BY id DESC LIMIT 200
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        raw_grade = str(raw.get("raw_signal_grade") or r["signal_grade"] or "D").upper()
+        if raw_grade not in grade_rank:
+            continue
+        ctx = raw.get("timeframe_context") or {}
+        if not isinstance(ctx, dict):
+            continue
+        bias_1d = str((ctx.get("1d") or {}).get("bias") or "").lower()
+        bias_4h = str((ctx.get("4h") or {}).get("bias") or "").lower()
+        bias_1h = str((ctx.get("1h") or {}).get("bias") or "").lower()
+        bias_15m = str((ctx.get("15m") or {}).get("bias") or "").lower()
+        # 5M bias is surfaced on the top-level ``m5_bias`` field by
+        # _apply_htf_alignment_caps (market_semantics.py). 5M is excluded
+        # from timeframe_context (data-only per schema), so it lives
+        # outside ctx. For pre-fix decisions (no m5_bias), this cap
+        # cannot be evaluated.
+        bias_5m = str(raw.get("m5_bias") or "").lower()
+        market_bias = str(raw.get("market_bias") or "").lower()
+        candidate_side = "LONG" if market_bias == "bullish" else "SHORT" if market_bias == "bearish" else None
+        opposite = "bearish" if candidate_side == "LONG" else "bullish" if candidate_side == "SHORT" else None
+        # R6 fix: compare bias values ("bullish"/"bearish") against bias values,
+        # NOT against candidate_side.lower() ("long"/"short"). The
+        # market_semantics.py implementation uses candidate_side_lower which
+        # is "bullish"/"bearish" (the bias value), not "long"/"short" (the
+        # side value). The previous diagnostic compared bias against side,
+        # which never matched -> Cap 3 and Cap 4 were dead branches.
+        candidate_bias = "bullish" if candidate_side == "LONG" else "bearish" if candidate_side == "SHORT" else None
+
+        # Implementation uses INDEPENDENT if-statements (market_semantics.py
+        # _apply_htf_alignment_caps). When multiple caps apply, the most
+        # severe (lowest max_allowed) wins. Replicate that here.
+        max_allowed = "S"  # default: no cap
+        applied_reasons: list[str] = []
+        if candidate_side and bias_1d == opposite and bias_4h == opposite:
+            if grade_rank[max_allowed] > grade_rank["B"]:
+                max_allowed = "B"
+            applied_reasons.append("htf_countertrend_cap")
+        if bias_4h in ("", "neutral", "mixed", "unknown"):
+            if grade_rank[max_allowed] > grade_rank["B"]:
+                max_allowed = "B"
+            applied_reasons.append("htf_4h_nondirectional_cap")
+        if candidate_bias and bias_1h != candidate_bias and bias_15m != candidate_bias:
+            if grade_rank[max_allowed] > grade_rank["B"]:
+                max_allowed = "B"
+            applied_reasons.append("mtf_misalignment_cap")
+        if (
+            candidate_bias
+            and bias_5m == candidate_bias
+            and bias_4h != candidate_bias
+            and bias_1h != candidate_bias
+        ):
+            if grade_rank[max_allowed] > grade_rank["C"]:
+                max_allowed = "C"
+            applied_reasons.append("low_tf_rebound_only_cap")
+
+        if grade_rank[raw_grade] > grade_rank[max_allowed]:
+            issues.append(_issue(
+                RAW_GRADE_EXCEEDS_HTF_CAP, "error",
+                {
+                    "decision_id": int(r["id"]),
+                    "symbol": r["symbol"],
+                    "analysis_time": int(r["analysis_time"] or 0),
+                    "raw_signal_grade": raw_grade,
+                    "max_allowed_grade": max_allowed,
+                    "applied_cap_reasons": applied_reasons or ["none"],
+                    "timeframe_context_bias": {
+                        "1d": bias_1d, "4h": bias_4h, "1h": bias_1h,
+                        "15m": bias_15m, "5m": bias_5m,
+                    },
+                    "market_bias": market_bias,
+                },
+                f"raw_signal_grade={raw_grade} 超过 HTF 对齐上限 {max_allowed}（{', '.join(applied_reasons)}）："
+                "Step 4b/4c/4d cap 未生效；检查 normalize_market_semantics 的 cap 逻辑是否被绕过。",
+            ))
+    return issues
+
+
+def _check_success_batch_missing_completed_symbols(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """Flag ``analysis_batches`` with ``status='success'`` but
+    ``completed_symbols_json=[]`` (raw column, NOT the read-time
+    compensation).
+
+    Per PRD AC18 / R8 and design §10.1, this is the write-link gap root cause:
+    ``finish_analysis_batch`` previously wrote only ``status`` + ``summary_json``
+    and never materialized ``completed_symbols_json`` / ``failed_symbols_json``
+    from ``batch_symbol_status``. The fix materializes those columns inside
+    the repo method. This diagnostic catches any batch that still shows the
+    inconsistent state (e.g., pre-fix batches, or regressions).
+
+    Detection reads the raw ``completed_symbols_json`` column (not
+    ``get_analysis_batch`` which compensates at read time). Any ``status=
+    success`` batch in the latest 20 with empty raw column is an ``error``.
+
+    R7 P2-1 fix: apply 24h cutoff matching the other 07-07 diagnostics.
+    Design §11 line 864 mandates "Each diagnostic has a cutoff: only fires
+    on batches from the last 24h (not historical)." Without this filter,
+    pre-fix historical batches (where finish_analysis_batch didn't
+    materialize the column) fire as ``error`` forever.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, status,
+               completed_symbols_json, failed_symbols_json, summary_json
+        FROM analysis_batches
+        WHERE status = 'success' AND analysis_time >= ?
+        ORDER BY started_at DESC LIMIT 20
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for r in rows:
+        completed_raw = _safe_json(r["completed_symbols_json"])
+        if isinstance(completed_raw, list) and len(completed_raw) > 0:
+            continue  # properly materialized
+        # Either None, malformed, or empty list — all are defects when
+        # status=success.
+        failed_raw = _safe_json(r["failed_symbols_json"])
+        # Cross-check: does batch_symbol_status have completed entries? If
+        # so, the column is genuinely stale (write-link gap). If not, the
+        # batch may have been marked success erroneously.
+        bid = r["batch_id"] if r["batch_id"] else ""
+        live_completed = 0
+        if bid:
+            try:
+                live_completed = repo.conn.execute(
+                    "SELECT COUNT(*) AS c FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                    (bid,),
+                ).fetchone()["c"]
+            except Exception:
+                live_completed = 0
+        issues.append(_issue(
+            SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, "error",
+            {
+                "batch_id": bid,
+                "primary_interval": r["primary_interval"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "status": r["status"],
+                "completed_symbols_json_raw": r["completed_symbols_json"] or "",
+                "failed_symbols_json_raw": r["failed_symbols_json"] or "",
+                "live_completed_count": int(live_completed),
+            },
+            "status=success 但 completed_symbols_json 为空（write-link gap）："
+            "finish_analysis_batch 必须从 batch_symbol_status 物化 completed/failed 列；"
+            "若 live_completed_count > 0，则列确实 stale；若 = 0，则批次被误标 success。",
+        ))
+    return issues
+
+
+def _check_hourly_report_used_partial_running_batch(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """Flag when the latest ``analysis_batches.status='running'`` AND a
+    hourly report was generated AFTER that batch started.
+
+    Per PRD AC18 / R7-R8 and design §9.4, the hourly report must select the
+    latest *complete* batch (``status='success'`` AND enabled_count > 0 AND
+    completed_count == enabled_count AND matching GA decision count ==
+    enabled_count). Rendering against a running/partial batch violates the
+    contract.
+
+    Detection checks: (1) is the latest batch (by ``started_at``) marked
+    ``running``? (2) was there an ``alert_outbox`` row with
+    ``alert_type='hourly_summary'`` created in the last hour? (3) was the
+    alert created AFTER the running batch's ``started_at`` (i.e., the
+    renderer had this running batch available but still emitted a report)?
+    Only when all three hold do we emit ``warning``.
+
+    The ``created_at`` vs ``started_at`` cross-reference replaces the
+    earlier ``payload_json.batch_id`` comparison (which was dead code:
+    production hourly_summary payloads do not include ``batch_id``).
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, status, started_at
+        FROM analysis_batches
+        ORDER BY started_at DESC LIMIT 5
+        """
+    ).fetchall()
+    if not rows:
+        return issues
+    latest = rows[0]
+    if str(latest["status"] or "") != "running":
+        return issues
+    # Check for a recent hourly_summary alert.
+    try:
+        alert_row = repo.conn.execute(
+            """
+            SELECT id, alert_type, created_at, status
+            FROM alert_outbox
+            WHERE alert_type = 'hourly_summary'
+              AND datetime(created_at) >= datetime('now', '-1 hour')
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+    except Exception:
+        alert_row = None
+    if not alert_row:
+        return issues  # no hourly report in last hour - nothing to flag
+    # P2-5 fix: cross-reference alert created_at vs running batch started_at.
+    # If the alert was created BEFORE the running batch started, the
+    # renderer correctly used a previous complete batch (no defect). Only
+    # flag when the alert was created AFTER the running batch started,
+    # indicating the renderer had the running batch available but still
+    # emitted a report.
+    running_started_at = str(latest["started_at"] or "")
+    alert_created_at = str(alert_row["created_at"] or "")
+    if running_started_at and alert_created_at:
+        try:
+            from datetime import datetime as _dt
+            # SQLite stores started_at as ISO string; alert_outbox.created_at
+            # is also ISO. Compare via datetime parsing.
+            t_running = _dt.fromisoformat(running_started_at.replace("Z", "+00:00"))
+            t_alert = _dt.fromisoformat(alert_created_at.replace("Z", "+00:00"))
+            if t_alert < t_running:
+                # Alert fired before the running batch started - renderer
+                # correctly used a previous complete batch. Not a defect.
+                return issues
+        except (ValueError, TypeError):
+            pass  # fall through to emit if timestamps unparseable
+    running_batch_id = str(latest["batch_id"] or "")
+    # Downgraded from "error" to "warning": a same-batch render while status=running
+    # is anomalous but recoverable; the next batch will produce a fresh report.
+    issues.append(_issue(
+        HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, "warning",
+        {
+            "batch_id": running_batch_id,
+            "primary_interval": latest["primary_interval"],
+            "analysis_time": int(latest["analysis_time"] or 0),
+            "batch_status": "running",
+            "batch_started_at": running_started_at,
+            "hourly_alert_id": int(alert_row["id"]),
+            "hourly_alert_created_at": alert_created_at,
+            "hourly_alert_status": str(alert_row["status"]),
+            "window": "latest_running_batch_and_last_1h_alert",
+        },
+        "小时报告使用了 running 批次：必须使用最新 status=success 的完整批次；"
+        "检查 _select_latest_complete_batch 是否生效，禁用 running/partial 渲染路径。"
+        "（已降级为 warning：仅当 hourly alert 创建于 running 批次 started_at 之后时触发。）",
+    ))
     return issues

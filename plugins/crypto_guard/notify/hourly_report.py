@@ -122,8 +122,58 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     # missing. Rendering the legacy text path would surface unfiltered
     # signals/analysis_states from previous cycles — fall back to degraded.
     if not ga_decisions:
-        degraded_state = {**batch_state, "status": "absent", "completed_count": 0}
-        return _render_degraded_report(repo, now, degraded_state, report_hour_utc, expected_batch_id)
+        # Phase E (07-07) per design §9.4: before degrading, try the latest
+        # *complete* batch (status=success AND enabled_count>0 AND
+        # completed_count==enabled_count AND matching GA decision count).
+        # This is the safety net when the expected batch's decisions are
+        # missing/stale but a previous complete batch exists. If found, use
+        # its batch_id for the GA decision fetch so the operator still gets a
+        # useful report. If none, degrade - the Phase A diagnostic
+        # ``_check_hourly_report_used_partial_running_batch`` will catch the
+        # condition on the next diagnostic run (latest batch running/partial
+        # + recent hourly alert).
+        now_ms_fallback = utc_ms()
+        complete_batch = _select_latest_complete_batch(repo, now_ms=now_ms_fallback)
+        if complete_batch is not None:
+            fallback_batch_id = complete_batch.get("batch_id")
+            fallback_summary = complete_batch.get("summary_json") or {}
+            if isinstance(fallback_summary, str):
+                try:
+                    fallback_summary = json.loads(fallback_summary) or {}
+                except Exception:
+                    fallback_summary = {}
+            fallback_analysis_time = int(complete_batch.get("analysis_time") or 0)
+            fallback_min_time = fallback_analysis_time - INTERVAL_MS["15m"] + 1 if fallback_analysis_time > 0 else min_analysis_time
+            ga_decisions = repo.latest_ga_decisions_by_symbol(
+                limit=120, min_analysis_time=fallback_min_time, batch_id=fallback_batch_id,
+            )
+            if ga_decisions:
+                # Switch to the complete batch for rendering.
+                batches_reported = fallback_batch_id
+                batch_state = {
+                    **batch_state,
+                    "batch_id": fallback_batch_id,
+                    "status": str(complete_batch.get("status") or "success"),
+                    "analysis_time": fallback_analysis_time,
+                    "min_analysis_time": fallback_min_time,
+                    "summary_json": fallback_summary,
+                }
+            else:
+                LOGGER.warning(
+                    "hourly_report: expected batch %s has no ga_decisions and no "
+                    "complete fallback batch found - rendering degraded report",
+                    expected_batch_id,
+                )
+                degraded_state = {**batch_state, "status": "absent", "completed_count": 0}
+                return _render_degraded_report(repo, now, degraded_state, report_hour_utc, expected_batch_id)
+        else:
+            LOGGER.warning(
+                "hourly_report: expected batch %s has no ga_decisions and no "
+                "complete fallback batch found - rendering degraded report",
+                expected_batch_id,
+            )
+            degraded_state = {**batch_state, "status": "absent", "completed_count": 0}
+            return _render_degraded_report(repo, now, degraded_state, report_hour_utc, expected_batch_id)
 
     signals = repo.latest_signals_by_symbol(limit=80)
     states = repo.latest_analysis_states(limit=120)
@@ -244,6 +294,24 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
     effective_batch_id = expected_batch_id
     effective_min_time = cutoff_ms - span + 1
 
+    # Phase E (07-07) per design §9.1: carry the batch's summary_json so the
+    # renderer can emit the LLM health line. ``get_analysis_batch`` parses
+    # the JSON blob into a dict; missing/None becomes {} so downstream
+    # ``_render_llm_health_line`` sees an empty llm_health block and renders
+    # no line (pre-Phase-B batches render without the line).
+    batch_summary_json: dict[str, Any] = {}
+    if snapshot is not None:
+        raw_summary = snapshot.get("summary_json")
+        if isinstance(raw_summary, dict):
+            batch_summary_json = raw_summary
+        elif isinstance(raw_summary, str) and raw_summary:
+            try:
+                parsed = json.loads(raw_summary)
+                if isinstance(parsed, dict):
+                    batch_summary_json = parsed
+            except Exception:
+                batch_summary_json = {}
+
     return {
         "batch_id": effective_batch_id,
         "primary_interval": primary_interval,
@@ -259,6 +327,9 @@ def _await_batch_completion(repo: CryptoGuardRepository, *, primary_interval: st
         "completed_count": completed_count,
         "total_count": total_count,
         "timeout_seconds": timeout_seconds,
+        # Phase E (07-07): full summary_json (with llm_health block) so the
+        # renderer can call ``_render_llm_health_line`` without re-fetching.
+        "summary_json": batch_summary_json,
     }
 
 
@@ -665,6 +736,16 @@ def render_ga_hourly_summary(
         include_status=True,
     )
 
+    # Phase E (07-07) per design §9.1: LLM health summary line. Placed after
+    # the system status section so the operator sees LLM call health (success
+    # / failure / retry counts, dominant error, breaker state) in one glance.
+    # Renders ``""`` (no line) when the batch has no ``llm_health`` block
+    # (pre-Phase-B batches or batches where LLM was disabled).
+    if batch_state:
+        llm_health_line = _render_llm_health_line(batch_state)
+        if llm_health_line:
+            lines.append(f"- {llm_health_line}")
+
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
         snap = _safe_json(equity_snapshot.get("snapshot_json"), {}) or equity_snapshot
@@ -891,6 +972,21 @@ def render_ga_hourly_summary(
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
+
+    # Phase E (07-07) per design §9.3: recent LLM failures (24h window).
+    # Replaces any prior unfiltered "最近失败" rendering of ga_decisions.
+    # Only decisions with ``llm_status='failed'`` whose ``analysis_time``
+    # falls within the 24h window are shown - older failures remain in the
+    # audit trail but are hidden from the hourly report (AC17).
+    now_ms_for_failures = utc_ms()
+    recent_llm_failures = _render_recent_failures(rows, now_ms=now_ms_for_failures)
+    if recent_llm_failures:
+        lines.extend(["", "**九之二、最近 24 小时 LLM 失败（仅本窗口内）**"])
+        for failed_row in recent_llm_failures[:10]:
+            sym = failed_row.get("symbol") or "-"
+            err = str(failed_row.get("llm_error") or "")[:100]
+            cat = failed_row.get("llm_error_category") or "-"
+            lines.append(f"- {sym}：{cat} · {err or '-'}")
 
     # P2: 报告准确性诊断 (research 00 P2 diagnostics)
     if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
@@ -1723,6 +1819,12 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "plan_blockers": raw.get("plan_blockers") or [],
         "llm_status": raw.get("llm_status"),
         "llm_error": raw.get("llm_error"),
+        # Phase B (07-07): LLM error taxonomy fields used by recent-failure
+        # rendering to show the category alongside the error text.
+        "llm_error_category": raw.get("llm_error_category"),
+        "llm_fallback_reason": raw.get("llm_fallback_reason"),
+        "plan_origin": raw.get("plan_origin"),
+        "plan_execution_state": raw.get("plan_execution_state"),
         # Phase F (07-05): raw vs effective grade/score. raw_signal_grade
         # / raw_score are the deterministic SOP's pre-gate conclusions.
         # effective_signal_grade / effective_execution_confidence are the
@@ -1933,6 +2035,14 @@ def _format_opportunity_row(
         candidate_summary = _trade_plan_summary(row)
         if candidate_summary and candidate_summary not in result:
             result += f"\n  {candidate_summary}"
+    # Phase C (07-07): always append the plan_execution_state label per
+    # design §6.5 so the operator sees the 5-branch candidate state wording
+    # (confirmed / unconfirmed / risk_rejected / invalidated / no_candidate)
+    # regardless of whether a structured blocker exists. This replaces the
+    # legacy single "候选计划已生成" text with the 5-branch wording.
+    _state_label = _render_plan_state_label(row)
+    if _state_label and _state_label not in result:
+        result += f"\n  {_state_label}"
     return result
 
 
@@ -2319,6 +2429,48 @@ def _signal_report_lines(symbol: str, signal: dict[str, Any], open_orders: list[
     return lines
 
 
+def _render_plan_state_label(decision: dict[str, Any]) -> str:
+    """Phase C (07-07): render the plan_execution_state × plan_origin label.
+
+    Per design §6.5, the hourly report distinguishes 5 candidate states so
+    the operator can tell a confirmed LLM plan from a deterministic fallback
+    candidate, a risk-rejected plan, an invalidated trigger, or a no-candidate
+    observation round. The function reads the structured fields set by
+    ``run_agent_sop_decision`` and ``controller.analyze_symbol``; it does NOT
+    parse rendered text.
+
+    Branches (design §6.5):
+      1. confirmed + llm_confirmed  -> "候选计划已生成（LLM 已确认）"
+      2. unconfirmed + deterministic_fallback
+         -> "规则候选计划已生成，LLM 未确认，禁止执行"
+      3. risk_rejected              -> "候选计划已生成，但风控未通过"
+      4. invalidated                -> "候选计划已生成，但前次触发已反转"
+      5. no_candidate               -> "无候选计划，本轮仅观察"
+
+    A ``confirmed`` state with ``plan_origin=deterministic_sop`` (LLM disabled
+    path where the deterministic SOP produced a plan) renders a distinct label
+    so operators know the plan is SOP-confirmed, not LLM-confirmed. Any
+    unrecognized combination falls back to the "no_candidate" observation
+    wording so the report never claims a candidate exists when the state is
+    ambiguous.
+    """
+    state = decision.get("plan_execution_state")
+    origin = decision.get("plan_origin")
+    if state == "confirmed" and origin == "llm_confirmed":
+        return "候选计划已生成（LLM 已确认）"
+    if state == "unconfirmed" and origin == "deterministic_fallback":
+        return "规则候选计划已生成，LLM 未确认，禁止执行"
+    if state == "risk_rejected":
+        return "候选计划已生成，但风控未通过"
+    if state == "invalidated":
+        return "候选计划已生成，但前次触发已反转"
+    if state == "no_candidate":
+        return "无候选计划，本轮仅观察"
+    if state == "confirmed" and origin == "deterministic_sop":
+        return "规则候选计划已生成（LLM 已禁用，SOP 确认）"
+    return "无候选计划，本轮仅观察"
+
+
 def _trade_plan_summary(decision: dict[str, Any]) -> str:
     plan = decision.get("trade_plan")
     risk = decision.get("risk_check") or {}
@@ -2331,6 +2483,11 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
     # is required by Phase A Fact 4 — the report must mention
     # "候选计划已生成" / "LLM 失败" so the operator can see the
     # deterministic path produced a candidate that was then blocked.
+    # Phase C (07-07): the 5-branch candidate-state wording now lives in
+    # ``_render_plan_state_label`` (design §6.5). This function keeps the
+    # detailed plan info (side/entry/stop) and the blocker summary; the
+    # "候选计划已生成" prefix is replaced with "候选计划详情" so the
+    # state label is not duplicated.
     candidate = decision.get("candidate_trade_plan")
     plan_status = str(decision.get("plan_status") or "")
     blockers = decision.get("plan_blockers") or []
@@ -2359,27 +2516,177 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
         stop = candidate.get("stop_loss") or "-"
         if blocker_texts:
             blockers_text = "；".join(blocker_texts)
-            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被 {blockers_text} 阻断执行。"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：{blockers_text}"
         if llm_status in {"failed", "disabled"}:
-            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被 LLM 失败阻断执行。"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：LLM 失败"
         if plan_status == "withheld":
-            return f"候选计划已生成（{side} 入场 {entry} 止损 {stop}），但被阻断执行。"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：执行门禁未通过"
     if llm_status in {"failed", "disabled"}:
         # P1-10 (07-05 final review): if a candidate was expected
         # (plan_status=withheld/executable) but is missing, surface that
         # as the root cause. If plan_status=no_plan, the deterministic
         # path did not produce a candidate — the LLM had nothing to
-        # fail over, so do NOT claim "候选计划已生成". The previous
-        # text "候选计划已生成，但被 LLM 失败阻断执行" was wrong for
-        # low-score / no-edge decisions where no candidate exists.
+        # fail over, so do NOT claim a candidate exists.
         if plan_status == "no_plan":
             return "LLM 失败但本轮无 deterministic candidate（no-edge / 低分路径）。"
         if plan_status in {"withheld", "executable"}:
-            return "候选计划已生成，但被 LLM 失败阻断执行。"
+            return "候选计划被 LLM 失败阻断执行。"
         return "LLM 失败阻断本轮分析。"
     if risk.get("reasons"):
         return "无可执行模拟盘计划；风控原因：" + "；".join(str(x) for x in risk.get("reasons", [])[:2])
     return "暂无完整交易计划。"
+
+
+# Phase E (07-07): LLM health summary line, latest-complete-batch selection,
+# and 24h-window recent-failure filtering per design §9.1 / §9.4 / §9.3.
+
+_LLM_CATEGORY_SHORT_LABELS = {
+    "llm_empty_response": "empty_response",
+    "llm_json_parse_failed": "json_parse",
+    "llm_transport_error": "timeout",
+    "llm_config_error": "config",
+    "llm_rate_limited": "rate_limited",
+    "llm_schema_validation_failed": "schema",
+    "llm_semantic_validation_failed": "semantic",
+}
+
+
+def _cat_short(category: str) -> str:
+    """Map a full ``llm_error_category`` to the short label used in the
+    LLM health summary line (design §9.1)."""
+    return _LLM_CATEGORY_SHORT_LABELS.get(str(category or ""), str(category or "unknown"))
+
+
+def _render_llm_health_line(batch: dict[str, Any]) -> str:
+    """Phase E (07-07) per design §9.1: render the LLM health summary line.
+
+    The line summarizes the batch's LLM call health so the operator can see
+    success/failure counts, retry usage, and the dominant failure cause in
+    one line. When the circuit breaker is open, a distinct breaker-open
+    message is rendered instead (the batch used deterministic SOP only and
+    no candidate plan may be auto-executed).
+
+    Reads ``batch.summary_json.llm_health`` (set by Phase B's breaker
+    snapshot merge in ``run_ga_workers.py``). Returns ``""`` when no
+    ``llm_health`` block is present (pre-Phase-B batches render no line).
+    """
+    summary = batch.get("summary_json") or {}
+    if isinstance(summary, str):
+        try:
+            summary = json.loads(summary) or {}
+        except Exception:
+            summary = {}
+    llm_health = summary.get("llm_health") if isinstance(summary, dict) else None
+    if not isinstance(llm_health, dict) or not llm_health:
+        return ""
+    state = str(llm_health.get("breaker_state") or "closed").lower()
+    if state == "open":
+        return "LLM：配置/网关异常，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+    total = int(llm_health.get("total_attempts") or 0)
+    ok = int(llm_health.get("successful") or 0)
+    failed = int(llm_health.get("failed") or 0)
+    retries = int(llm_health.get("total_retries") or 0)
+    by_cat = llm_health.get("by_category") or {}
+    parts: list[str] = []
+    if isinstance(by_cat, dict):
+        for cat, n in by_cat.items():
+            try:
+                count = int(n)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                parts.append(f"{_cat_short(cat)}={count}")
+    breakdown = ", ".join(parts) if parts else ""
+    line = f"LLM：{total} 个品种，成功 {ok}，失败 {failed}，重试 {retries}"
+    if breakdown:
+        line += f"；主要原因：{breakdown}"
+    return line
+
+
+def _select_latest_complete_batch(repo: CryptoGuardRepository, *, now_ms: int) -> dict[str, Any] | None:
+    """Phase E (07-07) per design §9.4: pick the latest *complete* batch.
+
+    A batch is complete when:
+    - ``status='success'`` (not running / failed / partial_failed)
+    - ``enabled_count > 0`` (the batch actually ran symbols)
+    - ``completed_count == enabled_count`` (every enabled symbol finished)
+    - matching GA decision count == enabled_count (decisions were persisted
+      for every enabled symbol, guarding against a batch marked success with
+      completed_symbols materialized but decisions missing/stale)
+
+    Returns the batch dict (with parsed ``summary_json`` /
+    ``completed_symbols_json`` / ``failed_symbols_json`` /
+    ``enabled_symbols_json``) or ``None`` when no complete batch exists. The
+    caller renders a degraded report and emits the
+    ``HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH`` diagnostic when ``None``.
+    """
+    rows = repo.list_recent_analysis_batches(limit=5)
+    for batch in rows:
+        if str(batch.get("status") or "") != "success":
+            continue
+        summary = batch.get("summary_json") or {}
+        if isinstance(summary, str):
+            try:
+                summary = json.loads(summary) or {}
+            except Exception:
+                summary = {}
+        enabled_symbols = batch.get("enabled_symbols") or []
+        if not isinstance(enabled_symbols, list):
+            enabled_symbols = []
+        enabled_count = len(enabled_symbols)
+        if enabled_count <= 0:
+            continue
+        completed_symbols = batch.get("completed_symbols") or []
+        if not isinstance(completed_symbols, list):
+            completed_symbols = []
+        completed_count = len(completed_symbols)
+        if completed_count != enabled_count:
+            continue
+        # Verify GA decision count matches enabled count.
+        batch_id = batch.get("batch_id")
+        if not batch_id:
+            continue
+        decisions = repo.list_ga_decisions_for_batch(batch_id)
+        if len(decisions) != enabled_count:
+            continue
+        return batch
+    return None
+
+
+def _render_recent_failures(
+    decisions: list[dict[str, Any]],
+    *,
+    now_ms: int,
+    window_ms: int = 24 * 3600 * 1000,
+) -> list[dict[str, Any]]:
+    """Phase E (07-07) per design §9.3: filter the recent-failure list to a
+    24h window and the current batch only.
+
+    Failures older than 24h must NOT appear in the hourly report's recent
+    failure section (AC17). They remain in the audit trail (DB rows) but
+    are hidden from the hourly report so stale failures don't clutter the
+    operator's view. The renderer calls this with the current batch's
+    decisions plus any recent decisions within the window.
+
+    The returned list preserves order (newest first) and only contains
+    decisions with ``llm_status='failed'`` whose ``analysis_time`` falls
+    within ``[now_ms - window_ms, now_ms]``.
+    """
+    cutoff = int(now_ms) - int(window_ms)
+    recent: list[dict[str, Any]] = []
+    for d in decisions or []:
+        if str(d.get("llm_status") or "").lower() != "failed":
+            continue
+        try:
+            at_ms = int(d.get("analysis_time") or 0)
+        except (TypeError, ValueError):
+            at_ms = 0
+        if at_ms <= 0:
+            continue
+        if at_ms < cutoff:
+            continue
+        recent.append(d)
+    return recent
 
 
 def _position_summary(open_orders: list[dict[str, Any]]) -> str:

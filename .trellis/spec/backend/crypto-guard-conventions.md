@@ -2051,6 +2051,139 @@ Task `07-05-hourly-decision-context-continuity` introduces the decision-context-
 
 **Implementation**: `plugins/crypto_guard/notify/hourly_report.py:_format_decision_card_for_audit` (and the `_format_opportunity_row` path) consume `candidate_trade_plan` + `plan_blockers` + `llm_status` directly from `raw_decision_json`.
 
+## 40. LLM Retry + Hourly Analysis Accuracy Contracts (07-07)
+
+### Contract 40.1: LLM Error Taxonomy (FR-1)
+
+**What**: `ga_decisions.raw_decision_json` must persist the following fields (never API keys/headers/secrets):
+- `llm_status`: `ok | failed | disabled`
+- `llm_error_category`: `llm_config_error | llm_transport_error | llm_rate_limited | llm_empty_response | llm_json_parse_failed | llm_schema_validation_failed | llm_semantic_validation_failed`
+- `llm_error_stage`: `call | parse | schema | semantic | retry_exhausted`
+- `llm_error`: error summary (<=300 chars)
+- `llm_attempt_count`: `0-3`. `0` only when LLM not called (`disabled`, `circuit_breaker_open`, `skipped_by_policy`); `1-3` for actual call count.
+- `llm_retry_round`: batch-level retry round (1-3) where applicable.
+- `llm_config_name`, `llm_model`, `llm_fallback_reason`.
+
+**Why**: 2026-07-07 production showed 56% LLM failure rate with coarse classification (HTTP 422 / malformed_json / empty / etc.). Without a stable taxonomy, retry policy and diagnostics can't distinguish non-retryable config errors from retryable transport errors.
+
+**Implementation**: `plugins/crypto_guard/reasoning/llm_agent_judge.py:_classify_llm_failure` is a pure function mapping exception/raw/stage to category. The classifier inspects both the raw response and the exception message (so `RuntimeError("!!!Error: ... model not found ...")` raised by `_call_ga_llm` still classifies as `llm_config_error`). Schema validation is NOT modified; new top-level fields pass under draft 2020-12 (root has no `additionalProperties: false`). `controller_decision_from_legacy` in `plugins/crypto_guard/ga_master/decision_schema.py` propagates the fields into `raw_decision_json`.
+
+### Contract 40.2: Bounded Retry + Wall-Clock Budget (FR-2)
+
+**What**: Per symbol max 3 attempts; per batch max 9 retry recovery calls; **batch wall-clock budget default 90s (configurable 60-180s)** covers Attempt 1 + all retries + jitter. **Before every LLM call, including Attempt 1**, the wrapper checks: (1) breaker `should_call()`; (2) wall-clock remaining > estimated call + jitter; (3) for retry only, retry budget remaining > 0. Exits:
+- `circuit_breaker_open` (skip LLM, `attempt_count=0`)
+- `wall_clock_budget_exhausted` (primary scheduler safeguard)
+- `retry_budget_exhausted` (9-call quota exhausted)
+- `non_retryable_error` (config/schema/semantic error - does NOT consume retry quota)
+- `retry_exhausted` (3 attempts all failed)
+- `schema_validation_failed` (post-parse schema reject)
+
+Non-retryable: `llm_config_error`, `llm_schema_validation_failed`, `llm_semantic_validation_failed`. Retryable: `llm_empty_response`, `llm_transport_error`, `llm_rate_limited`, `llm_json_parse_failed` (strict JSON prompt may repair).
+
+**Why**: Without the wall-clock check on Attempt 1, a batch arriving with budget already exhausted could still fire N symbols x 3 attempts and stall the 15m scheduler (900s cycle). The 90s hard cap is the PRIMARY scheduler safeguard; retry budget is secondary.
+
+**Implementation**: `plugins/crypto_guard/reasoning/llm_agent_judge.py:_call_ga_llm_with_retry` returns `(candidate_or_None, attempt_meta)`. Three prompt builders: `build_llm_decision_prompt` (normal), `build_llm_strict_json_prompt` (Attempt 2, SYSTEM_PROMPT_STRICT_JSON), `build_llm_minimal_safe_prompt` (Attempt 3, safe_payload). Config under `llm.retry` in `config/trading_mode.yaml`.
+
+### Contract 40.3: Batch Circuit Breaker (FR-3)
+
+**What**: Batch-scoped breaker (one per batch, lifetime = one batch). States: `closed | open | half_open`. Open conditions:
+- `llm_config_error`: open IMMEDIATELY (any count).
+- 3 consecutive `llm_transport_error` / `llm_empty_response`: open.
+- Failure rate >= 50% over latest 10 LLM calls in this batch: open.
+
+Breaker open: remaining symbols skip LLM, `llm_fallback_reason="circuit_breaker_open"`, `llm_attempt_count=0`.
+
+**Why**: A single broken LLM endpoint (e.g., `model not found: xopglm52`) would otherwise burn all 9 retry budget calls + 90s wall-clock per batch before failing closed. Immediate open on config error stops the bleeding.
+
+**Implementation**: `plugins/crypto_guard/reasoning/llm_breaker.py:CircuitBreaker`. `_NullBreaker` for tests/non-controller callers. The controller wires the breaker into `context["llm_breaker"]` per-batch via a module-level cache in `plugins/crypto_guard/run_ga_workers.py` (so the same breaker persists across per-job controller instances). `breaker.snapshot()` is merged into `analysis_batches.summary_json.llm_health` at `finish_analysis_batch`.
+
+### Contract 40.4: Plan State Model (FR-4)
+
+**What**: Two orthogonal fields distinguish "where the plan came from" vs "what state it's in":
+- `plan_origin`: `llm_confirmed | deterministic_fallback | deterministic_sop | none`
+- `plan_execution_state`: `confirmed | unconfirmed | risk_rejected | invalidated | no_candidate`
+
+LLM-failed candidates stay in `candidate_trade_plan` (preserved for audit), `has_trade_plan=False`, `trade_plan=None`, `plan_execution_state="unconfirmed"`. Controller overrides `plan_execution_state` AFTER all gates:
+- `risk_rejected` when candidate was preserved but plan cleared (risk gate failed).
+- `invalidated` when continuity trigger invalidated the candidate.
+- `no_candidate` when neither plan nor candidate exists.
+
+**Why**: 2026-07-07 production showed hourly reports misreading deterministic fallback candidates as "候选计划已生成" (implying LLM-confirmed and executable). The two-field model separates origin from execution eligibility.
+
+**Implementation**: `run_agent_sop_decision` sets the fields per path (success/breaker/failed/disabled). `controller.analyze_symbol` overrides only the state label, not the decision outcome. Risk gates are NOT weakened.
+
+### Contract 40.5: Raw Grade Caps (FR-5)
+
+**What**: `normalize_market_semantics` applies HTF alignment caps to `signal_grade` (idempotent via `_htf_cap_original_grade` marker):
+- **Step 4b**: 1D AND 4H both opposite to candidate direction -> max B, reason `htf_countertrend_cap`.
+- **Step 4c**: 4H in {range, transition, mixed, unknown} -> max B, reason `htf_4h_nondirectional_cap`.
+- **Step 4d**: 1H AND 15M both not aligned with candidate direction -> max B, reason `mtf_misalignment_cap`. Only 5M supports while 4H/1H don't -> max C, reason `low_tf_rebound_only_cap`, map `trend_stage` `early -> transition`, add `low_tf_rebound_only` to `market_reason_codes`.
+- **Step 4e (controller, after clamp)**: no structured entry confirmation -> executable grade max B, reason `no_entry_confirmation_cap`; LLM failed -> executable grade max B + `plan_execution_state="unconfirmed"`, reason `llm_failed_executable_cap`.
+
+**Why**: 2026-07-07 production showed DOGEUSDT raw `S/0.84` despite 1D/1H/15M bearish + 5M range; AVAXUSDT raw `S/0.84` despite 4H transition + 1H/15M range; BTCUSDT raw `A/0.79` despite 4H recovering + 1H mixed + 15M/5M range. Raw grade overheated on weak multi-TF alignment.
+
+**Implementation**: `plugins/crypto_guard/reasoning/market_semantics.py:_apply_htf_alignment_caps` + `_cap_grade` helper. Executable caps in `ga_master/controller.py:analyze_symbol` after `clamp_grade`, before `effective_signal_grade`. Config gate `htf_alignment_cap_enabled` (default True) for rollback.
+
+### Contract 40.6: Prompt Strategy (FR-6)
+
+**What**: Three prompt tiers, all bounded by `MAX_PROMPT_BYTES = 48 * 1024`:
+1. **Normal** (Attempt 1): `build_llm_decision_prompt` with full `multi_timeframe_feature_pack` (24 KiB budget) + modules + historical_memory + open_positions.
+2. **Strict JSON** (Attempt 2): `build_llm_strict_json_prompt` overrides SYSTEM_PROMPT with `SYSTEM_PROMPT_STRICT_JSON` to force pure JSON output (no prose, no markdown fences).
+3. **Minimal Safe** (Attempt 3): `build_llm_minimal_safe_prompt` drops market_snapshot/modules/feature_pack; keeps symbol + analysis_time + hard_rules + deterministic_reference + minimal output_requirements.
+
+**What is preserved across all tiers**: `symbol`, `analysis_time_utc`, `deterministic_reference`, `timeframe_context`, `data_health`, previous compact state, risk thresholds.
+
+**Why**: 2026-07-07 production showed `malformed_json` (39 failures) and `invalid_control_character` (9 failures). Strict JSON prompt forces the LLM to output parseable JSON. Minimal safe payload (smallest) avoids token-limit truncation on attempt 3.
+
+**Implementation**: `plugins/crypto_guard/reasoning/llm_agent_judge.py`. No raw K-line arrays in any prompt tier.
+
+### Contract 40.7: Hourly Report Wording (FR-7)
+
+**What**: Hourly report renders 5 candidate-state branches via `_render_plan_state_label(decision)`:
+1. "候选计划已生成（LLM 已确认）" - `plan_origin=llm_confirmed`, `plan_execution_state=confirmed`
+2. "规则候选计划已生成，LLM 未确认，禁止执行" - `plan_execution_state=unconfirmed`
+3. "候选计划已生成，但风控未通过" - `plan_execution_state=risk_rejected`
+4. "候选计划已生成，但前次触发已反转" - `plan_execution_state=invalidated`
+5. "无候选计划，本轮仅观察" - `plan_execution_state=no_candidate` or fallback
+
+Plus:
+- **LLM health summary line** (`_render_llm_health_line`): `LLM：N 个品种，成功 X，失败 Y，重试 Z；主要原因：cat=N, ...`. Breaker open: `LLM：配置/网关异常，已熔断；本批使用规则 SOP，禁止自动执行候选计划`.
+- **Recent failures 24h window** (`_render_recent_failures`): only decisions with `llm_status=failed` AND `analysis_time >= now_ms - 24h`. Old failures (>24h) hidden from hourly report (AC17). The existing `_check_failed_jobs_outside_window` diagnostic (7-day legacy_info) covers the audit trail.
+- **Latest complete batch selection** (`_select_latest_complete_batch`): only `status='success'` AND `enabled_count > 0` AND `completed_count == enabled_count` AND matching GA decision count == enabled_count. Running/partial batches rejected.
+- **Opportunity rows**: show raw grade only when it differs from executable grade.
+
+**Why**: 2026-07-07 production showed old failures (>7 days) permanently repeating in "最近失败", and `state_consistency` warnings (`deterministic_direction_from_failed_llm`) were misread as "候选计划已生成".
+
+**Implementation**: `plugins/crypto_guard/notify/hourly_report.py`. `_render_plan_state_label` is the single authoritative source for candidate-state wording; `_trade_plan_summary` uses "候选计划详情" prefix to avoid duplication.
+
+### Contract 40.8: Batch Completion Consistency (FR-8)
+
+**What**: `finish_analysis_batch(batch_id, status, summary)` materializes `completed_symbols_json` / `failed_symbols_json` from `batch_symbol_status` INSIDE the repo method, in the same UPDATE statement. Read path (`get_analysis_batch`) prefers the materialized raw columns; `batch_symbol_status` is only used for real-time checks.
+
+Selection criteria for hourly report: `status='success'` AND `enabled_count > 0` AND `completed_count == enabled_count` AND matching GA decision count == enabled_count. Running/partial batches do not render.
+
+**Why**: 2026-07-07 production showed `analysis_batches.status='success'` + `completed_symbols_json=[]` inconsistency. Root cause: `finish_analysis_batch` only wrote `status` + `summary_json`, never the raw columns. `get_analysis_batch` compensated at read time, but the raw column stayed empty, breaking the `SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS` diagnostic.
+
+**Implementation**: `plugins/crypto_guard/storage/repository.py:finish_analysis_batch` queries `batch_symbol_status` for completed/failed symbols, writes sorted JSON arrays into both raw columns. Callers in `run_ga_workers.py` need no change. The `SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS` diagnostic reads the raw column (not the read-time compensation) to catch the inconsistency.
+
+### Contract 40.9: Diagnostics and Test Coverage (FR-7 + FR-8)
+
+**What**: 8 new diagnostic codes in `plugins/crypto_guard/diagnostics/report_diagnostics.py`:
+- `LLM_FAILURE_RATE_HIGH` - latest batch `failed / total_attempts >= 0.5` over latest 10 calls.
+- `LLM_CONFIG_ERROR_DETECTED` - any 24h `ga_decisions.raw_decision_json.llm_error_category == "llm_config_error"`.
+- `LLM_RETRY_EXHAUSTED` - any 24h `ga_decisions.raw_decision_json.llm_fallback_reason == "retry_exhausted"`.
+- `LLM_CIRCUIT_BREAKER_OPEN` - latest batch `summary_json.llm_health.breaker_state == "open"`.
+- `DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN` - any 24h `ga_decisions` with `candidate_trade_plan` non-empty AND `has_trade_plan=False` AND `plan_execution_state` not in {`confirmed`, `no_candidate`}. **Source is `raw_decision_json` data fields, NOT rendered text.**
+- `RAW_GRADE_EXCEEDS_HTF_CAP` - recomputes Step 4b/4c/4d caps from `raw_decision_json.timeframe_context`; fires when `raw_signal_grade` exceeds the cap.
+- `SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS` - reads raw `completed_symbols_json` column; fires when `status='success'` + raw column empty/malformed + live `batch_symbol_status` has completed rows.
+- `HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH` - latest batch `status='running'` + recent `alert_outbox` `alert_type='hourly_summary'` row in last hour.
+
+7 new fault seeds in `plugins/crypto_guard/tools/_phase_h_fault_inject.py` cover each diagnostic. Total fault injection: 16/16 verified (9 Phase H + 7 Phase I).
+
+Test coverage: 21 targeted tests across `TestPhaseB07_07LLMRetryAndBreaker` (9), `TestPhaseC07_07PlanStateLabel` (3), `TestPhaseD07_07RawGradeCaps` (5), `TestPhaseE07_07HourlyReportAndBatchConsistency` (4). AC18-AC20 are meta/fault-injection validation (covered by `_phase_h_fault_inject.py` + `_phase_i_fresh_verify.py`), not counted in the 21 targeted tests.
+
+**Why**: Diagnostics must be data-driven (reading `raw_decision_json` fields) not text-driven (parsing rendered report text), so renderer wording changes don't silently break the diagnostic.
+
 ---
 
-**Last updated**: 2026-07-05 (07-05 hourly decision context continuity — Sections 39.1-39.8 added for multi-TF feature pack, analysis continuity, plan lifecycle separation, LLM fallback, batch-pinned health, recent-failed-jobs window, marker/cutoff, and report UX)
+**Last updated**: 2026-07-08 (07-07 LLM retry + hourly analysis accuracy repair - Section 40 added for LLM error taxonomy, bounded retry + wall-clock budget, batch circuit breaker, plan state model, raw grade caps, prompt strategy, hourly report wording, batch completion consistency, and diagnostics; 07-05 hourly decision context continuity - Sections 39.1-39.8 added for multi-TF feature pack, analysis continuity, plan lifecycle separation, LLM fallback, batch-pinned health, recent-failed-jobs window, marker/cutoff, and report UX)

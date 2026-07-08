@@ -33,6 +33,15 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
     CANDIDATE_EFFECTIVE_PLAN_MISMATCH,
     BATCH_TIME_HEALTH_MISMATCH,
     FAILED_JOBS_OUTSIDE_WINDOW,
+    # Phase I (07-07): LLM retry + hourly accuracy repair diagnostic codes.
+    LLM_FAILURE_RATE_HIGH,
+    LLM_CONFIG_ERROR_DETECTED,
+    LLM_RETRY_EXHAUSTED,
+    LLM_CIRCUIT_BREAKER_OPEN,
+    DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN,
+    RAW_GRADE_EXCEEDS_HTF_CAP,
+    SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS,
+    HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
 )
 
 
@@ -333,6 +342,175 @@ def fault_failed_jobs_outside_window(conn):
     conn.commit()
 
 
+# ── Phase I (07-07): LLM retry + hourly accuracy repair fault seeds ──────────
+
+def _recent_analysis_time_ms() -> int:
+    """Return a recent analysis_time (now - 1h in ms) so 24h-lookback
+    diagnostics see the seeded row."""
+    import time as _time
+    return int(_time.time() * 1000) - 3_600_000
+
+
+def fault_llm_config_error_http_422(conn):
+    """Fault: ga_decisions row with ``llm_error_category=llm_config_error``.
+
+    Per PRD AC1/AC18, HTTP 422 invalid_model_error → llm_config_error,
+    non-retryable, breaker opens. Diagnostic must catch this in latest 24h.
+    """
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "failed",
+        "llm_error_category": "llm_config_error",
+        "llm_error_stage": "call",
+        "llm_error": "HTTP 422 invalid_model_error: model not found: xopglm52",
+        "llm_attempt_count": 1,
+        "llm_fallback_reason": "non_retryable_error",
+        "llm_config_name": "native_claude_config",
+        "llm_model": "xopglm52",
+    }, analysis_time=at_ms, decision="no_edge", grade="D")
+
+
+def fault_llm_retry_exhausted(conn):
+    """Fault: ga_decisions row with ``llm_fallback_reason=retry_exhausted``."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "failed",
+        "llm_error_category": "llm_empty_response",
+        "llm_error_stage": "retry_exhausted",
+        "llm_error": "empty response after 3 attempts",
+        "llm_attempt_count": 3,
+        "llm_fallback_reason": "retry_exhausted",
+    }, analysis_time=at_ms, decision="no_edge", grade="D")
+
+
+def fault_llm_circuit_breaker_open(conn):
+    """Fault: latest batch with ``summary_json.llm_health.breaker_state=open``."""
+    at_ms = _recent_analysis_time_ms()
+    summary = {
+        "llm_health": {
+            "total_attempts": 10,
+            "successful": 0,
+            "failed": 10,
+            "skipped_by_breaker": 0,
+            "dominant_error_category": "llm_transport_error",
+            "breaker_state": "open",
+            "by_category": {"llm_transport_error": 10},
+            "total_retries": 3,
+        },
+    }
+    conn.execute(
+        "INSERT INTO analysis_batches ("
+        "  batch_id, primary_interval, analysis_time, status, started_at,"
+        "  summary_json"
+        ") VALUES (?, ?, ?, ?, datetime('now'), ?)",
+        ("BATCH_BREAKER_OPEN", "1h", at_ms, "failed",
+         json.dumps(summary)),
+    )
+    conn.commit()
+
+
+def fault_deterministic_candidate_reported_as_trade_plan(conn):
+    """Fault: ga_decisions row with candidate present but
+    ``plan_execution_state=unconfirmed`` and ``has_trade_plan=False``.
+
+    Per design §11.1, the diagnostic reads ``raw_decision_json`` fields
+    directly — it does NOT parse rendered report text. The seed plants a
+    candidate + unconfirmed state + has_trade_plan=False; the diagnostic
+    must flag it.
+    """
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "failed",
+        "llm_error_category": "llm_empty_response",
+        "llm_fallback_reason": "retry_exhausted",
+        "has_trade_plan": False,
+        "trade_plan": None,
+        "candidate_trade_plan": {
+            "side": "long", "entry": 100, "stop": 95,
+            "trigger_price": 100, "trigger_side": "long",
+        },
+        "plan_origin": "deterministic_fallback",
+        "plan_execution_state": "unconfirmed",
+        "plan_status": "withheld",
+    }, analysis_time=at_ms, decision="no_edge", grade="C")
+
+
+def fault_raw_grade_exceeds_htf_cap(conn):
+    """Fault: raw_signal_grade=S but 1D+4H both opposite to candidate.
+
+    Per design §7.1 Step 4b Cap 1: 1D and 4H both opposite to candidate →
+    max grade B. A raw S grade in this configuration violates the cap.
+    """
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "signal_grade": "S",
+        "raw_signal_grade": "S",
+        "market_bias": "bullish",
+        "timeframe_context": {
+            "1d": {"bias": "bearish"},
+            "4h": {"bias": "bearish"},
+            "1h": {"bias": "bullish"},
+            "15m": {"bias": "bullish"},
+            "5m": {"bias": "bullish"},
+        },
+    }, analysis_time=at_ms, decision="long", grade="S")
+
+
+def fault_success_batch_missing_completed_symbols(conn):
+    """Fault: ``status=success`` batch with ``completed_symbols_json=[]``.
+
+    Per design §10.1, this is the write-link gap. The diagnostic reads the
+    raw column (not the read-time compensation). The seed plants a success
+    batch with empty raw column but a live completed entry in
+    ``batch_symbol_status`` to prove the column is stale.
+    """
+    at_ms = _recent_analysis_time_ms()
+    conn.execute(
+        "INSERT INTO analysis_batches ("
+        "  batch_id, primary_interval, analysis_time, status, started_at,"
+        "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+        ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
+        ("BATCH_EMPTY_COMPLETED", "1h", at_ms, "success",
+         json.dumps(["BTCUSDT", "ETHUSDT"]),
+         json.dumps([]),  # ← raw column empty — the defect
+         json.dumps([])),
+    )
+    # Plant a live completed entry to prove the column is stale (not
+    # legitimately empty).
+    conn.execute(
+        "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+        "VALUES (?, ?, ?)",
+        ("BATCH_EMPTY_COMPLETED", "BTCUSDT", "completed"),
+    )
+    conn.commit()
+
+
+def fault_hourly_report_used_partial_running_batch(conn):
+    """Fault: latest batch ``status=running`` AND a recent hourly_summary
+    alert in ``alert_outbox``.
+
+    Per design §9.4, the hourly report must select the latest *complete*
+    batch. Rendering against a running batch + recent alert_outbox row
+    violates the contract.
+    """
+    at_ms = _recent_analysis_time_ms()
+    conn.execute(
+        "INSERT INTO analysis_batches ("
+        "  batch_id, primary_interval, analysis_time, status, started_at"
+        ") VALUES (?, ?, ?, ?, datetime('now'))",
+        ("BATCH_RUNNING", "1h", at_ms, "running"),
+    )
+    # Plant a recent hourly_summary alert (within last hour).
+    conn.execute(
+        "INSERT INTO alert_outbox ("
+        "  alert_type, symbol, priority, payload_json, status, created_at"
+        ") VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        ("hourly_summary", None, 5,
+         json.dumps({"fallback_text": "hourly report test"}), "sent"),
+    )
+    conn.commit()
+
+
 def assert_caught(result, expected_code):
     """Return (passed, message)."""
     if expected_code in result["codes"]:
@@ -421,6 +599,24 @@ def main():
         # must NOT fire the diagnostic. This is the legitimate no-edge path.
         ("no_plan_no_candidate_negative", fault_no_plan_no_candidate_negative,
          MISSING_CANDIDATE_ON_LLM_FAILURE, "not_caught", None),
+        # ── Phase I (07-07): LLM retry + hourly accuracy repair fault seeds ──
+        ("llm_config_error_http_422", fault_llm_config_error_http_422,
+         LLM_CONFIG_ERROR_DETECTED, "caught", None),
+        ("llm_retry_exhausted", fault_llm_retry_exhausted,
+         LLM_RETRY_EXHAUSTED, "caught", None),
+        ("llm_circuit_breaker_open", fault_llm_circuit_breaker_open,
+         LLM_CIRCUIT_BREAKER_OPEN, "caught", None),
+        ("deterministic_candidate_reported_as_trade_plan",
+         fault_deterministic_candidate_reported_as_trade_plan,
+         DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "caught", None),
+        ("raw_grade_exceeds_htf_cap", fault_raw_grade_exceeds_htf_cap,
+         RAW_GRADE_EXCEEDS_HTF_CAP, "caught", None),
+        ("success_batch_missing_completed_symbols",
+         fault_success_batch_missing_completed_symbols,
+         SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, "caught", None),
+        ("hourly_report_used_partial_running_batch",
+         fault_hourly_report_used_partial_running_batch,
+         HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, "caught", None),
     ]
 
     results = []

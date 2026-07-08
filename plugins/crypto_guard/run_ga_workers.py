@@ -29,6 +29,14 @@ from plugins.crypto_guard.utils import utc_ms
 
 LOGGER = get_logger("crypto_guard.worker")
 
+# Phase B (07-07): module-level cache for per-batch circuit breakers.
+# The controller is created per-job (line ~50), so the breaker cannot live
+# on the controller instance. Instead, we cache breakers here keyed by
+# batch_id. The breaker is created on first use and persists for the
+# batch lifetime. When the batch finishes, the snapshot is merged into
+# the batch summary and the breaker is removed from the cache.
+_batch_breakers: dict[str, Any] = {}
+
 
 def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     payload = json.loads(job["payload_json"])
@@ -46,8 +54,50 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
     if job_type == "scheduled_market_analysis":
         snapshot = payload["snapshot"]
         batch_id = payload.get("batch_id")
+        # Phase B (07-07): get or create per-batch circuit breaker
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            CircuitBreaker,
+            BatchRetryBudget,
+            BatchWallClockBudget,
+        )
+        from plugins.crypto_guard.config.loader import load_config
+        llm_cfg = load_config().trading_mode.get("llm", {})
+        breaker_cfg = llm_cfg.get("circuit_breaker", {})
+        retry_cfg = llm_cfg.get("retry", {})
+        breaker = _batch_breakers.get(batch_id or "")
+        if breaker is None and batch_id:
+            # Create the full batch_state dict (breaker + budgets) so the
+            # controller can reuse it. The controller will also create this
+            # on first symbol, but creating here ensures the breaker exists
+            # before the controller runs.
+            from plugins.crypto_guard.reasoning.llm_breaker import (
+                BatchRetryBudget,
+                BatchWallClockBudget,
+            )
+            breaker = CircuitBreaker(
+                enabled=breaker_cfg.get("enabled", True),
+                consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
+                rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
+                rate_window=breaker_cfg.get("rate_window", 10),
+            )
+            retry_budget = BatchRetryBudget(
+                max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),
+            )
+            wall_clock_budget = BatchWallClockBudget(
+                budget_seconds=retry_cfg.get("batch_wall_clock_budget_seconds", 90),
+            )
+            breaker._wall_clock_budget = wall_clock_budget
+            _batch_breakers[batch_id] = {
+                "breaker": breaker,
+                "retry_budget": retry_budget,
+                "wall_clock_budget": wall_clock_budget,
+            }
         try:
-            decision = GAMasterController(repo).analyze_symbol(
+            controller = GAMasterController(repo)
+            # Inject the shared breaker cache into the controller so it reuses
+            # the same breaker instead of creating a new one per symbol.
+            controller._breakers = _batch_breakers
+            decision = controller.analyze_symbol(
                 GAAnalysisRequest(
                     symbol=snapshot["symbol"],
                     decision_type="scheduled_analysis",
@@ -72,7 +122,12 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                             batch_status = "partial_failed"
                         else:
                             batch_status = "success"
-                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
+                        # Phase B (07-07): merge breaker snapshot into batch summary
+                        llm_health = controller.get_batch_llm_health(batch_id)
+                        summary = {"llm_health": llm_health} if llm_health else None
+                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status, summary=summary)
+                        # Clean up breaker cache for this batch
+                        _batch_breakers.pop(batch_id, None)
                 except Exception:
                     LOGGER.warning("mark_batch_symbol_completed failed batch=%s symbol=%s", batch_id, snapshot["symbol"])
         except Exception as analysis_exc:
@@ -88,7 +143,18 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                             batch_status = "partial_failed"
                         else:
                             batch_status = "success"
-                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status)
+                        # Phase B (07-07): merge breaker snapshot into batch summary.
+                        # Use the breaker cache directly since controller may not
+                        # be available in the except block.
+                        _bs = _batch_breakers.get(batch_id)
+                        _brk = _bs.get("breaker") if isinstance(_bs, dict) else None
+                        llm_health = _brk.snapshot() if _brk else {}
+                        wcb = _bs.get("wall_clock_budget") if isinstance(_bs, dict) else None
+                        if wcb is not None:
+                            llm_health["wall_clock_budget_ms_remaining"] = wcb.remaining_ms()
+                        summary = {"llm_health": llm_health} if llm_health else None
+                        repo.finish_analysis_batch(batch_id=batch_id, status=batch_status, summary=summary)
+                        _batch_breakers.pop(batch_id, None)
                 except Exception:
                     pass
             raise

@@ -151,6 +151,23 @@ def controller_decision_from_legacy(
         "analysis_source": legacy.get("analysis_source") or "ga_master_controller",
         "llm_status": legacy.get("llm_status") or "ok",
         "llm_error": legacy.get("llm_error"),
+        # Phase B (07-07): new LLM error taxonomy fields (design §3.4)
+        "llm_error_category": legacy.get("llm_error_category"),
+        "llm_error_stage": legacy.get("llm_error_stage"),
+        "llm_attempt_count": legacy.get("llm_attempt_count"),
+        "llm_retry_round": legacy.get("llm_retry_round"),
+        "llm_config_name": legacy.get("llm_config_name"),
+        "llm_model": legacy.get("llm_model"),
+        "llm_fallback_reason": legacy.get("llm_fallback_reason"),
+        # Phase B (07-07): plan state model (design §6.1)
+        "plan_origin": legacy.get("plan_origin"),
+        "plan_execution_state": legacy.get("plan_execution_state"),
+        # Phase B (07-07): 5M bias surfaced by _apply_htf_alignment_caps
+        # (market_semantics.py). 5M is data-only in TIMEFRAME_CONTEXT_TFS,
+        # so it cannot live under timeframe_context (schema
+        # additionalProperties:false). Exposed at top level so diagnostics
+        # can read it from raw_decision_json without re-fetching snapshot.
+        "m5_bias": legacy.get("m5_bias"),
         "batch_id": batch_id,
         "previous_grade": previous_grade,
         "grade_delta": grade_delta_value,

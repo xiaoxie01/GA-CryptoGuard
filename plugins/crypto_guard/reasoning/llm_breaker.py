@@ -1,0 +1,273 @@
+"""Batch-scoped LLM circuit breaker, retry budget, and wall-clock budget.
+
+Design references: design.md §5.1 (CircuitBreaker), §4.2 (BatchRetryBudget),
+§4.3 (BatchWallClockBudget).
+
+The breaker lifetime is one batch. A new batch starts with a fresh breaker
+in closed state. The breaker is NOT a global singleton — the controller
+creates one per batch and passes it via ``context["llm_breaker"]``.
+"""
+from __future__ import annotations
+
+import time
+from typing import Any
+
+
+class CircuitBreaker:
+    """Batch-scoped LLM circuit breaker.
+
+    States: closed | open | half_open.
+    - closed: normal LLM calls.
+    - open: skip LLM, deterministic fallback only.
+    - half_open: allow ONE probe call; on success -> closed; on fail -> open.
+
+    Open conditions (checked after each attempt):
+    - llm_config_error: open IMMEDIATELY (any count).
+    - 3 consecutive llm_transport_error / llm_empty_response: open.
+    - fail rate >= 50% over the latest 10 LLM calls in this batch: open.
+
+    Half-open transition: not automatic within a batch. A new batch starts
+    with a fresh breaker in closed state (breaker lifetime == one batch).
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        consecutive_threshold: int = 3,
+        rate_threshold: float = 0.5,
+        rate_window: int = 10,
+    ):
+        self._enabled = enabled
+        self._consecutive_threshold = consecutive_threshold
+        self._rate_threshold = rate_threshold
+        self._rate_window = rate_window
+        self._state: str = "closed"
+        self._consecutive_infra_failures: int = 0
+        self._recent_results: list[bool] = []  # True=ok, False=fail
+        self._total_attempts: int = 0
+        self._successful: int = 0
+        self._failed: int = 0
+        self._skipped_by_breaker: int = 0
+        self._by_category: dict[str, int] = {}
+        self._state_transitions: list[dict[str, Any]] = []
+        self._total_retries: int = 0
+        # Config name / model cached by the retry wrapper
+        self._llm_config_name: str | None = None
+        self._llm_model: str | None = None
+
+    # -- public API --
+
+    def should_call(self) -> bool:
+        """Return True if an LLM call is allowed."""
+        if not self._enabled:
+            return True  # disabled breaker never blocks
+        return self._state != "open"
+
+    def record_attempt(self, *, category: str | None, ok: bool) -> None:
+        """Record the outcome of an LLM attempt. May transition state."""
+        if not self._enabled:
+            return
+
+        self._total_attempts += 1
+        if ok:
+            self._successful += 1
+            self._consecutive_infra_failures = 0
+            self._recent_results.append(True)
+            if self._state == "half_open":
+                self._transition("closed", reason="half_open_probe_success")
+        else:
+            self._failed += 1
+            self._recent_results.append(False)
+            if category:
+                self._by_category[category] = self._by_category.get(category, 0) + 1
+
+            # Immediate open on config error
+            if category == "llm_config_error":
+                self._transition("open", reason="llm_config_error_immediate")
+                return
+
+            # Count consecutive infra failures (transport + empty)
+            if category in ("llm_transport_error", "llm_empty_response"):
+                self._consecutive_infra_failures += 1
+                if self._consecutive_infra_failures >= self._consecutive_threshold:
+                    self._transition(
+                        "open",
+                        reason=f"{self._consecutive_threshold}_consecutive_{category}",
+                    )
+                    return
+            else:
+                self._consecutive_infra_failures = 0
+
+            # Rate-based open: >= rate_threshold failures in latest rate_window calls
+            window = self._recent_results[-self._rate_window:]
+            if len(window) >= 3:  # need at least 3 samples for rate check
+                fail_rate = sum(1 for r in window if not r) / len(window)
+                if fail_rate >= self._rate_threshold:
+                    self._transition("open", reason=f"failure_rate_{fail_rate:.0%}")
+
+    def record_skip(self) -> None:
+        """Record a symbol skipped because the breaker was open."""
+        self._skipped_by_breaker += 1
+
+    def record_retry(self) -> None:
+        """Record one retry recovery call (attempt 2 or 3)."""
+        self._total_retries += 1
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def llm_config_name(self) -> str | None:
+        return self._llm_config_name
+
+    @llm_config_name.setter
+    def llm_config_name(self, value: str | None) -> None:
+        self._llm_config_name = value
+
+    @property
+    def llm_model(self) -> str | None:
+        return self._llm_model
+
+    @llm_model.setter
+    def llm_model(self, value: str | None) -> None:
+        self._llm_model = value
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a JSON-serializable summary for analysis_batches.summary_json."""
+        dominant = ""
+        if self._by_category:
+            dominant = max(self._by_category, key=self._by_category.get)  # type: ignore[arg-type]
+        # Expose the latest-10 failure rate so diagnostics can evaluate the
+        # breaker-open condition post-hoc (PRD AC18 / R3). Trims to the
+        # rate_window (default 10) and computes the failure rate over that
+        # window, not the whole-batch total.
+        window = self._recent_results[-self._rate_window:]
+        recent_10_failure_rate = (sum(1 for r in window if not r) / len(window)) if window else 0.0
+        return {
+            "total_attempts": self._total_attempts,
+            "successful": self._successful,
+            "failed": self._failed,
+            "skipped_by_breaker": self._skipped_by_breaker,
+            "dominant_error_category": dominant,
+            "breaker_state": self._state,
+            "breaker_state_transitions": list(self._state_transitions),
+            "by_category": dict(self._by_category),
+            "total_retries": self._total_retries,
+            "recent_10_calls": len(window),
+            "recent_10_failed": sum(1 for r in window if not r),
+            "recent_10_failure_rate": round(recent_10_failure_rate, 3),
+        }
+
+    # -- internal --
+
+    def _transition(self, new_state: str, *, reason: str) -> None:
+        if new_state == self._state:
+            return
+        from_iso = _now_iso()
+        self._state_transitions.append({
+            "from": self._state,
+            "to": new_state,
+            "at": from_iso,
+            "reason": reason,
+        })
+        self._state = new_state
+
+
+class _NullBreaker:
+    """No-op breaker for tests and non-controller callers.
+
+    ``should_call()`` always returns True. ``record_attempt`` does nothing.
+    Used when ``context`` is None or ``context["llm_breaker"]`` is missing.
+    This preserves backward compatibility for tests that call
+    ``run_agent_sop_decision`` directly without setting up a breaker.
+    """
+
+    def should_call(self) -> bool:
+        return True
+
+    def record_attempt(self, *, category: str | None, ok: bool) -> None:
+        pass
+
+    def record_skip(self) -> None:
+        pass
+
+    def record_retry(self) -> None:
+        pass
+
+    @property
+    def state(self) -> str:
+        return "closed"
+
+    @property
+    def llm_config_name(self) -> str | None:
+        return None
+
+    @llm_config_name.setter
+    def llm_config_name(self, value: str | None) -> None:
+        pass
+
+    @property
+    def llm_model(self) -> str | None:
+        return None
+
+    @llm_model.setter
+    def llm_model(self, value: str | None) -> None:
+        pass
+
+    def snapshot(self) -> dict[str, Any]:
+        return {}
+
+
+class BatchRetryBudget:
+    """Track remaining retry recovery calls for a batch.
+
+    Each retry attempt (attempt 2 or 3, NOT attempt 1) decrements the
+    counter. When the budget reaches 0, no further retries are allowed.
+    """
+
+    def __init__(self, *, max_batch_retry_calls: int = 9):
+        self._max = max_batch_retry_calls
+        self._remaining = max_batch_retry_calls
+
+    def remaining(self) -> int:
+        return self._remaining
+
+    def consume(self) -> bool:
+        """Consume one retry slot. Returns True if budget was available."""
+        if self._remaining <= 0:
+            return False
+        self._remaining -= 1
+        return True
+
+
+class BatchWallClockBudget:
+    """PRIMARY scheduler safeguard: cap total batch LLM wall-clock.
+
+    The budget is checked BEFORE every LLM call (Attempt 1, 2, and 3).
+    If ``remaining_ms() < estimated_call_ms + jitter_ms``, the call is
+    skipped and the symbol goes fail-closed with
+    ``llm_fallback_reason="wall_clock_budget_exhausted"``.
+    """
+
+    def __init__(self, *, budget_seconds: float = 90.0):
+        self._budget_ms = int(budget_seconds * 1000)
+        self._start_ms = _now_ms()
+
+    def remaining_ms(self) -> int:
+        elapsed = _now_ms() - self._start_ms
+        return max(0, self._budget_ms - elapsed)
+
+    def snapshot_remaining_ms(self) -> int:
+        """Return remaining ms for observability (snapshot)."""
+        return self.remaining_ms()
+
+
+def _now_ms() -> int:
+    return int(time.monotonic() * 1000)
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

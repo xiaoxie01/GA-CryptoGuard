@@ -381,6 +381,10 @@ class GAMasterController:
         self.risk_gate = RiskGate(repo)
         self.performance_gate = PerformanceGate(repo)
         self.persistence = DecisionPersistence(repo)
+        # Phase B (07-07): per-batch circuit breaker cache. Keyed by batch_id,
+        # each breaker lives for one batch. The controller creates the breaker
+        # on first symbol of a batch and reuses it for subsequent symbols.
+        self._breakers: dict[str, Any] = {}
 
     def analyze_symbol(self, request: GAAnalysisRequest) -> dict[str, Any]:
         context = self.context_builder.build(request)
@@ -442,6 +446,48 @@ class GAMasterController:
             exclude_batch_id=request.batch_id,
         ) if hasattr(self.repo, "previous_ga_decision_grade") else None
         context["previous_grade"] = previous_grade
+
+        # Phase B (07-07): create or retrieve per-batch circuit breaker and
+        # budgets. The breaker lives for one batch; the wall-clock budget
+        # timer starts when the breaker is first created (batch start).
+        # Both breaker and budgets are cached on self._breakers (keyed by
+        # batch_id) so they persist across symbols within the same batch,
+        # even when the controller is recreated per-job.
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            CircuitBreaker,
+            BatchRetryBudget,
+            BatchWallClockBudget,
+        )
+        from plugins.crypto_guard.config.loader import load_config
+        llm_cfg = load_config().trading_mode.get("llm", {})
+        breaker_cfg = llm_cfg.get("circuit_breaker", {})
+        retry_cfg = llm_cfg.get("retry", {})
+        batch_id = request.batch_id or ""
+        batch_state = self._breakers.get(batch_id)
+        if batch_state is None:
+            breaker = CircuitBreaker(
+                enabled=breaker_cfg.get("enabled", True),
+                consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
+                rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
+                rate_window=breaker_cfg.get("rate_window", 10),
+            )
+            retry_budget = BatchRetryBudget(
+                max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),
+            )
+            wall_clock_budget = BatchWallClockBudget(
+                budget_seconds=retry_cfg.get("batch_wall_clock_budget_seconds", 90),
+            )
+            breaker._wall_clock_budget = wall_clock_budget
+            batch_state = {
+                "breaker": breaker,
+                "retry_budget": retry_budget,
+                "wall_clock_budget": wall_clock_budget,
+            }
+            self._breakers[batch_id] = batch_state
+        breaker = batch_state["breaker"]
+        context["llm_breaker"] = breaker
+        context["llm_retry_budget"] = batch_state["retry_budget"]
+        context["llm_wall_clock_budget"] = batch_state["wall_clock_budget"]
 
         legacy = run_agent_sop_decision(snapshot, context=context)
         legacy["analysis_source"] = "ga_master_controller"
@@ -629,6 +675,56 @@ class GAMasterController:
         if perf_gate.get("confidence_adjustment", 0) < 0:
             legacy["confidence"] = perf_gate.get("effective_confidence", confidence)
 
+        # Phase D (07-07): executable grade caps per design §7.1 Step 4d/4e.
+        # These run AFTER clamp_grade and performance_gate, BEFORE
+        # effective_signal_grade is set. They cap the executable signal_grade
+        # (not raw_signal_grade) when execution-gate evidence is missing.
+        # Step 4d: no structured entry confirmation → max B
+        _trade_plan = legacy.get("trade_plan")
+        _has_structured_entry = (
+            isinstance(_trade_plan, dict)
+            and isinstance(_trade_plan.get("entry_trigger_confirmation"), dict)
+        )
+        if (
+            not _has_structured_entry
+            and str(legacy.get("signal_grade") or "D").upper() in {"S", "A"}
+        ):
+            _pre_cap = str(legacy.get("signal_grade") or "D").upper()
+            legacy["signal_grade"] = "B"
+            _notes = list(legacy.get("risk_notes") or [])
+            _notes.append("无结构化入场确认，executable grade 降至 B。")
+            legacy["risk_notes"] = _notes
+            grade_adjustments.append({
+                "code": "no_entry_confirmation_cap",
+                "stage": "grade_gate",
+                "from": _pre_cap,
+                "to": "B",
+                "detail": "trade_plan.entry_trigger_confirmation 缺失或非结构化对象",
+            })
+        # Step 4e: LLM failed → executable grade max B + plan_execution_state=unconfirmed
+        _llm_status_cap = str(legacy.get("llm_status") or "").lower()
+        if (
+            _llm_status_cap == "failed"
+            and str(legacy.get("signal_grade") or "D").upper() in {"S", "A"}
+        ):
+            _pre_cap = str(legacy.get("signal_grade") or "D").upper()
+            legacy["signal_grade"] = "B"
+            _notes = list(legacy.get("risk_notes") or [])
+            _notes.append("LLM 失败，executable grade 降至 B，plan_execution_state=unconfirmed。")
+            legacy["risk_notes"] = _notes
+            grade_adjustments.append({
+                "code": "llm_failed_executable_cap",
+                "stage": "synthesis",
+                "from": _pre_cap,
+                "to": "B",
+                "detail": "llm_status=failed 触发 fail-closed grade cap",
+            })
+            # Ensure plan_execution_state is unconfirmed (already set in
+            # run_agent_sop_decision for the LLM-failed path; this is a
+            # safety net in case an upstream override cleared it).
+            if legacy.get("plan_execution_state") not in {"unconfirmed", "risk_rejected", "invalidated", "no_candidate"}:
+                legacy["plan_execution_state"] = "unconfirmed"
+
         # Phase F (07-05): set effective_signal_grade / effective_execution_confidence
         # / grade_adjustments AFTER all gates (risk, hysteresis, clamp, perf) have
         # run. effective_signal_grade equals the canonical signal_grade (post-gate);
@@ -653,6 +749,35 @@ class GAMasterController:
                 "detail": f"llm_status={llm_status} 触发 fail-closed，候选计划保留为 candidate_trade_plan",
             })
             legacy["grade_adjustments"] = list(grade_adjustments)
+
+        # Phase C (07-07): override plan_execution_state based on risk_gate /
+        # continuity results per design §6.3. Only override the state label
+        # (not the decision outcome) so risk gates are not weakened. The
+        # fields are set initially in run_agent_sop_decision; here we refine
+        # them after all gates have finalized has_trade_plan / plan_blockers /
+        # candidate_trade_plan.
+        _candidate = legacy.get("candidate_trade_plan")
+        _has_candidate = isinstance(_candidate, dict) and bool(_candidate)
+        _has_plan = bool(legacy.get("has_trade_plan") and legacy.get("trade_plan"))
+        _blockers = legacy.get("plan_blockers") or []
+        _continuity_invalidated = any(
+            isinstance(b, dict) and b.get("code") == "continuity_trigger_invalidated"
+            for b in _blockers
+        )
+        if _continuity_invalidated:
+            legacy["plan_execution_state"] = "invalidated"
+        elif (_has_candidate and not _has_plan and not risk.get("ok")
+              and legacy.get("plan_origin") not in {"deterministic_fallback", "deterministic_sop"}):
+            # Risk gate rejected a plan that was executable before risk but got
+            # downgraded. Only applies when plan_origin is NOT deterministic_*
+            # (LLM-failed candidates are already unconfirmed and must stay so;
+            # overwriting them to risk_rejected would hide the LLM failure).
+            legacy["plan_execution_state"] = "risk_rejected"
+        elif not _has_plan and not _has_candidate:
+            legacy["plan_execution_state"] = "no_candidate"
+        # Otherwise: keep the state set by run_agent_sop_decision (confirmed
+        # for LLM-success path, unconfirmed for LLM-failed path with a
+        # candidate, etc.).
 
         feishu_actions = build_feishu_actions(legacy, risk)
         legacy["suggested_actions"] = feishu_actions
@@ -897,3 +1022,22 @@ class GAMasterController:
         compat["market_analysis_state"] = analysis_state
         compat["suggested_actions"] = feishu_actions
         return compat
+
+    def get_batch_llm_health(self, batch_id: str) -> dict[str, Any]:
+        """Return the LLM health snapshot for a batch (for batch summary persistence).
+
+        Called by run_ga_workers.py when finishing a batch to merge the breaker
+        snapshot into analysis_batches.summary_json.
+        """
+        batch_state = self._breakers.get(batch_id)
+        if batch_state is None:
+            return {}
+        breaker = batch_state.get("breaker")
+        if breaker is None:
+            return {}
+        snapshot = breaker.snapshot()
+        # Add wall-clock budget remaining for observability
+        wcb = batch_state.get("wall_clock_budget")
+        if wcb is not None:
+            snapshot["wall_clock_budget_ms_remaining"] = wcb.remaining_ms()
+        return snapshot

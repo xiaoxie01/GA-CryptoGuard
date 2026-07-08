@@ -414,12 +414,46 @@ class CryptoGuardRepository:
         )
 
     def finish_analysis_batch(self, *, batch_id: str, status: str = "success", summary: dict[str, Any] | None = None) -> None:
+        """Mark an analysis batch finished and materialize completed/failed lists.
+
+        Phase E (07-07) per design §10.1 P0: the previous implementation wrote
+        only ``status`` + ``summary_json`` and never touched the
+        ``completed_symbols_json`` / ``failed_symbols_json`` columns. The
+        read-side ``get_analysis_batch`` compensated by querying
+        ``batch_symbol_status`` at read time, but the raw columns stayed
+        empty — which masked the write-link gap and broke diagnostics that
+        read the raw column (``SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS``).
+
+        The fix materializes both columns from ``batch_symbol_status`` INSIDE
+        this repo method so callers (``run_ga_workers.py:128,156``) need no
+        change. ``get_analysis_batch`` continues to query
+        ``batch_symbol_status`` for real-time in-flight counts; post-finish
+        the two sources agree (column is authoritative at finish time).
+        """
+        completed_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed' ORDER BY symbol",
+            (batch_id,),
+        ).fetchall()
+        failed_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed' ORDER BY symbol",
+            (batch_id,),
+        ).fetchall()
+        completed = [r["symbol"] for r in completed_rows]
+        failed = [r["symbol"] for r in failed_rows]
         self.conn.execute(
             """
-            UPDATE analysis_batches SET finished_at=CURRENT_TIMESTAMP, status=?, summary_json=?
+            UPDATE analysis_batches
+            SET finished_at=CURRENT_TIMESTAMP, status=?, summary_json=?,
+                completed_symbols_json=?, failed_symbols_json=?
             WHERE batch_id=?
             """,
-            (status, json.dumps(summary, ensure_ascii=False) if summary is not None else None, batch_id),
+            (
+                status,
+                json.dumps(summary, ensure_ascii=False) if summary is not None else None,
+                json.dumps(completed, ensure_ascii=False),
+                json.dumps(failed, ensure_ascii=False),
+                batch_id,
+            ),
         )
 
     def is_batch_complete(self, batch_id: str) -> bool:
@@ -519,6 +553,84 @@ class CryptoGuardRepository:
             (primary_interval,),
         ).fetchone()
         return row["batch_id"] if row else None
+
+    def list_recent_analysis_batches(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Return the most recent ``analysis_batches`` rows (newest first).
+
+        Phase E (07-07) per design §9.4: used by
+        ``_select_latest_complete_batch`` to find the latest batch with
+        ``status='success'`` AND ``completed_count == enabled_count`` AND
+        matching GA decision count. Each row's ``summary_json`` /
+        ``completed_symbols_json`` / ``failed_symbols_json`` /
+        ``enabled_symbols_json`` columns are parsed into dict/list form
+        mirroring ``get_analysis_batch`` (without the real-time
+        ``batch_symbol_status`` re-query — the materialized columns are
+        authoritative post-finish per design §10.1).
+        """
+        rows = self.conn.execute(
+            """
+            SELECT * FROM analysis_batches
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            for col, default in (
+                ("enabled_symbols_json", []),
+                ("completed_symbols_json", []),
+                ("failed_symbols_json", []),
+                ("summary_json", {}),
+            ):
+                key = col.removesuffix("_json")
+                try:
+                    parsed = json.loads(item.get(col) or json.dumps(default))
+                except Exception:
+                    parsed = default
+                item[key] = parsed
+            items.append(item)
+        return items
+
+    def list_ga_decisions_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """Return all ``ga_decisions`` rows for a given batch (newest first).
+
+        Phase E (07-07) per design §9.4: used by
+        ``_select_latest_complete_batch`` to verify the GA decision count
+        matches the batch's enabled symbol count (guards against a batch
+        marked success with completed_symbols materialized but decisions
+        missing/stale).
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM ga_decisions WHERE batch_id=? ORDER BY id DESC",
+            (batch_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_recent_ga_decisions(self, limit: int = 200, *, since_ms: int | None = None) -> list[dict[str, Any]]:
+        """Return recent ``ga_decisions`` rows (newest first).
+
+        Phase E (07-07) per design §11.1: used by the
+        ``DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN`` diagnostic to
+        inspect ``raw_decision_json.plan_execution_state`` +
+        ``candidate_trade_plan`` + ``has_trade_plan`` over the latest 24h.
+        """
+        params: list[Any] = []
+        where = ""
+        if since_ms is not None:
+            where = "WHERE analysis_time >= ?"
+            params.append(int(since_ms))
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM ga_decisions
+            {where}
+            ORDER BY analysis_time DESC, id DESC
+            LIMIT ?
+            """,
+            params + [int(limit)],
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def previous_ga_decision_grade(self, symbol: str, *, exclude_batch_id: str | None = None) -> str | None:
         """Return the signal_grade of the most recent ga_decision for ``symbol``.

@@ -6,6 +6,27 @@ trading_mode:
   allow_trade_api: false
   require_public_market_data_only: true
 
+# Phase B (07-07): LLM retry + circuit breaker configuration.
+# When llm.retry.enabled=false, the wrapper does a single attempt + fail-closed
+# (pre-task behavior). When llm.circuit_breaker.enabled=false, the breaker
+# is a no-op (_NullBreaker). Operators can disable retry/breaker without code
+# changes if scheduler latency becomes unacceptable.
+llm:
+  retry:
+    enabled: true
+    max_attempts_per_symbol: 3
+    max_batch_retry_calls: 9
+    batch_wall_clock_budget_seconds: 90   # PRIMARY scheduler safeguard (60-180s range)
+    strict_json_attempt: 2
+    minimal_safe_attempt: 3
+    jitter_seconds_min: 2
+    jitter_seconds_max: 20
+  circuit_breaker:
+    enabled: true
+    consecutive_failures: 3
+    rate_threshold: 0.5
+    rate_window: 10
+
 analysis:
   mode: intraday
   timeframes:
