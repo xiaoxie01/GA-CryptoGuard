@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,84 +11,86 @@ from plugins.crypto_guard.storage.sqlite_db import connect_db
 
 
 SCHEMA_PATH = PLUGIN_ROOT / "storage" / "schema.sql"
+_INITIALIZE_DATABASE_LOCK = threading.RLock()
 
 
 def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, Any]:
     """执行 schema，并写入默认 symbol 与策略版本。"""
 
-    cfg = config or load_config()
-    conn = connect_db(cfg.database_path)
-    try:
-        # Run dedup cleanup BEFORE executescript: schema.sql defines the partial
-        # unique index on alert_outbox(dedupe_key) WHERE status='pending'. If a
-        # dirty DB has duplicate pending rows, the executescript would fail.
-        # Dedup first, then apply schema. The migration is table-guarded so it
-        # is a no-op on a fresh DB.
-        # P0-1: Run hourly_report_accuracy migration BEFORE executescript so that
-        # _add_column(batch_id, previous_grade, rendered_summary) completes before
-        # schema.sql tries CREATE INDEX ON ga_decisions(batch_id).  Old DBs that
-        # lack the column would otherwise crash with OperationalError.
-        _apply_stop_loss_adjustment_dedup(conn)
-        _ensure_profit_protection_cutoff_marker(conn)
-        _apply_hourly_report_accuracy_migration(conn)
-        with SCHEMA_PATH.open("r", encoding="utf-8") as f:
-            conn.executescript(f.read())
-        # R5-D1: Run dedupe_key migration AFTER executescript. schema.sql no
-        # longer creates the partial unique index on paper_trade_logs(dedupe_key)
-        # — the migration function owns the index. On old production DBs that
-        # lack the dedupe_key column, executescript's CREATE INDEX would crash
-        # with OperationalError("no such column: dedupe_key"). By removing the
-        # index DDL from schema.sql and keeping it here (after executescript
-        # which may have CREATE TABLE IF NOT EXISTS), _add_column runs safely
-        # on existing tables, and CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
-        # On fresh DBs: executescript creates the table with dedupe_key column
-        # (from CREATE TABLE DDL), then this migration creates the index.
-        _apply_paper_trade_logs_dedupe_key_migration(conn)
-        _apply_phase_01_02_migrations(conn)
-        _seed_symbols(conn, cfg.symbols)
-        _seed_strategies(conn, cfg.strategies)
-        _apply_phase_13_migrations(conn)
-        _apply_phase_14_15_migrations(conn)
-        _apply_decision_supplement_migrations(conn)
-        _apply_v2_migrations(conn)
-        _apply_ga_master_migrations(conn)
-        _apply_pending_order_lifecycle_migrations(conn)
-        _apply_p1_structured_feedback_migrations(conn)
-        _apply_account_feedback_gate_migration(conn)
-        _apply_daily_review_idempotency_migration(conn)
-        _apply_legacy_fuzzy_migration(conn)
-        _apply_phase_shadow_vt_v2_migration(conn)
-        _apply_candidate_cap_cleanup(conn)
-        # FS-5: R4 contract marker is the LAST step. Only write it after ALL
-        # schema, seed, and migration steps succeed AND schema health passes.
-        # If any prior step raised, the exception propagates and the marker
-        # is never written — diagnostics will not falsely believe the R4
-        # contract is deployed. The marker and any uncommitted work from this
-        # initialization are committed atomically together.
-        health = check_schema_health(conn=conn)
-        if not health["ok"]:
-            raise RuntimeError(
-                f"schema health check failed after migrations: {health.get('missing_columns')}"
-            )
-        _ensure_hourly_report_accuracy_r4_contract_marker(conn)
-        _ensure_btc9_trade_gate_contract_marker(conn)
-        _ensure_market_data_contract_marker(conn)
-        # Phase E (07-03): semantic-accuracy contract marker. Written AFTER
-        # the R4 marker so both are present when semantic diagnostics run.
-        # Independent cutoff for the five new checks (bias_stage_semantic_conflict,
-        # htf_countertrend_overconfidence, summary_structured_state_mismatch,
-        # observation_reason_missing_market_context, no_edge_reason_coverage_mismatch).
-        _ensure_hourly_market_semantic_accuracy_contract_marker(conn)
-        # Phase H (07-05): decision-context-continuity contract marker.
-        # Written AFTER the semantic-accuracy marker so all Phase A-G
-        # contract diagnostics can use a single independent cutoff. Rows
-        # persisted before this marker are demoted to legacy_info; rows
-        # after are evaluated against the full Phase A-G contract.
-        _ensure_hourly_decision_context_continuity_contract_marker(conn)
-        conn.commit()
-        return {"ok": True, "database_path": str(cfg.database_path)}
-    finally:
-        conn.close()
+    with _INITIALIZE_DATABASE_LOCK:
+        cfg = config or load_config()
+        conn = connect_db(cfg.database_path)
+        try:
+            # Run dedup cleanup BEFORE executescript: schema.sql defines the partial
+            # unique index on alert_outbox(dedupe_key) WHERE status='pending'. If a
+            # dirty DB has duplicate pending rows, the executescript would fail.
+            # Dedup first, then apply schema. The migration is table-guarded so it
+            # is a no-op on a fresh DB.
+            # P0-1: Run hourly_report_accuracy migration BEFORE executescript so that
+            # _add_column(batch_id, previous_grade, rendered_summary) completes before
+            # schema.sql tries CREATE INDEX ON ga_decisions(batch_id).  Old DBs that
+            # lack the column would otherwise crash with OperationalError.
+            _apply_stop_loss_adjustment_dedup(conn)
+            _ensure_profit_protection_cutoff_marker(conn)
+            _apply_hourly_report_accuracy_migration(conn)
+            with SCHEMA_PATH.open("r", encoding="utf-8") as f:
+                conn.executescript(f.read())
+            # R5-D1: Run dedupe_key migration AFTER executescript. schema.sql no
+            # longer creates the partial unique index on paper_trade_logs(dedupe_key)
+            # — the migration function owns the index. On old production DBs that
+            # lack the dedupe_key column, executescript's CREATE INDEX would crash
+            # with OperationalError("no such column: dedupe_key"). By removing the
+            # index DDL from schema.sql and keeping it here (after executescript
+            # which may have CREATE TABLE IF NOT EXISTS), _add_column runs safely
+            # on existing tables, and CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
+            # On fresh DBs: executescript creates the table with dedupe_key column
+            # (from CREATE TABLE DDL), then this migration creates the index.
+            _apply_paper_trade_logs_dedupe_key_migration(conn)
+            _apply_phase_01_02_migrations(conn)
+            _seed_symbols(conn, cfg.symbols)
+            _seed_strategies(conn, cfg.strategies)
+            _apply_phase_13_migrations(conn)
+            _apply_phase_14_15_migrations(conn)
+            _apply_decision_supplement_migrations(conn)
+            _apply_v2_migrations(conn)
+            _apply_ga_master_migrations(conn)
+            _apply_pending_order_lifecycle_migrations(conn)
+            _apply_p1_structured_feedback_migrations(conn)
+            _apply_account_feedback_gate_migration(conn)
+            _apply_daily_review_idempotency_migration(conn)
+            _apply_legacy_fuzzy_migration(conn)
+            _apply_phase_shadow_vt_v2_migration(conn)
+            _apply_candidate_cap_cleanup(conn)
+            # FS-5: R4 contract marker is the LAST step. Only write it after ALL
+            # schema, seed, and migration steps succeed AND schema health passes.
+            # If any prior step raised, the exception propagates and the marker
+            # is never written — diagnostics will not falsely believe the R4
+            # contract is deployed. The marker and any uncommitted work from this
+            # initialization are committed atomically together.
+            health = check_schema_health(conn=conn)
+            if not health["ok"]:
+                raise RuntimeError(
+                    f"schema health check failed after migrations: {health.get('missing_columns')}"
+                )
+            _ensure_hourly_report_accuracy_r4_contract_marker(conn)
+            _ensure_btc9_trade_gate_contract_marker(conn)
+            _ensure_market_data_contract_marker(conn)
+            # Phase E (07-03): semantic-accuracy contract marker. Written AFTER
+            # the R4 marker so both are present when semantic diagnostics run.
+            # Independent cutoff for the five new checks (bias_stage_semantic_conflict,
+            # htf_countertrend_overconfidence, summary_structured_state_mismatch,
+            # observation_reason_missing_market_context, no_edge_reason_coverage_mismatch).
+            _ensure_hourly_market_semantic_accuracy_contract_marker(conn)
+            # Phase H (07-05): decision-context-continuity contract marker.
+            # Written AFTER the semantic-accuracy marker so all Phase A-G
+            # contract diagnostics can use a single independent cutoff. Rows
+            # persisted before this marker are demoted to legacy_info; rows
+            # after are evaluated against the full Phase A-G contract.
+            _ensure_hourly_decision_context_continuity_contract_marker(conn)
+            conn.commit()
+            return {"ok": True, "database_path": str(cfg.database_path)}
+        finally:
+            conn.close()
 
 
 def _apply_phase_01_02_migrations(conn: sqlite3.Connection) -> None:
@@ -112,6 +115,48 @@ def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: s
     cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _index_matches(
+    conn: sqlite3.Connection,
+    index_name: str,
+    *,
+    columns: list[str],
+    sql_markers: list[str],
+) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (index_name,),
+    ).fetchone()
+    if not row:
+        return False
+    actual_columns = [
+        info["name"]
+        for info in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+    ]
+    if actual_columns != columns:
+        return False
+    sql = str(row["sql"] or "").lower().replace(" ", "")
+    return all(marker.lower().replace(" ", "") in sql for marker in sql_markers)
+
+
+def _ensure_index_definition(
+    conn: sqlite3.Connection,
+    index_name: str,
+    *,
+    columns: list[str],
+    sql_markers: list[str],
+    create_sql: str,
+) -> None:
+    if _index_matches(
+        conn,
+        index_name,
+        columns=columns,
+        sql_markers=sql_markers,
+    ):
+        return
+    conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    conn.execute(create_sql)
 
 
 def _apply_phase_13_migrations(conn: sqlite3.Connection) -> None:
@@ -1016,16 +1061,20 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # Drop any stale plain index (pre-dedup era) before creating the partial unique index.
-    # IF EXISTS makes this idempotent: no index, old plain index, or current partial index
-    # are all handled correctly.
-    conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique
-        ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)
-        WHERE COALESCE(status, '') != 'duplicate'
-        """
+    _ensure_index_definition(
+        conn,
+        "idx_shadow_vt_unique",
+        columns=["strategy_name", "candidate_version", "ga_decision_id"],
+        sql_markers=[
+            "CREATE UNIQUE INDEX",
+            "WHERE",
+            "COALESCE(status,'')!='duplicate'",
+        ],
+        create_sql="""
+            CREATE UNIQUE INDEX idx_shadow_vt_unique
+            ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)
+            WHERE COALESCE(status, '') != 'duplicate'
+            """,
     )
 
     # 1.2: strategy_evaluations add shadow_virtual_trade_id
@@ -1066,14 +1115,21 @@ def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # Drop old index if it exists (may be a plain index, not partial)
-    conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_evals_shadow_unique
-        ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
-        WHERE is_shadow = 1 AND COALESCE(outcome_source, '') != 'duplicate'
-        """
+    _ensure_index_definition(
+        conn,
+        "idx_strategy_evals_shadow_unique",
+        columns=["strategy_name", "strategy_version", "ga_decision_id"],
+        sql_markers=[
+            "CREATE UNIQUE INDEX",
+            "WHERE",
+            "is_shadow=1",
+            "COALESCE(outcome_source,'')!='duplicate'",
+        ],
+        create_sql="""
+            CREATE UNIQUE INDEX idx_strategy_evals_shadow_unique
+            ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
+            WHERE is_shadow = 1 AND COALESCE(outcome_source, '') != 'duplicate'
+            """,
     )
 
 
