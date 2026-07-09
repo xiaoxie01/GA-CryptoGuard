@@ -26,6 +26,14 @@ llm:
     consecutive_failures: 3
     rate_threshold: 0.5
     rate_window: 10
+    # 07-09-overtrigger P0-3: rate-based open only fires when at least
+    # ``min_rate_samples`` observations exist in the rate window. Pre-fix,
+    # 3 calls with 2 failures (67%) opened the breaker and skipped the
+    # remaining 7-8 symbols of a 10-symbol batch. With min_rate_samples=5,
+    # the first [fail, fail, success] sequence leaves the breaker closed
+    # so the rest of the batch is actually evaluated. llm_config_error
+    # still opens immediately regardless of sample count.
+    min_rate_samples: 5
 
 analysis:
   mode: intraday

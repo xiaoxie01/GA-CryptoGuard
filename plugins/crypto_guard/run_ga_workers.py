@@ -79,6 +79,15 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                 consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
                 rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
                 rate_window=breaker_cfg.get("rate_window", 10),
+                # 07-09-overtrigger P0-3: rate-based open only fires when the
+                # rate window has at least min_rate_samples observations. The
+                # worker is the production entrypoint for
+                # scheduled_market_analysis and creates the breaker BEFORE the
+                # controller claims it via _batch_breakers. If we do not pass
+                # the config here, the controller path cannot recover it -
+                # the worker's breaker (default 5) wins and any override in
+                # trading_mode.yaml is silently ignored.
+                min_rate_samples=breaker_cfg.get("min_rate_samples", 5),
             )
             retry_budget = BatchRetryBudget(
                 max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),

@@ -37,16 +37,26 @@ LLM_ERROR_CATEGORIES = (
     "llm_json_parse_failed",
     "llm_schema_validation_failed",
     "llm_semantic_validation_failed",
+    # 07-09-overtrigger follow-up: model produced stop_reason=tool_use with
+    # no assistant text. Distinct from gateway empty (no HTTP response at
+    # all) so the operator can remediate prompt/tool exposure vs. paging
+    # the gateway on-call. See ``_classify_llm_failure`` for the detection
+    # rule.
+    "llm_tool_call_no_text",
 )
 
 LLM_ERROR_STAGES = ("call", "parse", "schema", "semantic", "retry_exhausted")
 
-# Retryable categories (design §4.1.2)
+# Retryable categories (design §4.1.2). ``llm_tool_call_no_text`` is retryable:
+# a tool-call-only turn typically recovers on a strict-JSON retry that
+# forbids tools (see ``_call_ga_llm`` post-07-09-overtrigger - no placeholder
+# tool is injected for JSON-only market-decision prompts).
 _RETRYABLE_CATEGORIES = frozenset({
     "llm_transport_error",
     "llm_rate_limited",
     "llm_empty_response",
     "llm_json_parse_failed",
+    "llm_tool_call_no_text",
 })
 _NON_RETRYABLE_CATEGORIES = frozenset({
     "llm_config_error",
@@ -118,7 +128,41 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
         fallback["risk_notes"] = notes
         return apply_risk_to_decision(fallback, snapshot)
 
-    # LLM returned a candidate — normalize and validate
+    # LLM returned a candidate. 07-09-overtrigger P0-2: unwrap the
+    # ``{"decision": {...}}`` wrapper some models emit, BEFORE schema
+    # validation and BEFORE ``_normalize_llm_decision`` strips internal
+    # ``_``-prefixed fields. Conflict (wrapper + top-level schema keys)
+    # fails closed as a hard schema failure.
+    unwrapped_candidate, unwrap_changed = _unwrap_wrapped_decision(candidate)
+    if unwrapped_candidate is None:
+        # Conflict: wrapper + top-level schema keys with different values.
+        # Hard schema failure - fail closed, count toward breaker.
+        breaker.record_attempt(category="llm_schema_validation_failed", ok=False)
+        fallback["analysis_source"] = "deterministic_fallback"
+        fallback["llm_status"] = "failed"
+        fallback["llm_error_category"] = "llm_schema_validation_failed"
+        fallback["llm_error_stage"] = "schema"
+        fallback["llm_error"] = "wrapped decision conflict: top-level + nested decision both present"
+        fallback["llm_attempt_count"] = attempt_meta.get("llm_attempt_count", 1)
+        fallback["llm_retry_round"] = attempt_meta.get("llm_retry_round")
+        fallback["llm_config_name"] = attempt_meta.get("llm_config_name")
+        fallback["llm_model"] = attempt_meta.get("llm_model")
+        fallback["llm_fallback_reason"] = "schema_validation_failed"
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
+        notes = list(fallback.get("risk_notes") or [])
+        notes.append("LLM/GA 研判失败（决策对象包装冲突），本次使用规则 SOP 降级结果。")
+        fallback["risk_notes"] = notes
+        return apply_risk_to_decision(fallback, snapshot)
+
+    candidate = unwrapped_candidate
+
+    # 07-09-overtrigger P0-2/R4: a successful unwrap is a repairable event
+    # (the LLM produced schema-shaped output, just wrapped). Record it as
+    # repairable so it does NOT count toward the breaker rate window.
+    if unwrap_changed:
+        breaker.record_attempt(category="llm_schema_repairable", ok=True, repairable=True)
+
     decision = _normalize_llm_decision(candidate, snapshot, fallback)
     ok, err = validate_json("ga_decision.schema.json", decision)
     if not ok:
@@ -215,6 +259,73 @@ def _try_repair_entry_trigger_confirmation(
     return repaired, notes, True
 
 
+# 07-09-overtrigger P0-2: unwrap the ``{"decision": {...}}`` wrapper that
+# some models emit even when instructed to output a bare ``GADecision``.
+# The unwrap must run BEFORE schema validation so the inner object is what
+# gets validated, and BEFORE ``_normalize_llm_decision`` strips internal
+# ``_``-prefixed fields. Conflict detection (both top-level schema fields
+# AND nested ``decision`` present with different values) fails closed by
+# returning ``None`` - the caller then routes to the hard schema-fail path.
+_GA_DECISION_SCHEMA_TOP_LEVEL_KEYS = frozenset({
+    "symbol", "analysis_time_utc", "decision", "signal_grade", "market_bias",
+    "trend_stage", "confidence", "summary", "evidence", "counter_evidence",
+    "risk_notes", "has_trade_plan", "trade_plan", "opportunity_watch",
+    "suggested_actions", "timeframe_context", "alignment", "htf_conflict",
+    "market_reason_codes",
+})
+
+
+def _unwrap_wrapped_decision(candidate: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    """Unwrap ``{"decision": {...}}`` to the inner object.
+
+    Returns ``(unwrapped_or_None, changed_flag)``.
+
+    - If ``candidate`` is not a dict or has no ``decision`` key, returns
+      ``(candidate, False)`` (no change).
+    - If ``candidate["decision"]`` is a dict AND the wrapper has no other
+      GADecision schema top-level keys, returns ``(inner, True)``.
+    - If ``candidate["decision"]`` is a dict AND the wrapper ALSO has
+      top-level schema keys (e.g. both ``candidate["symbol"]`` and
+      ``candidate["decision"]["symbol"]``), this is a conflict - fail
+      closed by returning ``(None, True)``. The caller routes None to the
+      hard schema-fail path.
+    - If ``candidate["decision"]`` is NOT a dict (e.g. the string
+      ``"trade_plan_available"`` - the schema's ``decision`` enum value),
+      this is a real GADecision, NOT a wrapper. Return ``(candidate, False)``.
+    - ``_llm_parse_meta`` is always preserved across unwrap.
+    """
+    if not isinstance(candidate, dict):
+        return candidate, False
+    inner = candidate.get("decision")
+    if not isinstance(inner, dict):
+        # ``decision`` is the schema enum string (or missing) - real
+        # GADecision, not a wrapper. Leave as-is.
+        return candidate, False
+    # Detect conflict: any other schema top-level key present on the
+    # wrapper means the model emitted BOTH a wrapper AND top-level fields
+    # - we cannot safely pick one.
+    wrapper_schema_keys = _GA_DECISION_SCHEMA_TOP_LEVEL_KEYS & set(candidate.keys()) - {"decision"}
+    if wrapper_schema_keys:
+        # Conflict: fail closed.
+        return None, True
+    # Safe to unwrap. Preserve _llm_parse_meta from the wrapper.
+    parse_meta = candidate.get("_llm_parse_meta")
+    unwrapped = dict(inner)
+    if isinstance(parse_meta, dict):
+        meta = dict(parse_meta)
+        meta["llm_unwrapped_decision_object"] = True
+        # Preserve the inner object's own parse_meta if present (rare but
+        # possible if the model nested a prior parse).
+        inner_meta = inner.get("_llm_parse_meta")
+        if isinstance(inner_meta, dict):
+            for k, v in inner_meta.items():
+                meta.setdefault(k, v)
+        unwrapped["_llm_parse_meta"] = meta
+    else:
+        unwrapped["_llm_parse_meta"] = {"llm_unwrapped_decision_object": True}
+    return unwrapped, True
+
+
 def run_agent_json_task(
     *,
     task_name: str,
@@ -300,6 +411,17 @@ def _classify_llm_failure(exc: BaseException | None, raw: str | None, stage: str
 
         # Empty response
         if not raw_text.strip():
+            # 07-09-overtrigger R5/R6: distinguish "model called a tool
+            # with no assistant text" from "gateway returned nothing".
+            # ``_call_ga_llm`` encodes the session stop_reason into the
+            # RuntimeError message when the raw text is empty AND the
+            # stop reason indicates a tool/function call - those route to
+            # ``llm_tool_call_no_text`` (prompt remediation) instead of
+            # ``llm_empty_response`` (gateway on-call).
+            if "tool_call_no_text" in exc_msg or (
+                "stop_reason" in exc_msg and any(tok in exc_msg for tok in ("tool", "function"))
+            ):
+                return "llm_tool_call_no_text"
             return "llm_empty_response"
 
         # Exception-based classification for call stage
@@ -986,21 +1108,36 @@ def _call_ga_llm(prompt: str) -> str:
     session.system = SYSTEM_PROMPT
     if getattr(session, "thinking_type", None) == "enabled" and getattr(session, "thinking_budget_tokens", None) is None:
         session.thinking_type = "adaptive"
-    if hasattr(session, "tools") and not getattr(session, "tools", None):
-        session.tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "crypto_guard_noop",
-                    "description": "Placeholder only. Do not call this tool; answer with JSON text.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
+    # 07-09-overtrigger P0-1: DO NOT inject the ``crypto_guard_noop``
+    # placeholder tool for JSON-only market-decision prompts. With a complex
+    # market prompt + an exposed (placeholder) tool, the model can choose
+    # ``stop_reason=tool_use`` and emit empty assistant text, which the
+    # wrapper classified as ``llm_empty_response`` and the breaker opened
+    # after only 3 attempts. JSON-only tasks must have tools absent so the
+    # model is forced to produce text output. If the session arrives with
+    # leftover tools from a prior call, clear them.
+    if hasattr(session, "tools"):
+        session.tools = []
     if getattr(session, "read_timeout", 0) < 60:
         session.read_timeout = 60
     raw = "".join(session.raw_ask([{"role": "user", "content": [{"type": "text", "text": prompt}]}]))
     if not raw.strip():
+        # 07-09-overtrigger R5/R6: distinguish "gateway empty" (no HTTP
+        # response at all) from "model called a (non-existent) tool with
+        # no assistant text". Post-P0-1 fix no tools are exposed, but a
+        # hallucinated tool_use turn still produces empty text. Probe the
+        # session's last stop_reason if available so the classifier can
+        # route to ``llm_tool_call_no_text`` instead of the generic
+        # ``llm_empty_response`` - the remediation differs (prompt tuning
+        # vs. paging the gateway on-call).
+        stop_reason = ""
+        for attr in ("last_stop_reason", "stop_reason", "last_finish_reason"):
+            val = getattr(session, attr, None)
+            if val:
+                stop_reason = str(val)
+                break
+        if stop_reason and any(tok in stop_reason.lower() for tok in ("tool", "function")):
+            raise RuntimeError(f"empty LLM response; stop_reason={stop_reason} (tool_call_no_text)")
         raise RuntimeError("empty LLM response")
     if raw.lstrip().startswith("!!!Error"):
         raise RuntimeError(raw.strip()[:300])

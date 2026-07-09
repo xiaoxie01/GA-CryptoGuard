@@ -23,8 +23,14 @@ class CircuitBreaker:
 
     Open conditions (checked after each attempt):
     - llm_config_error: open IMMEDIATELY (any count).
-    - 3 consecutive llm_transport_error / llm_empty_response: open.
-    - fail rate >= 50% over the latest 10 LLM calls in this batch: open.
+    - ``consecutive_threshold`` consecutive llm_transport_error /
+      llm_empty_response: open.
+    - fail rate >= ``rate_threshold`` over the latest ``rate_window`` LLM
+      calls, BUT only when at least ``min_rate_samples`` observations
+      exist. Pre-07-09-overtrigger the rate check fired at 3 samples, so
+      [fail, fail, success] opened the breaker and skipped the remaining
+      7-8 symbols of a 10-symbol batch. With ``min_rate_samples=5`` (the
+      default), the same sequence leaves the breaker closed.
 
     Half-open transition: not automatic within a batch. A new batch starts
     with a fresh breaker in closed state (breaker lifetime == one batch).
@@ -37,11 +43,17 @@ class CircuitBreaker:
         consecutive_threshold: int = 3,
         rate_threshold: float = 0.5,
         rate_window: int = 10,
+        min_rate_samples: int = 5,
     ):
         self._enabled = enabled
         self._consecutive_threshold = consecutive_threshold
         self._rate_threshold = rate_threshold
         self._rate_window = rate_window
+        # 07-09-overtrigger P0-3: rate-based open only fires when the rate
+        # window has at least this many observations. Default 5 (matches
+        # trading_mode.yaml) so a 10-symbol batch is not killed after 3
+        # calls. ``llm_config_error`` still opens immediately regardless.
+        self._min_rate_samples = max(1, int(min_rate_samples))
         self._state: str = "closed"
         self._consecutive_infra_failures: int = 0
         self._recent_results: list[bool] = []  # True=ok, False=fail
@@ -127,8 +139,15 @@ class CircuitBreaker:
                 self._transition("open", reason="llm_config_error_immediate")
                 return
 
-            # Count consecutive infra failures (transport + empty)
-            if category in ("llm_transport_error", "llm_empty_response"):
+            # Count consecutive infra failures (transport + empty +
+            # tool-call-no-text). 07-09-overtrigger R5/R6: a sustained
+            # stream of ``llm_tool_call_no_text`` (model hallucinating tool
+            # calls despite no tools being exposed) is a real model/prompt
+            # defect and should still be able to open the breaker on the
+            # consecutive-infrastructure path, even before ``min_rate_samples``
+            # is reached. The wall-clock budget still bounds total batch
+            # time so this cannot deadlock.
+            if category in ("llm_transport_error", "llm_empty_response", "llm_tool_call_no_text"):
                 self._consecutive_infra_failures += 1
                 if self._consecutive_infra_failures >= self._consecutive_threshold:
                     self._transition(
@@ -139,9 +158,14 @@ class CircuitBreaker:
             else:
                 self._consecutive_infra_failures = 0
 
-            # Rate-based open: >= rate_threshold failures in latest rate_window calls
+            # Rate-based open: >= rate_threshold failures in latest rate_window calls.
+            # 07-09-overtrigger P0-3: require at least ``min_rate_samples``
+            # observations before the rate check fires. Pre-fix the check
+            # used a hardcoded ``len(window) >= 3`` floor, so [fail, fail,
+            # success] (3 samples, 67% rate) opened the breaker and skipped
+            # the remaining 7-8 symbols of a 10-symbol batch.
             window = self._recent_results[-self._rate_window:]
-            if len(window) >= 3:  # need at least 3 samples for rate check
+            if len(window) >= self._min_rate_samples:
                 fail_rate = sum(1 for r in window if not r) / len(window)
                 if fail_rate >= self._rate_threshold:
                     self._transition("open", reason=f"failure_rate_{fail_rate:.0%}")
@@ -198,6 +222,11 @@ class CircuitBreaker:
             "recent_10_calls": len(window),
             "recent_10_failed": sum(1 for r in window if not r),
             "recent_10_failure_rate": round(recent_10_failure_rate, 3),
+            # 07-09-overtrigger P0-3: expose the configured min-rate-samples
+            # floor so diagnostics can distinguish "breaker opened at 67%
+            # over 3 calls" (the bug) from "breaker opened at 60% over 5
+            # calls" (the post-fix behavior).
+            "min_rate_samples": self._min_rate_samples,
             # Phase C (07-09): repairable schema-alias events do not count
             # toward the rate window or consecutive infra failures. Exposed
             # here so diagnostics can distinguish "LLM is emitting aliases"
@@ -285,6 +314,7 @@ class _NullBreaker:
             "recent_10_failed": 0,
             "recent_10_failure_rate": 0.0,
             "repairable_count": 0,
+            "min_rate_samples": 5,
         }
 
 

@@ -2634,6 +2634,14 @@ _LLM_CATEGORY_SHORT_LABELS = {
     "llm_rate_limited": "rate_limited",
     "llm_schema_validation_failed": "schema",
     "llm_semantic_validation_failed": "semantic",
+    # 07-09-overtrigger R5/R6: distinct label for "model called a tool
+    # with no assistant text" - remediation is prompt/tuning (remove tool
+    # exposure), NOT paging the gateway on-call.
+    "llm_tool_call_no_text": "tool_call_no_text",
+    # 07-09-overtrigger R4: repairable schema-alias / wrapped-decision
+    # events are tracked separately so the operator can see the repair
+    # SOP is handling them without counting as hard failures.
+    "llm_schema_repairable": "schema_repaired",
 }
 
 
@@ -2717,6 +2725,16 @@ def _render_llm_health_line(batch: dict[str, Any]) -> str:
             if skipped > 0:
                 return f"LLM：配置错误，已熔断，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
             return "LLM：配置错误，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+        # 07-09-overtrigger R5/R6: tool-call-no-text is its own case. The
+        # model emitted ``stop_reason=tool_use`` with empty assistant text
+        # - the breaker opens because every call wastes the round-trip.
+        # Remediation is prompt-side (drop tool exposure, force strict
+        # JSON text), NOT paging the gateway on-call (which is what the
+        # ``_GATEWAY_CATEGORIES`` banner implies).
+        if dominant == "llm_tool_call_no_text":
+            if skipped > 0:
+                return f"LLM：模型输出空文本且尝试调用工具，已熔断，跳过 {skipped} 个品种；请检查 prompt 是否暴露工具，本批使用规则 SOP"
+            return "LLM：模型输出空文本且尝试调用工具，已熔断；请检查 prompt 是否暴露工具，本批使用规则 SOP"
         if dominant in _GATEWAY_CATEGORIES:
             if skipped > 0:
                 return f"LLM：网关/模型空响应，已熔断，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"

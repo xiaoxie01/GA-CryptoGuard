@@ -470,6 +470,7 @@ class GAMasterController:
                 consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
                 rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
                 rate_window=breaker_cfg.get("rate_window", 10),
+                min_rate_samples=breaker_cfg.get("min_rate_samples", 5),
             )
             retry_budget = BatchRetryBudget(
                 max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),

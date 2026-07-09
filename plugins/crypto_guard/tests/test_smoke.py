@@ -41474,3 +41474,535 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             2, brief_ids,
             "P2: legacy schema-fail job (id=2) must NOT be passed to the LLM brief",
         )
+
+
+class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
+    """07-09-overtrigger follow-up: placeholder tool removal, wrapped-decision
+    unwrap, breaker ``min_rate_samples`` floor, repairable-not-hard-failure,
+    and distinct LLM failure categories in the hourly report banner.
+
+    Each test proves the exact observed failure mode (repair-plan.md
+    Background §3-5) and would fail RED against the pre-fix code.
+    """
+
+    _CLOSE_TIME = 1_700_000_000_000
+    _ANALYSIS_TIME = 1_700_000_010_000
+
+    # -- R1: no placeholder tool injected for JSON-only market-decision calls --
+
+    def test_placeholder_tool_not_attached_for_json_decision(self) -> None:
+        """R1: ``_call_ga_llm`` must NOT inject the ``crypto_guard_noop``
+        placeholder tool. Pre-fix the session arrived with ``tools=[]`` and
+        the wrapper set ``tools=[crypto_guard_noop]``, inducing
+        ``stop_reason=tool_use`` + empty text on complex market prompts.
+        """
+        from unittest.mock import patch, MagicMock
+        from plugins.crypto_guard.reasoning import llm_agent_judge
+
+        captured_session = MagicMock()
+        captured_session.thinking_type = None
+        captured_session.read_timeout = 30
+        captured_session.tools = []  # pre-fix: wrapper would populate this
+        captured_session.raw_ask.return_value = "{}"
+
+        with patch("plugins.crypto_guard.reasoning.llm_agent_judge._resolve_llm_config_name", return_value="test"):
+            with patch("llmcore.resolve_session", return_value=captured_session):
+                llm_agent_judge._call_ga_llm("test prompt")
+
+        # Post-fix: tools must be EMPTY (no crypto_guard_noop placeholder).
+        self.assertEqual(
+            captured_session.tools, [],
+            "R1: _call_ga_llm must not inject crypto_guard_noop placeholder tool",
+        )
+
+    def test_call_ga_llm_clears_leftover_tools(self) -> None:
+        """R1: if the session arrives with leftover tools from a prior call,
+        ``_call_ga_llm`` must clear them so JSON-only output is forced."""
+        from unittest.mock import patch, MagicMock
+        from plugins.crypto_guard.reasoning import llm_agent_judge
+
+        captured_session = MagicMock()
+        captured_session.thinking_type = None
+        captured_session.read_timeout = 30
+        captured_session.tools = [{"type": "function", "function": {"name": "leftover_tool"}}]
+        captured_session.raw_ask.return_value = "{}"
+
+        with patch("plugins.crypto_guard.reasoning.llm_agent_judge._resolve_llm_config_name", return_value="test"):
+            with patch("llmcore.resolve_session", return_value=captured_session):
+                llm_agent_judge._call_ga_llm("test prompt")
+
+        self.assertEqual(
+            captured_session.tools, [],
+            "R1: leftover tools from prior session calls must be cleared",
+        )
+
+    # -- R2: wrapped decision ``{"decision": {...}}`` unwrap --
+
+    def test_wrapped_decision_object_unwrapped_before_schema_validation(self) -> None:
+        """R2: ``{"decision": {...}}`` must unwrap to the inner object before
+        schema validation. Pre-fix the wrapper itself was merged, missing
+        required top-level fields at validation time.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _unwrap_wrapped_decision
+
+        inner = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME,
+            "decision": "monitor_only",
+            "signal_grade": "C",
+            "market_bias": "neutral",
+            "trend_stage": "range",
+            "confidence": 0.3,
+            "summary": "no edge",
+            "counter_evidence": ["no edge"],
+            "has_trade_plan": False,
+            "suggested_actions": ["ignore"],
+            "timeframe_context": {
+                "1d": {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0},
+                "4h": {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0},
+                "1h": {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0},
+                "15m": {"bias": "unknown", "structure": "unknown", "closed": False, "close_time": 0},
+            },
+            "alignment": "unknown",
+            "htf_conflict": False,
+            "market_reason_codes": [],
+            "risk_notes": [],
+        }
+        wrapper = {"decision": inner}
+
+        unwrapped, changed = _unwrap_wrapped_decision(wrapper)
+
+        self.assertTrue(changed, "R2: wrapped decision must trigger changed=True")
+        self.assertIsNotNone(unwrapped, "R2: unwrapped candidate must not be None")
+        self.assertEqual(unwrapped["symbol"], "BTCUSDT")
+        self.assertEqual(unwrapped["decision"], "monitor_only")
+        # _llm_parse_meta must be preserved and tagged.
+        meta = unwrapped.get("_llm_parse_meta") or {}
+        self.assertTrue(meta.get("llm_unwrapped_decision_object"), "R2: parse meta must record unwrap")
+
+    def test_wrapped_decision_conflict_fails_closed(self) -> None:
+        """R2: when BOTH top-level schema keys AND nested ``decision`` exist,
+        the unwrap must fail closed (return None) - we cannot safely pick one.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _unwrap_wrapped_decision
+
+        inner = {"symbol": "BTCUSDT", "analysis_time_utc": self._ANALYSIS_TIME}
+        # Conflict: wrapper has its own ``symbol`` AND nested ``decision``.
+        wrapper = {"symbol": "ETHUSDT", "decision": inner}
+
+        unwrapped, changed = _unwrap_wrapped_decision(wrapper)
+
+        self.assertTrue(changed, "R2: conflict must still report changed=True")
+        self.assertIsNone(
+            unwrapped,
+            "R2: conflict (top-level + nested) must fail closed (return None)",
+        )
+
+    def test_bare_decision_enum_value_not_treated_as_wrapper(self) -> None:
+        """R2: ``{"decision": "monitor_only", ...real GADecision...}`` must
+        NOT be unwrapped - ``decision`` here is the schema enum string, not
+        a wrapper. Pre-fix the unwrap logic could misfire on this shape.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _unwrap_wrapped_decision
+
+        real_decision = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME,
+            "decision": "monitor_only",  # enum string, NOT a wrapper
+            "signal_grade": "C",
+        }
+        unwrapped, changed = _unwrap_wrapped_decision(real_decision)
+
+        self.assertFalse(changed, "R2: bare decision enum value must not trigger unwrap")
+        self.assertIs(
+            unwrapped, real_decision,
+            "R2: real GADecision with enum ``decision`` must pass through unchanged",
+        )
+
+    # -- R3: breaker min_rate_samples floor --
+
+    def test_breaker_rate_open_requires_min_rate_samples(self) -> None:
+        """R3: with ``min_rate_samples=5``, sequence [fail, fail, success]
+        (3 samples, 67% rate) must NOT open the breaker. Pre-fix the
+        hardcoded ``len(window) >= 3`` floor opened the breaker here and
+        skipped the remaining 7-8 symbols of a 10-symbol batch.
+        """
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            enabled=True,
+            consecutive_threshold=3,
+            rate_threshold=0.5,
+            rate_window=10,
+            min_rate_samples=5,
+        )
+        # 2 fails, 1 success - 67% rate over 3 samples. Pre-fix: open.
+        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category=None, ok=True)
+
+        self.assertEqual(
+            breaker.state, "closed",
+            "R3: [fail, fail, success] with min_rate_samples=5 must NOT open breaker",
+        )
+
+    def test_breaker_rate_open_fires_at_min_rate_samples(self) -> None:
+        """R3: at 5 samples with failure rate >= threshold, the breaker
+        DOES open. The floor prevents premature open, not permanent open."""
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            enabled=True,
+            consecutive_threshold=3,
+            rate_threshold=0.5,
+            rate_window=10,
+            min_rate_samples=5,
+        )
+        # 3 fails, 2 successes - 60% rate over 5 samples. Post-fix: open.
+        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category=None, ok=True)
+        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category=None, ok=True)
+        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+
+        self.assertEqual(
+            breaker.state, "open",
+            "R3: 5 samples with 60% failure rate must open breaker (>= min_rate_samples)",
+        )
+
+    def test_breaker_config_error_still_opens_immediately(self) -> None:
+        """R3: ``llm_config_error`` opens immediately regardless of
+        min_rate_samples - a config error is not a transient condition."""
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            enabled=True, consecutive_threshold=3,
+            rate_threshold=0.5, rate_window=10, min_rate_samples=5,
+        )
+        breaker.record_attempt(category="llm_config_error", ok=False)
+        self.assertEqual(
+            breaker.state, "open",
+            "R3: llm_config_error must open breaker immediately (no min sample floor)",
+        )
+
+    def test_breaker_min_rate_samples_in_snapshot(self) -> None:
+        """R3: ``min_rate_samples`` is exposed in the breaker snapshot so
+        diagnostics can distinguish "opened at 67% over 3 calls" (the bug)
+        from "opened at 60% over 5 calls" (post-fix behavior)."""
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(min_rate_samples=5)
+        snap = breaker.snapshot()
+        self.assertEqual(
+            snap["min_rate_samples"], 5,
+            "R3: min_rate_samples must be exposed in snapshot for diagnostics",
+        )
+
+    def test_controller_passes_min_rate_samples_to_breaker(self) -> None:
+        """R3: the controller must read ``min_rate_samples`` from
+        ``trading_mode.yaml`` and pass it to the CircuitBreaker constructor.
+        Default 5 when the key is absent.
+        """
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker_cfg = load_config().trading_mode.get("llm", {}).get("circuit_breaker", {})
+        self.assertEqual(
+            breaker_cfg.get("min_rate_samples"), 5,
+            "R3: trading_mode.yaml must configure min_rate_samples=5",
+        )
+        breaker = CircuitBreaker(
+            enabled=breaker_cfg.get("enabled", True),
+            consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
+            rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
+            rate_window=breaker_cfg.get("rate_window", 10),
+            min_rate_samples=breaker_cfg.get("min_rate_samples", 5),
+        )
+        self.assertEqual(breaker.state, "closed")
+        self.assertEqual(
+            breaker.snapshot()["min_rate_samples"], 5,
+            "R3: breaker constructed from config must carry min_rate_samples=5",
+        )
+
+    def test_run_ga_workers_passes_min_rate_samples_to_breaker(self) -> None:
+        """R3 P0: ``run_ga_workers.process_job`` is the production entrypoint
+        for ``scheduled_market_analysis``. It creates the per-batch breaker
+        in ``_batch_breakers`` and the controller reuses that breaker via
+        ``controller._breakers = _batch_breakers``. If the worker does not
+        pass ``min_rate_samples``, the controller's own construction path
+        never runs for the batch and the configured value is silently
+        ignored on the production path.
+
+        This test drives the real ``process_job`` with a stub
+        ``GAMasterController`` and a non-default ``min_rate_samples=7``
+        config override so we can inspect the cached breaker the worker
+        created BEFORE the controller was invoked. A revert that drops
+        ``min_rate_samples`` from the worker's ``CircuitBreaker(...)``
+        call must fail this test: the cached breaker would fall back to
+        the constructor default of 5, not the patched 7.
+        """
+        import os
+        import tempfile
+        from unittest.mock import patch
+        import plugins.crypto_guard.run_ga_workers as rgw
+        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+        # Sanity: production config pins min_rate_samples=5. We do NOT
+        # assert on this value in the e2e leg below - we patch load_config
+        # to return 7 (a non-default value) so a revert that drops the
+        # kwarg from the worker's CircuitBreaker(...) call falls back to
+        # the constructor default of 5 and fails the assertion.
+        prod_breaker_cfg = (
+            load_config().trading_mode.get("llm", {}).get("circuit_breaker", {})
+        )
+        self.assertEqual(
+            prod_breaker_cfg.get("min_rate_samples"), 5,
+            "R3 P0: trading_mode.yaml must configure min_rate_samples=5",
+        )
+
+        # End-to-end: drive process_job with a stub controller so the
+        # worker creates the real breaker in _batch_breakers and we can
+        # inspect it. The stub raises to short-circuit before analysis.
+        batch_id = "BATCH_R3_P0_WORKER_PATH"
+        rgw._batch_breakers.pop(batch_id, None)
+        tmpdir = tempfile.mkdtemp(prefix="cg_r3_p0_")
+        old_db = os.environ.get("CRYPTO_GUARD_DB")
+        os.environ["CRYPTO_GUARD_DB"] = os.path.join(tmpdir, "crypto_guard.sqlite3")
+        captured = {}
+
+        class _StubController:
+            def __init__(self, repo, *args, **kwargs):
+                pass
+
+            _breakers = None
+
+            def analyze_symbol(self, *args, **kwargs):
+                cache = rgw._batch_breakers.get(batch_id) or {}
+                brk = cache.get("breaker")
+                if brk is not None:
+                    captured["snapshot"] = brk.snapshot()
+                raise RuntimeError("stub_stop_after_breaker_creation")
+
+        # Patch load_config at its source module. The worker does a
+        # function-local `from plugins.crypto_guard.config.loader import
+        # load_config`, which binds the name fresh from the source module
+        # on each call - so patching rgw.load_config (the module-level
+        # alias) is NOT enough. Patch the source so both the worker's
+        # local import and any other caller see the override.
+        import plugins.crypto_guard.config.loader as _loader
+
+        def _patched_load_config():
+            class _Cfg:
+                trading_mode = {
+                    "llm": {
+                        "circuit_breaker": {
+                            "enabled": True,
+                            "consecutive_failures": 3,
+                            "rate_threshold": 0.5,
+                            "rate_window": 10,
+                            "min_rate_samples": 7,  # non-default override
+                        },
+                        "retry": {
+                            "max_batch_retry_calls": 9,
+                            "batch_wall_clock_budget_seconds": 90,
+                        },
+                    }
+                }
+            return _Cfg()
+
+        try:
+            initialize_database()
+            conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+            with patch(
+                "plugins.crypto_guard.run_ga_workers.GAMasterController",
+                _StubController,
+            ):
+                with patch(
+                    "plugins.crypto_guard.run_ga_workers.handle_button_callback",
+                    lambda *a, **kw: {"ok": True},
+                ):
+                    with patch.object(
+                        _loader, "load_config", _patched_load_config
+                    ):
+                        import json as _json
+                        job = {
+                            "id": 1,
+                            "job_type": "scheduled_market_analysis",
+                            "payload_json": _json.dumps({
+                                "snapshot": {
+                                    "symbol": "BTCUSDT",
+                                    "analysis_time_utc": 2_000_000_000_000,
+                                    "mode": "scheduled",
+                                },
+                                "batch_id": batch_id,
+                                "snapshot_id": 1,
+                            }),
+                        }
+                        try:
+                            rgw.process_job(
+                                repo, job, send_message=lambda *a, **kw: None
+                            )
+                        except RuntimeError as exc:
+                            self.assertEqual(
+                                str(exc), "stub_stop_after_breaker_creation"
+                            )
+            conn.close()
+            snap = captured.get("snapshot")
+            self.assertIsNotNone(
+                snap,
+                "R3 P0: worker must create a breaker in _batch_breakers "
+                "before invoking the controller",
+            )
+            self.assertEqual(
+                snap["min_rate_samples"], 7,
+                "R3 P0: worker-constructed breaker must carry "
+                "min_rate_samples=7 from patched load_config(). A revert "
+                "that drops the kwarg falls back to the constructor "
+                "default of 5 and fails here.",
+            )
+        finally:
+            rgw._batch_breakers.pop(batch_id, None)
+            if old_db is None:
+                os.environ.pop("CRYPTO_GUARD_DB", None)
+            else:
+                os.environ["CRYPTO_GUARD_DB"] = old_db
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # -- R4: repairable unwrap does not count toward breaker failure rate --
+
+    def test_wrapped_decision_repair_does_not_count_toward_breaker_failure_rate(self) -> None:
+        """R4: a successful unwrap is recorded as ``repairable=True`` and
+        does NOT push into the rate window. Pre-fix 5 consecutive unwraps
+        would look like 5 failures and open the breaker.
+        """
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(min_rate_samples=5)
+        for _ in range(5):
+            breaker.record_attempt(
+                category="llm_schema_repairable", ok=True, repairable=True,
+            )
+        self.assertEqual(
+            breaker.state, "closed",
+            "R4: 5 repairable unwraps must NOT open breaker",
+        )
+        snap = breaker.snapshot()
+        self.assertEqual(snap["repairable_count"], 5)
+        self.assertEqual(snap["failed"], 0)
+        self.assertEqual(snap["successful"], 5)
+        self.assertEqual(
+            snap["recent_10_calls"], 0,
+            "R4: repairable events must NOT push into the rate window",
+        )
+
+    # -- R5/R6: hourly report distinguishes tool-call-no-text --
+
+    def test_hourly_report_distinguishes_tool_call_no_text(self) -> None:
+        """R5/R6: when the dominant category is ``llm_tool_call_no_text``
+        and the breaker is open, the banner must render a distinct message
+        (not the generic "网关/模型空响应" or "Schema/输出格式异常").
+        """
+        from plugins.crypto_guard.notify.hourly_report import _render_llm_health_line
+
+        batch = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "dominant_error_category": "llm_tool_call_no_text",
+                    "skipped_by_breaker": 8,
+                },
+            },
+        }
+        line = _render_llm_health_line(batch)
+        self.assertIn(
+            "模型输出空文本且尝试调用工具", line,
+            "R5/R6: tool-call-no-text banner must surface the distinct message",
+        )
+        self.assertIn(
+            "8", line,
+            "R5/R6: skip count must be surfaced in the banner",
+        )
+        # Must NOT collapse into the gateway-empty or schema-generic wording.
+        self.assertNotIn("网关/模型空响应", line)
+        self.assertNotIn("Schema/输出格式异常", line)
+
+    def test_hourly_report_gateway_empty_still_rendered(self) -> None:
+        """R5/R6: ``llm_empty_response`` (gateway empty) banner is
+        preserved - the new tool-call-no-text branch does not swallow it.
+        """
+        from plugins.crypto_guard.notify.hourly_report import _render_llm_health_line
+
+        batch = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "dominant_error_category": "llm_empty_response",
+                    "skipped_by_breaker": 3,
+                },
+            },
+        }
+        line = _render_llm_health_line(batch)
+        self.assertIn("网关/模型空响应", line)
+        self.assertIn("3", line)
+
+    def test_classify_llm_failure_routes_tool_call_no_text(self) -> None:
+        """R5/R6: ``_classify_llm_failure`` must route an empty-response
+        exception carrying ``stop_reason=tool_use`` to
+        ``llm_tool_call_no_text``, NOT the generic ``llm_empty_response``.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _classify_llm_failure
+
+        exc = RuntimeError("empty LLM response; stop_reason=tool_use (tool_call_no_text)")
+        category = _classify_llm_failure(exc, "", "call")
+        self.assertEqual(
+            category, "llm_tool_call_no_text",
+            "R5/R6: tool-use stop_reason with empty text must classify as tool_call_no_text",
+        )
+
+    def test_classify_llm_failure_gateway_empty_unchanged(self) -> None:
+        """R5/R6: a plain empty response (no stop_reason signal) must
+        still classify as ``llm_empty_response`` - the new branch does not
+        regress the gateway-empty path.
+        """
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _classify_llm_failure
+
+        exc = RuntimeError("empty LLM response")
+        category = _classify_llm_failure(exc, "", "call")
+        self.assertEqual(
+            category, "llm_empty_response",
+            "R5/R6: plain empty response must stay as llm_empty_response",
+        )
+
+    def test_tool_call_no_text_is_retryable(self) -> None:
+        """R5/R6: ``llm_tool_call_no_text`` must be in _RETRYABLE_CATEGORIES
+        so the strict-JSON retry (attempt 2, no tools) can recover it."""
+        from plugins.crypto_guard.reasoning.llm_agent_judge import _RETRYABLE_CATEGORIES
+
+        self.assertIn(
+            "llm_tool_call_no_text", _RETRYABLE_CATEGORIES,
+            "R5/R6: tool_call_no_text must be retryable (strict JSON recovers it)",
+        )
+
+    def test_breaker_consecutive_tool_call_no_text_opens(self) -> None:
+        """R5/R6: 3 consecutive ``llm_tool_call_no_text`` must open the
+        breaker on the consecutive-infrastructure path. A sustained stream
+        of tool-call-no-text is a real model/prompt defect even when the
+        rate floor has not been reached."""
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5,
+            rate_window=10, min_rate_samples=5,
+        )
+        breaker.record_attempt(category="llm_tool_call_no_text", ok=False)
+        breaker.record_attempt(category="llm_tool_call_no_text", ok=False)
+        breaker.record_attempt(category="llm_tool_call_no_text", ok=False)
+        self.assertEqual(
+            breaker.state, "open",
+            "R5/R6: 3 consecutive tool_call_no_text must open breaker",
+        )
