@@ -943,3 +943,52 @@ Completed R5→R14 iterative independent review passes on the 07-05-hourly-decis
 ### Next Steps
 
 - None - task complete
+
+
+## Session 29: 07-09 LLM breaker over-trigger follow-up R1-R6 final seal
+
+**Date**: 2026-07-10
+**Task**: 07-09 LLM breaker over-trigger follow-up R1-R6 final seal
+**Branch**: `main`
+
+### Summary
+
+Resolved 4 P0/P1 defects + 1 P2 in LLM breaker/agent-judge/hourly-report path surfaced in post-commit review of 07-09-llm-schema-repair-breaker-tuning.
+
+R1: removed crypto_guard_noop placeholder tool from _call_ga_llm, clear session.tools unconditionally, probe stop_reason to classify llm_tool_call_no_text.
+
+R2: unwrap wrapped-decision object before schema validation, conflict fails closed.
+
+R3: added llm.circuit_breaker.min_rate_samples config (default 5), rate-based open now requires min samples so 3-sample 67% no longer kills 10-symbol batch. CRITICAL P0: production worker entrypoint run_ga_workers.process_job was missed in first round - controller never saw the configured value because worker pre-populated _batch_breakers; now passes kwarg.
+
+R4: repairable events tracked separately, do not push into rate window.
+
+R5/R6: hourly report distinct banner for llm_tool_call_no_text, added to _RETRYABLE_CATEGORIES and consecutive_infra_failures.
+
+Tests: 18 new follow-up tests, worker-path test patches source module with non-default min_rate_samples=7 (revert-fail verified).
+
+Verification: focused 56 passed, full 1024 passed/1 pre-existing mark_price failure (wall-clock-dependent test, unrelated, documented in final-seal.md), fault inject 16/16, fresh DB all green.
+
+No production migration needed. Code requires service restart (not performed). Excluded from commit: binance_rest.py (pre-existing BASE_URL debug edit), .claude/.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `301504ce` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
