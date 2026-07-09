@@ -222,3 +222,22 @@ def _final_decision(old_decision: str, legacy: dict[str, Any], risk_check: dict[
     if old_decision in {"monitor_only", "trade_plan_available"}:
         return "monitor_only"
     return "no_edge"
+
+# Phase B (07-09): re-export the alias-normalization helper from
+# ``reasoning.decision_schema`` to avoid a circular import
+# (``ga_master.__init__`` -> ``controller`` -> ``llm_agent_judge``
+# -> ``ga_master.decision_schema``). The implementation lives in
+# ``reasoning.decision_schema``; this re-export keeps tests and
+# callers that import from ``ga_master.decision_schema`` working
+# without triggering the package __init__.
+from plugins.crypto_guard.reasoning.decision_schema import (
+    normalize_entry_trigger_confirmation,
+)
+
+__all__ = [
+    "GAAnalysisRequest",
+    "iso_from_ms",
+    "controller_decision_from_legacy",
+    "legacy_decision_from_ga_decision",
+    "normalize_entry_trigger_confirmation",
+]

@@ -52,6 +52,13 @@ class CircuitBreaker:
         self._by_category: dict[str, int] = {}
         self._state_transitions: list[dict[str, Any]] = []
         self._total_retries: int = 0
+        # Phase C (07-09): repairable schema-alias events that were either
+        # repaired successfully or are pending re-validation. These do NOT
+        # count toward consecutive_infra_failures or the rate window - a
+        # sustained stream of LLM alias emissions must not open the breaker
+        # the way a sustained stream of transport/empty/config errors does.
+        # The wall-clock budget still bounds total batch time.
+        self._repairable_count: int = 0
         # Config name / model cached by the retry wrapper
         self._llm_config_name: str | None = None
         self._llm_model: str | None = None
@@ -64,12 +71,45 @@ class CircuitBreaker:
             return True  # disabled breaker never blocks
         return self._state != "open"
 
-    def record_attempt(self, *, category: str | None, ok: bool) -> None:
-        """Record the outcome of an LLM attempt. May transition state."""
+    def record_attempt(
+        self,
+        *,
+        category: str | None,
+        ok: bool,
+        repairable: bool = False,
+    ) -> None:
+        """Record the outcome of an LLM attempt. May transition state.
+
+        ``repairable=True`` marks the attempt as a schema-alias repair event
+        (either successfully repaired, or pending re-validation). Such
+        events are counted in ``repairable_count`` for diagnostics but do
+        NOT count toward ``consecutive_infra_failures`` or the rate window
+        - the LLM is still producing schema-shaped output, just with an
+        alias ``type`` value, and the repair path resolves it without
+        falling back to deterministic SOP.
+        """
         if not self._enabled:
             return
 
         self._total_attempts += 1
+        if repairable:
+            # Phase C (07-09): repairable events are tracked separately.
+            # They do NOT increment consecutive_infra_failures and do NOT
+            # push into _recent_results (which feeds the rate window). The
+            # breaker must stay closed when the only signal is "LLM emits
+            # alias, helper repairs, schema validates".
+            self._repairable_count += 1
+            if category:
+                self._by_category[category] = self._by_category.get(category, 0) + 1
+            if ok:
+                # Successful repair still counts as a success for the
+                # half-open -> closed transition and the successful tally.
+                self._successful += 1
+                self._consecutive_infra_failures = 0
+                if self._state == "half_open":
+                    self._transition("closed", reason="half_open_probe_success")
+            return
+
         if ok:
             self._successful += 1
             self._consecutive_infra_failures = 0
@@ -158,6 +198,11 @@ class CircuitBreaker:
             "recent_10_calls": len(window),
             "recent_10_failed": sum(1 for r in window if not r),
             "recent_10_failure_rate": round(recent_10_failure_rate, 3),
+            # Phase C (07-09): repairable schema-alias events do not count
+            # toward the rate window or consecutive infra failures. Exposed
+            # here so diagnostics can distinguish "LLM is emitting aliases"
+            # from "LLM is genuinely failing".
+            "repairable_count": self._repairable_count,
         }
 
     # -- internal --
@@ -187,7 +232,13 @@ class _NullBreaker:
     def should_call(self) -> bool:
         return True
 
-    def record_attempt(self, *, category: str | None, ok: bool) -> None:
+    def record_attempt(
+        self,
+        *,
+        category: str | None,
+        ok: bool,
+        repairable: bool = False,
+    ) -> None:
         pass
 
     def record_skip(self) -> None:
@@ -217,7 +268,24 @@ class _NullBreaker:
         pass
 
     def snapshot(self) -> dict[str, Any]:
-        return {}
+        # Phase C (07-09): mirror the real breaker's keys so consumers
+        # reading repairable_count do not KeyError when a _NullBreaker is
+        # in play (tests, non-controller callers).
+        return {
+            "total_attempts": 0,
+            "successful": 0,
+            "failed": 0,
+            "skipped_by_breaker": 0,
+            "dominant_error_category": "",
+            "breaker_state": "closed",
+            "breaker_state_transitions": [],
+            "by_category": {},
+            "total_retries": 0,
+            "recent_10_calls": 0,
+            "recent_10_failed": 0,
+            "recent_10_failure_rate": 0.0,
+            "repairable_count": 0,
+        }
 
 
 class BatchRetryBudget:

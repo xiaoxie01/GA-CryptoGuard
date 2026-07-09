@@ -43,6 +43,7 @@
         "reason": {"type": "string"},
         "entry_trigger_confirmation": {
           "type": ["object", "null"],
+          "additionalProperties": false,
           "required": ["type", "timeframe", "event_type", "direction", "candle_close_time", "price", "source", "symbol"],
           "properties": {
             "type": {"type": "string", "enum": ["closed_candle_confirmation"]},

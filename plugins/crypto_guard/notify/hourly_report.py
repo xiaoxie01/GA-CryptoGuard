@@ -196,6 +196,9 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=batches_reported)
     market_data_quality = _fetch_market_data_quality(repo, analysis_time_utc=batch_state.get("analysis_time"))
+    # P2 (07-09 R4): ``_agent_hourly_brief`` applies the legacy schema-fail
+    # split internally so the LLM brief context never receives archived
+    # legacy jobs. Pass raw ``failed_jobs`` here - the function filters.
     agent_brief = _agent_hourly_brief(active_symbols, signals, open_orders, failed_jobs, queue_counts)
     return {
         "ok": True,
@@ -421,6 +424,12 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=expected_batch_id)
 
+    # P2 (07-09 R3): split failed_jobs once at the top so the system-status
+    # line and the 三、风险事件 section share the same current_jobs list.
+    _current_failed_jobs, _legacy_schema_fail_count = _split_current_and_legacy_failed_jobs(
+        failed_jobs,
+    )
+
     # Build degraded text
     lines: list[str] = [
         "**CryptoGuard 每小时简报（降级模式）**",
@@ -441,7 +450,7 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     waiting = queue_counts.get("pending_user", 0) + queue_counts.get("pending_background", 0)
     lines.append(
         f"- 调度正常 · 等待任务 {waiting} 个 · "
-        f"正在执行 {queue_counts.get('running', 0)} 个 · 最近失败 {len(failed_jobs)} 个"
+        f"正在执行 {queue_counts.get('running', 0)} 个 · 最近失败 {len(_current_failed_jobs)} 个"
     )
 
     if risk_state:
@@ -474,10 +483,21 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     lines.append(f"- 当前持仓/挂单：{len(open_orders)}")
 
     # Risk events
+    # P1/P2 fix (07-09): filter known legacy schema-fail signatures out of
+    # the current risk-events list. ``_current_failed_jobs`` /
+    # ``_legacy_schema_fail_count`` are computed once at the top of the
+    # renderer so the count shown at the top matches the items listed below.
     lines.extend(["", "**三、风险事件**"])
-    if failed_jobs:
-        for job in failed_jobs[:5]:
+    if _current_failed_jobs or _legacy_schema_fail_count > 0:
+        for job in _current_failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
+        if _legacy_schema_fail_count > 0:
+            lines.append(
+                f"- 另有 {_legacy_schema_fail_count} 个历史 schema 校验失败已归档到审计"
+                "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
+            )
+        if not _current_failed_jobs and _legacy_schema_fail_count == 0:
+            lines.append("- 暂无新的失败任务或风险事件")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
 
@@ -500,6 +520,9 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
             lines.append("- 报告准确性诊断全部通过")
         else:
             for code, count in diag_summary.items():
+                # `layer_counts` is a nested dict, not a count — skip it
+                if isinstance(count, dict):
+                    continue
                 if int(count or 0) > 0:
                     lines.append(f"- {code}={count}")
 
@@ -637,6 +660,13 @@ def render_ga_hourly_summary(
     observation: list[dict[str, Any]] = []
     no_edge: list[dict[str, Any]] = []
     now_ms = utc_ms()
+    # P2 (07-09 R3): split failed_jobs once at the top so the system-status
+    # line and the 九、风险事件 section share the same current_jobs list.
+    # Without this, "最近失败 N 个" would count archived legacy schema-fail
+    # jobs while the list below shows only current failures.
+    _current_failed_jobs, _legacy_schema_fail_count = _split_current_and_legacy_failed_jobs(
+        failed_jobs,
+    )
     # The renderer's stale cutoff mirrors the batch completion gate (one
     # analysis cycle aged beyond the current 15m slot = stale).
     stale_cutoff_ms = latest_closed_close_time_ms("15m", now_ms) - INTERVAL_MS["15m"]
@@ -698,7 +728,7 @@ def render_ga_hourly_summary(
         "**一、系统状态**",
         f"- 调度正常 · 等待任务 {queue_counts.get('pending_user', 0) + queue_counts.get('pending_background', 0)} 个"
         f" · 正在执行 {queue_counts.get('running', 0)} 个"
-        f" · 最近失败 {len(failed_jobs)} 个",
+        f" · 最近失败 {len(_current_failed_jobs)} 个",
         "- 行情数据：Binance U本位合约公共行情 · SQLite",
     ])
 
@@ -967,9 +997,29 @@ def render_ga_hourly_summary(
                 lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**九、风险事件**"])
-    if failed_jobs:
-        for job in failed_jobs[:5]:
+    # P1/P2 fix (07-09): filter known legacy schema-fail signatures out of
+    # the current risk-events list. The 07-09 alias-repair SOP is already
+    # handling ``analysis_time_utc is a required property`` failures by
+    # normalizing ``entry_trigger_confirmation.type`` aliases to
+    # ``closed_candle_confirmation``. Historical agent_jobs rows within the
+    # 7-day ``recent_failed_jobs`` window would otherwise keep surfacing in
+    # every hourly report and drown out actionable current failures.
+    # Filtered rows are surfaced as a single legacy-audit count line so the
+    # operator knows they were archived (not silently dropped).
+    #
+    # P2 (07-09 R3): ``_current_failed_jobs`` / ``_legacy_schema_fail_count``
+    # are computed once at the top of the renderer (above the system-status
+    # line) so the count shown at the top matches the items listed below.
+    if _current_failed_jobs or _legacy_schema_fail_count > 0:
+        for job in _current_failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
+        if _legacy_schema_fail_count > 0:
+            lines.append(
+                f"- 另有 {_legacy_schema_fail_count} 个历史 schema 校验失败已归档到审计"
+                "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
+            )
+        if not _current_failed_jobs and _legacy_schema_fail_count == 0:
+            lines.append("- 暂无新的失败任务或风险事件")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
 
@@ -985,7 +1035,15 @@ def render_ga_hourly_summary(
         for failed_row in recent_llm_failures[:10]:
             sym = failed_row.get("symbol") or "-"
             err = str(failed_row.get("llm_error") or "")[:100]
-            cat = failed_row.get("llm_error_category") or "-"
+            cat = failed_row.get("llm_error_category") or ""
+            # Phase E (07-09): breaker-skipped rows carry
+            # llm_error_category=None (no LLM call was made) but a
+            # readable llm_fallback_reason. Translate the fallback reason
+            # into a Chinese category so the row does not render as "-".
+            if not cat:
+                cat = _fallback_reason_to_category_zh(
+                    failed_row.get("llm_fallback_reason"),
+                )
             lines.append(f"- {sym}：{cat} · {err or '-'}")
 
     # P2: 报告准确性诊断 (research 00 P2 diagnostics)
@@ -1758,13 +1816,25 @@ def render_hourly_report_text(
                 lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
-    health = "正常" if not failed_jobs and queue_counts.get("running", 0) < 5 else "需关注"
+    # P1/P2 fix (07-09): split failed_jobs via the shared helper so this
+    # brief path stays consistent with the system-status count and the
+    # 九、风险事件 section in render_ga_hourly_summary /
+    # render_hourly_report_text.
+    _brief_current_failed, _brief_legacy_count = _split_current_and_legacy_failed_jobs(
+        failed_jobs,
+    )
+    health = "正常" if not _brief_current_failed and queue_counts.get("running", 0) < 5 else "需关注"
     lines.extend(["", "**系统健康度：**", f"- 状态：{health}", f"- 飞书 outbox/队列：用户 {queue_counts['pending_user']}，后台 {queue_counts['pending_background']}，运行中 {queue_counts['running']}"])
-    if failed_jobs:
+    if _brief_current_failed or _brief_legacy_count > 0:
         lines.extend(["", "**最近失败任务：**"])
-        for job in failed_jobs:
+        for job in _brief_current_failed:
             err = (job.get("error_message") or "")[:120]
             lines.append(f"- #{job['id']} {job['job_type']}：{err}")
+        if _brief_legacy_count > 0:
+            lines.append(
+                f"- 另有 {_brief_legacy_count} 个历史 schema 校验失败已归档到审计"
+                "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
+            )
 
     # P2: report accuracy diagnostics (legacy renderer also surfaces them).
     if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
@@ -1775,6 +1845,11 @@ def render_hourly_report_text(
             lines.append("- 报告准确性诊断全部通过，未发现不一致")
         else:
             for code, count in summary.items():
+                # `layer_counts` is a nested dict, not a count — skip it
+                # (Phase E 07-09: report_diagnostics now returns a
+                # per-layer breakdown that would otherwise crash int()).
+                if isinstance(count, dict):
+                    continue
                 if int(count or 0) > 0:
                     lines.append(f"- {code}={count}")
     lines.append("")
@@ -2293,6 +2368,17 @@ def _agent_hourly_brief(
     failed_jobs: list[dict[str, Any]],
     queue_counts: dict[str, int],
 ) -> dict[str, Any]:
+    # P2 (07-09 R4): apply the legacy schema-fail split INSIDE the brief
+    # builder so the LLM context never receives archived legacy jobs. The
+    # renderers (``_render_degraded_report``, ``render_ga_hourly_summary``,
+    # ``render_hourly_report_text``) filter legacy jobs out of the
+    # user-visible risk-events section - if the brief still received them,
+    # the brief would reference them as current failures, contradicting
+    # the rendered "另有 N 个历史 schema 校验失败已归档" line. Making the
+    # brief self-contained ensures every caller gets the filter for free.
+    brief_failed_jobs, _brief_legacy_count = _split_current_and_legacy_failed_jobs(
+        failed_jobs,
+    )
     fallback = {
         "summary": "本小时巡航已完成，详见各产品趋势状态、机会判断与风险说明。",
         "focus_symbols": [],
@@ -2325,7 +2411,7 @@ def _agent_hourly_brief(
                 "active_symbols": active_symbols,
                 "latest_signals": compact_signals,
                 "open_orders": open_orders[:20],
-                "failed_jobs": failed_jobs,
+                "failed_jobs": brief_failed_jobs,
                 "queue_counts": queue_counts,
             },
             fallback=fallback,
@@ -2557,18 +2643,41 @@ def _cat_short(category: str) -> str:
     return _LLM_CATEGORY_SHORT_LABELS.get(str(category or ""), str(category or "unknown"))
 
 
+# Phase E (07-09): translate llm_fallback_reason (set when the LLM call
+# was never made or was skip-failed) into a readable Chinese category for
+# the 九之二 row. Without this, breaker-skipped rows render category as
+# "-" because llm_error_category is None (no call was attempted).
+_FALLBACK_REASON_TO_CATEGORY_ZH = {
+    "circuit_breaker_open": "熔断跳过",
+    "wall_clock_budget_exhausted": "重试预算耗尽",
+    "llm_disabled": "LLM 未启用",
+    "schema_validation_failed": "Schema 校验失败",
+    "retry_exhausted": "重试耗尽",
+    "llm_skipped": "LLM 跳过",
+}
+
+
+def _fallback_reason_to_category_zh(reason: Any) -> str:
+    """Map a fallback reason code to a short Chinese category label.
+
+    Falls back to ``"未知"`` when the reason is missing or unrecognized
+    so the row never renders as ``"-"``.
+    """
+    key = str(reason or "").strip()
+    if not key:
+        return "未知"
+    return _FALLBACK_REASON_TO_CATEGORY_ZH.get(key, key)
+
+
 def _render_llm_health_line(batch: dict[str, Any]) -> str:
     """Phase E (07-07) per design §9.1: render the LLM health summary line.
 
-    The line summarizes the batch's LLM call health so the operator can see
-    success/failure counts, retry usage, and the dominant failure cause in
-    one line. When the circuit breaker is open, a distinct breaker-open
-    message is rendered instead (the batch used deterministic SOP only and
-    no candidate plan may be auto-executed).
-
-    Reads ``batch.summary_json.llm_health`` (set by Phase B's breaker
-    snapshot merge in ``run_ga_workers.py``). Returns ``""`` when no
-    ``llm_health`` block is present (pre-Phase-B batches render no line).
+    Phase E (07-09) per design §4: the banner is now split into 5 cases
+    based on breaker_state + dominant_error_category + fallback_reason so
+    the operator can distinguish "Schema/输出格式异常" (alias-repair SOP
+    is handling it) from "网关/模型空响应" (real gateway outage) from
+    "配置错误" (immediate open) from "重试预算耗尽" (wall-clock budget
+    exhausted, breaker still closed).
     """
     summary = batch.get("summary_json") or {}
     if isinstance(summary, str):
@@ -2580,8 +2689,57 @@ def _render_llm_health_line(batch: dict[str, Any]) -> str:
     if not isinstance(llm_health, dict) or not llm_health:
         return ""
     state = str(llm_health.get("breaker_state") or "closed").lower()
+    dominant = str(llm_health.get("dominant_error_category") or "")
+    skipped = int(llm_health.get("skipped_by_breaker") or 0)
+    fallback_reason = str(summary.get("dominant_llm_fallback_reason") or "")
+
+    # Phase E (07-09): 5-case banner. The schema-failure and repairable
+    # categories use a distinct message because the breaker opens but the
+    # root cause is LLM contract violation, not gateway outage. The
+    # operator's remediation is different (tighten prompt / retrain vs.
+    # page gateway on-call).
+    _SCHEMA_CATEGORIES = {
+        "llm_schema_validation_failed",
+        "llm_schema_repairable",
+    }
+    _GATEWAY_CATEGORIES = {
+        "llm_transport_error",
+        "llm_empty_response",
+        "llm_rate_limited",
+    }
+
     if state == "open":
-        return "LLM：配置/网关异常，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+        if dominant in _SCHEMA_CATEGORIES:
+            if skipped > 0:
+                return f"LLM：Schema/输出格式异常，已熔断，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
+            return "LLM：Schema/输出格式异常，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+        if dominant == "llm_config_error":
+            if skipped > 0:
+                return f"LLM：配置错误，已熔断，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
+            return "LLM：配置错误，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+        if dominant in _GATEWAY_CATEGORIES:
+            if skipped > 0:
+                return f"LLM：网关/模型空响应，已熔断，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
+            return "LLM：网关/模型空响应，已熔断；本批使用规则 SOP，禁止自动执行候选计划"
+        # Unknown dominant category - keep the legacy generic message but
+        # avoid the misleading "配置/网关异常" wording (it groups two
+        # distinct remediation paths). Surface the skip count if symbols
+        # were skipped under the open breaker so the operator knows how
+        # many symbols fell into the unknown-category bucket (design §4
+        # case 5).
+        if skipped > 0:
+            return f"LLM：异常熔断，跳过 {skipped} 个品种（未知类别 {dominant}）；本批使用规则 SOP，禁止自动执行候选计划"
+        return "LLM：异常熔断；本批使用规则 SOP，禁止自动执行候选计划"
+
+    # Breaker closed but symbols were skipped - distinct from a clean run.
+    if skipped > 0:
+        if fallback_reason == "wall_clock_budget_exhausted":
+            return f"LLM：重试预算耗尽，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
+        # Skipped without an explicit budget reason - surface the count so
+        # the operator can investigate. The breaker is closed so this is
+        # NOT a breaker-skip; it's typically a per-symbol budget drop.
+        return f"LLM：本批跳过 {skipped} 个品种（breaker 已关闭）；请检查单品种预算或重试配置"
+
     total = int(llm_health.get("total_attempts") or 0)
     ok = int(llm_health.get("successful") or 0)
     failed = int(llm_health.get("failed") or 0)
@@ -2651,6 +2809,60 @@ def _select_latest_complete_batch(repo: CryptoGuardRepository, *, now_ms: int) -
             continue
         return batch
     return None
+
+
+# P1/P2 fix (07-09): known legacy schema-fail signatures that the 07-09
+# alias-repair SOP is already handling (``entry_trigger_confirmation.type``
+# alias normalization -> ``closed_candle_confirmation``). Historical
+# agent_jobs rows within the 7-day ``recent_failed_jobs`` window would
+# otherwise keep surfacing in every hourly report and drown out actionable
+# current failures. These signatures are filtered out of the current
+# risk-events list and counted in a legacy-audit line instead.
+#
+# P2 (07-09 R4): only the FULL ``no_edge fallback schema 校验失败`` prefix
+# is matched. The bare ``analysis_time_utc' is a required property`` string
+# is too broad — it would also match any FUTURE schema-fail that happens
+# to surface the same required-property message via a different code path
+# (e.g. a new SOP that doesn't include the ``no_edge fallback`` prefix).
+# Future failures must NOT be archived — they are actionable.
+_LEGACY_SCHEMA_FAIL_SIGNATURES = (
+    "no_edge fallback schema 校验失败: 'analysis_time_utc'",
+)
+
+
+def _is_legacy_schema_fail_job(job: dict[str, Any]) -> bool:
+    """Return True if the job's error_message matches a known legacy
+    schema-fail signature that the 07-09 alias-repair SOP has already
+    remediated. Used by ``_split_current_and_legacy_failed_jobs``.
+    """
+    msg = str(job.get("error_message") or "")
+    return any(sig in msg for sig in _LEGACY_SCHEMA_FAIL_SIGNATURES)
+
+
+def _split_current_and_legacy_failed_jobs(
+    failed_jobs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """P2 (07-09 R3): split failed_jobs into ``(current_jobs,
+    legacy_schema_fail_count)``.
+
+    The system-status line ("最近失败 N 个") and the 九、风险事件 section
+    must share the same filtering logic so the count shown at the top
+    matches the number of items listed below. Before this helper, the
+    system-status line counted all ``failed_jobs`` (including archived
+    legacy schema-fail) while the risk-events section filtered them out,
+    producing a mismatch like "最近失败 2 个" above a 1-item list.
+
+    Returns:
+        ``(current_jobs, legacy_schema_fail_count)`` where ``current_jobs``
+        preserves the input order and ``legacy_schema_fail_count`` is the
+        number of jobs whose error_message matches a known legacy
+        schema-fail signature.
+    """
+    if not failed_jobs:
+        return [], 0
+    current = [j for j in failed_jobs if not _is_legacy_schema_fail_job(j)]
+    legacy_count = len(failed_jobs) - len(current)
+    return current, legacy_count
 
 
 def _render_recent_failures(

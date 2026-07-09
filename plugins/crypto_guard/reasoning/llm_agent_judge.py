@@ -6,7 +6,10 @@ import re
 import time
 from typing import Any, Callable
 
-from plugins.crypto_guard.reasoning.decision_schema import validate_json
+from plugins.crypto_guard.reasoning.decision_schema import (
+    normalize_entry_trigger_confirmation,
+    validate_json,
+)
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
@@ -119,7 +122,38 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     decision = _normalize_llm_decision(candidate, snapshot, fallback)
     ok, err = validate_json("ga_decision.schema.json", decision)
     if not ok:
-        # Schema validation failure — non-retryable, fail-closed
+        # Phase B/C (07-09): schema-alias repair path. The most common
+        # production failure is the LLM emitting a semantic trigger-style
+        # ``entry_trigger_confirmation.type`` (price_rejection,
+        # pullback_rejection, breakout_retest, reclaim_confirmation)
+        # instead of the schema-canonical ``closed_candle_confirmation``.
+        # When the rest of the confirmation object is complete and
+        # internally consistent, normalize the alias and re-validate.
+        # Repairable successes do NOT count toward the breaker.
+        repaired_decision, repair_notes, repair_changed = _try_repair_entry_trigger_confirmation(
+            decision, snapshot
+        )
+        if repair_changed:
+            ok2, err2 = validate_json("ga_decision.schema.json", repaired_decision)
+            if ok2:
+                breaker.record_attempt(
+                    category="llm_schema_repairable", ok=True, repairable=True,
+                )
+                repaired_decision["plan_origin"] = "llm_confirmed"
+                repaired_decision["plan_execution_state"] = "confirmed"
+                existing_notes = list(repaired_decision.get("risk_notes") or [])
+                existing_notes.extend(repair_notes)
+                repaired_decision["risk_notes"] = existing_notes
+                parse_meta = repaired_decision.get("llm_parse_meta") or {}
+                if not isinstance(parse_meta, dict):
+                    parse_meta = {}
+                if repair_notes:
+                    parse_meta["original_entry_trigger_type"] = repair_notes[0]
+                repaired_decision["llm_parse_meta"] = parse_meta
+                return apply_risk_to_decision(repaired_decision, snapshot)
+            err = err2
+            decision = repaired_decision
+        # Hard schema failure - non-retryable, fail-closed.
         breaker.record_attempt(category="llm_schema_validation_failed", ok=False)
         fallback["analysis_source"] = "deterministic_fallback"
         fallback["llm_status"] = "failed"
@@ -143,6 +177,42 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     decision["plan_execution_state"] = "confirmed"  # may be overridden by risk_gate later
     breaker.record_attempt(category=None, ok=True)
     return apply_risk_to_decision(decision, snapshot)
+
+
+def _try_repair_entry_trigger_confirmation(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], list[str], bool]:
+    """Apply alias normalization to ``trade_plan.entry_trigger_confirmation``.
+
+    Returns ``(repaired_decision, audit_notes, changed_flag)``. When the
+    decision has no trade plan, no confirmation, or the confirmation is
+    already canonical, returns ``(decision, [], False)`` and the caller
+    falls through to the hard-fail path.
+    """
+    trade_plan = decision.get("trade_plan")
+    if not isinstance(trade_plan, dict):
+        return decision, [], False
+    confirmation = trade_plan.get("entry_trigger_confirmation")
+    if confirmation is None:
+        return decision, [], False
+    decision_symbol = decision.get("symbol") or snapshot.get("symbol")
+    if not isinstance(decision_symbol, str) or not decision_symbol:
+        return decision, [], False
+    analysis_time = snapshot.get("analysis_time_utc")
+    if not isinstance(analysis_time, int) or analysis_time <= 0:
+        return decision, [], False
+    normalized, notes, changed = normalize_entry_trigger_confirmation(
+        confirmation,
+        decision_symbol=decision_symbol,
+        analysis_time_utc=analysis_time,
+    )
+    if not changed or normalized is None:
+        return decision, [], False
+    repaired = dict(decision)
+    repaired_trade_plan = dict(trade_plan)
+    repaired_trade_plan["entry_trigger_confirmation"] = normalized
+    repaired["trade_plan"] = repaired_trade_plan
+    return repaired, notes, True
 
 
 def run_agent_json_task(
@@ -612,6 +682,15 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             "entry_trigger_confirmation 必须是结构化对象（type/timeframe/event_type/direction/candle_close_time/price/source/symbol），不得使用裸字符串",
             "entry_trigger_confirmation 必须与 schema 完全匹配，字段不可省略；无法提供时设为 null",
             "entry_trigger_confirmation.symbol 必须等于顶层 decision.symbol — 禁止跨 symbol 匹配",
+            # Phase D (07-09): tighten the type contract. The schema enum
+            # only allows "closed_candle_confirmation"; alias values such
+            # as price_rejection/pullback_rejection/breakout_retest/
+            # reclaim_confirmation are LLM-invented and trigger a
+            # schema-validation failure. The semantic trigger style must
+            # be encoded in event_type/reason/evidence/risk_notes instead.
+            "entry_trigger_confirmation.type 必须恒等于 \"closed_candle_confirmation\"；禁止使用 price_rejection / pullback_rejection / breakout_retest / reclaim_confirmation 等别名",
+            "若无法提供完整 closed-candle 确认对象，请将 entry_trigger_confirmation 设为 null，不要发明 type 值",
+            "触发风格（price_rejection/pullback/breakout_retest/reclaim）请写入 event_type、reason、evidence 或 risk_notes，不要写入 type",
         ],
         "market_snapshot": _compact_snapshot(snapshot),
         "pre_score": scoring,

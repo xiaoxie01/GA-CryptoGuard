@@ -158,8 +158,8 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
                 continue
             decision_ts = _get_decision_created_ts(repo, decision_id)
             if decision_ts is not None and decision_ts < marker_ts:
-                # Pre-marker decision — demote to legacy_info, preserve visibility.
-                issue["severity"] = "legacy_info"
+                # Pre-marker decision - demote to legacy_info, preserve visibility.
+                _demote_to_legacy_info(issue)
 
     # Phase E: apply the independent semantic-accuracy marker cutoff to the
     # five new semantic checks. Decisions created before the semantic marker
@@ -175,6 +175,15 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     error_count = sum(1 for i in issues if i["severity"] == "error")
     warning_count = sum(1 for i in issues if i["severity"] == "warning")
     legacy_info_count = sum(1 for i in issues if i["severity"] == "legacy_info")
+    # Phase E (07-09): layer_counts groups issues by diagnostic layer so
+    # report renderers can surface current-batch issues separately from
+    # warning trends and legacy_audit historical records. The mapping
+    # mirrors _layer_for_severity.
+    layer_counts = {
+        "current": sum(1 for i in issues if i.get("layer") == "current"),
+        "warning": sum(1 for i in issues if i.get("layer") == "warning"),
+        "legacy_audit": sum(1 for i in issues if i.get("layer") == "legacy_audit"),
+    }
 
     summary = {
         HOURLY_REPORT_INCOMPLETE_BATCH: _count(issues, HOURLY_REPORT_INCOMPLETE_BATCH),
@@ -212,6 +221,7 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
+        "layer_counts": layer_counts,
     }
     return {
         "ok": error_count == 0,
@@ -221,6 +231,7 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
+        "layer_counts": layer_counts,
     }
 
 
@@ -374,7 +385,7 @@ def _apply_continuity_marker_cutoff(repo: CryptoGuardRepository, issues: list[di
         else:
             decision_ts = _get_decision_created_ts(repo, decision_id)
         if decision_ts is not None and decision_ts < marker_ts:
-            issue["severity"] = "legacy_info"
+            _demote_to_legacy_info(issue)
 
 
 def _apply_semantic_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
@@ -408,7 +419,7 @@ def _apply_semantic_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict
         else:
             decision_ts = _get_decision_created_ts(repo, decision_id)
         if decision_ts is not None and decision_ts < marker_ts:
-            issue["severity"] = "legacy_info"
+            _demote_to_legacy_info(issue)
 
 
 def _get_decision_created_ts(repo: CryptoGuardRepository, decision_id: int | None) -> str | None:
@@ -444,7 +455,32 @@ def _count(issues: list[dict[str, Any]], code: str) -> int:
 
 
 def _issue(code: str, severity: str, details: dict[str, Any], action: str) -> dict[str, Any]:
-    return {"type": code, "severity": severity, "details": details, "suggested_action": action}
+    # Phase E (07-09): surface a ``layer`` field so report renderers can
+    # group issues into current / warning / legacy_audit buckets. The
+    # mapping is derived from ``severity`` (which is already demoted to
+    # ``legacy_info`` by the marker cutoff functions for pre-marker rows).
+    return {
+        "type": code,
+        "severity": severity,
+        "layer": _layer_for_severity(severity),
+        "details": details,
+        "suggested_action": action,
+    }
+
+
+def _layer_for_severity(severity: str) -> str:
+    """Map a severity value to its diagnostic layer bucket."""
+    if severity == "legacy_info":
+        return "legacy_audit"
+    if severity == "warning":
+        return "warning"
+    return "current"
+
+
+def _demote_to_legacy_info(issue: dict[str, Any]) -> None:
+    """Demote an issue's severity to legacy_info and refresh its layer."""
+    issue["severity"] = "legacy_info"
+    issue["layer"] = "legacy_audit"
 
 
 def _check_hourly_report_incomplete_batch(repo: CryptoGuardRepository, batch_id: str | None) -> list[dict[str, Any]]:

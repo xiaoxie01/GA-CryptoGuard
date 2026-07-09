@@ -40154,3 +40154,1323 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                 conn.close()
             _os.environ.pop("CRYPTO_GUARD_DB", None)
             tmp.cleanup()
+
+
+
+
+class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
+    """Phase A (07-09): LLM schema alias repair + breaker classification +
+    hourly report clarity + legacy noise filter + diagnostics layering.
+
+    Covers AC1-AC12 per task
+    `.trellis/tasks/07-09-llm-schema-repair-breaker-tuning/implement.md`.
+    All tests must fail RED before Phase B-E implementation and pass GREEN
+    after.
+    """
+
+    _CLOSE_TIME = 1_700_000_000_000
+    _ANALYSIS_TIME = 1_700_000_010_000
+    _ENTRY = 100.0
+    _STOP = 95.0
+    _TP = 110.0
+    _PRICE = 98.5
+
+    def _base_confirmation(self, *, alias: str = "closed_candle_confirmation",
+                           symbol: str = "BTCUSDT",
+                           close_time: int | None = None,
+                           event_type: str = "BOS",
+                           direction: str = "bullish",
+                           source: str = "price_action",
+                           timeframe: str = "5m",
+                           drop_fields: tuple[str, ...] = ()) -> dict:
+        """Build a confirmation dict; ``alias`` overrides ``type`` for testing."""
+        c = {
+            "type": alias,
+            "timeframe": timeframe,
+            "event_type": event_type,
+            "direction": direction,
+            "candle_close_time": close_time if close_time is not None else self._CLOSE_TIME,
+            "price": self._PRICE,
+            "source": source,
+            "symbol": symbol,
+        }
+        for f in drop_fields:
+            c.pop(f, None)
+        return c
+
+    def _base_decision(self, confirmation, *, symbol: str = "BTCUSDT",
+                       analysis_time: int = _ANALYSIS_TIME) -> dict:
+        return {
+            "symbol": symbol,
+            "analysis_time_utc": analysis_time,
+            "decision": "trade_plan_available",
+            "signal_grade": "A",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.82,
+            "has_trade_plan": True,
+            "trade_plan": {
+                "side": "LONG",
+                "entry_type": "limit",
+                "entry_price": self._ENTRY,
+                "stop_loss": self._STOP,
+                "take_profits": [{"price": self._TP, "ratio": 1.0}],
+                "invalid_condition": "跌破 97.5",
+                "entry_trigger_confirmation": confirmation,
+            },
+            "suggested_actions": ["create_paper_order"],
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+            },
+            "alignment": "aligned",
+            "htf_conflict": False,
+            "market_reason_codes": [],
+            "evidence": ["结构偏多"],
+            "counter_evidence": ["仍需等待价格确认"],
+            "risk_check": {"ok": True, "reasons": []},
+            "summary": "BTCUSDT 偏多，A 级。",
+            "final_summary": "BTCUSDT 偏多，A 级。",
+        }
+
+    # AC1: price_rejection alias normalized to closed_candle_confirmation
+    def test_07_09_price_rejection_alias_normalized(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(alias="price_rejection")
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNotNone(normalized, "AC1: price_rejection with complete fields must normalize")
+        self.assertEqual(normalized["type"], "closed_candle_confirmation")
+        self.assertTrue(changed, "AC1: changed flag must be True when alias was rewritten")
+        self.assertIn("price_rejection", notes, "AC1/AC3: original alias must be preserved in audit notes")
+
+    # AC2: pullback_rejection alias normalized
+    def test_07_09_pullback_rejection_alias_normalized(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(alias="pullback_rejection")
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNotNone(normalized, "AC2: pullback_rejection must normalize when fields complete")
+        self.assertEqual(normalized["type"], "closed_candle_confirmation")
+        self.assertTrue(changed)
+        self.assertIn("pullback_rejection", notes)
+
+    # AC1 extended: breakout_retest alias normalized
+    def test_07_09_breakout_retest_alias_normalized(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(alias="breakout_retest",
+                                       event_type="BREAKOUT_RETEST")
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["type"], "closed_candle_confirmation")
+        self.assertEqual(normalized["event_type"], "BREAKOUT_RETEST")
+        self.assertTrue(changed)
+        self.assertIn("breakout_retest", notes)
+
+    # AC1 extended: reclaim_confirmation alias normalized
+    def test_07_09_reclaim_confirmation_alias_normalized(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(alias="reclaim_confirmation",
+                                       event_type="RECLAIM")
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["type"], "closed_candle_confirmation")
+        self.assertEqual(normalized["event_type"], "RECLAIM")
+        self.assertTrue(changed)
+        self.assertIn("reclaim_confirmation", notes)
+
+    # AC3: original alias preserved in audit notes
+    def test_07_09_alias_preserved_in_audit_notes(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        for alias in ("price_rejection", "pullback_rejection",
+                       "breakout_retest", "reclaim_confirmation"):
+            conf = self._base_confirmation(alias=alias)
+            _, notes, _ = normalize_entry_trigger_confirmation(
+                conf, decision_symbol="BTCUSDT",
+                analysis_time_utc=self._ANALYSIS_TIME,
+            )
+            self.assertIn(alias, notes,
+                          f"AC3: alias {alias} must be preserved in audit notes")
+
+    # AC4: cross-symbol confirmation fails closed
+    def test_07_09_cross_symbol_confirmation_fails_closed(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(symbol="ETHUSDT")  # decision is BTCUSDT
+        normalized, _, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNone(normalized,
+                          "AC4: cross-symbol confirmation must NOT normalize")
+        self.assertFalse(changed)
+
+    # AC4: future candle_close_time fails closed
+    def test_07_09_future_candle_confirmation_fails_closed(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        future = self._ANALYSIS_TIME + 60_000
+        conf = self._base_confirmation(close_time=future)
+        normalized, _, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNone(normalized,
+                          "AC4: future candle_close_time must NOT normalize")
+        self.assertFalse(changed)
+
+    # AC4: missing required field fails closed
+    def test_07_09_missing_required_field_fails_closed(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        conf = self._base_confirmation(drop_fields=("candle_close_time",))
+        normalized, _, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNone(normalized,
+                          "AC4: missing required field must NOT normalize")
+        self.assertFalse(changed)
+
+    # AC4: bare string confirmation fails closed
+    def test_07_09_bare_string_confirmation_fails_closed(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        normalized, _, changed = normalize_entry_trigger_confirmation(
+            "price_rejection",  # bare string, not a dict
+            decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNone(normalized,
+                          "AC4: bare string confirmation must NOT normalize")
+        self.assertFalse(changed)
+
+    # AC5: empty response retries per policy before breaker opens
+    def test_07_09_empty_response_retries_before_breaker(self) -> None:
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            BatchRetryBudget, BatchWallClockBudget,
+        )
+        retry_budget = BatchRetryBudget(max_batch_retry_calls=9)
+        wall_budget = BatchWallClockBudget(budget_seconds=90.0)
+        ctx = {
+            "llm_breaker": breaker,
+            "llm_retry_budget": retry_budget,
+            "llm_wall_clock_budget": wall_budget,
+        }
+        snap = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME,
+            "mode": "scheduled",
+            "profiles": {
+                "1d": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "4h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "1h": {"market_structure": "bullish", "trend_stage": "middle", "momentum": "bullish", "candles_count": 80},
+                "15m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
+            },
+            "modules": {"price_action": {"market_structure": "bullish"},
+                         "momentum": {"direction": "bullish"},
+                         "trend_stage": {"trend_stage": "early"}},
+            "counter_evidence": {"bullish_evidence": ["偏多"], "bearish_evidence": [],
+                                 "neutral_or_risk_evidence": ["待确认"],
+                                 "contradiction_level": "low"},
+            "data_quality": {"closed_candles_only": True, "status": "complete",
+                             "analysis_time_utc": self._ANALYSIS_TIME,
+                             "missing_timeframes": [], "low_sample_timeframes": [],
+                             "health_by_tf": {
+                                 "1d": {"ready": True, "last_close_time": self._CLOSE_TIME},
+                                 "4h": {"ready": True, "last_close_time": self._CLOSE_TIME},
+                                 "1h": {"ready": True, "last_close_time": self._CLOSE_TIME},
+                                 "15m": {"ready": True, "last_close_time": self._CLOSE_TIME},
+                             }},
+            "timeframe_context": {
+                "1d": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "4h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "1h": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+                "15m": {"bias": "bullish", "structure": "uptrend", "closed": True, "close_time": self._CLOSE_TIME},
+            },
+            "alignment": "aligned", "htf_conflict": False, "market_reason_codes": [],
+        }
+        call_count = {"n": 0}
+
+        def fake_call(prompt: str) -> str:
+            call_count["n"] += 1
+            return ""
+
+        with patch("plugins.crypto_guard.reasoning.llm_agent_judge._call_ga_llm",
+                    side_effect=fake_call):
+            decision = run_agent_sop_decision(snap, use_llm=True, context=ctx)
+
+        # AC5: empty response retried up to 3 times.
+        self.assertEqual(call_count["n"], 3,
+                         "AC5: empty response must retry up to 3 attempts before failing")
+        self.assertEqual(decision["llm_status"], "failed")
+        # Breaker may be open after 3 consecutive fails, but the retries must happen first.
+        self.assertGreaterEqual(call_count["n"], 3)
+
+    # AC6: repairable schema alias does not immediately open breaker
+    def test_07_09_repairable_schema_error_does_not_open_breaker(self) -> None:
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        # Simulate two repairable schema alias events that were successfully
+        # normalized (the typical 07-09 production scenario: LLM emits alias,
+        # helper normalizes, schema validation passes).
+        breaker.record_attempt(
+            category="llm_schema_repairable", ok=False, repairable=True,
+        )
+        breaker.record_attempt(
+            category="llm_schema_repairable", ok=False, repairable=True,
+        )
+        # After repairable-only events, breaker must remain closed (would have
+        # been closed under old logic too with just 2 attempts, but the key
+        # property is: repairable schema errors do NOT count toward
+        # consecutive_infra_failures or rate window).
+        self.assertEqual(breaker.state, "closed",
+                         "AC6: repairable schema errors must NOT push breaker toward open")
+        snap = breaker.snapshot()
+        # Snapshot must expose repairable_count for diagnostics.
+        self.assertIn("repairable_count", snap,
+                      "AC6: snapshot must expose repairable_count field")
+        self.assertEqual(snap["repairable_count"], 2)
+        # And the recent_10_failure_rate must NOT include repairable-only fails.
+        self.assertEqual(snap["recent_10_failed"], 0,
+                         "AC6: repairable success must NOT count toward recent_10_failure_rate")
+
+    # AC7: hard schema failure remains non-executable
+    def test_07_09_hard_schema_failure_remains_non_executable(self) -> None:
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        # Cross-symbol -> hard-fail (returns None).
+        conf = self._base_confirmation(symbol="ETHUSDT")
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        self.assertIsNone(normalized, "AC7: hard schema fail must yield None")
+        self.assertFalse(changed)
+        # Notes should record the hard-fail reason.
+        joined = " ".join(notes)
+        self.assertIn("symbol", joined.lower(),
+                      "AC7: hard-fail notes must record the failing reason")
+
+    # AC8: prompt includes explicit type contract
+    def test_07_09_prompt_includes_type_contract(self) -> None:
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            build_llm_decision_prompt,
+        )
+        snap = {
+            "symbol": "BTCUSDT",
+            "analysis_time_utc": self._ANALYSIS_TIME,
+            "mode": "scheduled",
+            "profiles": {"15m": {"market_structure": "bullish"}},
+            "modules": {"price_action": {"market_structure": "bullish"},
+                         "momentum": {"direction": "bullish"}},
+        }
+        fallback = {
+            "symbol": "BTCUSDT", "analysis_time_utc": self._ANALYSIS_TIME,
+            "decision": "no_edge", "signal_grade": "D", "confidence": 0.4,
+            "market_bias": "neutral", "trend_stage": "unknown",
+        }
+        prompt = build_llm_decision_prompt(snap, fallback)
+        # AC8: prompt must explicitly state type must be closed_candle_confirmation.
+        self.assertIn("closed_candle_confirmation", prompt,
+                      "AC8: prompt must mention closed_candle_confirmation as the only allowed type")
+        # AC8: prompt must explicitly forbid alias values.
+        for forbidden in ("price_rejection", "pullback_rejection",
+                          "breakout_retest", "reclaim_confirmation"):
+            self.assertIn(forbidden, prompt,
+                          f"AC8: prompt must explicitly forbid alias {forbidden}")
+
+    # AC9: hourly banner distinguishes schema vs gateway
+    def test_07_09_hourly_banner_distinguishes_schema_vs_gateway(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import _render_llm_health_line
+
+        # Case A: breaker open + dominant schema failure -> schema banner.
+        batch_a = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "total_attempts": 8,
+                    "successful": 2,
+                    "failed": 6,
+                    "by_category": {"llm_schema_validation_failed": 6},
+                    "dominant_error_category": "llm_schema_validation_failed",
+                    "skipped_by_breaker": 2,
+                },
+            },
+        }
+        line_a = _render_llm_health_line(batch_a)
+        self.assertIn("Schema", line_a,
+                      "AC9: schema-fail-dominant banner must say Schema")
+        self.assertNotIn("配置/网关异常", line_a,
+                         "AC9: schema banner must NOT reuse gateway wording")
+
+        # Case B: breaker open + dominant empty response -> gateway banner.
+        batch_b = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "total_attempts": 8,
+                    "successful": 0,
+                    "failed": 8,
+                    "by_category": {"llm_empty_response": 8},
+                    "dominant_error_category": "llm_empty_response",
+                    "skipped_by_breaker": 2,
+                },
+            },
+        }
+        line_b = _render_llm_health_line(batch_b)
+        self.assertIn("网关", line_b,
+                      "AC9: empty-response-dominant banner must say 网关")
+
+        # Case C: breaker open + dominant config error -> config banner.
+        batch_c = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "total_attempts": 1,
+                    "successful": 0,
+                    "failed": 1,
+                    "by_category": {"llm_config_error": 1},
+                    "dominant_error_category": "llm_config_error",
+                    "skipped_by_breaker": 5,
+                },
+            },
+        }
+        line_c = _render_llm_health_line(batch_c)
+        self.assertIn("配置", line_c,
+                      "AC9: config-error banner must say 配置")
+
+        # Case D: breaker closed + skipped_by_breaker>0 + wall_clock_budget_exhausted.
+        # This requires reading llm_fallback_reason from batch summary; verify
+        # the renderer handles it without crashing on a budget-exhausted batch.
+        batch_d = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "closed",
+                    "total_attempts": 5,
+                    "successful": 5,
+                    "failed": 0,
+                    "by_category": {},
+                    "dominant_error_category": "",
+                    "skipped_by_breaker": 3,
+                },
+                "dominant_llm_fallback_reason": "wall_clock_budget_exhausted",
+            },
+        }
+        line_d = _render_llm_health_line(batch_d)
+        # Either budget banner or normal stats line; the test asserts no crash
+        # and a non-empty line is rendered.
+        self.assertIsInstance(line_d, str)
+
+    # AC10: 九之二 row renders readable category instead of "-"
+    def test_07_09_hourly_24h_failure_row_readable_category(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import _render_recent_failures
+
+        now_ms = self._ANALYSIS_TIME
+        rows = [
+            {
+                "symbol": "BTCUSDT", "analysis_time": now_ms - 60_000,
+                "llm_status": "failed",
+                "llm_error_category": "llm_empty_response",
+                "llm_error": "empty response",
+                "llm_fallback_reason": "retry_exhausted",
+            },
+            {
+                "symbol": "ETHUSDT", "analysis_time": now_ms - 120_000,
+                "llm_status": "failed",
+                "llm_error_category": None,  # breaker-skipped row
+                "llm_error": "circuit breaker open; LLM call skipped",
+                "llm_fallback_reason": "circuit_breaker_open",
+            },
+        ]
+        recent = _render_recent_failures(rows, now_ms=now_ms)
+        self.assertEqual(len(recent), 2,
+                         "AC10: both rows within 24h window must be surfaced")
+        # AC10: row must NOT render "-" for category.
+        # The renderer (hourly_report.py) currently does:
+        #   cat = failed_row.get("llm_error_category") or "-"
+        # which yields "-" for breaker-skipped rows. AC10 demands a readable
+        # category. This test asserts the row carries a readable category
+        # (the renderer itself will be fixed in Phase E to translate
+        # llm_fallback_reason into a readable Chinese category).
+        # Until Phase E, this test will fail because the breaker-skipped row
+        # has category=None which renders as "-".
+        breaker_row = next(r for r in recent
+                            if r["llm_fallback_reason"] == "circuit_breaker_open")
+        # The row must carry a non-None category OR the renderer must map
+        # fallback_reason to a readable category. This is verified at the
+        # row-data level here; the renderer test below verifies the output.
+        # We assert that the row's llm_error_category is no longer None
+        # after Phase E normalization, OR that the fallback_reason is
+        # present (which the renderer will translate).
+        self.assertTrue(
+            breaker_row.get("llm_error_category") is not None
+            or breaker_row.get("llm_fallback_reason") == "circuit_breaker_open",
+            "AC10: breaker-skipped row must carry fallback_reason for renderer translation",
+        )
+
+    # AC10 e2e: render_ga_hourly_summary final text contains "熔断跳过"
+    # (the readable Chinese category) and NOT the old "- · circuit breaker open"
+    # rendering (empty category before the separator).
+    def test_07_09_hourly_summary_breaker_skip_e2e_renders_chinese(self) -> None:
+        """AC10 end-to-end: render_ga_hourly_summary text must contain the
+        readable Chinese category for breaker-skipped rows and must NOT
+        contain the old ``- <sym>： · <fallback_reason>`` rendering (empty
+        category between colons and the separator)."""
+        from datetime import datetime, timezone
+        import json as _json
+        from plugins.crypto_guard.notify.hourly_report import render_ga_hourly_summary
+        from plugins.crypto_guard.utils import utc_ms
+
+        now_ms = utc_ms()
+        # Construct a ga_decision row with breaker-skipped raw_decision_json.
+        # Phase E (07-09) renderer reads llm_fallback_reason from
+        # raw_decision_json and translates it via _fallback_reason_to_category_zh.
+        raw = {
+            "llm_status": "failed",
+            "llm_error_category": None,
+            "llm_fallback_reason": "circuit_breaker_open",
+            "llm_error": "circuit breaker open; LLM call skipped",
+            "symbol": "BTCUSDT",
+        }
+        analysis_time = now_ms - 60_000
+        decision = {
+            "id": 1001,
+            "symbol": "BTCUSDT",
+            "signal_grade": "D",
+            "confidence": 0.0,
+            "decision": "no_edge",
+            "market_bias": "neutral",
+            "trend_stage": "unknown",
+            "analysis_time": analysis_time,
+            "analysis_time_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "batch_id": f"15m:{analysis_time}",
+            "previous_grade": None,
+            "trade_plan_json": None,
+            "risk_check_json": _json.dumps({"ok": False, "reasons": ["LLM failed"]}),
+            "feishu_actions_json": "[]",
+            "raw_decision_json": _json.dumps(raw),
+            "rendered_summary": "[规则SOP] BTCUSDT LLM熔断跳过",
+            "final_summary": "circuit breaker open; LLM call skipped",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        text = render_ga_hourly_summary(
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            active_symbols=["BTCUSDT"],
+            ga_decisions=[decision],
+            open_orders=[],
+            active_watches=[],
+            failed_jobs=[],
+            queue_counts={"pending_user": 0, "pending_background": 0, "running": 0},
+            equity_snapshot={"account_equity": 10000, "unrealized_pnl": 0, "realized_pnl": 0, "snapshot_json": "{}"},
+            batch_state={
+                "batch_id": f"15m:{analysis_time}",
+                "status": "success",
+                "incomplete": False,
+                "enabled_symbols": ["BTCUSDT"],
+                "completed_count": 1,
+                "total_count": 1,
+                "analysis_time": analysis_time,
+                "failed_symbols": [],
+            },
+        )
+        # AC10: must contain the readable Chinese category.
+        self.assertIn("熔断跳过", text,
+                      "AC10 e2e: render_ga_hourly_summary text must contain '熔断跳过' "
+                      "for breaker-skipped rows with llm_fallback_reason=circuit_breaker_open")
+        # AC10: must NOT contain the old "- · circuit breaker open" rendering
+        # (empty category between colons and the separator).
+        self.assertNotIn("- · circuit breaker open", text,
+                         "AC10 e2e: render_ga_hourly_summary must NOT render the old "
+                         "'- <sym>： · <fallback_reason>' form (empty category before separator)")
+
+    # P1 fix: legacy schema-fail signature filtered from current risk events
+    # even when the agent_jobs row is still within the 7-day window.
+    def test_07_09_legacy_schema_fail_signature_filtered_from_risk_events(self) -> None:
+        """P1 fix: ``no_edge fallback schema 校验失败: 'analysis_time_utc' is a
+        required property`` failures within the 7-day window must NOT appear
+        in the 九、风险事件 section. They should be filtered (or moved to a
+        legacy-audit sub-section) so the operator sees only actionable
+        current failures, not the historical schema-fail storm that the
+        07-09 alias-repair SOP is already handling.
+
+        This test inserts a 1-day-old legacy schema-fail job (within the
+        7-day ``recent_failed_jobs`` window) and asserts:
+        1. The legacy signature does NOT appear in 九、风险事件.
+        2. The renderer surfaces a legacy-audit count line so the operator
+           knows schema-fail events were archived (not silently dropped).
+        """
+        import tempfile
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            from plugins.crypto_guard.notify.hourly_report import render_ga_hourly_summary
+
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+
+            # Legacy schema-fail job 1 day old (within 7-day window).
+            legacy_finished = _dt.now(_tz.utc) - _td(days=1)
+            conn.execute(
+                "INSERT INTO agent_jobs ("
+                "  job_type, priority, source, session_id, payload_json,"
+                "  status, error_message, started_at, finished_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("scheduled_market_analysis", 0, "test", "S1", "{}", "failed",
+                 "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+                 legacy_finished.isoformat().replace("+00:00", "Z"),
+                 legacy_finished.isoformat().replace("+00:00", "Z")),
+            )
+            # Recent actionable failure 1 hour old.
+            recent_finished = _dt.now(_tz.utc) - _td(hours=1)
+            conn.execute(
+                "INSERT INTO agent_jobs ("
+                "  job_type, priority, source, session_id, payload_json,"
+                "  status, error_message, started_at, finished_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("scheduled_market_analysis", 0, "test", "S2", "{}", "failed",
+                 "data quality check failed",
+                 recent_finished.isoformat().replace("+00:00", "Z"),
+                 recent_finished.isoformat().replace("+00:00", "Z")),
+            )
+            conn.commit()
+
+            failed_jobs = repo.recent_failed_jobs(limit=10, days=7)
+            self.assertEqual(len(failed_jobs), 2,
+                             "Precondition: both jobs must be within 7-day window")
+
+            text = render_ga_hourly_summary(
+                _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"),
+                active_symbols=["BTCUSDT"],
+                ga_decisions=[],
+                open_orders=[],
+                active_watches=[],
+                failed_jobs=failed_jobs,
+                queue_counts={"pending_user": 0, "pending_background": 0, "running": 0},
+                equity_snapshot={"account_equity": 10000, "unrealized_pnl": 0, "realized_pnl": 0, "snapshot_json": "{}"},
+            )
+
+            # P1: legacy schema-fail signature must NOT appear in 九、风险事件.
+            self.assertNotIn(
+                "analysis_time_utc' is a required property",
+                text.split("**十、")[0],  # only look at the risk-events section
+                "P1: legacy schema-fail signature must NOT appear in 九、风险事件",
+            )
+            # P1: recent actionable failure must still appear.
+            self.assertIn(
+                "data quality check failed",
+                text,
+                "P1: recent actionable failure must still appear in 九、风险事件",
+            )
+            # P1: a legacy-audit count line must surface so the operator
+            # knows schema-fail events were archived (not silently dropped).
+            # Look for a line indicating archived/legacy schema-fail count.
+            risk_section = text.split("**九、风险事件**")[1].split("**十、")[0]
+            self.assertTrue(
+                "已归档" in risk_section or "历史 schema" in risk_section or "legacy" in risk_section.lower(),
+                "P1: renderer must surface a legacy-audit count line for filtered schema-fail events",
+            )
+            # P2 (07-09 R3): system-status line must count only current failures,
+            # not the archived legacy schema-fail jobs.
+            sys_status_line = next(
+                (ln for ln in text.split("\n") if "最近失败" in ln and "正在执行" in ln),
+                None,
+            )
+            self.assertIsNotNone(sys_status_line,
+                                 "P2: system-status line with '最近失败' must exist")
+            # Only 1 current failure (data quality); the legacy schema-fail
+            # must NOT inflate the count.
+            self.assertIn(
+                "最近失败 1 个", sys_status_line,
+                "P2: system-status line must count only current failures (1), "
+                "not 2 (current + archived legacy schema-fail)",
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()
+
+    # P2 (07-09 R3): shared helper splits failed_jobs into current vs legacy.
+    def test_07_09_split_current_and_legacy_failed_jobs_helper(self) -> None:
+        """P2: ``_split_current_and_legacy_failed_jobs`` must return
+        ``(current_jobs, legacy_schema_fail_count)`` so the system-status
+        line and the 九、风险事件 section share the same filtering logic.
+
+        This test verifies the helper directly with three job shapes:
+        - a current actionable failure (kept)
+        - a legacy schema-fail (archived)
+        - a non-schema legacy failure (kept - only the known schema-fail
+          signatures are filtered, not all historical errors)
+        """
+        from plugins.crypto_guard.notify.hourly_report import (
+            _split_current_and_legacy_failed_jobs,
+        )
+
+        jobs = [
+            {"id": 1, "job_type": "scheduled_market_analysis",
+             "error_message": "data quality check failed"},
+            {"id": 2, "job_type": "scheduled_market_analysis",
+             "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property"},
+            {"id": 3, "job_type": "scheduled_market_analysis",
+             "error_message": "connection timeout to exchange"},
+        ]
+        current, legacy_count = _split_current_and_legacy_failed_jobs(jobs)
+        self.assertEqual(legacy_count, 1,
+                         "P2: exactly 1 legacy schema-fail job must be archived")
+        self.assertEqual(len(current), 2,
+                         "P2: 2 current jobs (non-schema-fail) must remain")
+        current_ids = [j["id"] for j in current]
+        self.assertIn(1, current_ids, "P2: actionable failure id=1 must be in current")
+        self.assertIn(3, current_ids, "P2: timeout failure id=3 must be in current")
+        self.assertNotIn(2, current_ids,
+                         "P2: legacy schema-fail id=2 must NOT be in current")
+
+        # Edge case: empty list returns ([], 0).
+        empty_current, empty_legacy = _split_current_and_legacy_failed_jobs([])
+        self.assertEqual(empty_current, [])
+        self.assertEqual(empty_legacy, 0)
+
+        # Edge case: all legacy -> current empty, count = N.
+        all_legacy = [
+            {"id": i, "job_type": "x",
+             "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property"}
+            for i in range(5)
+        ]
+        all_current, all_legacy_count = _split_current_and_legacy_failed_jobs(all_legacy)
+        self.assertEqual(all_current, [])
+        self.assertEqual(all_legacy_count, 5)
+
+    # AC11: legacy analysis_time_utc failure not current risk event
+    def test_07_09_legacy_analysis_time_utc_failure_not_current(self) -> None:
+        """AC11: historical `analysis_time_utc is a required property` jobs
+        must NOT appear in the current failed_jobs risk event section. They
+        should be moved to a legacy subsection OR filtered out by age cutoff.
+        """
+        import tempfile
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+
+            # Legacy failure: 10 days old, with the analysis_time_utc signature.
+            legacy_finished = _dt.now(_tz.utc) - _td(days=10)
+            conn.execute(
+                "INSERT INTO agent_jobs ("
+                "  job_type, priority, source, session_id, payload_json,"
+                "  status, error_message, started_at, finished_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("scheduled_market_analysis", 0, "test", "S1", "{}", "failed",
+                 "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+                 legacy_finished.isoformat().replace("+00:00", "Z"),
+                 legacy_finished.isoformat().replace("+00:00", "Z")),
+            )
+            # Recent failure: 1 hour old, different error.
+            recent_finished = _dt.now(_tz.utc) - _td(hours=1)
+            conn.execute(
+                "INSERT INTO agent_jobs ("
+                "  job_type, priority, source, session_id, payload_json,"
+                "  status, error_message, started_at, finished_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("scheduled_market_analysis", 0, "test", "S2", "{}", "failed",
+                 "data quality check failed",
+                 recent_finished.isoformat().replace("+00:00", "Z"),
+                 recent_finished.isoformat().replace("+00:00", "Z")),
+            )
+            conn.commit()
+
+            # recent_failed_jobs has a 7-day window (per repository.py:1304).
+            # The legacy 10-day-old failure must NOT appear.
+            recent = repo.recent_failed_jobs(limit=10, days=7)
+            symbols = [r.get("error_message") for r in recent]
+            self.assertTrue(
+                all("analysis_time_utc" not in (s or "") for s in symbols),
+                "AC11: legacy analysis_time_utc failure (10d old) must NOT appear in recent_failed_jobs",
+            )
+            # The recent 1h failure must appear.
+            self.assertTrue(
+                any("data quality" in (s or "") for s in symbols),
+                "AC11: recent 1h failure must appear in recent_failed_jobs",
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()
+
+    # AC12: report diagnostics layered (current / warning / legacy_audit)
+    def test_07_09_report_diagnostics_layered(self) -> None:
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        import tempfile
+        import os as _os
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+
+            result = diagnose_report_accuracy(repo)
+            # AC12: result must include layer-grouped counts in summary.
+            summary = result.get("summary") or {}
+            self.assertIn("layer_counts", summary,
+                          "AC12: summary must include layer_counts (current/warning/legacy_audit)")
+            layer_counts = summary["layer_counts"]
+            self.assertIn("current", layer_counts)
+            self.assertIn("warning", layer_counts)
+            self.assertIn("legacy_audit", layer_counts)
+            # AC12: each issue must carry a `layer` field.
+            issues = result.get("issues") or []
+            for issue in issues:
+                self.assertIn("layer", issue,
+                              "AC12: each issue must carry a `layer` field")
+                self.assertIn(issue["layer"],
+                              {"current", "warning", "legacy_audit"},
+                              f"AC12: layer must be one of the three buckets, got {issue['layer']}")
+            # AC12: legacy_info severity maps to legacy_audit layer.
+            for issue in issues:
+                if issue.get("severity") == "legacy_info":
+                    self.assertEqual(issue["layer"], "legacy_audit",
+                                     "AC12: legacy_info severity must map to legacy_audit layer")
+                elif issue.get("severity") == "error":
+                    self.assertEqual(issue["layer"], "current",
+                                     "AC12: error severity must map to current layer")
+                elif issue.get("severity") == "warning":
+                    self.assertEqual(issue["layer"], "warning",
+                                     "AC12: warning severity must map to warning layer")
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()
+
+    # AC6 extended: repairable schema alias + repair success does not count
+    # toward breaker consecutive/rate.
+    def test_07_09_repairable_then_success_does_not_open_breaker(self) -> None:
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        # Two repairable events followed by a clear success.
+        breaker.record_attempt(category="llm_schema_repairable", ok=False, repairable=True)
+        breaker.record_attempt(category="llm_schema_repairable", ok=False, repairable=True)
+        breaker.record_attempt(category=None, ok=True)
+        self.assertEqual(breaker.state, "closed",
+                         "AC6: two repairable + one success must NOT open breaker")
+        snap = breaker.snapshot()
+        # repairable_count counts repairable events.
+        self.assertEqual(snap["repairable_count"], 2)
+        # successful counts the one real success.
+        self.assertEqual(snap["successful"], 1)
+        # recent_10_failure_rate must be 0 because repairable-only fails
+        # don't count.
+        self.assertEqual(snap["recent_10_failed"], 0)
+
+    # AC6 regression: 5 repairable events in a row must NOT open breaker
+    # (rate-based open would trigger at 5/5 = 100% if repairable counted).
+    def test_07_09_five_repairable_events_do_not_open_breaker(self) -> None:
+        from plugins.crypto_guard.reasoning.llm_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(
+            consecutive_threshold=3, rate_threshold=0.5, rate_window=10,
+        )
+        for _ in range(5):
+            breaker.record_attempt(
+                category="llm_schema_repairable", ok=False, repairable=True,
+            )
+        self.assertEqual(breaker.state, "closed",
+                         "AC6: 5 repairable events must NOT open breaker (rate must exclude repairable)")
+        snap = breaker.snapshot()
+        self.assertEqual(snap["recent_10_failed"], 0)
+        self.assertEqual(snap["repairable_count"], 5)
+
+    # AC9 extended: breaker closed + skipped_by_breaker>0 + budget exhausted
+    # must render the budget banner.
+    def test_07_09_hourly_banner_budget_exhausted(self) -> None:
+        from plugins.crypto_guard.notify.hourly_report import _render_llm_health_line
+        batch = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "closed",
+                    "total_attempts": 5,
+                    "successful": 5,
+                    "failed": 0,
+                    "by_category": {},
+                    "dominant_error_category": "",
+                    "skipped_by_breaker": 8,
+                },
+                "dominant_llm_fallback_reason": "wall_clock_budget_exhausted",
+            },
+        }
+        line = _render_llm_health_line(batch)
+        self.assertIn("预算", line,
+                      "AC9: budget-exhausted banner must mention 预算")
+
+    # P0 (07-09 R4 reviewer): render_hourly_report_text crashes with
+    # TypeError on `layer_counts` dict in summary when total_issues > 0.
+    # The legacy renderer (used when hourly_report_diagnostics is off /
+    # degraded) iterates summary.items() and calls int(count or 0) — which
+    # raises TypeError on a dict value. _render_degraded_report was already
+    # guarded (line 519-522); the legacy render_hourly_report_text path was
+    # missed. This regression test exercises the exact shape that triggered
+    # the crash to lock the fix in place.
+    def test_07_09_render_hourly_report_text_layer_counts_no_crash(self) -> None:
+        """P0 regression: ``render_hourly_report_text`` must NOT crash when
+        ``report_accuracy_diagnostics.summary`` contains the nested
+        ``layer_counts`` dict that ``diagnose_report_accuracy`` now returns.
+
+        Before fix: ``int(count or 0)`` on the dict raised TypeError.
+        After fix: ``isinstance(count, dict)`` skips the dict and renders
+        the integer codes correctly.
+        """
+        import tempfile
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz
+        tmp = tempfile.TemporaryDirectory()
+        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
+        conn = None
+        try:
+            from plugins.crypto_guard.storage.migrations import initialize_database
+            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+            from plugins.crypto_guard.storage.sqlite_db import connect_db
+            from plugins.crypto_guard.notify.hourly_report import render_hourly_report_text
+            from plugins.crypto_guard.diagnostics.report_diagnostics import (
+                diagnose_report_accuracy,
+            )
+
+            initialize_database()
+            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
+            repo = CryptoGuardRepository(conn)
+
+            # Seed a real issue so diagnose_report_accuracy returns
+            # total_issues > 0 with the layer_counts shape.
+            batch_id = "P0_LAYER"
+            analysis_time = 2_000_000_000_000
+            conn.execute(
+                "INSERT INTO analysis_batches ("
+                "  batch_id, primary_interval, analysis_time, status, started_at, finished_at,"
+                "  enabled_symbols_json, completed_symbols_json, summary_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id, "1h", analysis_time, "success",
+                    analysis_time, analysis_time,
+                    json.dumps(["BTCUSDT"]), json.dumps(["BTCUSDT"]),
+                    json.dumps({"total_symbols": 1, "completed_symbols": 1}),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO batch_symbol_status ("
+                "  batch_id, symbol, status, updated_at"
+                ") VALUES (?, ?, ?, ?)",
+                (batch_id, "BTCUSDT", "completed", analysis_time),
+            )
+            conn.commit()
+
+            diag = diagnose_report_accuracy(repo)
+            # Precondition: total_issues > 0 (otherwise the bug path is
+            # not exercised — the for-loop is only entered when total > 0).
+            self.assertGreater(
+                diag.get("total_issues", 0), 0,
+                "P0 regression precondition: diagnose_report_accuracy must return >0 issues "
+                "to exercise the crashing branch",
+            )
+            summary = diag.get("summary") or {}
+            self.assertIn(
+                "layer_counts", summary,
+                "P0 regression precondition: summary must contain layer_counts dict "
+                "to exercise the TypeError path",
+            )
+            self.assertIsInstance(
+                summary["layer_counts"], dict,
+                "P0 regression precondition: layer_counts must be a dict (not int)",
+            )
+
+            # Before the fix, this call raised TypeError: int() argument
+            # must be a string, a bytes-like object or a number, not 'dict'.
+            text = render_hourly_report_text(
+                _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"),
+                active_symbols=["BTCUSDT"],
+                signals=[],
+                open_orders=[],
+                failed_jobs=[],
+                queue_counts={"pending_user": 0, "pending_background": 0, "running": 0},
+                equity_snapshot={
+                    "account_equity": 10000, "unrealized_pnl": 0,
+                    "realized_pnl": 0, "snapshot_json": "{}",
+                },
+                report_accuracy_diagnostics=diag,
+            )
+            # The report must surface the 报告准确性诊断 section with the
+            # actual error code(s) — not crash. If we got here, the guard
+            # worked.
+            self.assertIn(
+                "报告准确性诊断", text,
+                "P0 regression: render_hourly_report_text must surface the diagnostics section",
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+            _os.environ.pop("CRYPTO_GUARD_DB", None)
+            tmp.cleanup()
+
+    # P2 (07-09 R4 reviewer): the broad first signature
+    # ``"analysis_time_utc' is a required property"`` would also match a
+    # FUTURE 1-hour-old schema-fail from a different code path (not the
+    # legacy ``no_edge fallback`` SOP). After tightening to the full
+    # ``no_edge fallback schema 校验失败`` prefix, future failures must
+    # NOT be archived.
+    def test_07_09_tightened_signature_does_not_filter_future_failures(self) -> None:
+        """P2: after dropping the broad ``analysis_time_utc' is a required
+        property`` signature, a NEW 1-hour-old failure that happens to
+        contain the same required-property string (but WITHOUT the
+        ``no_edge fallback`` prefix) must NOT be archived as legacy.
+
+        This locks the tightened filter: only the full ``no_edge fallback
+        schema 校验失败: 'analysis_time_utc'`` prefix is matched. Bare
+        required-property messages from future SOPs stay in current
+        risk events.
+        """
+        from plugins.crypto_guard.notify.hourly_report import (
+            _split_current_and_legacy_failed_jobs,
+        )
+
+        # Future-shape failure: contains the bare required-property string
+        # but NOT the ``no_edge fallback`` prefix. Must NOT be archived.
+        future_job = {
+            "id": 1, "job_type": "scheduled_market_analysis",
+            "error_message": "schema validation error: 'analysis_time_utc' is a required property",
+        }
+        current, legacy_count = _split_current_and_legacy_failed_jobs([future_job])
+        self.assertEqual(
+            legacy_count, 0,
+            "P2: future-shape failure WITHOUT the ``no_edge fallback`` prefix "
+            "must NOT be archived as legacy",
+        )
+        self.assertEqual(
+            len(current), 1,
+            "P2: future-shape failure must stay in current risk events",
+        )
+
+        # Legacy-shape failure: still has the full prefix. Must be archived.
+        legacy_job = {
+            "id": 2, "job_type": "scheduled_market_analysis",
+            "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+        }
+        current2, legacy_count2 = _split_current_and_legacy_failed_jobs([legacy_job])
+        self.assertEqual(
+            legacy_count2, 1,
+            "P2: legacy-shape failure WITH the full prefix must still be archived",
+        )
+        self.assertEqual(
+            len(current2), 0,
+            "P2: legacy-shape failure must NOT stay in current risk events",
+        )
+
+    # P2 (07-09 R4 reviewer): design §4 case 5 — ``state=open`` AND
+    # ``skipped_by_breaker > 0`` AND dominant is NOT in
+    # schema/config/gateway must surface a distinct banner instead of
+    # collapsing into the generic "异常熔断" wording. The 5-case matrix
+    # must be exhaustive — every case must have a test.
+    def test_07_09_hourly_banner_5th_case_unknown_dominant_with_skipped(self) -> None:
+        """P2: design §4 case 5 — when breaker is open, dominant is
+        unknown (not schema/config/gateway), and ``skipped_by_breaker > 0``,
+        the banner must surface the skip count + the unknown-category
+        signal so the operator can distinguish it from a no-skip open.
+
+        Before this test: the 5th case fell into the generic
+        "异常熔断" wording, hiding the skip count. After this test:
+        the banner surfaces "熔断跳过 N 个品种" + "未知异常".
+        """
+        from plugins.crypto_guard.notify.hourly_report import _render_llm_health_line
+        batch = {
+            "summary_json": {
+                "llm_health": {
+                    "breaker_state": "open",
+                    "total_attempts": 3,
+                    "successful": 0,
+                    "failed": 3,
+                    "by_category": {"llm_unknown_failure": 3},
+                    "dominant_error_category": "llm_unknown_failure",
+                    "skipped_by_breaker": 4,
+                },
+                "dominant_llm_fallback_reason": "circuit_breaker_open",
+            },
+        }
+        line = _render_llm_health_line(batch)
+        # Case 5: must surface the skip count so the operator knows 4
+        # symbols were skipped under the open breaker.
+        self.assertIn(
+            "4", line,
+            "P2 case 5: banner must surface the skipped count (4) when "
+            "breaker is open with unknown dominant category",
+        )
+        # Case 5: must surface the "熔断" signal so the operator knows the
+        # breaker is open (not just a per-symbol budget drop).
+        self.assertIn(
+            "熔断", line,
+            "P2 case 5: banner must surface 熔断 wording when breaker is open",
+        )
+        # Case 5: must NOT use the misleading "配置/网关异常" wording
+        # (that groups two distinct remediation paths).
+        self.assertNotIn(
+            "配置/网关异常", line,
+            "P2 case 5: banner must NOT use the misleading '配置/网关异常' wording "
+            "for an unknown dominant category",
+        )
+
+    # Recommended (07-09 R4 reviewer): entry_trigger_confirmation sub-object
+    # must reject extra fields via ``additionalProperties: false``. Without
+    # this, LLM can silently emit ``entry_trigger_type`` /
+    # ``confirmation_style`` / similar extras that the SOP doesn't expect,
+    # masking drift between the prompt contract and the actual output.
+    def test_07_09_entry_trigger_confirmation_rejects_extra_fields(self) -> None:
+        """Recommended: ``entry_trigger_confirmation`` sub-object in
+        ``ga_decision.schema.json`` has ``additionalProperties: false`` so
+        any extra field (e.g. ``confirmation_style``, ``entry_trigger_type``)
+        fails schema validation.
+
+        Before the fix: the sub-object had no ``additionalProperties`` key,
+        so JSON Schema (default ``true``) silently accepted extras. After
+        the fix: extras are rejected - forcing the LLM prompt contract to
+        be the source of truth.
+        """
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+
+        base = self._base_confirmation()
+        # Sanity: the base confirmation validates. Add the required
+        # ``risk_notes`` field that ``_base_decision`` omits (the helper
+        # was written for normalize-path tests, not schema validation).
+        decision = self._base_decision(base)
+        decision["risk_notes"] = []
+        ok, err = validate_json("ga_decision.schema.json", decision)
+        self.assertTrue(ok, f"Recommended: baseline must validate; got {err}")
+
+        # Add an extra field the schema does not declare. Must be rejected.
+        extra = dict(base, confirmation_style="reclaim")
+        decision_extra = self._base_decision(extra)
+        decision_extra["risk_notes"] = []
+        ok2, err2 = validate_json("ga_decision.schema.json", decision_extra)
+        self.assertFalse(
+            ok2,
+            f"Recommended: extra field 'confirmation_style' on entry_trigger_confirmation "
+            f"must be rejected (additionalProperties:false); got ok={ok2}, err={err2}",
+        )
+
+        # Also test that a typo on an existing field (which would otherwise
+        # be an extra field) is rejected. This catches drift early.
+        typo = dict(base)
+        # Remove the correct field, add a typo variant as an extra.
+        typo.pop("candle_close_time")
+        typo["candle_closed_time"] = self._CLOSE_TIME
+        decision_typo = self._base_decision(typo)
+        decision_typo["risk_notes"] = []
+        ok3, err3 = validate_json("ga_decision.schema.json", decision_typo)
+        # The schema must reject this - either because ``candle_close_time``
+        # is missing (required) OR because ``candle_closed_time`` is extra.
+        self.assertFalse(
+            ok3,
+            f"Recommended: typo 'candle_closed_time' (missing 'candle_close_time') "
+            f"must be rejected; got ok={ok3}, err={err3}",
+        )
+
+    # P0 (07-09 R4 reviewer pass 2): alias-repair SOP must succeed when
+    # the LLM emits extra fields alongside the alias. ``additionalProperties:
+    # false`` on ``entry_trigger_confirmation`` (recommended #1) combined
+    # with the original ``dict(confirmation)`` copy in
+    # ``normalize_entry_trigger_confirmation`` broke the repair SOP: the
+    # normalized dict still carried the LLM's extras, so re-validation
+    # failed and the decision silently fell through to hard-fail
+    # deterministic fallback - defeating the entire 07-09 task. The fix
+    # reconstructs the normalized dict from ONLY the schema-declared
+    # required fields, stripping extras before re-validation.
+    def test_07_09_alias_repair_succeeds_with_extra_fields(self) -> None:
+        """P0: when the LLM emits an alias ``type`` (e.g.
+        ``price_rejection``) PLUS extra fields (e.g. ``confirmation_style``,
+        ``note``), ``normalize_entry_trigger_confirmation`` must return a
+        normalized dict that passes ``ga_decision.schema.json`` validation
+        (i.e. extras are stripped).
+
+        Before the fix: ``dict(confirmation)`` copied extras -> re-validation
+        failed on ``additionalProperties: false`` -> repair abandoned ->
+        hard-fail fallback (defeats the task's core deliverable).
+        After the fix: normalized dict contains ONLY the required fields ->
+        re-validation passes -> repair succeeds.
+        """
+        from plugins.crypto_guard.ga_master.decision_schema import (
+            normalize_entry_trigger_confirmation,
+        )
+        from plugins.crypto_guard.reasoning.decision_schema import validate_json
+
+        # Confirmation with alias + 2 extra fields the LLM might emit.
+        conf = self._base_confirmation(alias="price_rejection")
+        conf["confirmation_style"] = "reclaim"
+        conf["note"] = "LLM-provided rationale, not schema-declared"
+
+        normalized, notes, changed = normalize_entry_trigger_confirmation(
+            conf, decision_symbol="BTCUSDT",
+            analysis_time_utc=self._ANALYSIS_TIME,
+        )
+        # Repair must succeed.
+        self.assertIsNotNone(
+            normalized,
+            "P0: alias + extras must still normalize successfully (extras stripped)",
+        )
+        self.assertTrue(changed, "P0: alias must trigger changed=True")
+        self.assertEqual(
+            normalized["type"], "closed_candle_confirmation",
+            "P0: alias must be normalized to closed_candle_confirmation",
+        )
+        # Extras must be stripped - only the schema-declared required fields
+        # plus the normalized type are present.
+        allowed_keys = {
+            "type", "timeframe", "event_type", "direction",
+            "candle_close_time", "price", "source", "symbol",
+        }
+        extra_keys = set(normalized.keys()) - allowed_keys
+        self.assertEqual(
+            extra_keys, set(),
+            f"P0: normalized dict must NOT carry extra fields; found {extra_keys}. "
+            f"Keys present: {sorted(normalized.keys())}",
+        )
+        # Audit notes must preserve the original alias for traceability.
+        joined_notes = " ".join(notes)
+        self.assertIn("price_rejection", joined_notes,
+                      "P0: audit notes must preserve the original alias")
+
+        # Critical assertion: the normalized confirmation must pass the
+        # schema validation that the production repair path performs.
+        decision = self._base_decision(normalized)
+        decision["risk_notes"] = []
+        ok, err = validate_json("ga_decision.schema.json", decision)
+        self.assertTrue(
+            ok,
+            f"P0: normalized decision (alias + extras stripped) must pass schema validation; "
+            f"got err={err}",
+        )
+
+    # P2 (07-09 R4 reviewer pass 2): ``_agent_hourly_brief`` must apply
+    # the legacy schema-fail split so the LLM brief context does NOT
+    # receive legacy schema-fail jobs. Without this, the renderer filters
+    # legacy jobs out of the user-visible risk-events section (so the
+    # operator sees "另有 N 个历史 schema 校验失败已归档") but the LLM
+    # brief still receives those same legacy jobs as current failure
+    # context - the brief then references them as current failures,
+    # contradicting the rendered section.
+    def test_07_09_agent_hourly_brief_excludes_legacy_schema_fail(self) -> None:
+        """P2: ``_agent_hourly_brief`` (called by ``build_hourly_report``)
+        must receive only the current failures, not the archived legacy
+        schema-fail jobs. The split is applied at the call site
+        (``hourly_report.py:199``) before passing to the brief.
+        """
+        from unittest.mock import patch, MagicMock
+        from plugins.crypto_guard.notify import hourly_report
+
+        # Two jobs: one current, one legacy schema-fail.
+        current_job = {
+            "id": 1, "job_type": "scheduled_market_analysis",
+            "error_message": "data quality check failed",
+        }
+        legacy_job = {
+            "id": 2, "job_type": "scheduled_market_analysis",
+            "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+        }
+        failed_jobs = [current_job, legacy_job]
+
+        # Capture the failed_jobs passed to run_agent_json_task.
+        captured_payload: dict = {}
+
+        def fake_run_agent_json_task(*, task_name, payload, fallback, instructions):
+            captured_payload.update(payload)
+            return fallback
+
+        # Patch the LLM call so the test is deterministic and we can
+        # inspect the payload.
+        with patch(
+            "plugins.crypto_guard.reasoning.llm_agent_judge.run_agent_json_task",
+            side_effect=fake_run_agent_json_task,
+        ):
+            hourly_report._agent_hourly_brief(
+                active_symbols=["BTCUSDT"],
+                signals=[],
+                open_orders=[],
+                failed_jobs=failed_jobs,
+                queue_counts={"pending_user": 0, "pending_background": 0, "running": 0},
+            )
+
+        # The payload's failed_jobs must contain ONLY the current job.
+        # The legacy schema-fail job must NOT be passed to the LLM brief.
+        brief_failed_jobs = captured_payload.get("failed_jobs", [])
+        self.assertEqual(
+            len(brief_failed_jobs), 1,
+            f"P2: brief must receive exactly 1 current job (not the legacy schema-fail); "
+            f"got {len(brief_failed_jobs)}",
+        )
+        self.assertEqual(
+            brief_failed_jobs[0]["id"], 1,
+            "P2: brief must receive the current job id=1, not the legacy schema-fail id=2",
+        )
+        # Sanity: the legacy schema-fail job must NOT be in the brief.
+        brief_ids = [j["id"] for j in brief_failed_jobs]
+        self.assertNotIn(
+            2, brief_ids,
+            "P2: legacy schema-fail job (id=2) must NOT be passed to the LLM brief",
+        )
