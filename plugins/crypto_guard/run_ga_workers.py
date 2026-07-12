@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
@@ -37,6 +39,1160 @@ LOGGER = get_logger("crypto_guard.worker")
 # the batch summary and the breaker is removed from the cache.
 _batch_breakers: dict[str, Any] = {}
 
+# 07-10 R3-P0-1 + R4-P0-1 + R5-P0 (terminal-review-repair-plan-r5 P0): a
+# ``single_flight_skipped`` symbol defers THIS tick's own ``agent_jobs`` claim
+# back to ``pending`` (CAS keyed on this worker's ``claim_token``) and moves
+# ``scheduled_at`` forward by a defer interval so a later ``run_once`` reclaims
+# + processes it once the owning tick releases the symbol lease.
+#
+# R4-P0-1 (ABSOLUTE defer window): the pre-R4 design used a fixed
+# ``_SINGLE_FLIGHT_DEFER_SECONDS * _SINGLE_FLIGHT_MAX_DEFERS`` product
+# (15*8 = 120s) to bound the defer. But the legitimate LLM per-symbol lease runs
+# 180..1200s (config ``llm.scheduling.per_symbol_timeout_seconds``). A 120s
+# defer window would falsely mark a 20-min lease ``single_flight_defer_exhausted``
+# at 2 min — the owning tick is still mid-flight. The defer window is now
+# ABSOLUTE: terminate only once ``now - deferred_at >= per_symbol_timeout +
+# _SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS`` (a cleanup buffer so a call
+# finishing right at the deadline still releases before exhaustion). The
+# per-scheduled-at defer interval (``_SINGLE_FLIGHT_DEFER_SECONDS``) stays small
+# so the owning tick is re-polled promptly; it is NOT the exhaustion bound.
+#
+# R5-P0 (dynamic backstop): the R4-P0-1 follow-on kept a FIXED
+# ``_SINGLE_FLIGHT_MAX_DEFERS = 8`` backstop and OR-ed it into the exhaustion
+# condition. Because ``_SINGLE_FLIGHT_DEFER_SECONDS = 15``, that backstop still
+# fired at 8*15 = 120s -- EARLIER than the shortest legitimate absolute window
+# (180+60 = 240s) and far earlier than the default (300+60 = 360s) / max
+# (1200+60 = 1260s). The absolute window was "authoritative" in name only; the
+# OR-ed fixed count owned precedence and re-introduced the very premature
+# exhaustion R4-P0-1 was meant to kill. The count backstop is now DYNAMIC and
+# derives from the absolute window:
+# ``max_defers = ceil(defer_window_seconds / defer_seconds) + cleanup_margin``
+# (e.g. 240/15 -> 17, 360/15 -> 25, 1260/15 -> 85), so it can NEVER fire inside
+# the legitimate absolute window. The absolute window is the SOLE authority when
+# ``deferred_at`` is parseable; the dynamic count backstop is a FAIL-CLOSED
+# fallback used ONLY when ``deferred_at`` is None / unparseable (an unknown
+# elapsed time must not silently defer forever, but must also never fire inside a
+# legitimate window).
+#
+# The defer config (interval + absolute window + dynamic max_defers) is resolved
+# from ``llm.scheduling`` in ``_resolve_single_flight_defer_config`` so it scales
+# with the operator's configured ``per_symbol_timeout_seconds``; the module
+# constants below are the FALLBACK for tests / a missing scheduling block.
+_SINGLE_FLIGHT_DEFER_SECONDS = 15
+_SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS = 60
+# R5-P0: margin added on top of ceil(window/interval) so the dynamic count
+# backstop never coincides with the absolute-window boundary (avoids a race where
+# the two bounds tie and the count fires a tick early).
+_SINGLE_FLIGHT_DEFER_CLEANUP_MARGIN = 1
+
+
+def _dynamic_max_defers(defer_window_seconds: int, defer_seconds: int) -> int:
+    """07-10 R5-P0: compute the dynamic count backstop from the ABSOLUTE defer
+    window so the count can NEVER fire inside the legitimate window.
+
+    ``max_defers = ceil(defer_window_seconds / defer_seconds) + cleanup_margin``.
+    E.g. window=240 / interval=15 -> ceil(16) + 1 = 17; 360/15 -> 25; 1260/15 ->
+    85. Because ``defer_seconds`` is strictly positive and the cleanup margin is
+    added AFTER the ceil, the count backstop only becomes operative strictly
+    AFTER the absolute window has already elapsed -- so when ``deferred_at`` is
+    parseable the absolute window is the sole authority, and the count backstop
+    is a FAIL-CLOSED fallback for the (defensive) case where ``deferred_at`` is
+    None / unparseable (an unknown elapsed time must not silently defer forever).
+    """
+    if defer_seconds <= 0:
+        # Defensive: a non-positive interval would otherwise divide-by-zero.
+        # Fall back to the window itself as a (very large) per-tick count.
+        return max(1, int(defer_window_seconds)) + _SINGLE_FLIGHT_DEFER_CLEANUP_MARGIN
+    return int(math.ceil(defer_window_seconds / defer_seconds)) + _SINGLE_FLIGHT_DEFER_CLEANUP_MARGIN
+
+
+@dataclass(frozen=True)
+class _SingleFlightDeferConfig:
+    """07-10 R4-P0-1 + R5-P0: resolved single-flight defer policy for one batch.
+
+    ``defer_seconds``: the per-iteration ``scheduled_at`` bump (small, so the
+    owning tick is re-polled promptly after it releases the lease).
+    ``defer_window_seconds``: the ABSOLUTE exhaustion bound = the legitimate
+    per-symbol LLM lease (``per_symbol_timeout_seconds``) + a cleanup buffer. A
+    symbol is terminated with ``single_flight_defer_exhausted`` only once
+    ``now - deferred_at >= defer_window_seconds`` -- this is the SOLE authority
+    when ``deferred_at`` is parseable. This guarantees a legitimately long lease
+    (up to 1200s) is never falsely exhausted at 120s.
+    ``max_defers``: R5-P0 DYNAMIC count backstop =
+    ``ceil(defer_window_seconds / defer_seconds) + cleanup_margin`` (e.g. 240/15
+    -> 17, 360/15 -> 25, 1260/15 -> 85). It is a FAIL-CLOSED fallback used ONLY
+    when ``deferred_at`` is None / unparseable; it can NEVER fire inside the
+    legitimate absolute window (the pre-R5 fixed ``=8`` backstop fired at 120s
+    and re-introduced the premature exhaustion R4-P0-1 was meant to kill).
+    ``per_symbol_timeout_seconds``: the configured per-symbol LLM deadline, kept
+    for audit / diagnostics.
+    """
+    defer_seconds: int = _SINGLE_FLIGHT_DEFER_SECONDS
+    defer_window_seconds: int = 300 + _SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS
+    max_defers: int = _dynamic_max_defers(
+        300 + _SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS, _SINGLE_FLIGHT_DEFER_SECONDS
+    )
+    per_symbol_timeout_seconds: int = 300
+
+
+def _resolve_single_flight_defer_config(llm_cfg: dict[str, Any]) -> _SingleFlightDeferConfig:
+    """07-10 R4-P0-1 + R5-P0: resolve the single-flight defer policy from
+    ``llm.scheduling.per_symbol_timeout_seconds`` so the ABSOLUTE defer window
+    scales with the configured LLM lease and never prematurely exhausts a
+    legitimately long call.
+
+    The defer window = ``per_symbol_timeout_seconds`` (180..1200) +
+    ``_SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS`` (60s), so a call finishing
+    right at the per-symbol deadline still releases the lease before exhaustion.
+    R5-P0: ``max_defers`` is derived DYNAMICALLY from that same window
+    (``ceil(window / defer_seconds) + cleanup_margin``), so the count backstop
+    can never fire inside the legitimate window.
+    Validation of ``per_symbol_timeout_seconds`` already ran at startup
+    (``config/loader.py::_validate_llm_scheduling``), so a value reaching here is
+    an int in [180, 1200]; the floor / int coercion below is a defensive
+    backstop for tests that pass a raw dict without the full loader validation.
+    """
+    sched = (llm_cfg.get("scheduling") or {}) if isinstance(llm_cfg, dict) else {}
+    try:
+        pst = int(sched.get("per_symbol_timeout_seconds", 300))
+    except (TypeError, ValueError):
+        pst = 300
+    if pst < 180:
+        pst = 180
+    elif pst > 1200:
+        pst = 1200
+    _defer_window = pst + _SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS
+    return _SingleFlightDeferConfig(
+        defer_seconds=_SINGLE_FLIGHT_DEFER_SECONDS,
+        defer_window_seconds=_defer_window,
+        max_defers=_dynamic_max_defers(_defer_window, _SINGLE_FLIGHT_DEFER_SECONDS),
+        per_symbol_timeout_seconds=pst,
+    )
+
+
+def _parse_sqlite_ts_ms(ts: str | None) -> int | None:
+    """07-10 R4-P0-1: parse a SQLite ``CURRENT_TIMESTAMP`` / ``datetime('now')``
+    string (``YYYY-MM-DD HH:MM:SS`` or an ISO-8601 variant with optional
+    fractional seconds / timezone) into epoch milliseconds. Returns ``None`` on
+    any parse failure so the caller can treat an unparseable ``deferred_at`` as
+    "elapsed unknown -> do NOT exhaust" (fail-safe: a None/unknown elapsed time
+    must NOT prematurely terminate a legitimate lease)."""
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    # Normalize the SQLite "YYYY-MM-DD HH:MM:SS" form to ISO-8601.
+    iso = s.replace(" ", "T", 1) if " " in s else s
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        # Fall back to the common SQLite UTC format without timezone.
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _post_decision_effects(
+    repo: CryptoGuardRepository,
+    decision: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    send_message: Callable[..., Any] | None = None,
+    job_id: Any = None,
+) -> dict[str, Any]:
+    """07-10 R5-3: shared post-decision side-effect pipeline.
+
+    Runs the paper-order auto-create, position-conflict revalidation, and the
+    real-time signal alert for a finalized GA decision. Extracted from
+    ``process_job``'s ``scheduled_market_analysis`` branch so the fair-batch
+    path (``process_fair_batch``) can apply the EXACT same side effects to a
+    fair-batch-produced decision as the legacy serial path — no divergence in
+    paper orders, position revalidation, or alerts between the two dispatch
+    modes.
+
+    ``payload`` carries ``allow_realtime_signal_alert`` + the report target
+    metadata (same shape ``enqueue_market_analysis`` writes). ``job_id`` is
+    used only for the done-log line.
+    """
+    signal_id = int(decision["signal_id"])
+    sent = False
+    target = None
+
+    # Auto-create paper order for S/A grade signals with valid trade plan
+    auto_order = None
+    grade = str(decision.get("signal_grade") or "D").upper()
+    has_plan = bool(decision.get("has_trade_plan") and decision.get("trade_plan"))
+    risk_ok = bool((decision.get("risk_check") or {}).get("ok"))
+    ga_decision_id = decision.get("ga_decision_id")
+    # Don't auto-create if there's already an open order for this symbol
+    existing_orders = repo.list_open_paper_orders_for_symbol(decision.get("symbol", ""))
+    if grade in {"S", "A"} and has_plan and risk_ok and ga_decision_id and not existing_orders:
+        try:
+            from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+            auto_order = create_paper_order_from_ga_decision(repo, int(ga_decision_id))
+            LOGGER.info("auto paper order created ga_decision_id=%s result=%s", ga_decision_id, auto_order)
+            # Send notification when order is newly created (not idempotent)
+            if auto_order.get("ok") and auto_order.get("created"):
+                _target = resolve_report_target(repo, payload)
+                if _target and send_message:
+                    plan = decision.get("trade_plan") or {}
+                    tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
+                    side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
+                    entry_type = str(plan.get("entry_type") or "limit")
+                    status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
+                    entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
+                    from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+                    event_time = format_event_time_cst(datetime.now(timezone.utc))
+                    order_text = "\n".join([
+                        "**CryptoGuard 已自动创建模拟盘订单**",
+                        "",
+                        f"- 时间：{event_time}",
+                        f"- 产品：{decision.get('symbol')}",
+                        f"- 方向：{side_cn}",
+                        f"- 状态：{status_cn}",
+                        f"- 入场价：{entry_price}",
+                        f"- 止损价：{plan.get('stop_loss')}",
+                        f"- 止盈价：{tps}",
+                        f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
+                        "",
+                        "不构成实盘建议，仅用于模拟盘与策略研究。",
+                    ])
+                    send_markdown_alert(
+                        repo, send_message,
+                        receive_id=_target["receive_id"],
+                        receive_id_type=_target.get("receive_id_type", "chat_id"),
+                        text=order_text,
+                        alert_type="paper_order_filled",
+                        symbol=decision.get("symbol"),
+                        priority=3,
+                    )
+        except Exception as exc:
+            LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
+            auto_order = {"ok": False, "error": str(exc)}
+
+    # Position-aware analysis: revalidate open positions when GA decision conflicts
+    from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
+    _pos_result = run_position_conflict_revalidation(
+        repo,
+        symbol=decision.get("symbol"),
+        ga_decision_id=ga_decision_id,
+        send_message=send_message,
+    )
+    if _pos_result.get("conflict_count"):
+        LOGGER.info(
+            "position_conflict_revalidation: symbol=%s checked=%s conflicts=%s closed=%s stop_adjusted=%s recheck=%s",
+            decision.get("symbol"),
+            _pos_result.get("checked_count"),
+            _pos_result.get("conflict_count"),
+            _pos_result.get("closed_count"),
+            _pos_result.get("stop_adjusted_count"),
+            _pos_result.get("recheck_count"),
+        )
+
+    # v2: scheduled analysis is recorded into analysis_states/signals and summarized hourly.
+    # Real-time Feishu alerts are reserved for paper/risk/opportunity events.
+    if payload.get("allow_realtime_signal_alert") and should_push_signal(decision):
+        target = resolve_report_target(repo, payload)
+        if target and send_message:
+            sent = bool(
+                _send_interactive_alert(
+                    repo,
+                    send_message,
+                    target["receive_id"],
+                    target.get("receive_id_type", "chat_id"),
+                    build_analysis_card_json(decision, signal_id=signal_id),
+                    alert_type="signal_alert",
+                    symbol=decision.get("symbol"),
+                    priority=5,
+                ).get("sent")
+            )
+    result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target, "auto_order": auto_order}
+    LOGGER.info(
+        "post_decision_effects done job_id=%s signal_id=%s grade=%s pushed=%s decision=%s",
+        job_id,
+        signal_id,
+        decision.get("signal_grade"),
+        sent,
+        decision.get("decision"),
+    )
+    return result
+
+
+def process_fair_batch(
+    repo: CryptoGuardRepository,
+    jobs: list[dict[str, Any]],
+    *,
+    send_message: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """07-10 R5-3: run a whole batch of ``scheduled_market_analysis`` jobs
+    through the fair-pool coordinator, then persist each symbol's decision via
+    the SAME post-decision pipeline the legacy serial path uses.
+
+    Flow:
+    1. Collect ``{symbol: snapshot}`` + the shared ``batch_id`` from the
+       claimed jobs (all carry the same batch_id — ``claim_next_batch``
+       grouped them).
+    2. Build/refresh ``_batch_breakers[batch_id]`` (breaker + retry_budget +
+       wall_clock_budget) + the PROCESS-LEVEL ``SingleFlightLease`` singleton
+       (S5, P1 #5 — shared across every batch_id so the cross-batch same-symbol
+       mutex is real). ``run_fair_batch`` is called with ``release_lease=False``
+       so the lease survives the LLM phase; this function releases each symbol's
+       lease AFTER its persistence + ``_post_decision_effects`` finish.
+    3. Resolve ``FairBatchConfig`` from the loaded llm config and call
+       ``run_fair_batch`` with ``llm_call_fn=fair_llm_call_adapter`` (ONE
+       provider call per attempt, no inner 3x retry wrapper — directive #2).
+    4. For each ``SymbolLLMResult``: feed ``(candidate, attempt_meta)`` into
+       ``controller.analyze_symbol`` as the PRESET candidate so the
+       controller's risk gate / hysteresis / clamp / persistence run WITHOUT a
+       second LLM call. The §8 envelope (attempt_meta) is carried into the
+       persisted decision row for the report.
+    5. Per symbol: ``mark_batch_symbol_completed``; **finish this symbol's
+       ``agent_job``** (S6, P1 #6 — ``finish_job(job_id, result=,
+       error_message=)`` with the per-symbol outcome, so a failed symbol's job
+       is ``status='failed'`` not mislabeled ``success``); when the batch
+       completes, ``finish_analysis_batch`` with the controller's
+       ``get_batch_llm_health`` (Phase E aggregate). The breaker cache entry
+       is popped on completion (success or partial-failed). ``run_once`` no
+       longer uniformly finishes fair-batch jobs (that would double-finish +
+       overwrite per-symbol outcomes).
+    6. Per symbol: ``_post_decision_effects`` (paper order / position
+       revalidation / signal alert) — identical to the serial path.
+
+    A symbol whose ``analyze_symbol`` post-decision pipeline raises is marked
+    failed in ``batch_symbol_status`` and counted in the Phase E
+    ``llm_symbols_worker_failed`` aggregate (expected denominator =
+    ``enabled_symbols`` from the batch row, R1-2). The exception is logged but
+    does NOT abort the rest of the batch — each symbol is independently
+    finalized.
+    """
+    if not jobs:
+        return {"ok": True, "processed": False, "reason": "empty_batch"}
+    # All jobs share one batch_id (claim_next_batch grouped them). Read it
+    # from the first job's payload.
+    first_payload = json.loads(jobs[0]["payload_json"])
+    batch_id = first_payload.get("batch_id") or ""
+    # Collect per-symbol snapshot + job metadata keyed by symbol. A symbol
+    # appearing twice in the batch (shouldn't happen — enqueue dedupes by
+    # session_id) would collapse to its last job.
+    snapshots: dict[str, dict[str, Any]] = {}
+    job_by_symbol: dict[str, dict[str, Any]] = {}
+    # 07-10 P1-3 (terminal review): a malformed scheduled_market_analysis job
+    # whose payload carries NO symbol is a poison pill. ``claim_next_batch``
+    # already flipped it to ``status='running'`` (S3 ownership token), so the
+    # pre-P1-3 code's bare ``continue`` left it ``running`` forever: its lease
+    # expires -> ``recover_stale_running_jobs`` resets it to ``pending`` -> it
+    # is re-claimed next tick -> re-skipped -> infinite loop, and the job is
+    # NEVER surfaced as failed (the operator sees a phantom re-claiming job).
+    # P1-3 fix: mark every malformed job ``failed`` IMMEDIATELY with
+    # ``invalid_scheduled_payload`` so it exits the queue for good, and record
+    # the malformed count so the batch's final status reflects the failure
+    # (it must NOT render ``success`` with a job that crashed on ingest).
+    malformed_jobs: list[dict[str, Any]] = []
+    for job in jobs:
+        payload = json.loads(job["payload_json"])
+        snap = payload.get("snapshot") or {}
+        sym = str(snap.get("symbol") or payload.get("symbol") or "")
+        if not sym:
+            job_id = job.get("id")
+            LOGGER.error(
+                "process_fair_batch: malformed scheduled_market_analysis job "
+                "id=%s batch=%s has no symbol in payload -> marking failed "
+                "(invalid_scheduled_payload). It will NOT be retried.",
+                job_id, batch_id,
+            )
+            try:
+                repo.finish_job(
+                    int(job_id),
+                    result={
+                        "ok": False,
+                        "reason": "invalid_scheduled_payload",
+                        "batch_id": batch_id,
+                    },
+                    error_message="invalid_scheduled_payload: payload has no symbol",
+                )
+            except Exception:
+                LOGGER.exception(
+                    "process_fair_batch: failed to mark malformed job id=%s "
+                    "failed (batch=%s); it may re-loop on lease expiry.",
+                    job_id, batch_id,
+                )
+            malformed_jobs.append({"job_id": job_id, "reason": "invalid_scheduled_payload"})
+            continue
+        snapshots[sym] = snap
+        job_by_symbol[sym] = {"job": job, "payload": payload}
+    symbols = list(snapshots.keys())
+    if not symbols:
+        # Every job in this batch was malformed (no symbol). Mark the batch
+        # failed so it does not render ``success`` with zero symbols processed,
+        # and return. ``is_batch_complete`` would otherwise see an enabled-set
+        # subset mismatch; ``finish_analysis_batch(status='failed')`` records
+        # the terminal state and clears the batch from the active set.
+        if malformed_jobs:
+            try:
+                repo.finish_analysis_batch(
+                    batch_id=batch_id, status="failed",
+                    summary={"malformed_jobs": malformed_jobs},
+                )
+            except Exception:
+                LOGGER.warning(
+                    "process_fair_batch: finish_analysis_batch(failed) for "
+                    "all-malformed batch=%s", batch_id, exc_info=True,
+                )
+            _batch_breakers.pop(batch_id, None)
+            return {
+                "ok": True, "processed": True, "batch_id": batch_id,
+                "symbols": 0, "results": [], "failed_symbols": [],
+                "malformed_jobs": malformed_jobs, "queue": "fair_pool",
+            }
+        return {"ok": True, "processed": False, "reason": "no_symbols"}
+
+    # 07-10 S1 (P0 #1) + terminal-review P0-1: inject the REAL strict
+    # cross-batch previous-analysis continuity into each snapshot BEFORE the
+    # fair coordinator builds the LLM prompt. ``fair_llm_call_adapter`` runs
+    # inside ``run_fair_batch`` (below), which executes BEFORE
+    # ``controller.analyze_symbol`` -- so the controller's own
+    # ``attach_analysis_continuity_to_snapshot`` call (controller.py:467) runs
+    # AFTER the prompt is already built. Without this pre-injection,
+    # ``_compact_snapshot`` lazily builds continuity with ``previous_row=None``
+    # -> ``continuity_status="missing"`` and the LLM never sees the real prior
+    # analysis/time/changes. ``attach_analysis_continuity_to_snapshot`` is
+    # idempotent (returns early if the key exists), so the controller's later
+    # attach is a no-op. ``snapshots[sym]`` is the SAME dict reference the
+    # adapter reads, so mutating it here is visible to the prompt builder.
+    #
+    # design §11 "Missing continuity: fail closed for LLM confirmation, retain
+    # deterministic observation." The PRE-S1 code swallowed any per-symbol
+    # injection exception (warn + continue) but STILL let the symbol proceed
+    # to ``run_fair_batch`` -> the adapter built the prompt with a
+    # ``continuity_status="missing"`` block the LLM could not distinguish from
+    # a legitimate first analysis, then the LLM confirmed a plan on top of
+    # unverified/unavailable context. That is FAIL-OPEN and violates §11.
+    # P0-1 fix: a symbol whose strict-prior lookup OR attach raises is added to
+    # ``continuity_unavailable`` and is REMOVED from the symbols handed to
+    # ``run_fair_batch`` so NO provider call is made for it (the adapter is
+    # never reached). Below, after ``run_fair_batch`` returns, each such symbol
+    # is synthesized a terminal ``continuity_unavailable`` envelope carrying a
+    # DETERMINISTIC-SOP candidate (``use_llm=False``) so the controller's
+    # observation/risk/persistence pipeline still runs for audit, but the
+    # envelope's ``llm_terminal_reason="continuity_unavailable"`` +
+    # ``plan_execution_state="no_candidate"`` PROHIBIT any executable plan
+    # (fail-closed). One symbol's failure does NOT abort the rest of the batch
+    # (each is finalized independently).
+    try:
+        from plugins.crypto_guard.reasoning.decision_context import (
+            attach_analysis_continuity_to_snapshot,
+        )
+    except Exception:
+        attach_analysis_continuity_to_snapshot = None  # type: ignore[assignment]
+    continuity_unavailable: set[str] = set()
+    for sym, snap in snapshots.items():
+        try:
+            previous_row_strict = None
+            if attach_analysis_continuity_to_snapshot is not None:
+                previous_row_strict = repo.latest_analysis_state_for_continuity(
+                    str(snap.get("symbol") or sym),
+                    analysis_time_utc=int(snap.get("analysis_time_utc") or 0),
+                    exclude_batch_id=batch_id,
+                )
+                attach_analysis_continuity_to_snapshot(
+                    snap,
+                    previous_row=previous_row_strict,
+                    current_batch_id=batch_id,
+                    current_decision=None,
+                )
+        except Exception:
+            # design §11 fail-closed: this symbol may NOT receive an LLM
+            # confirmation. Record it and synthesize a deterministic-only
+            # envelope below. Do NOT re-raise (one symbol must not abort the
+            # batch).
+            continuity_unavailable.add(sym)
+            LOGGER.warning(
+                "process_fair_batch: pre-inject continuity FAILED batch=%s "
+                "symbol=%s -> fail-closed (§11): LLM confirmation DISABLED, "
+                "deterministic SOP observation only, no executable plan.",
+                batch_id, sym, exc_info=True,
+            )
+    # Symbols whose continuity could not be verified are EXCLUDED from the
+    # fair coordinator's work list so no provider call / lease / prompt is
+    # ever made for them (the adapter, which would build a prompt on top of an
+    # unverifiable continuity block, is never reached). The expected-symbol
+    # denominator (BatchMetrics.expected_symbols) stays the FULL count so the
+    # Phase F coverage diagnostic still counts these as "missing Attempt-1"
+    # (the correct fail-closed signal), not as silently-attempted.
+    attemptable_symbols = [s for s in symbols if s not in continuity_unavailable]
+    # Build/refresh the batch breaker cache entry (breaker + retry_budget +
+    # wall_clock_budget). Mirrors process_job's scheduled_market_analysis
+    # branch so the controller reuses the SAME breaker the fair coordinator
+    # records against (R1-1: coordinator owns record_attempt).
+    from plugins.crypto_guard.reasoning.llm_breaker import (
+        CircuitBreaker, BatchRetryBudget, BatchWallClockBudget, SingleFlightLease,
+        global_single_flight_lease,
+    )
+    from plugins.crypto_guard.config.loader import load_config
+    llm_cfg = load_config().trading_mode.get("llm", {})
+    breaker_cfg = llm_cfg.get("circuit_breaker", {})
+    retry_cfg = llm_cfg.get("retry", {})
+    batch_state = _batch_breakers.get(batch_id)
+    if not isinstance(batch_state, dict):
+        breaker = CircuitBreaker(
+            enabled=breaker_cfg.get("enabled", True),
+            consecutive_threshold=breaker_cfg.get("consecutive_failures", 3),
+            rate_threshold=breaker_cfg.get("rate_threshold", 0.5),
+            rate_window=breaker_cfg.get("rate_window", 10),
+            min_rate_samples=breaker_cfg.get("min_rate_samples", 5),
+        )
+        retry_budget = BatchRetryBudget(
+            max_batch_retry_calls=retry_cfg.get("max_batch_retry_calls", 9),
+        )
+        wall_clock_budget = BatchWallClockBudget(
+            budget_seconds=retry_cfg.get("batch_wall_clock_budget_seconds", 90),
+        )
+        breaker._wall_clock_budget = wall_clock_budget
+        batch_state = {
+            "breaker": breaker,
+            "retry_budget": retry_budget,
+            "wall_clock_budget": wall_clock_budget,
+        }
+        _batch_breakers[batch_id] = batch_state
+    breaker = batch_state["breaker"]
+    retry_budget = batch_state["retry_budget"]
+    wall_clock_budget = batch_state["wall_clock_budget"]
+    # 07-10 S5 (P1 #5): use the PROCESS-LEVEL ``SingleFlightLease`` singleton,
+    # NOT a per-``batch_id`` instance. The prior design cached a fresh
+    # ``SingleFlightLease()`` per ``_batch_breakers[batch_id]`` -> every
+    # batch_id got its OWN lease registry -> two overlapping ticks for the SAME
+    # symbol but DIFFERENT batch_ids each acquired cleanly on their isolated
+    # lease -> NO cross-batch mutex (the P1 #5 hole). The singleton is shared
+    # across every ``process_fair_batch`` call in this process, so a symbol
+    # held by batch A's tick is visible as held to batch B's tick. CryptoGuard
+    # runs a single process (4 daemon worker threads; no multi-process
+    # fan-out), so module-level scope is correct.
+    lease = global_single_flight_lease()
+
+    # Resolve the fair-pool config and run the coordinator. The adapter does
+    # ONE provider call per attempt; the coordinator owns retry + breaker +
+    # the two-pass barrier. R2-2 bounds the barrier wait so a hung provider
+    # call cannot block the coordinator forever.
+    from plugins.crypto_guard.reasoning.llm_fair_scheduler import (
+        run_fair_batch, resolve_fair_batch_config, BatchMetrics,
+        SymbolLLMResult,
+    )
+    from plugins.crypto_guard.reasoning.llm_agent_judge import fair_llm_call_adapter
+    from plugins.crypto_guard.utils import utc_ms
+    cfg = resolve_fair_batch_config(llm_cfg)
+    metrics = BatchMetrics(expected_symbols=len(symbols))
+    fair_results = run_fair_batch(
+        batch_id=batch_id, symbols=attemptable_symbols, snapshots=snapshots,
+        cfg=cfg, breaker=breaker, retry_budget=retry_budget,
+        wall_clock_budget=wall_clock_budget, metrics=metrics, lease=lease,
+        llm_call_fn=fair_llm_call_adapter, now_ms=utc_ms,
+        release_lease=False,
+    )
+    # 07-10 P0-1 (design §11 fail-closed): synthesize a terminal
+    # ``continuity_unavailable`` envelope for every symbol whose strict-prior
+    # continuity could NOT be verified above. The coordinator never attempted
+    # them (excluded from ``attemptable_symbols``), so they are absent from
+    # ``fair_results``. Each gets a DETERMINISTIC-SOP candidate (``use_llm=
+    # False``) so the controller's observation/risk/persistence pipeline runs
+    # for audit, but the envelope marks LLM confirmation DISABLED with
+    # ``llm_terminal_reason="continuity_unavailable"`` and forces
+    # ``plan_execution_state="no_candidate"`` so NO executable plan is
+    # produced (the §11 "prohibit execution" half). The per-symbol loop below
+    # treats this like any other preset candidate: the controller consumes it
+    # (no provider call), persists a decision, and ``finish_job`` records the
+    # per-symbol outcome. ``candidate`` carries the deterministic observation;
+    # ``attempt_meta`` carries the structured terminal reason for the report.
+    if continuity_unavailable:
+        from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            run_agent_sop_decision,
+        )
+        for sym in continuity_unavailable:
+            snap = snapshots.get(sym) or {}
+            det_candidate: dict[str, Any] | None = None
+            try:
+                det_candidate = run_agent_sop_decision(snap, use_llm=False)
+            except Exception:
+                LOGGER.exception(
+                    "process_fair_batch: deterministic SOP fallback also "
+                    "failed for continuity_unavailable symbol=%s batch=%s; "
+                    "persisting with no candidate (still fail-closed).",
+                    sym, batch_id,
+                )
+                det_candidate = None
+            # Force the deterministic observation to be NON-executable: even
+            # if ``run_ga_sop_decision`` produced a candidate trade plan, a
+            # symbol whose continuity is unavailable may NOT execute it
+            # (design §11: prohibit execution). Strip the trade plan + mark
+            # the envelope so the controller's risk gate and the Phase F
+            # diagnostics both see a withheld, non-executable outcome.
+            #
+            # The §8 LLM-metadata envelope (llm_terminal_reason etc.) is
+            # carried ON the candidate dict itself: when candidate is not
+            # None, the controller's preset path
+            # (llm_agent_judge.py:171-174) returns
+            # ``apply_risk_to_decision(candidate, snapshot)`` WITHOUT merging
+            # ``attempt_meta`` -- so the persisted decision's envelope fields
+            # come from the candidate. We overwrite the SOP defaults
+            # (``llm_disabled``) with the precise ``continuity_unavailable``
+            # reason so the report + Phase F diagnostics classify it
+            # correctly (NOT as a generic llm_disabled / llm_parse_failed).
+            if isinstance(det_candidate, dict):
+                det_candidate = dict(det_candidate)
+                det_candidate["trade_plan"] = None
+                det_candidate["has_trade_plan"] = False
+                det_candidate["candidate_trade_plan"] = None
+                det_candidate["plan_status"] = "withheld"
+                det_candidate["plan_blockers"] = ["continuity_unavailable"]
+                det_candidate["plan_origin"] = "deterministic_sop"
+                det_candidate["plan_execution_state"] = "no_candidate"
+                # §8 envelope override (see comment above re: candidate path).
+                det_candidate["llm_status"] = "disabled"
+                det_candidate["llm_attempt_count"] = 0
+                det_candidate["llm_provider_call_count"] = 0
+                det_candidate["llm_latency_ms"] = 0
+                det_candidate["llm_prompt_bytes"] = None
+                det_candidate["llm_continuity_included"] = None
+                det_candidate["llm_model"] = None
+                det_candidate["llm_config_name"] = None
+                det_candidate["llm_terminal_reason"] = "continuity_unavailable"
+                det_candidate["llm_fallback_reason"] = "continuity_unavailable"
+                det_candidate["llm_error_category"] = None
+                det_candidate["llm_error_stage"] = None
+                det_candidate["llm_error"] = None
+                det_candidate["llm_retry_round"] = None
+                det_candidate["llm_schedule_round"] = None
+                det_candidate["llm_schedule_position"] = -1
+                det_candidate["llm_effective_thinking_budget_tokens"] = None
+                det_candidate["llm_effective_max_output_tokens"] = None
+                det_candidate["llm_effective_temperature"] = None
+                det_candidate["llm_provider_timeout_ms"] = None
+            fair_results[sym] = SymbolLLMResult(
+                symbol=sym,
+                schedule_position=-1,
+                schedule_round=0,
+                candidate=det_candidate,
+                attempt_meta={
+                    "llm_status": "disabled",
+                    "llm_attempt_count": 0,
+                    "llm_provider_call_count": 0,
+                    "llm_latency_ms": 0,
+                    "llm_prompt_bytes": None,
+                    "llm_continuity_included": None,
+                    "llm_model": None,
+                    "llm_config_name": None,
+                    "llm_terminal_reason": "continuity_unavailable",
+                    "llm_fallback_reason": "continuity_unavailable",
+                    "llm_error_category": None,
+                    "llm_error_stage": None,
+                    "llm_error": None,
+                    "llm_retry_round": None,
+                    "llm_schedule_round": None,
+                    "llm_schedule_position": -1,
+                    "llm_effective_thinking_budget_tokens": None,
+                    "llm_effective_max_output_tokens": None,
+                    "llm_effective_temperature": None,
+                    "llm_provider_timeout_ms": None,
+                    "continuity_unavailable": True,
+                },
+                terminal_reason="continuity_unavailable",
+            )
+
+    # Persist each symbol's decision via the controller's post-decision
+    # pipeline, feeding the fair-batch candidate as the preset so NO second
+    # LLM call happens. The controller reuses the shared breaker (above).
+    controller = GAMasterController(repo)
+    controller._breakers = _batch_breakers
+    per_symbol_results: list[dict[str, Any]] = []
+    failed_symbols: list[str] = []
+    # 07-10 S5 (P1 #5): ``run_fair_batch`` was called with ``release_lease=False``
+    # above, so the global single-flight lease for every ACQUIRED symbol is still
+    # HELD. The acquired set = keys of ``fair_results`` whose terminal_reason is
+    # NOT a policy-skip / continuity-unavailable code. P1-2 (terminal review):
+    # policy-skipped symbols (``single_flight_skipped`` / ``missing_snapshot``)
+    # are NOW keys in ``fair_results`` (P1-2 synthesized structured envelopes for
+    # them), but they were NEVER acquired by THIS tick - their lease is held by
+    # ANOTHER tick (single-flight) or was never taken (missing-snapshot).
+    # Releasing them here would drop ANOTHER batch's lease and re-open the P1 #5
+    # cross-batch mutex hole, so they MUST be excluded from the release set
+    # exactly like ``continuity_unavailable``. P0-1 caveat: the synthesized
+    # ``continuity_unavailable`` envelopes are ALSO keys in ``fair_results`` but
+    # were NEVER leased (the coordinator never attempted them), so they too are
+    # excluded. We own the release now and MUST drop each ACQUIRED symbol's
+    # lease ONLY after its per-symbol persistence
+    # (``mark_batch_symbol_completed``) + side effects (``_post_decision_effects``)
+    # finish, so the cross-batch mutex covers the whole decision-write + side-
+    # effect window -- not just the LLM-call window (the P1 #5 fix). The outer
+    # ``try/finally`` releases any acquired symbol still held if the loop itself
+    # raises unexpectedly (no lease leak on any exit path).
+    _POLICY_SKIP_TERMINAL = {"single_flight_skipped", "missing_snapshot"}
+
+    def _is_releaseable(sym: str, result: Any) -> bool:
+        if sym in continuity_unavailable:
+            return False
+        tr = getattr(result, "terminal_reason", None)
+        if tr in _POLICY_SKIP_TERMINAL:
+            return False
+        return True
+
+    _acquired_symbols = [
+        s for s, r in fair_results.items() if _is_releaseable(s, r)
+    ]
+    _released_symbols: set[str] = set()
+    # 07-10 R3-P0-1 (terminal-review-repair-plan-r3 §3): the single-flight skip
+    # path MUST NOT execute any protected side effect. A ``single_flight_skipped``
+    # symbol's cross-batch lease is held by ANOTHER in-flight tick; this tick
+    # never acquired it and therefore MUST NOT call ``controller.analyze_symbol``
+    # (which would write ``ga_decisions`` / ``analysis_states`` / ``signals``),
+    # MUST NOT run ``_post_decision_effects`` (position-conflict revalidation /
+    # auto paper order / real-time alert), MUST NOT mark
+    # ``batch_symbol_status`` completed, and MUST NOT ``finish_job`` as success.
+    # Instead this tick defers ITS OWN claim on the symbol's ``agent_jobs`` row:
+    # CAS it from ``running`` back to ``pending`` (clearing this tick's
+    # ``claim_token`` / ``lease_until`` / ``started_at``) and moves
+    # ``scheduled_at`` forward by a small defer interval so a later
+    # ``run_once(background=True)`` reclaims it once the owning tick releases
+    # the symbol lease (historical contract #10 / R3 §3.2). ``missing_snapshot``
+    # is malformed INPUT (not a legitimate defer): it fails TERMINALLY with zero
+    # controller / persist / post effects. Both skip types therefore short-circuit
+    # BELOW before any controller / persistence / post-effect work runs.
+    # (_SINGLE_FLIGHT_DEFER_SECONDS / _SINGLE_FLIGHT_DEFER_CLEANUP_MARGIN are
+    # module-level; max_defers is derived dynamically -- see
+    # _resolve_single_flight_defer_config / _dynamic_max_defers.)
+    deferred_symbols: list[str] = []
+    defer_exhausted_symbols: list[str] = []
+    try:
+        for sym in symbols:
+            sym_meta = job_by_symbol.get(sym)
+            if sym_meta is None:
+                continue
+            payload = sym_meta["payload"]
+            snap = payload["snapshot"]
+            fair_result = fair_results.get(sym)
+            preset_candidate = fair_result.candidate if fair_result else None
+            preset_attempt_meta = (
+                fair_result.attempt_meta if fair_result else {}
+            )
+            # R3-P0-1 §3.2: short-circuit policy-skip symbols BEFORE any
+            # controller / persistence / post-effect work. ``single_flight_skipped``
+            # defers this tick's claim (bounded); ``missing_snapshot`` fails
+            # terminally. Neither writes a GA decision / analysis state / signal
+            # / order / alert for this symbol.
+            _skip_reason = getattr(fair_result, "terminal_reason", None) if fair_result else None
+            if _skip_reason == "single_flight_skipped":
+                job_id = int(sym_meta["job"].get("id"))
+                claim_token = sym_meta["job"].get("claim_token")
+                # R4-P1-4: defer count + first-defer timestamp live in DEDICATED
+                # columns (NOT error_message). R4-P0-1 + R5-P0: the exhaustion
+                # bound is ABSOLUTE (now - deferred_at >= defer_window), not a
+                # fixed defer_seconds*max_defers product, so a legitimate long LLM
+                # lease (up to per_symbol_timeout=1200s) is never falsely
+                # exhausted at 120s.
+                _defer_cfg = _resolve_single_flight_defer_config(llm_cfg)
+                defer_count = 0
+                deferred_at: str | None = None
+                try:
+                    defer_count, deferred_at = repo.get_job_defer_state(job_id)
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: get_job_defer_state failed "
+                        "batch=%s symbol=%s job_id=%s",
+                        batch_id, sym, job_id, exc_info=True,
+                    )
+                # R4-P0-1 + R5-P0: ABSOLUTE defer window is the SOLE authority
+                # whenever deferred_at is parseable. A symbol is exhausted ONLY
+                # if the owning tick has held the lease past the legitimate
+                # per_symbol_timeout + cleanup buffer (the LLM call should have
+                # finished or hard-timed-out by then). A deferred_at that is None
+                # (first defer this sequence) can NEVER be exhausted yet.
+                #
+                # R5-P0 (dynamic backstop, FAIL-CLOSED): the pre-R5 design OR-ed
+                # a FIXED ``defer_count >= 8`` backstop into the exhaustion
+                # condition, which fired at 8*15 = 120s -- EARLIER than every
+                # legitimate absolute window (240/360/1260s) and re-introduced the
+                # premature exhaustion R4-P0-1 was meant to kill. The count
+                # backstop is now (a) DYNAMIC -- ``max_defers =
+                # ceil(defer_window_seconds / defer_seconds) + cleanup_margin`` so
+                # it can never fire inside the legitimate window -- AND (b) gated
+                # so it is consulted ONLY when ``deferred_at`` is None /
+                # unparseable (``_deferred_at_known`` is False). When the
+                # timestamp IS known, the absolute window alone decides; the
+                # count backstop never gets a vote. This is the fail-closed
+                # fallback for an unknown elapsed time (must not silently defer
+                # forever) without ever firing inside a legitimate window.
+                _defer_elapsed_s = 0
+                _deferred_at_known = False
+                if deferred_at:
+                    try:
+                        _deferred_ms = _parse_sqlite_ts_ms(deferred_at)
+                        _now_ms = utc_ms()
+                        if _deferred_ms is not None:
+                            _defer_elapsed_s = max(0, (_now_ms - _deferred_ms) // 1000)
+                            _deferred_at_known = True
+                    except Exception:
+                        _defer_elapsed_s = 0
+                _absolute_exhausted = (
+                    _deferred_at_known
+                    and _defer_elapsed_s >= _defer_cfg.defer_window_seconds
+                )
+                # R5-P0: the count backstop is consulted ONLY when the absolute
+                # window CANNOT be evaluated (deferred_at None / unparseable).
+                _backstop_exhausted = (
+                    (not _deferred_at_known) and defer_count >= _defer_cfg.max_defers
+                )
+                if _absolute_exhausted or _backstop_exhausted:
+                    # R3 §3.2.10 + R4-P0-1: defer policy exhausted -> terminate
+                    # the job with an explicit non-executable reason. NO GA
+                    # decision, NO post effects. The batch_symbol_status row is
+                    # marked failed so the batch can still complete (and the
+                    # operator sees the exhaustion, not a phantom pending job).
+                    # The reason string records WHICH bound fired (absolute vs
+                    # backstop) for diagnostics.
+                    _exhaust_reason = (
+                        "single_flight_defer_exhausted:absolute_window"
+                        if _absolute_exhausted
+                        else "single_flight_defer_exhausted:backstop_cap"
+                    )
+                    try:
+                        repo.mark_batch_symbol_completed(
+                            batch_id=batch_id, symbol=sym, failed=True,
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "process_fair_batch: mark_batch_symbol_completed"
+                            "(defer_exhausted) failed batch=%s symbol=%s",
+                            batch_id, sym,
+                        )
+                    try:
+                        repo.finish_job(
+                            job_id,
+                            result={
+                                "ok": False,
+                                "reason": "single_flight_defer_exhausted",
+                                "exhaust_reason": _exhaust_reason,
+                                "batch_id": batch_id,
+                                "symbol": sym,
+                                "defer_count": defer_count,
+                                "defer_elapsed_s": _defer_elapsed_s,
+                                "defer_window_s": _defer_cfg.defer_window_seconds,
+                                "per_symbol_timeout_s": _defer_cfg.per_symbol_timeout_seconds,
+                            },
+                            error_message=(
+                                f"single_flight_defer_exhausted: "
+                                f"defer_count={defer_count} "
+                                f"defer_elapsed_s={_defer_elapsed_s} "
+                                f"defer_window_s={_defer_cfg.defer_window_seconds} "
+                                f"max_defers={_defer_cfg.max_defers} "
+                                f"reason={_exhaust_reason}"
+                            ),
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "process_fair_batch: finish_job(defer_exhausted) "
+                            "failed batch=%s symbol=%s job_id=%s",
+                            batch_id, sym, job_id,
+                        )
+                    defer_exhausted_symbols.append(sym)
+                    failed_symbols.append(sym)
+                    per_symbol_results.append({
+                        "symbol": sym, "ok": False,
+                        "reason": "single_flight_defer_exhausted",
+                    })
+                    continue
+                # Defer this tick's claim: CAS running->pending keyed on THIS
+                # worker's claim_token. Zero rows = claim-loss (another worker
+                # / recovery owns the row now) -> nothing further to do (do NOT
+                # touch another worker's row). On success the row is pending
+                # again with a forward ``scheduled_at``; a later ``run_once``
+                # reclaims + processes it exactly once (R3 §3.2.9). R4-P1-4: the
+                # atomic increment of defer_count + COALESCE(deferred_at, now)
+                # happen INSIDE this CAS UPDATE.
+                deferred_ok = False
+                if claim_token:
+                    try:
+                        deferred_ok = repo.defer_claimed_job(
+                            job_id, str(claim_token),
+                            reason="single_flight_deferred",
+                            defer_seconds=_defer_cfg.defer_seconds,
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "process_fair_batch: defer_claimed_job raised "
+                            "batch=%s symbol=%s job_id=%s",
+                            batch_id, sym, job_id,
+                        )
+                        deferred_ok = False
+                if deferred_ok:
+                    deferred_symbols.append(sym)
+                    per_symbol_results.append({
+                        "symbol": sym, "ok": True,
+                        "reason": "single_flight_deferred",
+                        "defer_count": defer_count + 1,
+                    })
+                    LOGGER.info(
+                        "process_fair_batch: deferred single-flight-skip "
+                        "symbol=%s batch=%s job_id=%s defer_count=%s "
+                        "defer_elapsed_s=%s/%s (absolute window)",
+                        sym, batch_id, job_id, defer_count + 1,
+                        _defer_elapsed_s, _defer_cfg.defer_window_seconds,
+                    )
+                else:
+                    # Claim-loss (lease expired + recovered by another worker,
+                    # or this tick never owned it). The row is no longer ours;
+                    # leave it for whoever owns it. Record the outcome so the
+                    # batch summary is honest (no phantom success).
+                    LOGGER.warning(
+                        "process_fair_batch: single-flight defer claim-loss "
+                        "(row no longer owned by this tick) symbol=%s "
+                        "batch=%s job_id=%s",
+                        sym, batch_id, job_id,
+                    )
+                    deferred_symbols.append(sym)
+                    per_symbol_results.append({
+                        "symbol": sym, "ok": False,
+                        "reason": "single_flight_defer_claim_loss",
+                    })
+                # batch_symbol_status is LEFT PENDING (never registered for a
+                # deferred symbol) so ``is_batch_complete`` stays False and the
+                # batch is NOT falsely completed while the symbol awaits
+                # re-claim (R3 §3.2.7). NO lease release here -- this tick never
+                # acquired the symbol's lease (the owning tick holds it).
+                continue
+            if _skip_reason == "missing_snapshot":
+                # R3 §3.2 final paragraph: ``missing_snapshot`` is malformed
+                # INPUT (the enqueue pipeline failed to attach a snapshot), NOT a
+                # legitimate defer. Fail TERMINALLY with zero controller /
+                # persist-decision / post effects: no ``analyze_symbol``, no
+                # ``ga_decisions`` row, no ``_post_decision_effects``. Mark the
+                # batch symbol failed + finish the job failed so the batch can
+                # still complete and the operator sees the malformed input.
+                job_id = int(sym_meta["job"].get("id"))
+                LOGGER.error(
+                    "process_fair_batch: missing_snapshot (malformed input) -> "
+                    "terminal fail, zero controller/post effects. symbol=%s "
+                    "batch=%s job_id=%s",
+                    sym, batch_id, job_id,
+                )
+                try:
+                    repo.mark_batch_symbol_completed(
+                        batch_id=batch_id, symbol=sym, failed=True,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: mark_batch_symbol_completed"
+                        "(missing_snapshot) failed batch=%s symbol=%s",
+                        batch_id, sym,
+                    )
+                try:
+                    repo.finish_job(
+                        job_id,
+                        result={
+                            "ok": False,
+                            "reason": "missing_snapshot",
+                            "batch_id": batch_id,
+                            "symbol": sym,
+                        },
+                        error_message="missing_snapshot: malformed scheduled payload",
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: finish_job(missing_snapshot) "
+                        "failed batch=%s symbol=%s job_id=%s",
+                        batch_id, sym, job_id,
+                    )
+                failed_symbols.append(sym)
+                per_symbol_results.append({
+                    "symbol": sym, "ok": False, "reason": "missing_snapshot",
+                })
+                continue
+            try:
+                decision = controller.analyze_symbol(
+                    GAAnalysisRequest(
+                        symbol=snap["symbol"],
+                        decision_type="scheduled_analysis",
+                        analysis_time_utc=int(snap.get("analysis_time_utc") or 0),
+                        mode=snap.get("mode") or "scheduled",
+                        snapshot=snap,
+                        snapshot_id=payload.get("snapshot_id"),
+                        allow_realtime_signal_alert=bool(payload.get("allow_realtime_signal_alert")),
+                        batch_id=batch_id,
+                    ),
+                    preset_llm_candidate=preset_candidate,
+                    preset_llm_attempt_meta=preset_attempt_meta,
+                )
+                try:
+                    repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym)
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: mark_batch_symbol_completed failed "
+                        "batch=%s symbol=%s", batch_id, sym,
+                    )
+                _post_decision_effects(
+                    repo, decision, payload,
+                    send_message=send_message, job_id=sym_meta["job"].get("id"),
+                )
+                per_symbol_results.append({"symbol": sym, "ok": True, "decision": decision})
+                # 07-10 S6 (P1 #6): finish THIS symbol's agent_job as success.
+                # The prior design left per-job finishing to ``run_once``'s
+                # uniform post-batch loop, which marked EVERY job in the batch
+                # ``success`` regardless of whether its ``analyze_symbol`` raised
+                # -> a failed symbol's job was mislabeled success (the P1 #6
+                # defect, which hid per-symbol failures from the ops/dashboard).
+                # ``finish_job(job_id, result=, error_message=)`` already supports
+                # per-job success/failed; we call it here per-symbol so the job
+                # row's status reflects THIS symbol's outcome. The uniform loop
+                # in ``run_once`` is removed (it would double-finish + mislabel).
+                try:
+                    repo.finish_job(
+                        int(sym_meta["job"].get("id")),
+                        result=per_symbol_results[-1],
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: finish_job(success) failed "
+                        "batch=%s symbol=%s job_id=%s",
+                        batch_id, sym, sym_meta["job"].get("id"),
+                    )
+            except Exception as sym_exc:
+                LOGGER.exception(
+                    "process_fair_batch: analyze_symbol failed batch=%s symbol=%s",
+                    batch_id, sym,
+                )
+                failed_symbols.append(sym)
+                try:
+                    repo.mark_batch_symbol_completed(
+                        batch_id=batch_id, symbol=sym, failed=True,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: failed-mark_batch_symbol_completed "
+                        "failed batch=%s symbol=%s", batch_id, sym,
+                    )
+                per_symbol_results.append(
+                    {"symbol": sym, "ok": False, "error": str(sym_exc)},
+                )
+                # 07-10 S6 (P1 #6): finish THIS symbol's agent_job as FAILED with
+                # the exception text -- NOT success. Revert-fail: the prior
+                # uniform loop in ``run_once`` would overwrite this with
+                # ``finish_job(result=<batch result>)`` (no error_message ->
+                # status='success'), mislabeling the failed symbol.
+                try:
+                    repo.finish_job(
+                        int(sym_meta["job"].get("id")),
+                        result=per_symbol_results[-1],
+                        error_message=str(sym_exc)[:500],
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "process_fair_batch: finish_job(failed) failed "
+                        "batch=%s symbol=%s job_id=%s",
+                        batch_id, sym, sym_meta["job"].get("id"),
+                    )
+            finally:
+                # S5 (P1 #5): release this symbol's lease now that its
+                # persistence + side effects are done (success OR failure).
+                # Only release symbols ``run_fair_batch`` actually acquired.
+                # P1-2 (terminal review): a policy-skipped symbol IS now in
+                # ``fair_results`` (structured envelope) but was NEVER acquired
+                # by THIS tick - its lease (if any) belongs to ANOTHER tick that
+                # is still mid-flight. Releasing it here would drop that other
+                # tick's cross-batch mutex (the P1 #5 hole), so exclude policy-
+                # skip terminal reasons exactly as we exclude
+                # ``continuity_unavailable``. ``_is_releaseable`` is the single
+                # source of truth shared with the safety-net release below.
+                fair_result = fair_results.get(sym)
+                if (fair_result is not None
+                        and sym not in _released_symbols
+                        and _is_releaseable(sym, fair_result)):
+                    try:
+                        lease.release(symbol=sym)
+                    except Exception:
+                        LOGGER.exception(
+                            "process_fair_batch: failed to release lease for "
+                            "%s (batch=%s)", sym, batch_id,
+                        )
+                    else:
+                        _released_symbols.add(sym)
+    finally:
+        # Safety net: release any acquired symbol NOT already released (e.g. an
+        # unexpected exception skipped its per-symbol finally). Idempotent --
+        # ``release`` on an already-released symbol is a no-op.
+        for sym in _acquired_symbols:
+            if sym not in _released_symbols:
+                try:
+                    lease.release(symbol=sym)
+                except Exception:
+                    LOGGER.exception(
+                        "process_fair_batch: safety-net release failed for %s "
+                        "(batch=%s)", sym, batch_id,
+                    )
+
+    # Finish the batch when all enabled symbols are processed. Mirror the
+    # serial path's status selection + llm_health merge (including the P2-5
+    # exception-path per-decision aggregate).
+    # 07-10 P1-3 (terminal review): if any malformed job was marked failed
+    # above, the batch must NOT render ``success`` even if every ENABLED
+    # symbol completed cleanly — a poison-pill ingest failure is a real
+    # defect the operator must see. Force ``partial_failed`` (or ``failed``
+    # when every enabled symbol also failed) and carry the malformed list in
+    # the summary so the report surfaces it.
+    # 07-10 R3-P0-1 (terminal review): a batch with a DEFERRED symbol is NOT
+    # complete — ``is_batch_complete`` is False because the deferred symbol's
+    # ``batch_symbol_status`` row stays ``pending`` (R3 §3.2.7). So this block
+    # is skipped and the batch stays ``running`` until a later ``run_once``
+    # re-claims the deferred job, processes it, and registers it. That is the
+    # required behavior (the batch must NOT be falsely completed). The
+    # ``defer_exhausted`` path marks the batch symbol failed, so a batch where
+    # the defer policy is exhausted DOES complete (as ``partial_failed`` /
+    # ``failed``) and surfaces the exhausted symbols below.
+    batch_summary: dict[str, Any] | None = None
+    try:
+        if repo.is_batch_complete(batch_id):
+            if repo.batch_all_failed(batch_id):
+                batch_status = "failed"
+            elif repo.batch_has_failures(batch_id) or malformed_jobs:
+                batch_status = "partial_failed"
+            else:
+                batch_status = "success"
+            llm_health = controller.get_batch_llm_health(batch_id)
+            summary: dict[str, Any] | None = {"llm_health": llm_health} if llm_health else None
+            if malformed_jobs:
+                if summary is None:
+                    summary = {}
+                summary["malformed_jobs"] = malformed_jobs
+            if defer_exhausted_symbols:
+                if summary is None:
+                    summary = {}
+                summary["defer_exhausted_symbols"] = defer_exhausted_symbols
+            repo.finish_analysis_batch(
+                batch_id=batch_id, status=batch_status, summary=summary,
+            )
+            batch_summary = summary
+            _batch_breakers.pop(batch_id, None)
+    except Exception:
+        LOGGER.warning(
+            "process_fair_batch: finish_analysis_batch failed batch=%s",
+            batch_id, exc_info=True,
+        )
+
+    return {
+        "ok": True,
+        "processed": True,
+        "batch_id": batch_id,
+        "symbols": len(symbols),
+        "results": per_symbol_results,
+        "failed_symbols": failed_symbols,
+        "malformed_jobs": malformed_jobs,
+        "deferred_symbols": deferred_symbols,
+        "defer_exhausted_symbols": defer_exhausted_symbols,
+        "batch_summary": batch_summary,
+        "queue": "fair_pool",
+    }
+
 
 def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     payload = json.loads(job["payload_json"])
@@ -64,6 +1220,54 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         llm_cfg = load_config().trading_mode.get("llm", {})
         breaker_cfg = llm_cfg.get("circuit_breaker", {})
         retry_cfg = llm_cfg.get("retry", {})
+        # 07-10 S7 (P1 #8): deterministic-only rollback. When the fair-pool
+        # scheduling mode is DISABLED (the feature-flag rollback case), the
+        # serial ``process_job`` path is the ONLY path a scheduled analysis
+        # takes. The prior design let it fall through to
+        # ``controller.analyze_symbol`` with NO preset -> ``run_agent_sop_decision``
+        # consulted ``CRYPTO_GUARD_LLM_ANALYSIS`` (default on) -> the serial
+        # LLM starvation path (the very bug fair scheduling was built to fix:
+        # one shared 90s budget, first-few-symbols-drain-it, rest starved).
+        # implement.md:64 requires the rollback fallback be DETERMINISTIC-ONLY.
+        # Fix: build the deterministic SOP decision with ``use_llm=False`` and
+        # feed it to the controller as a preset candidate. ``run_agent_sop_decision``
+        # consumes the preset (no provider call) and the controller runs the
+        # full risk/hysteresis/clamp/persistence pipeline on it. No LLM, no
+        # shared-budget starvation. When mode == ``fair_pool`` this branch is
+        # only reached for stragglers not claimed by ``claim_next_batch``;
+        # preserve the existing (preset-free) serial behavior there.
+        _sched_mode_s7 = (llm_cfg.get("scheduling", {}) or {}).get("mode", "fair_pool")
+        _deterministic_only_s7 = _sched_mode_s7 != "fair_pool"
+        _preset_candidate_s7: dict[str, Any] | None = None
+        _preset_attempt_meta_s7: dict[str, Any] | None = None
+        if _deterministic_only_s7:
+            from plugins.crypto_guard.reasoning.llm_agent_judge import (
+                run_agent_sop_decision,
+            )
+            _det_s7 = run_agent_sop_decision(snapshot, use_llm=False)
+            _preset_candidate_s7 = _det_s7
+            _preset_attempt_meta_s7 = {
+                "llm_status": "disabled",
+                "llm_attempt_count": 0,
+                "llm_provider_call_count": 0,
+                "llm_terminal_reason": "llm_disabled",
+                "llm_fallback_reason": "llm_disabled",
+                "llm_config_name": None,
+                "llm_model": None,
+                "llm_error_category": None,
+                "llm_error_stage": None,
+                "llm_error": None,
+                "llm_retry_round": None,
+                "llm_schedule_round": None,
+                "llm_schedule_position": None,
+                "llm_continuity_included": None,
+                "llm_prompt_bytes": None,
+                "llm_latency_ms": 0,
+                "llm_effective_thinking_budget_tokens": None,
+                "llm_effective_max_output_tokens": None,
+                "llm_effective_temperature": None,
+                "llm_provider_timeout_ms": None,
+            }
         breaker = _batch_breakers.get(batch_id or "")
         if breaker is None and batch_id:
             # Create the full batch_state dict (breaker + budgets) so the
@@ -106,18 +1310,30 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
             # Inject the shared breaker cache into the controller so it reuses
             # the same breaker instead of creating a new one per symbol.
             controller._breakers = _batch_breakers
-            decision = controller.analyze_symbol(
-                GAAnalysisRequest(
-                    symbol=snapshot["symbol"],
-                    decision_type="scheduled_analysis",
-                    analysis_time_utc=int(snapshot.get("analysis_time_utc") or 0),
-                    mode=snapshot.get("mode") or "scheduled",
-                    snapshot=snapshot,
-                    snapshot_id=payload.get("snapshot_id"),
-                    allow_realtime_signal_alert=bool(payload.get("allow_realtime_signal_alert")),
-                    batch_id=batch_id,
-                )
+            _analyze_request_s7 = GAAnalysisRequest(
+                symbol=snapshot["symbol"],
+                decision_type="scheduled_analysis",
+                analysis_time_utc=int(snapshot.get("analysis_time_utc") or 0),
+                mode=snapshot.get("mode") or "scheduled",
+                snapshot=snapshot,
+                snapshot_id=payload.get("snapshot_id"),
+                allow_realtime_signal_alert=bool(payload.get("allow_realtime_signal_alert")),
+                batch_id=batch_id,
             )
+            if _deterministic_only_s7:
+                # P1 #8: feed the deterministic SOP decision as a preset so the
+                # controller runs the full risk/persistence pipeline WITHOUT an
+                # LLM call (no shared-budget starvation on the rollback path).
+                decision = controller.analyze_symbol(
+                    _analyze_request_s7,
+                    preset_llm_candidate=_preset_candidate_s7,
+                    preset_llm_attempt_meta=_preset_attempt_meta_s7,
+                )
+            else:
+                # fair_pool mode: preserve the prior call signature (no preset
+                # kwargs). Some tests stub ``analyze_symbol(request)`` with a
+                # narrower signature, so we must not add kwargs here.
+                decision = controller.analyze_symbol(_analyze_request_s7)
             # Hourly Report Accuracy: record batch progress for completion gate.
             if batch_id:
                 try:
@@ -161,6 +1377,31 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                         wcb = _bs.get("wall_clock_budget") if isinstance(_bs, dict) else None
                         if wcb is not None:
                             llm_health["wall_clock_budget_ms_remaining"] = wcb.remaining_ms()
+                        # 07-10 Phase E reviewer P2-5: the normal completion
+                        # path calls ``controller.get_batch_llm_health`` which
+                        # merges the per-decision aggregate (_aggregate_batch_
+                        # llm_outcomes) into the snapshot. This exception path
+                        # used to build llm_health from the breaker snapshot
+                        # alone, dropping the Phase E per-decision fields
+                        # (expected_symbols, llm_symbols_attempted, coverage, ...).
+                        # Without them _render_llm_coverage_line returns "" and
+                        # the report silently falls back to the legacy single-
+                        # line stats, losing the pipeline/coverage split and the
+                        # skip breakdown exactly when something went wrong. Merge
+                        # the aggregate here too so the exception-path batch
+                        # reports with the same fidelity as the happy path.
+                        try:
+                            from plugins.crypto_guard.ga_master.controller import (
+                                _aggregate_batch_llm_outcomes,
+                            )
+                            _per_decision = _aggregate_batch_llm_outcomes(repo, batch_id)
+                            if _per_decision:
+                                llm_health.update(_per_decision)
+                        except Exception:
+                            LOGGER.warning(
+                                "run_ga_workers: per-decision LLM aggregate failed "
+                                "on exception path batch=%s", batch_id, exc_info=True,
+                            )
                         summary = {"llm_health": llm_health} if llm_health else None
                         repo.finish_analysis_batch(batch_id=batch_id, status=batch_status, summary=summary)
                         _batch_breakers.pop(batch_id, None)
@@ -168,106 +1409,13 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                     pass
             raise
         signal_id = int(decision["signal_id"])
-        sent = False
-        target = None
-
-        # Auto-create paper order for S/A grade signals with valid trade plan
-        auto_order = None
-        grade = str(decision.get("signal_grade") or "D").upper()
-        has_plan = bool(decision.get("has_trade_plan") and decision.get("trade_plan"))
-        risk_ok = bool((decision.get("risk_check") or {}).get("ok"))
-        ga_decision_id = decision.get("ga_decision_id")
-        # Don't auto-create if there's already an open order for this symbol
-        existing_orders = repo.list_open_paper_orders_for_symbol(decision.get("symbol", ""))
-        if grade in {"S", "A"} and has_plan and risk_ok and ga_decision_id and not existing_orders:
-            try:
-                from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
-                auto_order = create_paper_order_from_ga_decision(repo, int(ga_decision_id))
-                LOGGER.info("auto paper order created ga_decision_id=%s result=%s", ga_decision_id, auto_order)
-                # Send notification when order is newly created (not idempotent)
-                if auto_order.get("ok") and auto_order.get("created"):
-                    _target = resolve_report_target(repo, payload)
-                    if _target and send_message:
-                        plan = decision.get("trade_plan") or {}
-                        tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
-                        side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
-                        entry_type = str(plan.get("entry_type") or "limit")
-                        status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
-                        entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
-                        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
-                        event_time = format_event_time_cst(datetime.now(timezone.utc))
-                        order_text = "\n".join([
-                            "**CryptoGuard 已自动创建模拟盘订单**",
-                            "",
-                            f"- 时间：{event_time}",
-                            f"- 产品：{decision.get('symbol')}",
-                            f"- 方向：{side_cn}",
-                            f"- 状态：{status_cn}",
-                            f"- 入场价：{entry_price}",
-                            f"- 止损价：{plan.get('stop_loss')}",
-                            f"- 止盈价：{tps}",
-                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
-                            "",
-                            "不构成实盘建议，仅用于模拟盘与策略研究。",
-                        ])
-                        send_markdown_alert(
-                            repo, send_message,
-                            receive_id=_target["receive_id"],
-                            receive_id_type=_target.get("receive_id_type", "chat_id"),
-                            text=order_text,
-                            alert_type="paper_order_filled",
-                            symbol=decision.get("symbol"),
-                            priority=3,
-                        )
-            except Exception as exc:
-                LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
-                auto_order = {"ok": False, "error": str(exc)}
-
-        # Position-aware analysis: revalidate open positions when GA decision conflicts
-        from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
-        _pos_result = run_position_conflict_revalidation(
-            repo,
-            symbol=decision.get("symbol"),
-            ga_decision_id=ga_decision_id,
-            send_message=send_message,
-        )
-        if _pos_result.get("conflict_count"):
-            LOGGER.info(
-                "position_conflict_revalidation: symbol=%s checked=%s conflicts=%s closed=%s stop_adjusted=%s recheck=%s",
-                decision.get("symbol"),
-                _pos_result.get("checked_count"),
-                _pos_result.get("conflict_count"),
-                _pos_result.get("closed_count"),
-                _pos_result.get("stop_adjusted_count"),
-                _pos_result.get("recheck_count"),
-            )
-
-        # v2: scheduled analysis is recorded into analysis_states/signals and summarized hourly.
-        # Real-time Feishu alerts are reserved for paper/risk/opportunity events.
-        if payload.get("allow_realtime_signal_alert") and should_push_signal(decision):
-            target = resolve_report_target(repo, payload)
-            if target and send_message:
-                sent = bool(
-                    _send_interactive_alert(
-                        repo,
-                        send_message,
-                        target["receive_id"],
-                        target.get("receive_id_type", "chat_id"),
-                        build_analysis_card_json(decision, signal_id=signal_id),
-                        alert_type="signal_alert",
-                        symbol=decision.get("symbol"),
-                        priority=5,
-                    ).get("sent")
-                )
-        result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target, "auto_order": auto_order}
-        LOGGER.info(
-            "process_job done id=%s type=%s signal_id=%s grade=%s pushed=%s decision=%s",
-            job.get("id"),
-            job_type,
-            signal_id,
-            decision.get("signal_grade"),
-            sent,
-            decision.get("decision"),
+        # 07-10 R5-3: post-decision side effects are shared with the fair
+        # batch path via ``_post_decision_effects`` so paper orders, position
+        # revalidation, and signal alerts cannot diverge between dispatch
+        # modes. This block used to inline all three effects.
+        result = _post_decision_effects(
+            repo, decision, payload,
+            send_message=send_message, job_id=job.get("id"),
         )
         return result
     if job_type == "update_opportunity_watches":
@@ -1192,6 +2340,35 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
             current_db = db_row["file"] if db_row and "file" in db_row.keys() else None
             if current_db and str(redis_payload.get("database_path")) != str(current_db):
                 redis_payload = None
+        # 07-10 P1-4 (terminal review): consumer-side guard. The S2 producer
+        # guard (``_enqueue_job_redis``) already keeps
+        # ``scheduled_market_analysis`` out of the Redis queue, so a popped
+        # payload of this type means the producer guard was bypassed (a stale
+        # item enqueued before S2, a future code path that skips
+        # ``enqueue_job``/``_enqueue_job_redis``, or a manual RPUSH). Without
+        # this guard, ``run_once`` would execute it as a SINGLE serial
+        # ``process_job`` here -> bypassing ``claim_next_batch`` and the fair
+        # batch entirely (the known LLM starvation path), and the SQLite row
+        # (the sole authority) would never be claimed by the batch coordinator.
+        # Defense in depth: drop the Redis payload (do NOT claim its
+        # ``sqlite_job_id`` here -- the row stays ``status='pending'`` so
+        # ``claim_next_batch`` can claim the whole batch together below) and
+        # fall through to the fair-pool path. We MUST NOT execute it serially,
+        # even if Redis says so. The ``database_path`` mismatch check above
+        # already ran; this is a job-type gate independent of which DB the item
+        # came from.
+        if redis_payload and redis_payload.get("job_type") == "scheduled_market_analysis":
+            LOGGER.warning(
+                "run_once: Redis popped a scheduled_market_analysis payload "
+                "(job_type=%s sqlite_job_id=%s) -- the S2 producer guard should "
+                "have kept this out of Redis. Dropping the Redis item and "
+                "re-routing to the fair-pool batch path (claim_next_batch); the "
+                "SQLite row is the sole authority and stays pending for the "
+                "batch coordinator to claim as a group. NOT executing it as a "
+                "single serial job (would bypass the fair batch / starve LLM).",
+                redis_payload.get("job_type"), redis_payload.get("sqlite_job_id"),
+            )
+            redis_payload = None
         if redis_payload:
             payload = redis_payload.get("payload") or {}
             sqlite_job_id = redis_payload.get("sqlite_job_id")
@@ -1226,6 +2403,70 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                 if sqlite_job_id:
                     repo.finish_job(int(sqlite_job_id), error_message=str(exc))
                 raise
+        # 07-10 R5-2: fair-pool dispatch. When the configured LLM scheduling
+        # mode is ``fair_pool`` and this is a background worker (not a user-
+        # only worker, which must still handle interactive jobs serially),
+        # claim an entire batch of ``scheduled_market_analysis`` jobs at once
+        # and run it through ``process_fair_batch`` -> ``run_fair_batch``.
+        # This is the production entry point the directive requires: a real
+        # batch-level production path that atomically claims same-batch jobs
+        # (directive #1) and feeds them to the fair coordinator's single-
+        # attempt adapter (directive #2). Legacy serial mode (or any non-
+        # scheduled user job) still falls through to the per-job path below.
+        if background and not user_only:
+            try:
+                sched_mode = (
+                    cfg.trading_mode.get("llm", {}).get("scheduling", {}).get("mode", "fair_pool")
+                )
+            except Exception:
+                sched_mode = "fair_pool"
+            if sched_mode == "fair_pool":
+                batch_jobs = repo.claim_next_batch()
+                if batch_jobs:
+                    try:
+                        result = process_fair_batch(repo, batch_jobs, send_message=send_message)
+                        # 07-10 S6 (P1 #6): ``process_fair_batch`` now finishes
+                        # EACH symbol's agent_job per-symbol (success/failed
+                        # reflecting that symbol's ``analyze_symbol`` outcome).
+                        # The prior uniform ``finish_job`` loop here would (a)
+                        # double-finish every job and (b) overwrite a failed
+                        # symbol's ``status='failed'`` with ``status='success'``
+                        # (no error_message) -- the P1 #6 defect. Removed.
+                        return {
+                            "ok": True, "processed": True,
+                            "batch_id": result.get("batch_id"),
+                            "result": result, "queue": "fair_pool",
+                        }
+                    except Exception as exc:
+                        LOGGER.exception(
+                            "process_fair_batch failed batch_id=%s",
+                            (json.loads(batch_jobs[0]["payload_json"]) if batch_jobs else {}).get("batch_id"),
+                        )
+                        # 07-10 S6 (P1 #6): a whole-batch exception means
+                        # ``process_fair_batch`` raised BEFORE or AFTER the
+                        # per-symbol loop. Per-symbol jobs already finished inside
+                        # ``process_fair_batch`` carry ``status`` in
+                        # {success, failed}; only mark the STILL-RUNNING ones
+                        # failed here so we never overwrite a symbol's real
+                        # per-symbol outcome (e.g. a success finished just before
+                        # the batch-completion block raised).
+                        for j in batch_jobs:
+                            try:
+                                _jid = int(j["id"])
+                                _cur = repo.conn.execute(
+                                    "SELECT status FROM agent_jobs WHERE id=?",
+                                    (_jid,),
+                                ).fetchone()
+                                _cur_status = _cur["status"] if _cur else None
+                                if _cur_status in ("success", "failed"):
+                                    continue  # already finished per-symbol
+                                repo.finish_job(_jid, error_message=str(exc))
+                            except Exception:
+                                pass
+                        raise
+                # No fair-pool batch ready -> fall through to the idle / serial
+                # claim_next_job path below (handles alert outbox, shadow
+                # verdicts, and any non-scheduled user jobs).
         job = repo.claim_next_job(max_priority=2) if user_only else repo.claim_next_job(background=background)
         if not job:
             if background:

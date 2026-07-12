@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -1095,9 +1096,15 @@ class CryptoGuardRepository:
             status = existing["status"]
             if status in ("pending", "running", "success"):
                 return existing_id
-            # Reset failed/cancelled/duplicate to pending
+            # Reset failed/cancelled/duplicate to pending. This is a FRESH
+            # lifecycle for a previously-TERMINATED job (the prior attempt ran
+            # to a terminal failed/cancelled state), so the single-flight defer
+            # history MUST be cleared -- unlike ``claim_next_batch`` (which
+            # reclaims a still-deferred PENDING row and MUST preserve defer
+            # history so a perpetually-deferred job can reach exhaustion under
+            # the R4-P0-1 absolute window). See R1 final-seal recommendation.
             self.conn.execute(
-                "UPDATE agent_jobs SET status='pending', priority=?, source=?, payload_json=?, started_at=NULL, error_message=NULL, finished_at=NULL, scheduled_at=COALESCE(?, CURRENT_TIMESTAMP) WHERE id=?",
+                "UPDATE agent_jobs SET status='pending', priority=?, source=?, payload_json=?, started_at=NULL, error_message=NULL, finished_at=NULL, defer_count=0, deferred_at=NULL, scheduled_at=COALESCE(?, CURRENT_TIMESTAMP) WHERE id=?",
                 (int(priority), source, json.dumps(payload, ensure_ascii=False), scheduled_at, existing_id),
             )
             self._enqueue_job_redis(existing_id, job_type, priority, source, session_id, payload)
@@ -1126,6 +1133,23 @@ class CryptoGuardRepository:
 
     def _enqueue_job_redis(self, job_id: int, job_type: str, priority: int, source: str, session_id: str, payload: dict[str, Any]) -> None:
         try:
+            # 07-10 S2 (P0 #2): ``scheduled_market_analysis`` must NOT enter the
+            # Redis single-job queue. The fair-pool dispatch path
+            # (``run_once`` -> ``claim_next_batch`` -> ``process_fair_batch``)
+            # is the ONLY authority for scheduled market analysis: it atomically
+            # claims an entire batch's rows from SQLite and runs them through
+            # the fair coordinator together. If a ``scheduled_market_analysis``
+            # job were RPUSH'd to the Redis background queue, ``run_once``'s
+            # ``redis.pop_background_job()`` branch would pop and execute it as a
+            # SINGLE job via the legacy serial ``process_job`` path -- bypassing
+            # ``claim_next_batch`` and the fair batch entirely (the known LLM
+            # starvation path). Redis stays an (optional) wake-up / user-job
+            # channel; SQLite ``claim_next_batch`` is the sole ownership
+            # authority for scheduled analysis. ``enqueue_job`` already wrote the
+            # SQLite row, so simply returning here leaves the job claimable by
+            # the batch coordinator.
+            if job_type == "scheduled_market_analysis":
+                return
             db_row = self.conn.execute("PRAGMA database_list").fetchone()
             database_path = db_row["file"] if db_row and "file" in db_row.keys() else None
             from plugins.crypto_guard.storage.redis_adapter import RedisAdapter, should_use_redis_for_path
@@ -1177,15 +1201,275 @@ class CryptoGuardRepository:
             return None
         return dict(row)
 
-    def recover_stale_running_jobs(self, *, older_than_minutes: int = 30) -> int:
+    def claim_next_batch(self) -> list[dict[str, Any]] | None:
+        """07-10 R5-1 / S3 (P0 #4): atomically claim ALL pending
+        ``scheduled_market_analysis`` jobs of ONE batch as a group, AND stamp
+        a unique ``claim_token`` + ``lease_until`` on every claimed row so the
+        caller can prove ownership.
+
+        The fair-pool dispatch mode (``run_once`` -> ``process_fair_batch``)
+        must run an entire batch's symbols through ``run_fair_batch`` together
+        so the two-pass barrier + fair rotation can operate on the whole
+        enabled-symbol set at once. Claiming one job at a time (the legacy
+        ``claim_next_job`` path) would force serial execution and defeat the
+        fairness fix.
+
+        CAS semantics across concurrent workers (P0 #4): only ONE worker's
+        ``UPDATE...WHERE status='pending'`` can flip a given batch's rows to
+        ``running`` AND stamp its own ``claim_token``. A second worker that
+        races on the same batch sees those rows already ``running`` (with the
+        first worker's token), so its head SELECT finds no pending row for
+        that batch -> it either picks a DIFFERENT batch or returns None (idle).
+        The re-SELECT keys on ``claim_token=?`` (this worker's token) so the
+        returned rows are PROVABLY this worker's claim — never a row another
+        worker flipped concurrently. SQLite serializes writes under the
+        default journal, so the UPDATE is atomic.
+
+        ``lease_until`` is set to ``datetime('now','+30 minutes')``. A worker
+        that crashes mid-batch leaves ``status='running'`` with an expired
+        lease; ``recover_stale_running_jobs`` resets it to ``pending`` so the
+        batch can be reclaimed. Pre-S3 running rows (``lease_until IS NULL``,
+        e.g. legacy ``claim_next_job`` rows) are still recovered by age.
+
+        07-10 R4-P0-1: this UPDATE does NOT reset ``defer_count`` /
+        ``deferred_at``. A job that was ``single_flight_skipped`` (deferred)
+        and re-claimed MUST retain its defer history so the ABSOLUTE exhaustion
+        window (``now - deferred_at >= per_symbol_timeout + buffer``) and the
+        ``max_defers`` backstop can ACCUMULATE across reclaims -- otherwise a
+        job perpetually stuck behind a long-lived lease would never reach
+        exhaustion (each reclaim would wipe the clock). New jobs start at
+        ``defer_count=0 / deferred_at=NULL`` (schema default); only
+        ``defer_claimed_job`` increments the counter + stamps the anchor, and
+        only ``finish_job`` (terminal success/failed) retires the row. So a
+        re-claimed deferred job keeps its accumulated defer state, while a
+        never-deferred job keeps its fresh zeros.
+
+        Strategy:
+        1. Select the oldest ready pending ``scheduled_market_analysis`` job
+           (priority ASC, scheduled_at ASC, id ASC) and read its ``batch_id``
+           from the payload — this identifies the target batch.
+        2. Generate ``token = secrets.token_hex(16)`` (unique per claim).
+        3. Atomically flip ALL pending jobs of that batch to ``running``,
+           stamping ``started_at=CURRENT_TIMESTAMP`` (legacy age-recovery),
+           ``claim_token=token`` and ``lease_until=datetime('now','+30 minutes')``
+           (``UPDATE...WHERE json_extract(payload_json,'$.batch_id')=? AND
+           status='pending'``).
+        4. Re-SELECT the rows keyed on ``claim_token=token`` (this worker only)
+           and return them, so the caller has the exact, PROVABLY-owned set.
+
+        Returns ``None`` when no pending ``scheduled_market_analysis`` job is
+        ready (idle tick). Returns ``[]`` only if a race left zero rows after
+        the batch_id was selected — the caller treats both as idle.
+        """
+        head = self.conn.execute(
+            """
+            SELECT priority, scheduled_at, id, payload_json
+            FROM agent_jobs
+            WHERE job_type='scheduled_market_analysis'
+              AND status='pending'
+              AND datetime(scheduled_at) <= datetime('now')
+            ORDER BY priority ASC, scheduled_at ASC, id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not head:
+            return None
+        try:
+            payload = json.loads(head["payload_json"] or "{}")
+        except Exception:
+            return None
+        batch_id = payload.get("batch_id")
+        if not batch_id:
+            # A scheduled_market_analysis job without a batch_id is a legacy
+            # pre-batch job; leave it for the serial claim_next_job path.
+            return None
+        # S3 (P0 #4): unique ownership token per claim. Stamped on every row
+        # this claim flips to running, so the re-SELECT can PROVE these rows
+        # belong to THIS worker (never a row another worker flipped in a race).
+        token = secrets.token_hex(16)
+        # Atomic flip of the whole batch's pending rows to running. The
+        # started_at=CURRENT_TIMESTAMP pin records when this batch was claimed
+        # (used by recover_stale_running_jobs' age fallback for pre-S3 rows);
+        # it is NOT used to match the re-SELECT below, because SQLite
+        # CURRENT_TIMESTAMP has one-second resolution and a wall-clock-second
+        # boundary straddle between this UPDATE and the re-SELECT would make
+        # started_at=CURRENT_TIMESTAMP match nothing -> false idle (reviewer
+        # P2). The re-SELECT keys on claim_token=? (this worker's unique token)
+        # which is time-stable and proves ownership. Safe due to the head-SELECT
+        # invariant: the head row was pending, and a prior claim on this batch
+        # would have atomically flipped ALL its rows to running (none left
+        # pending for the head SELECT) - so every row this UPDATE flips belongs
+        # to THIS worker's claim_token.
+        cur = self.conn.execute(
+            """
+            UPDATE agent_jobs
+            SET status='running',
+                started_at=CURRENT_TIMESTAMP,
+                claim_token=?,
+                lease_until=datetime('now', '+30 minutes')
+            WHERE job_type='scheduled_market_analysis'
+              AND status='pending'
+              AND datetime(scheduled_at) <= datetime('now')
+              AND json_extract(payload_json, '$.batch_id')=?
+            """,
+            (token, str(batch_id)),
+        )
+        if cur.rowcount <= 0:
+            # Lost the race — another worker claimed this batch between the
+            # head SELECT and the UPDATE. Signal idle so the caller loops.
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM agent_jobs
+            WHERE job_type='scheduled_market_analysis'
+              AND status='running'
+              AND claim_token=?
+            ORDER BY priority ASC, scheduled_at ASC, id ASC
+            """,
+            (token,),
+        ).fetchall()
+        if not rows:
+            return None
+        return [dict(r) for r in rows]
+
+    def defer_claimed_job(
+        self, job_id: int, claim_token: str, *,
+        reason: str = "single_flight_deferred",
+        defer_seconds: int = 30,
+    ) -> bool:
+        """07-10 R3-P0-1 (terminal-review-repair-plan-r3 §3.3) + R4-P1-4:
+        CAS-defer a claimed ``agent_jobs`` row from ``running`` back to
+        ``pending`` WITHOUT releasing or modifying another worker's ownership.
+
+        A ``single_flight_skipped`` symbol's lease is held by ANOTHER in-flight
+        tick (the cross-batch single-flight mutex). This worker MUST NOT call
+        ``controller.analyze_symbol``, write ``ga_decisions``/``analysis_states``
+        /``signals``, run ``_post_decision_effects``, or release the other
+        tick's lease (design §3.2 / historical contract #10). Instead it defers
+        ITS OWN claim: CAS the row back to ``pending`` (clearing this tick's
+        ``claim_token`` / ``lease_until`` / ``started_at``) and moves
+        ``scheduled_at`` forward by ``defer_seconds`` so a later
+        ``run_once(background=True)`` reclaims it once the owning tick releases
+        the symbol lease.
+
+        CAS semantics (§3.3): the UPDATE affects EXACTLY one row WHERE
+        ``id=job_id AND status='running' AND claim_token=<this worker's
+        token>``. A zero-row result is a CLAIM-LOSS failure (the row was
+        reclaimed by ``recover_stale_running_jobs`` or never owned by this
+        worker) and MUST be reported as ``False`` -- it MUST NOT release or
+        modify another worker's row. SQLite serializes writes under the default
+        journal, so the conditional UPDATE is atomic.
+
+        R4-P1-4 (defer accounting): the defer count is persisted in a DEDICATED
+        ``defer_count`` column via an ATOMIC SQL increment
+        (``defer_count = defer_count + 1``) inside the same CAS UPDATE, NOT
+        parsed out of ``error_message`` (which couples machine state to display
+        text and would be reset by any later error-message update).
+        ``deferred_at`` anchors the first-defer timestamp
+        (``COALESCE(deferred_at, datetime('now'))``) so the caller can apply the
+        R4-P0-1 ABSOLUTE defer window (terminate once
+        ``now - deferred_at >= per_symbol_timeout + cleanup_buffer``) instead
+        of the pre-R4 fixed ``defer_seconds * max_defers`` product that would
+        exhaust a 20-min lease at 2 min. ``error_message`` carries only the
+        defer ``reason`` string for operators (NOT ``<reason>:<n>``); the
+        authoritative count lives in the dedicated ``defer_count`` column
+        (R4-P1-4 decoupling -- embedding the count in ``error_message`` would
+        re-couple machine state to display text and be clobbered by any later
+        error-message update). ``result_json`` is left untouched (no GA
+        decision / batch result is written for a deferred symbol).
+
+        Returns ``True`` iff exactly one row was deferred (this worker still
+        owned it). Returns ``False`` on claim-loss (zero rows) -- the caller
+        treats this as "another worker owns it now; do nothing further".
+        """
+        # Atomic CAS UPDATE: increment defer_count + stamp deferred_at (only if
+        # not already set, so the FIRST defer anchors the absolute window) +
+        # reset this worker's ownership + push scheduled_at forward.
+        # ``error_message`` carries only the defer ``reason`` for operators;
+        # ``defer_count`` is the authoritative counter (R4-P1-4).
         cur = self.conn.execute(
             """
             UPDATE agent_jobs
             SET status='pending',
                 started_at=NULL,
+                claim_token=NULL,
+                lease_until=NULL,
+                finished_at=NULL,
+                scheduled_at=datetime('now', ?),
+                defer_count=defer_count + 1,
+                deferred_at=COALESCE(deferred_at, datetime('now')),
+                error_message=?
+            WHERE id=?
+              AND status='running'
+              AND claim_token=?
+            """,
+            (
+                f"+{int(defer_seconds)} seconds",
+                f"{reason}",
+                int(job_id),
+                str(claim_token),
+            ),
+        )
+        return int(cur.rowcount) == 1
+
+    def get_job_defer_state(self, job_id: int) -> tuple[int, str | None]:
+        """07-10 R4-P1-4 + R4-P0-1: read the single-flight defer state for a
+        job from the DEDICATED columns (NOT ``error_message``). Returns
+        ``(defer_count, deferred_at)``; ``(0, None)`` for a fresh / non-deferred
+        job. ``defer_count`` is the authoritative counter incremented atomically
+        by ``defer_claimed_job``; ``deferred_at`` anchors the first-defer
+        timestamp so ``process_fair_batch`` can apply an ABSOLUTE defer window
+        (terminate once ``now - deferred_at >= per_symbol_timeout +
+        cleanup_buffer``) instead of the pre-R4 fixed ``defer_seconds *
+        max_defers`` product. Used by ``process_fair_batch`` to decide
+        defer-vs-terminate BEFORE calling ``defer_claimed_job``."""
+        row = self.conn.execute(
+            "SELECT defer_count, deferred_at FROM agent_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            return (0, None)
+        try:
+            dc = int(row["defer_count"]) if row["defer_count"] is not None else 0
+        except (TypeError, ValueError):
+            dc = 0
+        da = row["deferred_at"] if row["deferred_at"] is not None else None
+        return (dc, da)
+
+    def get_job_defer_count(self, job_id: int) -> int:
+        """07-10 R3-P0-1 + R4-P1-4: read the single-flight defer count for a
+        job. R4-P1-4: the count now lives in the DEDICATED ``defer_count`` column
+        (NOT parsed out of ``error_message``); this helper delegates to
+        ``get_job_defer_state``. Kept for backward-compat with callers/tests
+        that only need the count."""
+        return self.get_job_defer_state(job_id)[0]
+
+    def recover_stale_running_jobs(self, *, older_than_minutes: int = 30) -> int:
+        """07-10 S3 (P0 #4): reset running jobs whose lease has expired (or
+        pre-S3 legacy rows with no lease, by age). A worker that crashes
+        mid-batch leaves ``status='running'`` with an expired ``lease_until``;
+        this resets those rows to ``pending`` so the batch can be reclaimed.
+
+        A row is stale if EITHER its ``lease_until`` has passed (S3 path) OR
+        it has no ``lease_until`` (pre-S3 legacy ``claim_next_job`` rows, whose
+        ownership was never tokenized) AND its ``started_at`` is older than
+        ``older_than_minutes``. Rows with a valid, unexpired lease are LEFT
+        running (the owning worker may still be processing)."""
+        cur = self.conn.execute(
+            """
+            UPDATE agent_jobs
+            SET status='pending',
+                started_at=NULL,
+                claim_token=NULL,
+                lease_until=NULL,
                 error_message=COALESCE(error_message, 'recovered stale running job after process restart')
             WHERE status='running'
-              AND datetime(started_at) <= datetime('now', ?)
+              AND (
+                lease_until IS NOT NULL AND datetime(lease_until) <= datetime('now')
+                OR
+                (lease_until IS NULL AND datetime(started_at) <= datetime('now', ?))
+              )
             """,
             (f"-{int(older_than_minutes)} minutes",),
         )

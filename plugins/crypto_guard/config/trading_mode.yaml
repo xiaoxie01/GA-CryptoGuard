@@ -34,6 +34,60 @@ llm:
     # so the rest of the batch is actually evaluated. llm_config_error
     # still opens immediately regardless of sample count.
     min_rate_samples: 5
+  # --------------------------------------------------------------------
+  # 07-10 LLM Fair Scheduling + Context Continuity.
+  # ``scheduling`` replaces the fixed ``ESTIMATED_CALL_MS=30_000`` admission
+  # gate (which starved the last 7 of 10 symbols under a shared 90s budget)
+  # with a PER-SYMBOL deadline. Each symbol gets its own bounded wall-clock
+  # window (call + retry + jitter + parse + validate); the shared batch
+  # budget no longer lets the first few symbols drain the pool for everyone.
+  # The fair scheduler (Phase C) runs Attempt 1 for every eligible symbol
+  # concurrently (bounded by ``max_concurrency``) with deterministic
+  # rotation, so no symbol is permanently starved by alphabetical order.
+  # ``generation`` bounds the prompt, output tokens, thinking budget, and
+  # temperature for structured JSON synthesis (no unbounded adaptive
+  # thinking). Validation lives in ``config/loader.py``.
+  # --------------------------------------------------------------------
+  scheduling:
+    # ``fair_pool`` = bounded concurrent executor with two-pass barriers
+    # (Phase C). ``legacy_serial`` is reserved for the rollback flag; the
+    # fallback MUST be deterministic-only, never the known-starving path.
+    mode: fair_pool
+    # Provider-call concurrency cap. Range 1..4. Higher values may trigger
+    # provider rate limits; the default 4 keeps a 10-symbol batch inside
+    # one 15-minute scheduler tick at P95 35s latency.
+    max_concurrency: 4
+    # Per-symbol end-to-end deadline (Attempt 1 + retries + jitter + parse
+    # + validate). Valid range 180..1200 seconds. 300s (5 min) lets a slow
+    # P95-35s symbol complete up to 3 attempts with jitter; the fair
+    # scheduler guarantees every symbol gets a first attempt before any
+    # symbol gets a second.
+    per_symbol_timeout_seconds: 300
+    # Per-attempt provider-call timeout. Must be <= per_symbol_timeout.
+    # The provider call for each attempt is bounded by
+    # min(per_attempt_timeout_seconds, remaining_per_symbol_seconds).
+    per_attempt_timeout_seconds: 180
+    # Guard subtracted from the scheduler interval to compute the effective
+    # batch deadline; must be positive and smaller than the scheduler
+    # interval so the batch finishes inside one tick.
+    batch_completion_guard_seconds: 60
+    # Deterministic batch-derived rotation offset so no symbol is
+    # permanently first/last by alphabetical order. ``true`` rotates by
+    # stable_hash(batch_id) % len(symbols).
+    rotate_start_symbol: true
+  generation:
+    # Hard prompt cap. Mandatory core > max_prompt_bytes => fail-closed
+    # with ``prompt_budget_contract_violation`` (no provider call).
+    max_prompt_bytes: 49152
+    # Target prompt size; optional sections are trimmed to reach it.
+    target_prompt_bytes: 32768
+    # Explicit output token limit for structured JSON synthesis. Replaces
+    # the unbounded adaptive-thinking path.
+    max_output_tokens: 4096
+    # Explicit thinking budget (tokens). 0 = extended thinking disabled.
+    thinking_budget_tokens: 6000
+    # Low temperature for deterministic structured JSON output.
+    temperature: 0.2
 
 analysis:
   mode: intraday

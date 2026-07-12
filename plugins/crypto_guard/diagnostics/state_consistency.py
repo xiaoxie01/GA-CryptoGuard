@@ -64,6 +64,34 @@ def _btc9_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
     return None
 
 
+# 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract marker key.
+# The three S1-S6 production-chain postcondition diagnostics use this
+# independent cutoff (NOT the R4 / BTC#9 / continuity markers).
+LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY = "llm_fair_scheduling_context_contract_v1"
+
+
+def _llm_fair_scheduling_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
+    """07-10 S7 (P1 #7): Return the cutoff timestamp for the fair-scheduling
+    + context-continuity contract checks.
+
+    Uses the independent ``llm_fair_scheduling_context_contract_v1`` marker.
+    Returns None when the marker is absent, meaning the contract has not been
+    deployed yet and the new diagnostics should be skipped (no false-green
+    suppression - the marker-missing check separately surfaces the absence).
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = ? LIMIT 1",
+            (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        pass
+    return None
+
+
 def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Run all state consistency checks.
 
@@ -124,6 +152,13 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     issues.extend(_check_paper_order_created_with_unready_market_data(repo))
     issues.extend(_check_report_claims_complete_for_gapped_data(repo))
     issues.extend(_check_deterministic_direction_from_failed_llm(repo))
+    # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract checks.
+    # The marker-missing check runs first so a missing contract is explicitly
+    # surfaced even when the ownership / continuity / per-job checks would
+    # otherwise pass (or skip). These verify the S1-S6 production-chain
+    # postconditions survive in persisted state.
+    issues.extend(_check_llm_fair_scheduling_contract_marker_missing(repo))
+    issues.extend(_check_batch_claim_ownership_integrity(repo))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -154,6 +189,8 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "financial_action_stale_price": len([i for i in issues if i["type"] == "financial_action_stale_price"]),
         "paper_notification_missing_event_time": len([i for i in issues if i["type"] == "paper_notification_missing_event_time"]),
         "btc9_contract_marker_missing": len([i for i in issues if i["type"] == "btc9_contract_marker_missing"]),
+        "llm_fair_scheduling_contract_marker_missing": len([i for i in issues if i["type"] == "llm_fair_scheduling_contract_marker_missing"]),
+        "batch_claim_ownership_integrity": len([i for i in issues if i["type"] == "batch_claim_ownership_integrity"]),
     }
 
     # Section 八: Separate counts for error/warning/legacy_info
@@ -2865,4 +2902,124 @@ def _check_schema_health_as_issues(repo: CryptoGuardRepository) -> list[dict[str
                 "suggested_action": "Check migrations for missed schema updates.",
             })
 
+    return issues
+
+
+def _check_llm_fair_scheduling_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 S7 (P1 #7): flag a missing fair-scheduling + context-continuity
+    contract marker.
+
+    Mirrors the BTC#9 / continuity marker-missing checks. The marker
+    ``llm_fair_scheduling_context_contract_v1`` must exist in
+    ``_migration_state``. When absent, emit an ``error`` so callers detect the
+    missing contract rather than receiving a silently-healthy report. When the
+    marker is absent the three S1-S6 contract checks skip themselves (no
+    historical data is flagged with ``error`` against an undeployed contract).
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = ? LIMIT 1",
+            (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "llm_fair_scheduling_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "fair-scheduling + context-continuity 契约 marker 缺失。"
+                "运行 initialize_database() 部署 marker；marker 缺失时 S1-S6 "
+                "契约诊断（batch_claim_ownership_integrity / "
+                "fair_path_continuity_real_injection / "
+                "per_job_failure_consistency）被跳过，可能导致假绿。"
+            ),
+        })
+    return issues
+
+
+def _check_batch_claim_ownership_integrity(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 S7 (P1 #7) / S3 (P0 #4): every ``status='running'`` row of a
+    ``scheduled_market_analysis`` batch claimed via ``claim_next_batch`` MUST
+    carry a non-null ``claim_token`` AND an unexpired ``lease_until``.
+
+    The fair-pool dispatch path (``run_once`` -> ``claim_next_batch`` -> the
+    only path a scheduled analysis takes under ``scheduling.mode='fair_pool'``)
+    stamps a unique ``claim_token = secrets.token_hex(16)`` and
+    ``lease_until = datetime('now','+30 minutes')`` on EVERY claimed row. A
+    running scheduled row with a NULL ``claim_token`` was NOT claimed through
+    this path - either a pre-S3 legacy row (acceptable, skipped) or a
+    regression where ``claim_next_batch`` forgot to stamp the token (the P0#4
+    defect). A running row whose ``lease_until`` has already passed is a
+    leaked claim - the worker crashed mid-batch and
+    ``recover_stale_running_jobs`` has not yet reset it.
+
+    Detection: post-contract running ``scheduled_market_analysis`` rows with
+    ``claim_token IS NULL`` OR an expired ``lease_until`` are ``error``. The
+    contract cutoff is the marker timestamp applied to ``started_at`` so
+    pre-S3 legacy rows are demoted to ``legacy_info``.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff = _llm_fair_scheduling_contract_cutoff(repo)
+    if cutoff is None:
+        # Marker absent -> marker-missing check already surfaced it. Skip so
+        # historical data is not flagged against an undeployed contract.
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, session_id, status, claim_token, lease_until, started_at
+        FROM agent_jobs
+        WHERE job_type = 'scheduled_market_analysis'
+          AND status = 'running'
+          AND datetime(started_at) >= datetime(?)
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        (cutoff,),
+    ).fetchall()
+    for r in rows:
+        token = r["claim_token"]
+        lease = r["lease_until"]
+        defect = None
+        if token is None:
+            defect = "claim_token_null"
+        elif lease is None:
+            defect = "lease_until_null"
+        else:
+            # Compare lease_until against now. SQLite datetime('now') is UTC.
+            try:
+                expired_row = repo.conn.execute(
+                    "SELECT (datetime(?) <= datetime('now')) AS expired",
+                    (str(lease),),
+                ).fetchone()
+                if expired_row and int(expired_row["expired"]):
+                    defect = "lease_until_expired"
+            except Exception:
+                defect = "lease_until_unparseable"
+        if defect is None:
+            continue
+        issues.append({
+            "type": "batch_claim_ownership_integrity",
+            "severity": "error",
+            "details": {
+                "job_id": int(r["id"]),
+                "session_id": r["session_id"],
+                "status": r["status"],
+                "claim_token": token,
+                "lease_until": lease,
+                "started_at": r["started_at"],
+                "defect": defect,
+            },
+            "suggested_action": (
+                "fair-pool 批次归属不完整：running scheduled_market_analysis 行 "
+                "缺少 claim_token 或 lease_until 已过期。检查 claim_next_batch "
+                "是否同时写 token+lease，以及 recover_stale_running_jobs 是否复位"
+                "过期租约。(P0#4/S3 契约)"
+            ),
+        })
     return issues

@@ -87,6 +87,14 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
             # persisted before this marker are demoted to legacy_info; rows
             # after are evaluated against the full Phase A-G contract.
             _ensure_hourly_decision_context_continuity_contract_marker(conn)
+            # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract
+            # marker. Written AFTER the continuity marker so all prior contract
+            # diagnostics can use a single independent cutoff. The three new
+            # S1-S6 checks (batch_claim_ownership_integrity,
+            # fair_path_continuity_real_injection, per_job_failure_consistency)
+            # use this cutoff. Release-gated on the production DB: this task
+            # does NOT run initialize_database() against production.
+            _ensure_llm_fair_scheduling_context_contract_marker(conn)
             conn.commit()
             return {"ok": True, "database_path": str(cfg.database_path)}
         finally:
@@ -512,6 +520,27 @@ def _apply_ga_master_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_parquet_archive_runs_recent ON parquet_archive_runs(created_at, symbol, interval)")
+    # 07-10 S3 (P0 #4): LLM fair-scheduling batch-claim ownership columns.
+    # claim_next_batch stamps a unique claim_token + lease_until on every row it
+    # flips to running, so the re-SELECT proves ownership and recover_stale_run-
+    # ning_jobs can reset rows whose lease expired after a worker crash.
+    # Additive (ALTER TABLE ADD COLUMN) via _add_column's PRAGMA guard - idempotent
+    # on existing DBs, a no-op on fresh DBs where schema.sql already declares them.
+    _add_column(conn, "agent_jobs", "claim_token", "TEXT")
+    _add_column(conn, "agent_jobs", "lease_until", "TEXT")
+    # 07-10 R4-P1-4 (terminal-review-repair-plan-r4): defer accounting columns.
+    # The single-flight defer count + first-defer timestamp MUST live in dedicated
+    # columns, NOT parsed out of ``error_message`` (which couples machine state
+    # to display text and would be reset by any later error-message update). An
+    # atomic ``defer_count = defer_count + 1`` in ``defer_claimed_job`` makes the
+    # increment race-free; ``deferred_at`` anchors the ABSOLUTE defer window used
+    # by R4-P0-1 (terminate once ``now - deferred_at >= per_symbol_timeout +
+    # cleanup_buffer``), so a legitimately long LLM lease (up to per_symbol_timeout
+    # = 1200s) cannot be falsely exhausted by a fixed ``defer_seconds * max_defers``
+    # product (the pre-R4 15*8=120s would exhaust at 2min, mid-flight on a 20-min
+    # lease). Additive / idempotent via _add_column's PRAGMA guard.
+    _add_column(conn, "agent_jobs", "defer_count", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "agent_jobs", "deferred_at", "TEXT")
 
 
 def _apply_pending_order_lifecycle_migrations(conn: sqlite3.Connection) -> None:
@@ -1599,6 +1628,48 @@ def _ensure_hourly_decision_context_continuity_contract_marker(conn: sqlite3.Con
     )
 
 
+def _ensure_llm_fair_scheduling_context_contract_marker(conn: sqlite3.Connection) -> None:
+    """07-10 S7 (P1 #7): Write the ``llm_fair_scheduling_context_contract_v1``
+    marker.
+
+    Independent cutoff for the fair-scheduling + context-continuity contract
+    diagnostics (S1-S6 production-chain postconditions):
+      - batch_claim_ownership_integrity: every ``status='running'`` row of a
+        ``scheduled_market_analysis`` batch claimed via ``claim_next_batch``
+        must carry a non-null ``claim_token`` AND an unexpired ``lease_until``
+        (S3/P0#4). Rows claimed by the legacy ``claim_next_job`` path
+        (``claim_token IS NULL``) are not part of this contract.
+      - fair_path_continuity_real_injection: a fair-batch decision persisted
+        with a prior cross-batch analysis state must record
+        ``analysis_continuity.continuity_status == "ok"`` (S1/P0#1), not the
+        lazy ``"missing"`` the pre-fix adapter produced.
+      - per_job_failure_consistency: a ``batch_symbol_status='failed'`` row
+        must agree with the owning ``agent_jobs.status='failed'`` (S6/P1#6).
+
+    Written AFTER the continuity marker so all prior contract diagnostics can
+    use a single independent cutoff. Rows persisted before this marker are
+    demoted to ``legacy_info``; rows after are evaluated against the full
+    S1-S6 contract. ``INSERT OR IGNORE`` keeps the marker idempotent -
+    re-running ``initialize_database()`` never refreshes the timestamp.
+
+    NOTE (release boundary): on the PRODUCTION database this marker is written
+    only when ``initialize_database()`` runs there, which is a release-gated
+    operation (``/trellis:crypto-guard-release`` + explicit user confirmation).
+    This task does NOT write the production marker. Fresh-DB tests verify the
+    helper writes the marker and that the new diagnostics evaluate against it.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migration_state ("
+        "  key TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+        ("llm_fair_scheduling_context_contract_v1",),
+    )
+
+
 def _migrate_batch_json_to_symbol_status(conn: sqlite3.Connection) -> None:
     """One-shot migration: populate batch_symbol_status from existing JSON columns.
 
@@ -1807,6 +1878,12 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         "shadow_virtual_trades": ["strategy_name", "status", "entry_type", "opened_at", "expires_at", "last_processed_candle_time"],
         # P1-11: backfill_progress table must exist with correct columns.
         "backfill_progress": ["symbol", "interval", "last_open_time_fetched", "last_updated_ms"],
+        # 07-10 S3 (P0 #4): batch-claim ownership columns for the fair-pool
+        # dispatch path (claim_next_batch stamps a unique claim_token + lease).
+        # 07-10 R4-P1-4: defer accounting columns (defer_count + deferred_at)
+        # replace the error_message-parsed defer count so a legitimate long LLM
+        # lease cannot be falsely exhausted (R4-P0-1 absolute defer window).
+        "agent_jobs": ["claim_token", "lease_until", "defer_count", "deferred_at"],
     }
 
     # Required indexes

@@ -42,6 +42,16 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
     RAW_GRADE_EXCEEDS_HTF_CAP,
     SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS,
     HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
+    # 07-10 P1-1 (design §10): eight formal Phase F fair-scheduling +
+    # context-continuity diagnostic codes.
+    LLM_FIRST_ATTEMPT_COVERAGE_LOW,
+    LLM_SYMBOL_STARVATION,
+    LLM_REPORT_COUNT_MISMATCH,
+    LLM_SUCCESS_MISSING_ATTEMPT_METADATA,
+    LLM_CONTINUITY_NOT_INCLUDED,
+    LLM_TIMEOUT_CONFIG_OUT_OF_RANGE,
+    LLM_BATCH_DEGRADED_REPORTED_HEALTHY,
+    LLM_REPAIR_COUNTED_AS_PROVIDER_CALL,
 )
 
 
@@ -511,6 +521,456 @@ def fault_hourly_report_used_partial_running_batch(conn):
     conn.commit()
 
 
+# ── 07-10 P1-1 (design §10): eight Phase F fair-scheduling fault seeds ───────
+#
+# Each seed plants the EXACT production defect into a fresh DB (whose
+# ``initialize_database`` writes the ``llm_fair_scheduling_context_contract_v1``
+# marker, so findings fire at their real severity - NOT demoted). Each has a
+# paired negative control proving the check does NOT fire on the healthy
+# shape (so a future widening cannot silently green it).
+#
+# Batch-row helper: the batch-level checks (coverage / starvation / mismatch /
+# degraded) read ``analysis_batches`` rows. ``enabled_symbols_json`` is the
+# authoritative denominator; the §8 envelope on each ga_decisions row is the
+# authoritative per-symbol outcome. Both mirror the production write path
+# (``finish_analysis_batch`` + ``create_ga_decision``).
+
+def _insert_batch(conn, *, batch_id, enabled, analysis_time=None,
+                  status="success", summary=None):
+    """Insert an ``analysis_batches`` row mirroring production's
+    ``finish_analysis_batch`` shape (enabled/completed/failed lists +
+    summary_json). Returns ``batch_id`` for chaining."""
+    if analysis_time is None:
+        analysis_time = _recent_analysis_time_ms()
+    conn.execute(
+        "INSERT INTO analysis_batches ("
+        "  batch_id, primary_interval, analysis_time, status, started_at,"
+        "  enabled_symbols_json, completed_symbols_json, failed_symbols_json,"
+        "  summary_json"
+        ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)",
+        (batch_id, "15m", analysis_time, status,
+         json.dumps(list(enabled)),
+         json.dumps(list(enabled)),
+         json.dumps([]),
+         json.dumps(summary) if summary is not None else None),
+    )
+    return batch_id
+
+
+def _insert_batch_decision(conn, *, batch_id, symbol, analysis_time=None,
+                           **envelope):
+    """Insert a ga_decisions row carrying the given §8 envelope at the top
+    level of ``raw_decision_json`` (mirrors decision_schema's
+    ``controller_decision_from_legacy`` surfacing). The envelope fields are
+    merged on top of the default raw shape from ``_insert_decision``."""
+    if analysis_time is None:
+        analysis_time = _recent_analysis_time_ms()
+    _insert_decision(
+        conn,
+        raw=dict(envelope),
+        analysis_time=analysis_time,
+        symbol=symbol,
+        batch_id=batch_id,
+    )
+
+
+def fault_llm_first_attempt_coverage_low(conn):
+    """Fault: a ``success`` batch with 3 enabled symbols but only 1 made a
+    physical provider call. The 2 unattempted symbols have rows with
+    ``llm_status="failed"`` AND ``llm_provider_call_count=0`` and NO
+    budget/breaker terminal reason - bare failures that fall into NONE of
+    production's accounting buckets (policy/breaker/budget skip exclude
+    status="failed"; worker_failed requires no row). This is the silent-
+    coverage gap - the original starvation signature (symbols recorded as
+    failed with no call and no allowed reason)."""
+    at_ms = _recent_analysis_time_ms()
+    bid = _insert_batch(conn, batch_id="BATCH_COV_LOW",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms)
+    # Only BTC made a provider call.
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    # ETH + SOL: bare failures (pcc=0, status=failed, no budget/breaker
+    # reason) -> unaccounted residual (the defect).
+    for sym in ("ETHUSDT", "SOLUSDT"):
+        _insert_batch_decision(conn, batch_id=bid, symbol=sym,
+                               analysis_time=at_ms,
+                               llm_status="failed", llm_attempt_count=0,
+                               llm_provider_call_count=0, llm_latency_ms=0,
+                               llm_prompt_bytes=None,
+                               llm_continuity_included=None,
+                               llm_terminal_reason=None,
+                               llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def fault_llm_first_attempt_coverage_low_negative(conn):
+    """Negative: 3 enabled, 1 attempted, but the 2 unattempted are ALL
+    explained by allowed skips (1 policy + 1 breaker). The coverage gap is
+    fully explained -> must NOT fire LLM_FIRST_ATTEMPT_COVERAGE_LOW. This
+    proves the check distinguishes explained skips from the bare-failure
+    residual."""
+    at_ms = _recent_analysis_time_ms()
+    bid = _insert_batch(conn, batch_id="BATCH_COV_OK",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms)
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    # ETH: policy skip (LLM disabled) - allowed.
+    _insert_batch_decision(conn, batch_id=bid, symbol="ETHUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=0,
+                           llm_provider_call_count=0, llm_latency_ms=0,
+                           llm_prompt_bytes=None, llm_continuity_included=None,
+                           llm_terminal_reason="llm_disabled",
+                           llm_provider_timeout_ms=None)
+    # SOL: breaker skip - allowed.
+    _insert_batch_decision(conn, batch_id=bid, symbol="SOLUSDT",
+                           analysis_time=at_ms,
+                           llm_status="skipped", llm_attempt_count=0,
+                           llm_provider_call_count=0, llm_latency_ms=0,
+                           llm_prompt_bytes=None, llm_continuity_included=None,
+                           llm_terminal_reason="breaker_skipped",
+                           llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def _starvation_batch(conn, *, batch_id, at_ms, eligible=True):
+    """Insert one eligible success batch with ZERO physical provider calls
+    (all symbols policy-skipped with no terminal reason -> the starvation
+    signature: eligible but structurally unreachable)."""
+    enabled = ["BTCUSDT", "ETHUSDT"] if eligible else []
+    _insert_batch(conn, batch_id=batch_id, enabled=enabled,
+                  analysis_time=at_ms)
+    for sym in enabled:
+        _insert_batch_decision(conn, batch_id=batch_id, symbol=sym,
+                               analysis_time=at_ms,
+                               llm_status="ok", llm_attempt_count=0,
+                               llm_provider_call_count=0, llm_latency_ms=0,
+                               llm_prompt_bytes=None,
+                               llm_continuity_included=None,
+                               llm_terminal_reason=None,
+                               llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def fault_llm_symbol_starvation(conn):
+    """Fault: 3 CONSECUTIVE eligible batches, each with zero physical
+    provider calls. The most-recent batch anchors the finding."""
+    base = _recent_analysis_time_ms()
+    # Insert oldest-first so started_at ordering (now) is stable; use distinct
+    # analysis_time so each batch is independently identifiable.
+    for i, bid in enumerate(("BATCH_STARVE_OLD", "BATCH_STARVE_MID",
+                             "BATCH_STARVE_NEW")):
+        _starvation_batch(conn, batch_id=bid, at_ms=base + i * 60_000)
+
+
+def fault_llm_symbol_starvation_negative(conn):
+    """Negative: 3 consecutive eligible batches but the MOST RECENT made a
+    physical provider call -> the run is broken -> must NOT fire
+    LLM_SYMBOL_STARVATION."""
+    base = _recent_analysis_time_ms()
+    _starvation_batch(conn, batch_id="BATCH_STARVE_N1", at_ms=base)
+    _starvation_batch(conn, batch_id="BATCH_STARVE_N2", at_ms=base + 60_000)
+    # Most recent: real provider call -> run broken.
+    bid = _insert_batch(conn, batch_id="BATCH_STARVE_N3",
+                       enabled=["BTCUSDT"], analysis_time=base + 120_000)
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=base + 120_000,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    conn.commit()
+
+
+def fault_llm_report_count_mismatch(conn):
+    """Fault: the persisted ``summary_json.llm_health`` claims
+    ``llm_symbols_attempted=3`` but the real ga_decisions rows show only 1
+    physical provider call. The rendered report would say "3/3 covered"
+    while only 1 symbol was actually attempted -> false-healthy report."""
+    at_ms = _recent_analysis_time_ms()
+    summary = {
+        "llm_health": {
+            "expected_symbols": 3,
+            "llm_symbols_attempted": 3,  # ← LIES: only 1 real call
+            "llm_physical_provider_calls": 3,
+            "llm_symbols_success": 3,
+            "llm_symbols_failed": 0,
+        }
+    }
+    bid = _insert_batch(conn, batch_id="BATCH_MISMATCH",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms, summary=summary)
+    # Only BTC actually made a call.
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    _insert_batch_decision(conn, batch_id=bid, symbol="ETHUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=0,
+                           llm_provider_call_count=0, llm_latency_ms=0,
+                           llm_prompt_bytes=None, llm_continuity_included=None,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=None)
+    _insert_batch_decision(conn, batch_id=bid, symbol="SOLUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=0,
+                           llm_provider_call_count=0, llm_latency_ms=0,
+                           llm_prompt_bytes=None, llm_continuity_included=None,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def fault_llm_report_count_mismatch_negative(conn):
+    """Negative: persisted ``summary_json.llm_health`` AGREES with the real
+    re-aggregation (both say 3 attempted, 3 calls) -> must NOT fire
+    LLM_REPORT_COUNT_MISMATCH."""
+    at_ms = _recent_analysis_time_ms()
+    summary = {
+        "llm_health": {
+            "expected_symbols": 3,
+            "llm_symbols_attempted": 3,
+            "llm_physical_provider_calls": 3,
+            "llm_symbols_success": 3,
+            "llm_symbols_failed": 0,
+        }
+    }
+    bid = _insert_batch(conn, batch_id="BATCH_MATCH",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms, summary=summary)
+    for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+        _insert_batch_decision(conn, batch_id=bid, symbol=sym,
+                               analysis_time=at_ms,
+                               llm_status="ok", llm_attempt_count=1,
+                               llm_provider_call_count=1, llm_latency_ms=10,
+                               llm_prompt_bytes=100,
+                               llm_continuity_included=True,
+                               llm_terminal_reason=None,
+                               llm_provider_timeout_ms=60_000)
+    conn.commit()
+
+
+def fault_llm_success_missing_attempt_metadata(conn):
+    """Fault: a decision with ``llm_status="ok"`` but
+    ``llm_provider_call_count`` is None (the audit-gap defect: a success
+    recorded without proof of a real provider call)."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": None,  # ← missing on an "ok" success
+        "llm_attempt_count": 1,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_success_missing_attempt_metadata_negative(conn):
+    """Negative: ``llm_status="ok"`` WITH a complete §8 envelope (pcc=1,
+    latency, prompt_bytes, continuity_included) -> must NOT fire
+    LLM_SUCCESS_MISSING_ATTEMPT_METADATA."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": None,
+        "llm_provider_timeout_ms": 60_000,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_continuity_not_included(conn):
+    """Fault: a decision that made a real provider call (pcc=1) but
+    ``llm_continuity_included`` is False - the prompt was built WITHOUT the
+    analysis_continuity block (the S1 / P0 #1 regression)."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": False,  # ← continuity block absent
+        "llm_terminal_reason": None,
+        "llm_provider_timeout_ms": 60_000,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_continuity_not_included_negative(conn):
+    """Negative: real provider call WITH ``llm_continuity_included=True`` ->
+    must NOT fire LLM_CONTINUITY_NOT_INCLUDED. Also covers the no-call path
+    (pcc=0): continuity flag is irrelevant when no prompt was sent."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": None,
+        "llm_provider_timeout_ms": 60_000,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_timeout_config_out_of_range(conn):
+    """Fault: a real provider call (pcc=1) with
+    ``llm_provider_timeout_ms=0`` - the deadline was already exhausted yet a
+    call still happened (the zero-on-real-call defect)."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": None,
+        "llm_provider_timeout_ms": 0,  # ← zero on a real call
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_timeout_config_out_of_range_negative(conn):
+    """Negative: real provider call with a valid in-range timeout
+    (60_000 ms, within (0, 1_200_000]) -> must NOT fire
+    LLM_TIMEOUT_CONFIG_OUT_OF_RANGE. Also covers the legitimate 0-on-skip
+    path: pcc=0 + timeout=0 is the exhausted-deadline skip, NOT a defect."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": None,
+        "llm_provider_timeout_ms": 60_000,  # ← valid
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_batch_degraded_reported_healthy(conn):
+    """Fault: a batch with real coverage 1/3 (< 1.0, degraded) but
+    ``summary_json.llm_health`` claims full coverage
+    (``llm_first_attempt_coverage=1.0``) -> the report rendered false-healthy."""
+    at_ms = _recent_analysis_time_ms()
+    summary = {
+        "llm_health": {
+            "expected_symbols": 3,
+            "llm_symbols_attempted": 3,
+            "llm_first_attempt_coverage": 1.0,  # ← LIES: real is 0.333
+            "llm_coverage_degraded": False,
+        }
+    }
+    bid = _insert_batch(conn, batch_id="BATCH_FALSE_HEALTHY",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms, summary=summary)
+    # Only BTC attempted -> real coverage 1/3.
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    for sym in ("ETHUSDT", "SOLUSDT"):
+        _insert_batch_decision(conn, batch_id=bid, symbol=sym,
+                               analysis_time=at_ms,
+                               llm_status="ok", llm_attempt_count=0,
+                               llm_provider_call_count=0, llm_latency_ms=0,
+                               llm_prompt_bytes=None,
+                               llm_continuity_included=None,
+                               llm_terminal_reason=None,
+                               llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def fault_llm_batch_degraded_reported_healthy_negative(conn):
+    """Negative: a degraded batch (coverage < 1.0) whose persisted
+    ``summary_json.llm_health`` HONESTLY marks ``llm_coverage_degraded=True``
+    -> must NOT fire LLM_BATCH_DEGRADED_REPORTED_HEALTHY."""
+    at_ms = _recent_analysis_time_ms()
+    summary = {
+        "llm_health": {
+            "expected_symbols": 3,
+            "llm_symbols_attempted": 1,
+            "llm_first_attempt_coverage": 0.333,
+            "llm_coverage_degraded": True,  # ← honestly marked
+        }
+    }
+    bid = _insert_batch(conn, batch_id="BATCH_HONEST_DEGRADED",
+                        enabled=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        analysis_time=at_ms, summary=summary)
+    _insert_batch_decision(conn, batch_id=bid, symbol="BTCUSDT",
+                           analysis_time=at_ms,
+                           llm_status="ok", llm_attempt_count=1,
+                           llm_provider_call_count=1, llm_latency_ms=10,
+                           llm_prompt_bytes=100, llm_continuity_included=True,
+                           llm_terminal_reason=None,
+                           llm_provider_timeout_ms=60_000)
+    for sym in ("ETHUSDT", "SOLUSDT"):
+        _insert_batch_decision(conn, batch_id=bid, symbol=sym,
+                               analysis_time=at_ms,
+                               llm_status="ok", llm_attempt_count=0,
+                               llm_provider_call_count=0, llm_latency_ms=0,
+                               llm_prompt_bytes=None,
+                               llm_continuity_included=None,
+                               llm_terminal_reason=None,
+                               llm_provider_timeout_ms=None)
+    conn.commit()
+
+
+def fault_llm_repair_counted_as_provider_call(conn):
+    """Fault: a repaired success (``llm_terminal_reason="schema_repaired"``)
+    where ``llm_provider_call_count=2 > llm_attempt_count=1`` - the repair
+    was billed as a second provider call (the over-counting defect)."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 2,  # ← repair inflated the call counter
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": "schema_repaired",
+        "llm_provider_timeout_ms": 60_000,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
+def fault_llm_repair_counted_as_provider_call_negative(conn):
+    """Negative: a repaired success with correct accounting
+    (``llm_provider_call_count=1 == llm_attempt_count=1``) -> the repair did
+    NOT inflate the physical call counter -> must NOT fire
+    LLM_REPAIR_COUNTED_AS_PROVIDER_CALL."""
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "ok",
+        "llm_provider_call_count": 1,  # ← correct: repair is not a 2nd call
+        "llm_attempt_count": 1,
+        "llm_latency_ms": 10,
+        "llm_prompt_bytes": 100,
+        "llm_continuity_included": True,
+        "llm_terminal_reason": "schema_repaired",
+        "llm_provider_timeout_ms": 60_000,
+    }, analysis_time=at_ms, decision="monitor_only", grade="C")
+
+
 def assert_caught(result, expected_code):
     """Return (passed, message)."""
     if expected_code in result["codes"]:
@@ -617,6 +1077,50 @@ def main():
         ("hourly_report_used_partial_running_batch",
          fault_hourly_report_used_partial_running_batch,
          HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH, "caught", None),
+        # ── 07-10 P1-1 (design §10): eight Phase F fair-scheduling fault seeds ──
+        ("llm_first_attempt_coverage_low", fault_llm_first_attempt_coverage_low,
+         LLM_FIRST_ATTEMPT_COVERAGE_LOW, "caught", None),
+        ("llm_first_attempt_coverage_low_negative",
+         fault_llm_first_attempt_coverage_low_negative,
+         LLM_FIRST_ATTEMPT_COVERAGE_LOW, "not_caught", None),
+        ("llm_symbol_starvation", fault_llm_symbol_starvation,
+         LLM_SYMBOL_STARVATION, "caught", None),
+        ("llm_symbol_starvation_negative", fault_llm_symbol_starvation_negative,
+         LLM_SYMBOL_STARVATION, "not_caught", None),
+        ("llm_report_count_mismatch", fault_llm_report_count_mismatch,
+         LLM_REPORT_COUNT_MISMATCH, "caught", None),
+        ("llm_report_count_mismatch_negative",
+         fault_llm_report_count_mismatch_negative,
+         LLM_REPORT_COUNT_MISMATCH, "not_caught", None),
+        ("llm_success_missing_attempt_metadata",
+         fault_llm_success_missing_attempt_metadata,
+         LLM_SUCCESS_MISSING_ATTEMPT_METADATA, "caught", None),
+        ("llm_success_missing_attempt_metadata_negative",
+         fault_llm_success_missing_attempt_metadata_negative,
+         LLM_SUCCESS_MISSING_ATTEMPT_METADATA, "not_caught", None),
+        ("llm_continuity_not_included", fault_llm_continuity_not_included,
+         LLM_CONTINUITY_NOT_INCLUDED, "caught", None),
+        ("llm_continuity_not_included_negative",
+         fault_llm_continuity_not_included_negative,
+         LLM_CONTINUITY_NOT_INCLUDED, "not_caught", None),
+        ("llm_timeout_config_out_of_range",
+         fault_llm_timeout_config_out_of_range,
+         LLM_TIMEOUT_CONFIG_OUT_OF_RANGE, "caught", None),
+        ("llm_timeout_config_out_of_range_negative",
+         fault_llm_timeout_config_out_of_range_negative,
+         LLM_TIMEOUT_CONFIG_OUT_OF_RANGE, "not_caught", None),
+        ("llm_batch_degraded_reported_healthy",
+         fault_llm_batch_degraded_reported_healthy,
+         LLM_BATCH_DEGRADED_REPORTED_HEALTHY, "caught", None),
+        ("llm_batch_degraded_reported_healthy_negative",
+         fault_llm_batch_degraded_reported_healthy_negative,
+         LLM_BATCH_DEGRADED_REPORTED_HEALTHY, "not_caught", None),
+        ("llm_repair_counted_as_provider_call",
+         fault_llm_repair_counted_as_provider_call,
+         LLM_REPAIR_COUNTED_AS_PROVIDER_CALL, "caught", None),
+        ("llm_repair_counted_as_provider_call_negative",
+         fault_llm_repair_counted_as_provider_call_negative,
+         LLM_REPAIR_COUNTED_AS_PROVIDER_CALL, "not_caught", None),
     ]
 
     results = []

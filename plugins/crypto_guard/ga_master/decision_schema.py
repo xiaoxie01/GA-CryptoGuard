@@ -159,6 +159,37 @@ def controller_decision_from_legacy(
         "llm_config_name": legacy.get("llm_config_name"),
         "llm_model": legacy.get("llm_model"),
         "llm_fallback_reason": legacy.get("llm_fallback_reason"),
+        # 07-10 Phase D §8: per-decision LLM metadata envelope. These MUST
+        # reach the top level of ga_decision (and thus raw_decision_json via
+        # create_ga_decision's json.dumps(decision)) so diagnostics can read
+        # them WITHOUT descending into raw_legacy_decision. They are merged
+        # onto ``legacy`` by run_agent_sop_decision's success/failure/skip
+        # paths (decision.update(attempt_meta)); the adapter surfaces them.
+        # - llm_provider_call_count: physical provider calls (separate from
+        #   attempt count, which includes no-call skips). Design §10
+        #   LLM_REPAIR_COUNTED_AS_PROVIDER_CALL relies on this distinction.
+        # - llm_latency_ms / llm_prompt_bytes / llm_continuity_included:
+        #   the prompt+latency envelope from the thread-local capture in
+        #   _call_ga_llm (None when _call_ga_llm is patched in tests).
+        # - llm_terminal_reason: exact structured reason (design §9), never
+        #   the generic llm_parse_failed. None on raw success.
+        # - llm_schedule_round / llm_schedule_position: fair-scheduler
+        #   placement for LLM_SYMBOL_STARVATION / coverage diagnostics.
+        # - llm_effective_*: resolved generation settings actually applied
+        #   to the provider call (thinking budget / output tokens / temp).
+        # - llm_provider_timeout_ms: the per-attempt provider call timeout
+        #   derived from the per-symbol deadline (Phase B primitive).
+        "llm_provider_call_count": legacy.get("llm_provider_call_count"),
+        "llm_latency_ms": legacy.get("llm_latency_ms"),
+        "llm_prompt_bytes": legacy.get("llm_prompt_bytes"),
+        "llm_continuity_included": legacy.get("llm_continuity_included"),
+        "llm_terminal_reason": legacy.get("llm_terminal_reason"),
+        "llm_schedule_round": legacy.get("llm_schedule_round"),
+        "llm_schedule_position": legacy.get("llm_schedule_position"),
+        "llm_effective_thinking_budget_tokens": legacy.get("llm_effective_thinking_budget_tokens"),
+        "llm_effective_max_output_tokens": legacy.get("llm_effective_max_output_tokens"),
+        "llm_effective_temperature": legacy.get("llm_effective_temperature"),
+        "llm_provider_timeout_ms": legacy.get("llm_provider_timeout_ms"),
         # Phase B (07-07): plan state model (design §6.1)
         "plan_origin": legacy.get("plan_origin"),
         "plan_execution_state": legacy.get("plan_execution_state"),

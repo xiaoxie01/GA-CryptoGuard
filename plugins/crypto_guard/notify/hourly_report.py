@@ -771,10 +771,16 @@ def render_ga_hourly_summary(
     # / failure / retry counts, dominant error, breaker state) in one glance.
     # Renders ``""`` (no line) when the batch has no ``llm_health`` block
     # (pre-Phase-B batches or batches where LLM was disabled).
+    # 07-10 Phase E (design §9 / Fact 4): the closed path now emits TWO lines
+    # (Pipeline completion + LLM first-attempt coverage). Each line is its own
+    # bullet so the coverage line is not visually absorbed into the pipeline
+    # line. The open-state banner remains a single alert line.
     if batch_state:
         llm_health_line = _render_llm_health_line(batch_state)
         if llm_health_line:
-            lines.append(f"- {llm_health_line}")
+            for _sub in llm_health_line.split("\n"):
+                if _sub:
+                    lines.append(f"- {_sub}")
 
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity_snapshot:
@@ -2019,25 +2025,17 @@ def _format_opportunity_row(
         raw_score_text = f"{confidence * 100:.0f}%"
     grade_adjustments = row.get("grade_adjustments") or []
     # Summarize grade_adjustments into a short reason code list.
+    # 07-10 Phase E: each LLM outcome code maps to a precise label via
+    # ``_grade_adjustment_code_to_zh`` (no more generic "LLM 解析失败" for
+    # every llm_status=failed row).
     adj_texts: list[str] = []
     for adj in grade_adjustments:
         if not isinstance(adj, dict):
             continue
         code = str(adj.get("code") or "")
-        if code == "hysteresis":
-            adj_texts.append("评级迟滞")
-        elif code == "clamp_sa_evidence":
-            adj_texts.append("S/A 证据不足")
-        elif code == "llm_parse_failed":
-            adj_texts.append("LLM 解析失败")
-        elif code == "llm_disabled":
-            adj_texts.append("LLM 已禁用")
-        elif code == "performance_gate_degraded":
-            adj_texts.append("Performance 降级")
-        elif code == "performance_gate_watch_only":
-            adj_texts.append("Performance 阻断")
-        elif code:
-            adj_texts.append(code)
+        label = _grade_adjustment_code_to_zh(code)
+        if label:
+            adj_texts.append(label)
     adj_suffix = f"（{'；'.join(adj_texts)}）" if adj_texts else ""
     # P2-13: age based on analysis_time (market time), not created_at (DB insert time)
     age_min = ""
@@ -2463,20 +2461,10 @@ def _signal_report_lines(symbol: str, signal: dict[str, Any], open_orders: list[
             if not isinstance(adj, dict):
                 continue
             code = str(adj.get("code") or "")
-            if code == "hysteresis":
-                adj_texts.append("评级迟滞")
-            elif code == "clamp_sa_evidence":
-                adj_texts.append("S/A 证据不足")
-            elif code == "llm_parse_failed":
-                adj_texts.append("LLM 解析失败")
-            elif code == "llm_disabled":
-                adj_texts.append("LLM 已禁用")
-            elif code == "performance_gate_degraded":
-                adj_texts.append("Performance 降级")
-            elif code == "performance_gate_watch_only":
-                adj_texts.append("Performance 阻断")
-            elif code:
-                adj_texts.append(code)
+            # 07-10 Phase E: precise label per structured LLM outcome code.
+            label = _grade_adjustment_code_to_zh(code)
+            if label:
+                adj_texts.append(label)
         if adj_texts:
             grade_suffix_parts.append("；".join(adj_texts))
     grade_suffix = f"（{'；'.join(grade_suffix_parts)}）" if grade_suffix_parts else ""
@@ -2657,7 +2645,16 @@ def _cat_short(category: str) -> str:
 # "-" because llm_error_category is None (no call was attempted).
 _FALLBACK_REASON_TO_CATEGORY_ZH = {
     "circuit_breaker_open": "熔断跳过",
-    "wall_clock_budget_exhausted": "重试预算耗尽",
+    # 07-10 Phase E (Fact 2): ``wall_clock_budget_exhausted`` is the per-symbol
+    # / batch wall-clock budget running out BEFORE the LLM call - the LLM was
+    # never called. Pre-Phase-E this mapped to "重试预算耗尽" (retry budget
+    # exhausted), conflating it with the retry-call budget. The two are
+    # distinct: a budget skip means "no time", a retry-exhausted means "retries
+    # used up after calls were made". Distinct labels so an operator can tell
+    # "the scheduler ran out of time" from "the LLM kept failing and we spent
+    # the retry budget".
+    "wall_clock_budget_exhausted": "批次/品种时间预算耗尽",
+    "retry_budget_exhausted": "重试预算耗尽",
     "llm_disabled": "LLM 未启用",
     "schema_validation_failed": "Schema 校验失败",
     "retry_exhausted": "重试耗尽",
@@ -2675,6 +2672,46 @@ def _fallback_reason_to_category_zh(reason: Any) -> str:
     if not key:
         return "未知"
     return _FALLBACK_REASON_TO_CATEGORY_ZH.get(key, key)
+
+
+# 07-10 Phase E (design §9 / Fact 2): map the structured LLM grade_adjustment
+# ``code`` (now derived from ``llm_terminal_reason`` in controller.py, no
+# longer the generic ``llm_parse_failed``) to a precise Chinese label. A
+# budget skip (``llm_symbol_timeout`` / ``llm_batch_deadline_skipped``) MUST
+# NOT render as "LLM 解析失败" - the LLM was never called, so claiming a
+# parse failure misleads the operator. Distinct labels for distinct failure
+# modes so the report can distinguish "ran out of time" from "malformed
+# JSON" from "schema rejected" from "breaker skipped".
+_GRADE_ADJ_CODE_TO_ZH: dict[str, str] = {
+    "hysteresis": "评级迟滞",
+    "clamp_sa_evidence": "S/A 证据不足",
+    # Legacy generic code kept for rows produced before Phase E.
+    "llm_parse_failed": "LLM 解析失败",
+    "llm_disabled": "LLM 已禁用",
+    "llm_failure": "LLM 研判失败",
+    "llm_json_parse_failed": "LLM 解析失败",
+    "llm_schema_validation_failed": "LLM Schema 校验失败",
+    "llm_symbol_timeout": "LLM 品种超时",
+    "llm_batch_deadline_skipped": "LLM 批次预算跳过",
+    "llm_breaker_skipped": "LLM 熔断跳过",
+    "llm_retry_budget_exhausted": "LLM 重试预算耗尽",
+    "llm_prompt_budget_violation": "LLM Prompt 预算违规",
+    "llm_schema_repaired": "LLM Schema 修复",
+    "performance_gate_degraded": "Performance 降级",
+    "performance_gate_watch_only": "Performance 阻断",
+}
+
+
+def _grade_adjustment_code_to_zh(code: Any) -> str:
+    """Map a grade_adjustment ``code`` to a short Chinese label.
+
+    Returns ``""`` for an empty code (the caller decides whether to append).
+    Falls back to the raw code when unrecognized so no information is lost.
+    """
+    key = str(code or "").strip()
+    if not key:
+        return ""
+    return _GRADE_ADJ_CODE_TO_ZH.get(key, key)
 
 
 def _render_llm_health_line(batch: dict[str, Any]) -> str:
@@ -2699,7 +2736,20 @@ def _render_llm_health_line(batch: dict[str, Any]) -> str:
     state = str(llm_health.get("breaker_state") or "closed").lower()
     dominant = str(llm_health.get("dominant_error_category") or "")
     skipped = int(llm_health.get("skipped_by_breaker") or 0)
-    fallback_reason = str(summary.get("dominant_llm_fallback_reason") or "")
+    # 07-10 Phase E reviewer P2-2: ``dominant_llm_fallback_reason`` is produced
+    # by ``controller.get_batch_llm_health`` which merges the per-decision
+    # aggregate into the breaker snapshot, and that snapshot becomes
+    # ``summary["llm_health"]`` (nested, run_ga_workers.py:136). So in
+    # production the field lives on ``llm_health``, NOT at the top level of
+    # ``summary``. Reading only ``summary`` left the renderer always falling
+    # back to ``wall_clock_budget_exhausted`` and mislabeling breaker skips
+    # (circuit_breaker_open) as budget exhaustion. Read from llm_health first,
+    # then fall back to the top-level (legacy/older summary shape) for back-compat.
+    fallback_reason = str(
+        llm_health.get("dominant_llm_fallback_reason")
+        or summary.get("dominant_llm_fallback_reason")
+        or ""
+    )
 
     # Phase E (07-09): 5-case banner. The schema-failure and repairable
     # categories use a distinct message because the breaker opens but the
@@ -2750,14 +2800,26 @@ def _render_llm_health_line(batch: dict[str, Any]) -> str:
         return "LLM：异常熔断；本批使用规则 SOP，禁止自动执行候选计划"
 
     # Breaker closed but symbols were skipped - distinct from a clean run.
+    # 07-10 Phase E (Fact 2 / design §9): render budget skips with the exact
+    # label, NOT the conflated "重试预算耗尽". The coverage line follows so
+    # the operator sees how many symbols were attempted vs skipped.
     if skipped > 0:
-        if fallback_reason == "wall_clock_budget_exhausted":
-            return f"LLM：重试预算耗尽，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
-        # Skipped without an explicit budget reason - surface the count so
-        # the operator can investigate. The breaker is closed so this is
-        # NOT a breaker-skip; it's typically a per-symbol budget drop.
-        return f"LLM：本批跳过 {skipped} 个品种（breaker 已关闭）；请检查单品种预算或重试配置"
+        skip_label = _fallback_reason_to_category_zh(
+            fallback_reason or "wall_clock_budget_exhausted"
+        )
+        coverage_line = _render_llm_coverage_line(llm_health, batch)
+        return (
+            f"LLM：{skip_label}，跳过 {skipped} 个品种；本批使用规则 SOP，禁止自动执行候选计划"
+            + (f"\n{coverage_line}" if coverage_line else "")
+        )
 
+    # Normal closed path: emit the Phase E coverage line (Pipeline completion
+    # + LLM first-attempt coverage + success/failed/skips/retries/repairs).
+    # Falls back to the legacy single-line stats when per-decision counts are
+    # absent (legacy batches / older summary_json) so readers never break.
+    coverage_line = _render_llm_coverage_line(llm_health, batch)
+    if coverage_line:
+        return coverage_line
     total = int(llm_health.get("total_attempts") or 0)
     ok = int(llm_health.get("successful") or 0)
     failed = int(llm_health.get("failed") or 0)
@@ -2777,6 +2839,79 @@ def _render_llm_health_line(batch: dict[str, Any]) -> str:
     if breakdown:
         line += f"；主要原因：{breakdown}"
     return line
+
+
+def _render_llm_coverage_line(llm_health: dict[str, Any], batch: dict[str, Any]) -> str:
+    """07-10 Phase E (design §9 / PRD R7 / Fact 4): render the LLM coverage
+    summary as a separate line from pipeline completion.
+
+    Returns two lines joined by ``\\n``:
+
+    - ``Pipeline：完成 X/Y，失败任务 Z`` - worker-job completion (how many
+      symbols the pipeline ran to completion vs the enabled set, and how many
+      worker jobs failed). X/Y comes from the per-decision expected count and
+      the batch's completed-symbol count; Z from failed worker jobs.
+    - ``LLM：首轮覆盖 A/X，成功，失败，预算跳过，熔断跳过，重试，修复`` -
+      first-attempt coverage = symbols that received a physical provider call
+      / expected symbols, plus the success/failed/skip/retry/repair counts.
+
+    A degraded-coverage state (coverage < 1.0 with decisions present) is
+    surfaced as ``（首轮覆盖不足）`` so an operator reading "Pipeline 完成
+    10/10" does NOT mistake it for "LLM 覆盖 10/10" (Fact 4).
+
+    Returns ``""`` when the per-decision fields are absent (legacy batch
+    summary) so the caller falls back to the legacy single-line stats.
+    """
+    if not isinstance(llm_health, dict):
+        return ""
+    expected = llm_health.get("expected_symbols")
+    attempted = llm_health.get("llm_symbols_attempted")
+    # Require the per-decision aggregate fields to be present; absent => legacy.
+    if expected is None or attempted is None:
+        return ""
+
+    expected_i = int(expected or 0)
+    attempted_i = int(attempted or 0)
+    success = int(llm_health.get("llm_symbols_success") or 0)
+    failed = int(llm_health.get("llm_symbols_failed") or 0)
+    budget_skip = int(llm_health.get("llm_budget_skip_count") or 0)
+    breaker_skip = int(llm_health.get("llm_breaker_skip_count") or 0)
+    policy_skip = int(llm_health.get("llm_policy_skip_count") or 0)
+    repairs = int(llm_health.get("llm_repair_count") or 0)
+    retries = int(llm_health.get("llm_retry_calls") or 0)
+    coverage = float(llm_health.get("llm_first_attempt_coverage") or 0.0)
+    degraded = bool(llm_health.get("llm_coverage_degraded"))
+
+    # Pipeline completion: completed symbols vs enabled. The batch may carry
+    # completed_symbols / enabled_symbols lists; otherwise fall back to the
+    # per-decision expected count (one decision per completed symbol).
+    enabled_symbols = batch.get("enabled_symbols") if isinstance(batch, dict) else None
+    completed_symbols = batch.get("completed_symbols") if isinstance(batch, dict) else None
+    enabled_count = len(enabled_symbols) if isinstance(enabled_symbols, list) and enabled_symbols else expected_i
+    completed_count = len(completed_symbols) if isinstance(completed_symbols, list) and completed_symbols else expected_i
+    # Failed worker jobs: symbols that did not produce a decision OR are marked
+    # failed. Use the failed_symbols list when present, else 0 (the per-decision
+    # failed count tracks LLM failure, not worker-job failure).
+    failed_symbols = batch.get("failed_symbols") if isinstance(batch, dict) else None
+    failed_jobs = len(failed_symbols) if isinstance(failed_symbols, list) else 0
+
+    pipeline_line = f"Pipeline：完成 {completed_count}/{enabled_count}"
+    if failed_jobs:
+        pipeline_line += f"，失败任务 {failed_jobs}"
+
+    coverage_pct = f"{round(coverage * 100)}%" if expected_i else "0%"
+    coverage_line = (
+        f"LLM：首轮覆盖 {attempted_i}/{expected_i}（{coverage_pct}），"
+        f"成功 {success}，失败 {failed}，"
+        f"预算跳过 {budget_skip}，熔断跳过 {breaker_skip}"
+    )
+    if policy_skip:
+        coverage_line += f"，策略跳过 {policy_skip}"
+    coverage_line += f"，重试 {retries}，修复 {repairs}"
+    if degraded:
+        coverage_line += "（首轮覆盖不足）"
+
+    return pipeline_line + "\n" + coverage_line
 
 
 def _select_latest_complete_batch(repo: CryptoGuardRepository, *, now_ms: int) -> dict[str, Any] | None:

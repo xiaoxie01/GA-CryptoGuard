@@ -105,6 +105,10 @@ def load_config(config_dir: Path | None = None) -> CryptoGuardConfig:
         raise RuntimeError("CryptoGuard 禁止交易/提现权限 API")
     # Phase B (07-03): validate market_semantics config segment.
     _validate_market_semantics(config.trading_mode)
+    # Phase B (07-10): validate llm.scheduling + llm.generation config
+    # segments. Per-symbol timeout must be a real integer in 180..1200s with
+    # no silent clamping — out-of-range values fail fast at startup.
+    _validate_llm_scheduling(config.trading_mode)
     return config
 
 
@@ -155,4 +159,147 @@ def _validate_market_semantics(trading_mode: dict[str, Any]) -> None:
         if invalid:
             raise ValueError(
                 f"market_semantics.{key} 含非法 stage {invalid}；合法集合 {sorted(legal_stages)}"
+            )
+
+
+# 07-10 Phase B: per-symbol deadline range. Out-of-range values fail fast at
+# startup - NO silent clamping. The contract is 180..1200s (3..20 min). Below
+# 180 a single slow provider call (P95 35s, max 104s) cannot complete even one
+# attempt plus jitter+parse; above 1200 (20 min) the symbol can overlap the
+# 15-minute scheduler tick and must rely on single-flight instead.
+LLM_PER_SYMBOL_TIMEOUT_MIN_SECONDS = 180
+LLM_PER_SYMBOL_TIMEOUT_MAX_SECONDS = 1200
+
+
+def _validate_llm_scheduling(trading_mode: dict[str, Any]) -> None:
+    """Validate the ``llm.scheduling`` + ``llm.generation`` segments.
+
+    The per-symbol timeout MUST be a real integer in 180..1200. ``bool`` is a
+    subclass of ``int`` in Python, so a literal ``true``/``false`` in YAML
+    would silently pass an ``isinstance(x, int)`` check - reject it. Floats
+    and strings are also rejected (no silent coercion). Out-of-range values
+    raise, never clamp - a misconfigured 30s timeout that silently became
+    180s would mask the starvation we are repairing.
+
+    ``per_attempt_timeout_seconds`` must be a positive integer no greater
+    than the per-symbol timeout. ``max_concurrency`` must be an integer in
+    1..4. ``batch_completion_guard_seconds`` must be positive.
+    """
+    llm = trading_mode.get("llm")
+    if not isinstance(llm, dict):
+        # ``llm`` is optional in legacy configs; only validate when present.
+        return
+
+    sched = llm.get("scheduling")
+    if not isinstance(sched, dict):
+        raise ValueError(
+            "llm.scheduling must be a mapping (07-10 fair scheduling); "
+            f"got {type(sched).__name__}"
+        )
+
+    # per_symbol_timeout_seconds: reject bool, float, str; range 180..1200.
+    pst = sched.get("per_symbol_timeout_seconds")
+    if isinstance(pst, bool) or not isinstance(pst, int):
+        raise ValueError(
+            "llm.scheduling.per_symbol_timeout_seconds 必须是整数（不可为 "
+            f"bool/float/str）；got {pst!r}"
+        )
+    if pst < LLM_PER_SYMBOL_TIMEOUT_MIN_SECONDS or pst > LLM_PER_SYMBOL_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            "llm.scheduling.per_symbol_timeout_seconds 必须 ∈ ["
+            f"{LLM_PER_SYMBOL_TIMEOUT_MIN_SECONDS}, "
+            f"{LLM_PER_SYMBOL_TIMEOUT_MAX_SECONDS}]（不允许静默截断）；got {pst}"
+        )
+
+    # per_attempt_timeout_seconds: positive int, <= per_symbol_timeout.
+    pat = sched.get("per_attempt_timeout_seconds")
+    if isinstance(pat, bool) or not isinstance(pat, int):
+        raise ValueError(
+            "llm.scheduling.per_attempt_timeout_seconds 必须是整数；"
+            f"got {pat!r}"
+        )
+    if pat <= 0:
+        raise ValueError(
+            f"llm.scheduling.per_attempt_timeout_seconds 必须为正整数；got {pat}"
+        )
+    if pat > pst:
+        raise ValueError(
+            "llm.scheduling.per_attempt_timeout_seconds 必须 <= "
+            f"per_symbol_timeout_seconds ({pat} > {pst})"
+        )
+
+    # max_concurrency: integer 1..4.
+    mc = sched.get("max_concurrency")
+    if isinstance(mc, bool) or not isinstance(mc, int):
+        raise ValueError(
+            f"llm.scheduling.max_concurrency 必须是整数；got {mc!r}"
+        )
+    if mc < 1 or mc > 4:
+        raise ValueError(
+            f"llm.scheduling.max_concurrency 必须 ∈ [1, 4]；got {mc}"
+        )
+
+    # batch_completion_guard_seconds: positive.
+    guard = sched.get("batch_completion_guard_seconds")
+    if isinstance(guard, bool) or not isinstance(guard, int):
+        raise ValueError(
+            "llm.scheduling.batch_completion_guard_seconds 必须是整数；"
+            f"got {guard!r}"
+        )
+    if guard <= 0:
+        raise ValueError(
+            "llm.scheduling.batch_completion_guard_seconds 必须为正整数；"
+            f"got {guard}"
+        )
+
+    # mode: must be a known value.
+    mode = sched.get("mode")
+    if mode not in ("fair_pool", "legacy_serial"):
+        raise ValueError(
+            "llm.scheduling.mode 必须是 'fair_pool' 或 'legacy_serial'；"
+            f"got {mode!r}"
+        )
+
+    # rotate_start_symbol: bool.
+    if not isinstance(sched.get("rotate_start_symbol"), bool):
+        raise ValueError(
+            "llm.scheduling.rotate_start_symbol 必须是 bool；"
+            f"got {sched.get('rotate_start_symbol')!r}"
+        )
+
+    # generation: optional but, when present, must have valid bounds.
+    gen = llm.get("generation")
+    if gen is None:
+        return
+    if not isinstance(gen, dict):
+        raise ValueError(
+            f"llm.generation must be a mapping；got {type(gen).__name__}"
+        )
+    for key, minimum in (
+        ("max_prompt_bytes", 1024),
+        ("target_prompt_bytes", 1024),
+        ("max_output_tokens", 1),
+        ("thinking_budget_tokens", 0),
+    ):
+        val = gen.get(key)
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ValueError(f"llm.generation.{key} 必须是整数；got {val!r}")
+        if val < minimum:
+            raise ValueError(
+                f"llm.generation.{key} 必须 >= {minimum}；got {val}"
+            )
+    if gen.get("target_prompt_bytes") > gen.get("max_prompt_bytes"):
+        raise ValueError(
+            "llm.generation.target_prompt_bytes 必须 <= max_prompt_bytes"
+        )
+    temp = gen.get("temperature")
+    if temp is not None:
+        if isinstance(temp, bool) or not isinstance(temp, (int, float)):
+            raise ValueError(
+                f"llm.generation.temperature 必须是数字；got {temp!r}"
+            )
+        temp_f = float(temp)
+        if temp_f < 0.0 or temp_f > 2.0:
+            raise ValueError(
+                f"llm.generation.temperature 必须 ∈ [0.0, 2.0]；got {temp_f}"
             )

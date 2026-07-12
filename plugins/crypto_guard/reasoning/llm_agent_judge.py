@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as _mp_mod
 import os
 import re
 import time
@@ -14,6 +15,12 @@ from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
 from plugins.crypto_guard.utils import _strict_positive_int_ms
+
+
+# 07-10 R5: sentinel distinguishing "preset key absent" from "preset value is
+# None" (a None candidate is a legitimate fair-batch terminal failure that must
+# route to the fail-closed fallback, NOT be treated as "no preset supplied").
+_SENTINEL: Any = object()
 
 
 SYSTEM_PROMPT = """你是 GA CryptoGuard 的市场研究 Agent。
@@ -43,6 +50,28 @@ LLM_ERROR_CATEGORIES = (
     # the gateway on-call. See ``_classify_llm_failure`` for the detection
     # rule.
     "llm_tool_call_no_text",
+    # 07-10 S4 (P0 #3): the process-isolation hard timeout killed a wedged
+    # provider call (the child outlived ``proc.join(timeout=)`` and was
+    # terminate/killed). This is a NON-retryable, terminal ``symbol_timeout``:
+    # the provider was already wedged for the full provider-timeout window,
+    # so retrying would burn all attempts on a known-bad provider and still
+    # miss the symbol deadline. Distinct from ``llm_transport_error`` (a
+    # single transient gateway timeout that may recover on retry) so the
+    # coordinator stops at attempt 1 and Phase E accounting counts it as a
+    # symbol-timeout, not a retry-exhaustion.
+    "llm_subprocess_hard_timeout",
+    # 07-10 R4-P0-2 (terminal-review-repair-plan-r4): subprocess FATAL errors
+    # that MUST NOT be retried (retrying would spawn a NEW child while the
+    # OLD unreaped child is still leaking resources / the response contract
+    # was already violated / the subprocess runtime cannot start). Each is
+    # terminal non-retryable; ``cleanup_failed`` in particular MUST stop the
+    # symbol at attempt 1 (attempt_count=1) so the coordinator does not amplify
+    # orphan processes. See ``_run_single_llm_attempt`` for the signature
+    # detection (BEFORE ``_classify_llm_failure`` which would otherwise route
+    # these RuntimeErrors to ``llm_transport_error`` / retryable).
+    "llm_subprocess_cleanup_failed",
+    "llm_subprocess_response_oversized",
+    "llm_subprocess_start_failed",
 )
 
 LLM_ERROR_STAGES = ("call", "parse", "schema", "semantic", "retry_exhausted")
@@ -62,6 +91,17 @@ _NON_RETRYABLE_CATEGORIES = frozenset({
     "llm_config_error",
     "llm_schema_validation_failed",
     "llm_semantic_validation_failed",
+    # 07-10 S4 (P0 #3): a subprocess hard-killed provider call is terminal
+    # ``symbol_timeout`` - the provider was wedged for the full provider-timeout
+    # window, so retrying burns attempts on a known-bad provider.
+    "llm_subprocess_hard_timeout",
+    # 07-10 R4-P0-2: subprocess FATAL errors are non-retryable - retrying
+    # would amplify orphan processes (cleanup_failed), the response contract
+    # was already violated (response_oversized), or the runtime cannot start
+    # (start_failed). See LLM_ERROR_CATEGORIES for the per-reason rationale.
+    "llm_subprocess_cleanup_failed",
+    "llm_subprocess_response_oversized",
+    "llm_subprocess_start_failed",
 })
 
 
@@ -80,10 +120,22 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     if not use_llm:
         fallback["analysis_source"] = "deterministic_sop"
         fallback["llm_status"] = "disabled"
+        # Phase D §8: carry the metadata envelope on the disabled path too,
+        # so every decision row (success, failure, disabled, breaker-skip)
+        # has the same field shape for diagnostics. No provider call here.
+        fallback["llm_attempt_count"] = 0
+        fallback["llm_provider_call_count"] = 0
+        fallback["llm_latency_ms"] = 0
+        fallback["llm_prompt_bytes"] = None
+        fallback["llm_continuity_included"] = None
+        fallback["llm_model"] = None
+        fallback["llm_terminal_reason"] = "llm_disabled"
+        _sched_ctx_d = context or {}
+        fallback["llm_schedule_round"] = _sched_ctx_d.get("schedule_round")
+        fallback["llm_schedule_position"] = _sched_ctx_d.get("schedule_position")
         fallback["plan_origin"] = "deterministic_sop"
         fallback["plan_execution_state"] = "no_candidate" if not fallback.get("has_trade_plan") else "confirmed"
         fallback["llm_fallback_reason"] = "llm_disabled"
-        fallback["llm_attempt_count"] = 0
         return apply_risk_to_decision(fallback, snapshot)
 
     # Resolve breaker from context (controller wires it per-batch)
@@ -94,16 +146,82 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     if not breaker.should_call():
         breaker.record_skip()
         fallback["analysis_source"] = "deterministic_fallback"
+        # Phase D §8: full per-decision metadata envelope even on the
+        # pre-call breaker skip path. No provider call was made, so
+        # llm_provider_call_count=0 and llm_latency_ms=0. The terminal
+        # reason is the exact structured value (design §9), never generic.
         fallback["llm_status"] = "failed"
         fallback["llm_error_category"] = None  # no call was made
         fallback["llm_error_stage"] = None
         fallback["llm_error"] = "circuit breaker open; LLM call skipped"
         fallback["llm_fallback_reason"] = "circuit_breaker_open"
         fallback["llm_attempt_count"] = 0
+        fallback["llm_provider_call_count"] = 0
+        fallback["llm_latency_ms"] = 0
+        fallback["llm_prompt_bytes"] = None
+        fallback["llm_continuity_included"] = None
+        fallback["llm_model"] = None
+        fallback["llm_terminal_reason"] = "breaker_skipped"
+        _sched_ctx = context or {}
+        fallback["llm_schedule_round"] = _sched_ctx.get("schedule_round")
+        fallback["llm_schedule_position"] = _sched_ctx.get("schedule_position")
         fallback["plan_origin"] = "deterministic_fallback"
         fallback["plan_execution_state"] = "unconfirmed"
         notes = list(fallback.get("risk_notes") or [])
         notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
+        fallback["risk_notes"] = notes
+        return apply_risk_to_decision(fallback, snapshot)
+
+    # 07-10 R5: fair-batch preset injection. When the fair coordinator has
+    # ALREADY run the provider call via ``fair_llm_call_adapter`` (one call,
+    # no inner retry wrapper — directive #2), the caller hands the produced
+    # candidate + §8 attempt_meta here through ``context``. We skip
+    # ``_call_ga_llm_with_retry`` entirely so the provider is NOT called a
+    # second time and the breaker is NOT re-recorded (the coordinator owns
+    # both for the fair path). This lets ``analyze_symbol`` reuse its ENTIRE
+    # post-decision pipeline (continuity, risk gate, hysteresis, clamp,
+    # performance gate, persistence) on the fair-batch candidate — closing
+    # the run_once -> fair_batch -> controller -> DB -> report chain without
+    # a second LLM call.
+    preset_candidate = (context or {}).get("llm_preset_candidate", _SENTINEL)
+    if preset_candidate is not _SENTINEL:
+        attempt_meta = (context or {}).get("llm_preset_attempt_meta") or {}
+        candidate = preset_candidate
+        if candidate is not None:
+            # The fair adapter's ``_run_single_llm_attempt`` already normalized
+            # + validated the candidate and set plan_origin / plan_execution_state.
+            return apply_risk_to_decision(candidate, snapshot)
+        # Preset candidate is None -> the fair batch's terminal outcome for
+        # this symbol was a failure/skip (symbol_timeout / schema fail /
+        # breaker / budget). Fail closed to the deterministic fallback with
+        # the fair batch's attempt_meta so the §8 envelope is accurate.
+        fallback["analysis_source"] = "deterministic_fallback"
+        fallback["llm_status"] = "failed"
+        fallback.update(attempt_meta)
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
+        notes = list(fallback.get("risk_notes") or [])
+        _tr = attempt_meta.get("llm_terminal_reason")
+        if _tr == "breaker_skipped":
+            notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
+        elif _tr == "prompt_budget_contract_violation":
+            notes.append("LLM/GA 研判失败（提示词预算超限），本次使用规则 SOP 降级结果。")
+        elif _tr == "llm_schema_validation_failed":
+            notes.append("LLM/GA 研判失败（schema 校验未通过），本次使用规则 SOP 降级结果。")
+        elif _tr in ("symbol_timeout", "batch_deadline_skipped"):
+            notes.append("LLM/GA 研判失败（时间预算耗尽），本次使用规则 SOP 降级结果。")
+        elif _tr == "single_flight_skipped":
+            # 07-10 P1-2: the fair coordinator skipped this symbol because an
+            # overlapping tick (cross-batch single-flight) is still analyzing
+            # it - a legitimate dedup, NOT a failure. The note must NOT claim
+            # "研判失败" (that would mislead the operator).
+            notes.append("LLM/GA 跳过：同品种跨批次分析仍在进行（single-flight），本次使用规则 SOP 结果。")
+        elif _tr == "missing_snapshot":
+            # 07-10 P1-2: defensive policy skip (no market snapshot). Also a
+            # legit upstream skip, not a failure.
+            notes.append("LLM/GA 跳过：缺少市场快照（missing_snapshot），本次使用规则 SOP 结果。")
+        else:
+            notes.append("LLM/GA 研判失败，本次使用规则 SOP 降级结果。")
         fallback["risk_notes"] = notes
         return apply_risk_to_decision(fallback, snapshot)
 
@@ -117,110 +235,44 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     )
 
     if candidate is None:
-        # Fail-closed: use deterministic fallback with attempt metadata
+        # Fail-closed: use deterministic fallback with attempt metadata.
+        # 07-10 R1-1: the retry wrapper now owns ALL breaker.record_attempt
+        # calls (the single-attempt unit surfaces the outcome, the wrapper
+        # emits the physical/repairable/non-retryable events). Do NOT
+        # re-record here - that would double-count failed attempts.
         fallback["analysis_source"] = "deterministic_fallback"
         fallback["llm_status"] = "failed"
         fallback.update(attempt_meta)
         fallback["plan_origin"] = "deterministic_fallback"
         fallback["plan_execution_state"] = "unconfirmed"
         notes = list(fallback.get("risk_notes") or [])
-        notes.append("LLM/GA 研判失败，本次使用规则 SOP 降级结果。")
+        # Tailor the risk note to the exact terminal reason so the report
+        # labels match the failure class (budget skip / breaker / schema /
+        # retry-exhausted), not a generic parse-failure blanket.
+        _tr = attempt_meta.get("llm_terminal_reason")
+        if _tr == "breaker_skipped":
+            notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
+        elif _tr == "prompt_budget_contract_violation":
+            notes.append("LLM/GA 研判失败（提示词预算超限），本次使用规则 SOP 降级结果。")
+        elif _tr == "llm_schema_validation_failed":
+            notes.append("LLM/GA 研判失败（schema 校验未通过），本次使用规则 SOP 降级结果。")
+        elif _tr in ("symbol_timeout", "batch_deadline_skipped"):
+            notes.append("LLM/GA 研判失败（时间预算耗尽），本次使用规则 SOP 降级结果。")
+        else:
+            notes.append("LLM/GA 研判失败，本次使用规则 SOP 降级结果。")
         fallback["risk_notes"] = notes
         return apply_risk_to_decision(fallback, snapshot)
 
-    # LLM returned a candidate. 07-09-overtrigger P0-2: unwrap the
-    # ``{"decision": {...}}`` wrapper some models emit, BEFORE schema
-    # validation and BEFORE ``_normalize_llm_decision`` strips internal
-    # ``_``-prefixed fields. Conflict (wrapper + top-level schema keys)
-    # fails closed as a hard schema failure.
-    unwrapped_candidate, unwrap_changed = _unwrap_wrapped_decision(candidate)
-    if unwrapped_candidate is None:
-        # Conflict: wrapper + top-level schema keys with different values.
-        # Hard schema failure - fail closed, count toward breaker.
-        breaker.record_attempt(category="llm_schema_validation_failed", ok=False)
-        fallback["analysis_source"] = "deterministic_fallback"
-        fallback["llm_status"] = "failed"
-        fallback["llm_error_category"] = "llm_schema_validation_failed"
-        fallback["llm_error_stage"] = "schema"
-        fallback["llm_error"] = "wrapped decision conflict: top-level + nested decision both present"
-        fallback["llm_attempt_count"] = attempt_meta.get("llm_attempt_count", 1)
-        fallback["llm_retry_round"] = attempt_meta.get("llm_retry_round")
-        fallback["llm_config_name"] = attempt_meta.get("llm_config_name")
-        fallback["llm_model"] = attempt_meta.get("llm_model")
-        fallback["llm_fallback_reason"] = "schema_validation_failed"
-        fallback["plan_origin"] = "deterministic_fallback"
-        fallback["plan_execution_state"] = "unconfirmed"
-        notes = list(fallback.get("risk_notes") or [])
-        notes.append("LLM/GA 研判失败（决策对象包装冲突），本次使用规则 SOP 降级结果。")
-        fallback["risk_notes"] = notes
-        return apply_risk_to_decision(fallback, snapshot)
-
-    candidate = unwrapped_candidate
-
-    # 07-09-overtrigger P0-2/R4: a successful unwrap is a repairable event
-    # (the LLM produced schema-shaped output, just wrapped). Record it as
-    # repairable so it does NOT count toward the breaker rate window.
-    if unwrap_changed:
-        breaker.record_attempt(category="llm_schema_repairable", ok=True, repairable=True)
-
-    decision = _normalize_llm_decision(candidate, snapshot, fallback)
-    ok, err = validate_json("ga_decision.schema.json", decision)
-    if not ok:
-        # Phase B/C (07-09): schema-alias repair path. The most common
-        # production failure is the LLM emitting a semantic trigger-style
-        # ``entry_trigger_confirmation.type`` (price_rejection,
-        # pullback_rejection, breakout_retest, reclaim_confirmation)
-        # instead of the schema-canonical ``closed_candle_confirmation``.
-        # When the rest of the confirmation object is complete and
-        # internally consistent, normalize the alias and re-validate.
-        # Repairable successes do NOT count toward the breaker.
-        repaired_decision, repair_notes, repair_changed = _try_repair_entry_trigger_confirmation(
-            decision, snapshot
-        )
-        if repair_changed:
-            ok2, err2 = validate_json("ga_decision.schema.json", repaired_decision)
-            if ok2:
-                breaker.record_attempt(
-                    category="llm_schema_repairable", ok=True, repairable=True,
-                )
-                repaired_decision["plan_origin"] = "llm_confirmed"
-                repaired_decision["plan_execution_state"] = "confirmed"
-                existing_notes = list(repaired_decision.get("risk_notes") or [])
-                existing_notes.extend(repair_notes)
-                repaired_decision["risk_notes"] = existing_notes
-                parse_meta = repaired_decision.get("llm_parse_meta") or {}
-                if not isinstance(parse_meta, dict):
-                    parse_meta = {}
-                if repair_notes:
-                    parse_meta["original_entry_trigger_type"] = repair_notes[0]
-                repaired_decision["llm_parse_meta"] = parse_meta
-                return apply_risk_to_decision(repaired_decision, snapshot)
-            err = err2
-            decision = repaired_decision
-        # Hard schema failure - non-retryable, fail-closed.
-        breaker.record_attempt(category="llm_schema_validation_failed", ok=False)
-        fallback["analysis_source"] = "deterministic_fallback"
-        fallback["llm_status"] = "failed"
-        fallback["llm_error_category"] = "llm_schema_validation_failed"
-        fallback["llm_error_stage"] = "schema"
-        fallback["llm_error"] = str(err)[:300]
-        fallback["llm_attempt_count"] = attempt_meta.get("llm_attempt_count", 1)
-        fallback["llm_retry_round"] = attempt_meta.get("llm_retry_round")
-        fallback["llm_config_name"] = attempt_meta.get("llm_config_name")
-        fallback["llm_model"] = attempt_meta.get("llm_model")
-        fallback["llm_fallback_reason"] = "schema_validation_failed"
-        fallback["plan_origin"] = "deterministic_fallback"
-        fallback["plan_execution_state"] = "unconfirmed"
-        notes = list(fallback.get("risk_notes") or [])
-        notes.append("LLM/GA 研判失败（schema 校验未通过），本次使用规则 SOP 降级结果。")
-        fallback["risk_notes"] = notes
-        return apply_risk_to_decision(fallback, snapshot)
-
-    # Success path
-    decision["plan_origin"] = "llm_confirmed"
-    decision["plan_execution_state"] = "confirmed"  # may be overridden by risk_gate later
-    breaker.record_attempt(category=None, ok=True)
-    return apply_risk_to_decision(decision, snapshot)
+    # LLM returned a SUCCESS candidate. 07-10 R1-1: the single-attempt unit
+    # (``_run_single_llm_attempt``, invoked via ``_call_ga_llm_with_retry``)
+    # now performs the unwrap + schema validation + schema-alias repair and
+    # returns a normalized, validated decision with the §8 envelope merged
+    # and ``plan_origin="llm_confirmed"`` / ``plan_execution_state="confirmed"``
+    # set. The retry wrapper already emitted the breaker events (physical-ok
+    # + repairable for a repaired success, one physical-ok for a plain
+    # success). So this function's job is ONLY the final risk-gate pass —
+    # do NOT re-unwrap, re-validate, or re-record the breaker here.
+    return apply_risk_to_decision(candidate, snapshot)
 
 
 def _try_repair_entry_trigger_confirmation(
@@ -466,15 +518,23 @@ def build_llm_strict_json_prompt(
     with SYSTEM_PROMPT_STRICT_JSON to force pure JSON output.
     """
     # Build the normal prompt first to get the payload, then replace
-    # the system prompt prefix.
+    # the system prompt prefix. ``build_llm_decision_prompt`` stashes the
+    # prompt metadata (bytes + continuity_included) into the thread-local.
     normal_prompt = build_llm_decision_prompt(snapshot, deterministic_decision, context=context)
     # The normal prompt is: SYSTEM_PROMPT + "\n\n输入：\n" + json_payload
     # Replace the system prompt prefix
     if normal_prompt.startswith(SYSTEM_PROMPT):
         json_part = normal_prompt[len(SYSTEM_PROMPT):]
-        return SYSTEM_PROMPT_STRICT_JSON + json_part
-    # Fallback: just prepend strict prompt
-    return SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + normal_prompt
+        strict_prompt = SYSTEM_PROMPT_STRICT_JSON + json_part
+    else:
+        # Fallback: just prepend strict prompt
+        strict_prompt = SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + normal_prompt
+    # Phase D §8: re-stash the FINAL (strict) prompt byte size. The strict
+    # system prompt differs in length from SYSTEM_PROMPT, so the bytes
+    # stashed by build_llm_decision_prompt are stale. Continuity inclusion
+    # is unchanged (same payload).
+    _llm_call_state.prompt_bytes = len(strict_prompt.encode("utf-8"))
+    return strict_prompt
 
 
 def build_llm_minimal_safe_prompt(
@@ -488,6 +548,14 @@ def build_llm_minimal_safe_prompt(
     Reuses the R8 P1 safe_payload fallback path: symbol + analysis_time +
     hard_rules + deterministic_reference + minimal output_requirements.
     No market_snapshot, no modules, no multi_timeframe_feature_pack.
+
+    07-10 Phase D (design §7.1): the minimal-safe prompt MUST still include
+    ``analysis_continuity``. Continuity is protected across EVERY prompt tier
+    (design §5.1) — dropping it entirely on attempt 3 would break the
+    cross-round continuity contract precisely when the symbol is under the
+    most retry pressure. ``_compact_snapshot`` already surfaces a (possibly
+    "missing"-status) continuity block; surface it here as a top-level key
+    so the LLM still sees prior grade/bias/trigger state.
     """
     from plugins.crypto_guard.config.loader import load_config
     risk_cfg = load_config().trading_mode.get("risk", {})
@@ -505,6 +573,8 @@ def build_llm_minimal_safe_prompt(
             f"创建模拟盘必须经过风控：RR>={min_rr}、confidence>={min_conf}",
             "只输出一个 JSON 对象，禁止 Markdown",
         ],
+        # Phase D §7.1: continuity survives even the minimal-safe tier.
+        "analysis_continuity": safe_ms.get("analysis_continuity"),
         "deterministic_reference": {
             k: safe_dr.get(k)
             for k in (
@@ -522,9 +592,19 @@ def build_llm_minimal_safe_prompt(
         },
         "_trim_note": "prompt_over_budget_minimal_fallback",
     }
-    return SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + json.dumps(
+    prompt = SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"),
     )
+    # Phase D §8: stash prompt metadata for the retry wrapper. The
+    # minimal-safe tier surfaces continuity as a TOP-LEVEL payload key (not
+    # under ``market_snapshot``), so check both locations.
+    _cont = payload.get("analysis_continuity")
+    if _cont is None:
+        _ms = payload.get("market_snapshot")
+        _cont = _ms.get("analysis_continuity") if isinstance(_ms, dict) else None
+    _llm_call_state.prompt_bytes = len(prompt.encode("utf-8"))
+    _llm_call_state.continuity_included = _cont is not None
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -590,8 +670,17 @@ def _call_ga_llm_with_retry(
     wall_clock_budget = (context or {}).get("llm_wall_clock_budget") or BatchWallClockBudget(
         budget_seconds=retry_cfg.get("batch_wall_clock_budget_seconds", 90),
     )
+    # 07-10 Phase B: per-symbol deadline. When the fair scheduler (Phase C)
+    # injects ``llm_per_symbol_deadline``, it is the admission gate — the
+    # fixed 30s ESTIMATED_CALL_MS estimate is NOT used. When the deadline is
+    # absent (legacy callers, the Phase A repro tests that exercise the
+    # known-starving path), the old ESTIMATED_CALL_MS gate remains byte-for-
+    # byte unchanged so the rollback point ("config defaults retain old
+    # execution until fair scheduler is wired") holds.
+    per_symbol_deadline = (context or {}).get("llm_per_symbol_deadline")
 
-    # Estimated call time: 30s for normal, 30s for strict, 30s for minimal
+    # Estimated call time: 30s for normal, 30s for strict, 30s for minimal.
+    # Used ONLY on the legacy admission path (no per-symbol deadline).
     ESTIMATED_CALL_MS = 30_000
 
     attempt_meta: dict[str, Any] = {
@@ -604,7 +693,41 @@ def _call_ga_llm_with_retry(
         "llm_config_name": cfg_name,
         "llm_model": model_name,
         "llm_fallback_reason": None,
+        # 07-10 Phase D §8 per-decision metadata. Defaults are
+        # zero/None/False so they persist for BOTH successes and failures.
+        # ``llm_provider_call_count`` counts physical provider calls made
+        # for this symbol (a successful parse on attempt 2 = 2 calls).
+        # ``llm_latency_ms`` is the last attempt's provider-call latency.
+        # ``llm_prompt_bytes`` / ``llm_continuity_included`` reflect the
+        # last attempt's built prompt. ``llm_terminal_reason`` is the exact
+        # structured terminal reason (design §9) - never the generic
+        # ``llm_parse_failed``. ``llm_schedule_round`` /
+        # ``llm_schedule_position`` are injected by the Phase C fair
+        # scheduler via context when the symbol runs through ``run_fair_batch``.
+        "llm_provider_call_count": 0,
+        "llm_latency_ms": None,
+        "llm_prompt_bytes": None,
+        "llm_continuity_included": None,
+        "llm_terminal_reason": None,
+        "llm_schedule_round": None,
+        "llm_schedule_position": None,
+        # 07-10 Phase D §6 effective generation controls (what actually
+        # landed on the llmcore session, NOT just the configured values).
+        "llm_effective_thinking_budget_tokens": None,
+        "llm_effective_max_output_tokens": None,
+        "llm_effective_temperature": None,
+        # ``llm_provider_timeout_ms`` (Phase B) - effective per-attempt
+        # provider timeout derived from the per-symbol deadline.
+        "llm_provider_timeout_ms": None,
     }
+
+    # 07-10 Phase D §8: when the symbol runs through the Phase C fair
+    # scheduler (``run_fair_batch``), the coordinator injects its schedule
+    # position/round via context. Surface them so the per-decision metadata
+    # is complete even on the legacy serial path (None when absent).
+    _sched_ctx = context or {}
+    attempt_meta["llm_schedule_round"] = _sched_ctx.get("llm_schedule_round")
+    attempt_meta["llm_schedule_position"] = _sched_ctx.get("llm_schedule_position")
 
     last_category: str | None = None
     last_error: str | None = None
@@ -617,28 +740,57 @@ def _call_ga_llm_with_retry(
         if not breaker.should_call():
             breaker.record_skip()
             attempt_meta["llm_fallback_reason"] = "circuit_breaker_open"
+            attempt_meta["llm_terminal_reason"] = "breaker_skipped"
             attempt_meta["llm_attempt_count"] = attempt - 1
             attempt_meta["llm_error_category"] = last_category
             attempt_meta["llm_error_stage"] = last_stage
             attempt_meta["llm_error"] = last_error or "circuit breaker open; LLM call skipped"
             return None, attempt_meta
 
-        # Check 2: wall-clock budget (PRIMARY safeguard)
+        # Check 2: wall-clock budget. 07-10 Phase B introduces a per-symbol
+        # deadline that REPLACES the fixed 30s admission estimate. When the
+        # per-symbol deadline is present, the symbol's own remaining time is
+        # the gate — a symbol with remaining time gets its call even if the
+        # shared batch budget is low, and a symbol whose deadline elapsed is
+        # skipped with ``symbol_timeout`` (Phase C/E wiring; the wrapper
+        # records ``wall_clock_budget_exhausted`` here for the legacy label
+        # until Phase E replaces the terminal reason). When the per-symbol
+        # deadline is absent, the legacy ``ESTIMATED_CALL_MS + jitter`` gate
+        # against the shared batch budget is used unchanged.
         jitter_ms = 0
         if attempt > 1:
             jitter_ms = int((jitter_min + (jitter_max - jitter_min) * (attempt / max_attempts)) * 1000)
-        if wall_clock_budget.remaining_ms() < ESTIMATED_CALL_MS + jitter_ms:
-            attempt_meta["llm_fallback_reason"] = "wall_clock_budget_exhausted"
-            attempt_meta["llm_attempt_count"] = attempt - 1
-            attempt_meta["llm_error_category"] = last_category
-            attempt_meta["llm_error_stage"] = last_stage
-            attempt_meta["llm_error"] = last_error or "batch wall-clock budget exhausted"
-            return None, attempt_meta
+        if per_symbol_deadline is not None:
+            # Per-symbol deadline path (Phase B primitive). The provider call
+            # timeout for THIS attempt is derived from remaining symbol time.
+            # Persist it on attempt_meta so Phase D can record the effective
+            # timeout. If the deadline is already exhausted, skip the call.
+            if per_symbol_deadline.exhausted():
+                attempt_meta["llm_fallback_reason"] = "wall_clock_budget_exhausted"
+                attempt_meta["llm_terminal_reason"] = "symbol_timeout"
+                attempt_meta["llm_attempt_count"] = attempt - 1
+                attempt_meta["llm_error_category"] = last_category
+                attempt_meta["llm_error_stage"] = last_stage
+                attempt_meta["llm_error"] = last_error or "per-symbol deadline exhausted before call"
+                attempt_meta["llm_provider_timeout_ms"] = 0
+                return None, attempt_meta
+            attempt_meta["llm_provider_timeout_ms"] = per_symbol_deadline.provider_timeout_ms()
+        else:
+            # Legacy admission path (unchanged, for rollback parity).
+            if wall_clock_budget.remaining_ms() < ESTIMATED_CALL_MS + jitter_ms:
+                attempt_meta["llm_fallback_reason"] = "wall_clock_budget_exhausted"
+                attempt_meta["llm_terminal_reason"] = "batch_deadline_skipped"
+                attempt_meta["llm_attempt_count"] = attempt - 1
+                attempt_meta["llm_error_category"] = last_category
+                attempt_meta["llm_error_stage"] = last_stage
+                attempt_meta["llm_error"] = last_error or "batch wall-clock budget exhausted"
+                return None, attempt_meta
 
         # Check 3: retry budget (only for Attempt 2/3)
         if attempt > 1:
             if not retry_budget.consume():
                 attempt_meta["llm_fallback_reason"] = "retry_budget_exhausted"
+                attempt_meta["llm_terminal_reason"] = "retry_budget_exhausted"
                 attempt_meta["llm_attempt_count"] = attempt - 1
                 attempt_meta["llm_error_category"] = last_category
                 attempt_meta["llm_error_stage"] = last_stage
@@ -655,24 +807,57 @@ def _call_ga_llm_with_retry(
             )
             time.sleep(actual_jitter / 1000.0)
 
-        # --- Build prompt and call LLM ---
-        builder_idx = min(attempt - 1, len(prompt_builders) - 1)
-        # For attempt 2 with json_parse_failed, use strict JSON builder
-        # For attempt 3, use minimal safe builder
-        if attempt == 2 and last_category == "llm_json_parse_failed":
-            builder_idx = 1  # strict JSON
-        elif attempt >= 3:
-            builder_idx = 2  # minimal safe
+        # --- Build prompt, call LLM, parse, unwrap, validate, repair ---
+        # 07-10 R1-1: the single-attempt unit is now ``_run_single_llm_attempt``
+        # (shared with the fair adapter). It does prompt build + budget-
+        # contract check + ONE provider call + parse + unwrap + schema
+        # validation + schema-alias repair, returning ``(candidate_or_None,
+        # per_attempt_meta)`` with ``llm_repair_event`` surfaced. The retry
+        # wrapper owns the admission gates above and the breaker record below.
+        _cand, _am = _run_single_llm_attempt(
+            snapshot=snapshot, fallback=fallback, context=context,
+            attempt=attempt, max_attempts=max_attempts, breaker=breaker,
+            cfg_name=cfg_name, model_name=model_name,
+            prompt_builders=prompt_builders, last_category=last_category,
+            budget_violation_is_skip=False,  # legacy path: budget violation is a failed terminal
+            # 07-10 R2-1: thread the per-symbol deadline's provider timeout
+            # into the call so the legacy retry path is ALSO bounded when a
+            # deadline is injected (R5 controller wiring). When the deadline is
+            # absent (legacy callers, Phase A repro), None preserves the 60s
+            # read-timeout floor + the session's default max_retries.
+            provider_timeout_seconds=(
+                None if per_symbol_deadline is None
+                else float(per_symbol_deadline.provider_timeout_ms()) / 1000.0
+            ),
+        )
 
-        prompt_builder = prompt_builders[builder_idx]
-        prompt = prompt_builder(snapshot, fallback, context=context)
+        # Merge the per-attempt §8 envelope fields onto the wrapper's outer
+        # attempt_meta (prompt bytes, continuity, latency, effective settings,
+        # terminal reason). The provider_call_count accumulator is additive
+        # across attempts (a success on attempt 2 = 2 calls).
+        attempt_meta["llm_prompt_bytes"] = _am.get("llm_prompt_bytes")
+        attempt_meta["llm_continuity_included"] = _am.get("llm_continuity_included")
+        attempt_meta["llm_latency_ms"] = _am.get("llm_latency_ms")
+        attempt_meta["llm_effective_thinking_budget_tokens"] = _am.get("llm_effective_thinking_budget_tokens")
+        attempt_meta["llm_effective_max_output_tokens"] = _am.get("llm_effective_max_output_tokens")
+        attempt_meta["llm_effective_temperature"] = _am.get("llm_effective_temperature")
+        # 07-10 R1-1: surface the per-symbol deadline's provider timeout
+        # (Phase B). The admission gate above already returned
+        # ``llm_provider_timeout_ms=0`` on the exhausted-deadline skip path;
+        # for a real call, derive it from the deadline's remaining time so
+        # the §8 envelope records the effective per-attempt timeout.
+        if per_symbol_deadline is not None:
+            attempt_meta["llm_provider_timeout_ms"] = per_symbol_deadline.provider_timeout_ms()
+        _prov_calls = int(_am.get("llm_provider_call_count") or 0)
+        if _prov_calls:
+            attempt_meta["llm_provider_call_count"] = attempt_meta.get("llm_provider_call_count", 0) + _prov_calls
 
-        raw: str | None = None
-        category: str | None = None
-        try:
-            raw = _call_ga_llm(prompt)
-            candidate = _parse_json_object(raw)
-            # Success!
+        _attempt_status = str(_am.get("llm_status") or "failed")
+        _attempt_category = _am.get("llm_error_category")
+        _repair_event = bool(_am.get("llm_repair_event"))
+
+        # Success (plain or repaired): persist envelope + emit breaker events.
+        if _attempt_status == "ok" and _cand is not None:
             attempt_meta["llm_status"] = "ok"
             attempt_meta["llm_attempt_count"] = attempt
             attempt_meta["llm_retry_round"] = attempt
@@ -680,43 +865,59 @@ def _call_ga_llm_with_retry(
             attempt_meta["llm_error_stage"] = None
             attempt_meta["llm_error"] = None
             attempt_meta["llm_fallback_reason"] = None
-            return candidate, attempt_meta
-        except json.JSONDecodeError as exc:
-            category = _classify_llm_failure(exc, raw, "parse")
-            last_category = category
-            last_error = str(exc)[:300]
-            last_stage = "parse"
-        except ValueError as exc:
-            # Schema validation error from _parse_json_object or downstream
-            err_msg = str(exc)[:300]
-            if "not a JSON object" in err_msg:
-                category = "llm_json_parse_failed"
-            else:
-                category = "llm_schema_validation_failed"
-            last_category = category
-            last_error = err_msg
-            last_stage = "schema"
-        except RuntimeError as exc:
-            category = _classify_llm_failure(exc, raw, "call")
-            last_category = category
-            last_error = str(exc)[:300]
-            last_stage = "call"
-        except Exception as exc:
-            category = _classify_llm_failure(exc, raw, "call")
-            last_category = category
-            last_error = str(exc)[:300]
-            last_stage = "call"
+            attempt_meta["llm_terminal_reason"] = _am.get("llm_terminal_reason")
+            attempt_meta["llm_repair_event"] = _repair_event
+            # 07-10 R1-1 (P0-1): mirror the legacy run_agent_sop_decision
+            # path (llm_agent_judge.py:223-226 / :278) - a repaired success
+            # emits the PHYSICAL success first (drives the state machine),
+            # THEN the repairable event (tracks repairable_count only). A
+            # plain success emits one physical-ok record.
+            breaker.record_attempt(category=None, ok=True)
+            if _repair_event:
+                breaker.record_attempt(
+                    category="llm_schema_repairable", ok=True, repairable=True,
+                )
+            # Merge the full envelope onto the success decision (mirrors
+            # legacy llm_agent_judge.py:246/:289).
+            _cand.update(attempt_meta)
+            return _cand, attempt_meta
 
-        # Record the failed attempt with the breaker
+        # Prompt-budget contract violation: terminal non-retryable (D5). No
+        # provider call, no breaker event (budget skip, not a failed call).
+        if _attempt_status == "skipped" or \
+                _attempt_category == "llm_prompt_budget_violation":
+            attempt_meta["llm_status"] = _attempt_status
+            attempt_meta["llm_fallback_reason"] = _am.get("llm_fallback_reason") or "prompt_budget_contract_violation"
+            attempt_meta["llm_terminal_reason"] = _am.get("llm_terminal_reason") or "prompt_budget_contract_violation"
+            attempt_meta["llm_error_category"] = _attempt_category
+            attempt_meta["llm_error_stage"] = _am.get("llm_error_stage")
+            attempt_meta["llm_error"] = _am.get("llm_error")
+            attempt_meta["llm_attempt_count"] = attempt
+            attempt_meta["llm_retry_round"] = attempt
+            last_category = _attempt_category
+            last_error = _am.get("llm_error")
+            last_stage = _am.get("llm_error_stage")
+            return None, attempt_meta
+
+        # Failed attempt (parse / schema-conflict / transport / empty). The
+        # provider call DID happen - record the breaker failure. Schema-
+        # validation-failed (incl. unwrap conflict) is non-retryable.
+        category = _attempt_category
+        last_category = category
+        last_error = _am.get("llm_error")
+        last_stage = _am.get("llm_error_stage")
+        attempt_meta["llm_error_category"] = category
+        attempt_meta["llm_error_stage"] = last_stage
+        attempt_meta["llm_error"] = last_error
+
         breaker.record_attempt(category=category, ok=False)
 
         # Check if the error is non-retryable
         if category in _NON_RETRYABLE_CATEGORIES:
+            attempt_meta["llm_status"] = "failed"
             attempt_meta["llm_fallback_reason"] = "non_retryable_error"
+            attempt_meta["llm_terminal_reason"] = category
             attempt_meta["llm_attempt_count"] = attempt
-            attempt_meta["llm_error_category"] = category
-            attempt_meta["llm_error_stage"] = last_stage
-            attempt_meta["llm_error"] = last_error
             return None, attempt_meta
 
         # Special case: json_parse_failed on strict JSON attempt -> allow
@@ -729,7 +930,9 @@ def _call_ga_llm_with_retry(
         # Continue to next attempt if retryable and budget allows
 
     # All attempts exhausted
+    attempt_meta["llm_status"] = "failed"
     attempt_meta["llm_fallback_reason"] = "retry_exhausted"
+    attempt_meta["llm_terminal_reason"] = last_category or "retry_exhausted"
     attempt_meta["llm_attempt_count"] = max_attempts
     attempt_meta["llm_error_category"] = last_category
     attempt_meta["llm_error_stage"] = "retry_exhausted"
@@ -764,6 +967,463 @@ def _resolve_llm_model(cfg_name: str) -> str:
 # not possible from a test. With this constant at module scope, tests
 # can patch it to a small value to fire the safe_payload path.
 MAX_PROMPT_BYTES = 48 * 1024  # 2x feature pack budget
+
+
+def _run_single_llm_attempt(
+    *,
+    snapshot: dict[str, Any],
+    fallback: dict[str, Any],
+    context: dict[str, Any] | None,
+    attempt: int,
+    max_attempts: int,
+    breaker: Any,
+    cfg_name: str,
+    model_name: str,
+    prompt_builders: tuple[
+        Callable[[dict, dict, Any], str],  # normal
+        Callable[[dict, dict, Any], str],  # strict JSON
+        Callable[[dict, dict, Any], str],  # minimal safe
+    ],
+    last_category: str | None = None,
+    budget_violation_is_skip: bool = False,
+    provider_timeout_seconds: float | None = None,
+    subprocess_hard_timeout: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """07-10 R1-1: ONE LLM attempt - prompt build + budget-contract check +
+    ONE provider call + JSON parse + unwrap + schema validation + schema-alias
+    repair. Shared by the legacy retry wrapper (3x loop) and the new
+    ``fair_llm_call_adapter`` (1 call, no inner retry).
+
+    Does NOT own admission gates (breaker.should_call / wall-clock budget /
+    retry_budget.consume) and does NOT call ``breaker.record_attempt`` - the
+    CALLER owns those (retry wrapper / fair coordinator). This matches the
+    coordinator contract (llm_fair_scheduler.py ``_run_one_attempt`` owns the
+    breaker) and the directive: "fair coordinator 调用单次-attempt adapter，
+    不能再套内部三次 retry wrapper" - the adapter must do ONE provider call,
+    not wrap the 3x retry wrapper.
+
+    07-10 R2-1: ``provider_timeout_seconds`` threads the per-symbol deadline's
+    provider timeout into the ONE ``_call_ga_llm`` call (``session.read_timeout``
+    + ``session.max_retries = 0``). None preserves the legacy 60s read-timeout
+    floor + the session's default max_retries (the legacy retry wrapper has its
+    OWN 3x loop and relies on the breaker for backoff).
+
+    Returns ``(candidate_or_None, attempt_meta)``:
+    - ``candidate``: the normalized + validated decision dict on success
+      (including a schema-alias / unwrap repaired success), else None.
+    - ``attempt_meta``: §8 envelope with ``llm_status`` ("ok" | "failed" |
+      "skipped"), ``llm_error_category`` / ``llm_error_stage`` / ``llm_error``,
+      ``llm_fallback_reason``, ``llm_terminal_reason``, ``llm_provider_call_count``
+      (1 on a real call, 0 on budget violation), ``llm_latency_ms``,
+      ``llm_prompt_bytes``, ``llm_continuity_included``, ``llm_repair_event``
+      (True when a schema-alias or unwrap repair succeeded - the caller emits
+      BOTH the physical-success and repairable breaker events, mirroring the
+      legacy ``run_agent_sop_decision`` path), and the effective generation
+      settings.
+
+    ``budget_violation_is_skip``: when True (fair adapter path), a prompt-budget
+    contract violation returns ``llm_status="skipped"`` +
+    ``llm_fallback_reason="prompt_budget_contract_violation"`` (P0-2: no
+    provider call, recorded as a skip not a failure, terminal non-retryable).
+    When False (legacy retry wrapper path), it returns ``llm_status="failed"``
+    with the exact same terminal reason - preserving the D5 contract
+    (test_smoke.py prompt_budget_contract_violation test).
+    """
+    # Phase D §8: reset the per-call metadata thread-local BEFORE building
+    # the prompt so stale values from a prior attempt cannot leak. The
+    # builder stashes ``prompt_bytes`` + ``continuity_included`` into the
+    # thread-local; ``_call_ga_llm`` stashes latency + effective settings.
+    _llm_call_state_reset()
+
+    # --- Build prompt: tier selection by attempt + last failure category ---
+    builder_idx = min(attempt - 1, len(prompt_builders) - 1)
+    # For attempt 2 with json_parse_failed, use strict JSON builder.
+    # For attempt 3, use minimal safe builder.
+    if attempt == 2 and last_category == "llm_json_parse_failed":
+        builder_idx = 1  # strict JSON
+    elif attempt >= 3:
+        builder_idx = 2  # minimal safe
+    prompt_builder = prompt_builders[builder_idx]
+    prompt = prompt_builder(snapshot, fallback, context=context)
+
+    # Phase D §8: capture prompt metadata for this attempt BEFORE the
+    # provider call so it persists even if the call fails.
+    _prompt_meta = _prompt_meta_snapshot()
+
+    # Per-attempt attempt_meta. The caller's outer attempt_meta carries the
+    # cross-attempt accumulators (cfg_name / model_name / schedule context /
+    # running provider_call_count); the caller merges the relevant fields
+    # from this dict.
+    attempt_meta: dict[str, Any] = {
+        "llm_status": "failed",
+        "llm_error_category": None,
+        "llm_error_stage": None,
+        "llm_error": None,
+        "llm_attempt_count": attempt,
+        "llm_retry_round": attempt,
+        "llm_config_name": cfg_name,
+        "llm_model": model_name,
+        "llm_fallback_reason": None,
+        "llm_terminal_reason": None,
+        "llm_provider_call_count": 0,
+        "llm_latency_ms": None,
+        "llm_prompt_bytes": _prompt_meta.get("prompt_bytes"),
+        "llm_continuity_included": _prompt_meta.get("continuity_included"),
+        "llm_repair_event": False,
+        "llm_effective_thinking_budget_tokens": None,
+        "llm_effective_max_output_tokens": None,
+        "llm_effective_temperature": None,
+        "llm_provider_timeout_ms": None,
+    }
+
+    # Phase D §5.1 / R3-1 (design §5.1): fail-closed when the MANDATORY CORE
+    # exceeds the hard cap. 07-10 R3-1: continuity is PROTECTED and is NEVER
+    # trimmed - it survives every tier. If the minimal stub STILL exceeds
+    # ``max_prompt_bytes`` (with continuity retained), the prompt is over-
+    # budget on mandatory core alone. Do NOT call the provider - return a
+    # structured terminal reason. Continuity is preserved in the metadata.
+    _gen_cfg = _resolve_generation_config()
+    _prompt_bytes = _prompt_meta.get("prompt_bytes")
+    if isinstance(_prompt_bytes, int) and _prompt_bytes > _gen_cfg["max_prompt_bytes"]:
+        if budget_violation_is_skip:
+            # Fair adapter path (P0-2): no provider call -> a SKIP, not a
+            # failure. The coordinator records a budget skip (no breaker
+            # event) and treats it as terminal non-retryable.
+            attempt_meta["llm_status"] = "skipped"
+        else:
+            attempt_meta["llm_status"] = "failed"
+        attempt_meta["llm_fallback_reason"] = "prompt_budget_contract_violation"
+        attempt_meta["llm_terminal_reason"] = "prompt_budget_contract_violation"
+        attempt_meta["llm_error_category"] = "llm_prompt_budget_violation"
+        attempt_meta["llm_error_stage"] = "prompt_build"
+        attempt_meta["llm_error"] = (
+            f"prompt mandatory core {_prompt_bytes}B exceeds "
+            f"max_prompt_bytes {_gen_cfg['max_prompt_bytes']}B; provider call suppressed"
+        )
+        attempt_meta["llm_provider_call_count"] = 0
+        attempt_meta["llm_latency_ms"] = None
+        return None, attempt_meta
+
+    # --- ONE provider call + JSON parse ---
+    # 07-10 R2-1: thread the per-symbol deadline's provider timeout into the
+    # call via the thread-local ``_llm_call_state.provider_timeout_seconds``
+    # (same channel as ``prompt_bytes`` / ``continuity_included``). This keeps
+    # ``_call_ga_llm(prompt)``'s single-positional-arg signature unchanged so
+    # existing test mocks (``def fake_call(prompt)``) work without modification.
+    # When set (fair adapter path, or legacy wrapper with an injected deadline),
+    # ``_call_ga_llm`` sets ``session.read_timeout`` + ``session.max_retries=0``
+    # so the call is bounded. None (no deadline) preserves the 60s floor +
+    # default retries.
+    _llm_call_state.provider_timeout_seconds = provider_timeout_seconds
+    # 07-10 S4 (P0 #3): the fair adapter opts the call into process-isolation
+    # hard timeout. When True (and a provider timeout is set), ``_call_ga_llm``
+    # runs ``session.raw_ask`` in a child process bounded by
+    # ``proc.join(timeout=)`` + ``terminate``/``kill`` - the guarantee the R2-2
+    # thread barrier could not provide. False (legacy retry wrapper, default)
+    # keeps the in-process call byte-for-byte unchanged.
+    _llm_call_state.subprocess_hard_timeout = bool(subprocess_hard_timeout)
+    raw: str | None = None
+    category: str | None = None
+    error_str: str | None = None
+    stage: str | None = None
+    try:
+        raw = _call_ga_llm(prompt)
+        candidate = _parse_json_object(raw)
+    except json.JSONDecodeError as exc:
+        category = _classify_llm_failure(exc, raw, "parse")
+        error_str = str(exc)[:300]
+        stage = "parse"
+        candidate = None
+    except ValueError as exc:
+        err_msg = str(exc)[:300]
+        if "not a JSON object" in err_msg:
+            category = "llm_json_parse_failed"
+        else:
+            category = "llm_schema_validation_failed"
+        error_str = err_msg
+        stage = "schema"
+        candidate = None
+    except RuntimeError as exc:
+        # 07-10 S4 (P0 #3) + R4-P0-2: a subprocess FATAL error is TERMINAL
+        # non-retryable, NOT a transient transport error.
+        # ``_run_subprocess_with_target`` raises a RuntimeError whose message
+        # carries a DISTINCT structured signature for each fatal case:
+        #   - ``llm_subprocess_hard_timeout``: the child outlived
+        #     ``proc.join(timeout=)`` and was killed -> terminal ``symbol_timeout``.
+        #   - ``llm_subprocess_cleanup_failed``: the child sent a result but
+        #     could NOT be reaped after terminate+kill (orphan risk) -> terminal
+        #     non-retryable. The provider WAS physically called, but retrying
+        #     would spawn a NEW child while the old one leaks -> amplify orphan
+        #     + resource exhaustion (R4-P0-2). MUST stop the symbol at
+        #     attempt_count=1.
+        #   - ``llm_subprocess_response_oversized``: the child response exceeded
+        #     the IPC byte contract -> terminal non-retryable (the contract was
+        #     violated; a retry would re-violate it).
+        #   - ``llm_subprocess_start_failed``: ``proc.start()`` raised -> the
+        #     subprocess runtime cannot spawn -> terminal non-retryable.
+        # Detect EACH signature here - BEFORE ``_classify_llm_failure`` (which
+        # would route them to ``llm_transport_error`` / retryable -> the
+        # coordinator would retry, amplifying the orphan). The category is in
+        # ``_NON_RETRYABLE_CATEGORIES`` so the coordinator's retry loop stops
+        # at attempt 1 (``return None, attempt_meta`` with
+        # ``llm_terminal_reason=<category>``).
+        _exc_msg_s4 = str(exc)
+        _subproc_fatal = None
+        for _sig in (
+            "llm_subprocess_hard_timeout",
+            "llm_subprocess_cleanup_failed",
+            "llm_subprocess_response_oversized",
+            "llm_subprocess_start_failed",
+        ):
+            if _sig in _exc_msg_s4:
+                _subproc_fatal = _sig
+                break
+        if _subproc_fatal is not None:
+            category = _subproc_fatal
+            error_str = _exc_msg_s4[:300]
+            stage = "call"
+            candidate = None
+        else:
+            category = _classify_llm_failure(exc, raw, "call")
+            error_str = str(exc)[:300]
+            stage = "call"
+            candidate = None
+    except Exception as exc:
+        category = _classify_llm_failure(exc, raw, "call")
+        error_str = str(exc)[:300]
+        stage = "call"
+        candidate = None
+
+    # Phase D §8: the provider call DID happen (raw returned or raised after
+    # a network/gateway round-trip). Count it and capture the latency +
+    # effective settings from the thread-local (accurate even on the exception
+    # path - ``_call_ga_llm`` stashes them in a ``finally`` block).
+    if candidate is None:
+        _failed_effective = _llm_call_effective_snapshot()
+        attempt_meta["llm_provider_call_count"] = 1
+        attempt_meta["llm_latency_ms"] = _failed_effective.get("latency_ms")
+        attempt_meta["llm_effective_thinking_budget_tokens"] = _failed_effective.get("effective_thinking_budget_tokens")
+        attempt_meta["llm_effective_max_output_tokens"] = _failed_effective.get("effective_max_output_tokens")
+        attempt_meta["llm_effective_temperature"] = _failed_effective.get("effective_temperature")
+        attempt_meta["llm_status"] = "failed"
+        attempt_meta["llm_error_category"] = category
+        attempt_meta["llm_error_stage"] = stage
+        attempt_meta["llm_error"] = error_str
+        # Terminal reason is set by the caller (retry wrapper / coordinator)
+        # based on retryability; surface the category + stage so the caller
+        # can classify. Non-retryable categories short-circuit upstream.
+        return None, attempt_meta
+
+    # --- Success path: unwrap + schema validate + schema-alias repair ---
+    # 07-10 R1-1: moved INTO the single-attempt unit (was post-loop in
+    # ``run_agent_sop_decision``). schema-validation-failed is non-retryable
+    # (in ``_NON_RETRYABLE_CATEGORIES``), so classifying it here preserves
+    # legacy behavior - a schema-invalid-but-parseable response fails closed
+    # rather than retrying. Confirmed sound by the R1-1 reviewer.
+    _effective = _llm_call_effective_snapshot()
+    attempt_meta["llm_provider_call_count"] = 1
+    attempt_meta["llm_latency_ms"] = _effective.get("latency_ms")
+    attempt_meta["llm_effective_thinking_budget_tokens"] = _effective.get("effective_thinking_budget_tokens")
+    attempt_meta["llm_effective_max_output_tokens"] = _effective.get("effective_max_output_tokens")
+    attempt_meta["llm_effective_temperature"] = _effective.get("effective_temperature")
+
+    unwrapped_candidate, unwrap_changed = _unwrap_wrapped_decision(candidate)
+    if unwrapped_candidate is None:
+        # Conflict: wrapper + top-level schema keys. Hard schema failure.
+        attempt_meta["llm_status"] = "failed"
+        attempt_meta["llm_error_category"] = "llm_schema_validation_failed"
+        attempt_meta["llm_error_stage"] = "schema"
+        attempt_meta["llm_error"] = "wrapped decision conflict: top-level + nested decision both present"
+        attempt_meta["llm_fallback_reason"] = "schema_validation_failed"
+        attempt_meta["llm_terminal_reason"] = "llm_schema_validation_failed"
+        return None, attempt_meta
+
+    candidate = unwrapped_candidate
+    repair_event = False
+    if unwrap_changed:
+        # A successful unwrap is a repairable event. Surface it so the caller
+        # emits the physical-success breaker event + the repairable event
+        # (mirrors legacy llm_agent_judge.py:192 + :278).
+        repair_event = True
+
+    decision = _normalize_llm_decision(candidate, snapshot, fallback)
+    ok, err = validate_json("ga_decision.schema.json", decision)
+    if not ok:
+        # Phase B/C (07-09): schema-alias repair path.
+        repaired_decision, repair_notes, repair_changed = _try_repair_entry_trigger_confirmation(
+            decision, snapshot
+        )
+        if repair_changed:
+            ok2, err2 = validate_json("ga_decision.schema.json", repaired_decision)
+            if ok2:
+                # Repaired success: ONE physical provider call that succeeded
+                # after a schema-alias repair. Surface ``llm_repair_event``
+                # so the caller emits BOTH breaker events (physical ok +
+                # repairable), mirroring legacy llm_agent_judge.py:223-226.
+                repaired_decision["plan_origin"] = "llm_confirmed"
+                repaired_decision["plan_execution_state"] = "confirmed"
+                existing_notes = list(repaired_decision.get("risk_notes") or [])
+                existing_notes.extend(repair_notes)
+                repaired_decision["risk_notes"] = existing_notes
+                parse_meta = repaired_decision.get("llm_parse_meta") or {}
+                if not isinstance(parse_meta, dict):
+                    parse_meta = {}
+                if repair_notes:
+                    parse_meta["original_entry_trigger_type"] = repair_notes[0]
+                repaired_decision["llm_parse_meta"] = parse_meta
+                attempt_meta["llm_status"] = "ok"
+                attempt_meta["llm_error_category"] = None
+                attempt_meta["llm_error_stage"] = None
+                attempt_meta["llm_error"] = None
+                attempt_meta["llm_fallback_reason"] = None
+                attempt_meta["llm_terminal_reason"] = "schema_repaired"
+                attempt_meta["llm_repair_event"] = True
+                # Merge the §8 envelope onto the repaired decision so the
+                # success row carries complete attempt metadata (mirrors
+                # legacy llm_agent_judge.py:246).
+                repaired_decision.update(attempt_meta)
+                return repaired_decision, attempt_meta
+            err = err2
+            decision = repaired_decision
+        # Hard schema failure - non-retryable, fail-closed.
+        attempt_meta["llm_status"] = "failed"
+        attempt_meta["llm_error_category"] = "llm_schema_validation_failed"
+        attempt_meta["llm_error_stage"] = "schema"
+        attempt_meta["llm_error"] = str(err)[:300]
+        attempt_meta["llm_fallback_reason"] = "schema_validation_failed"
+        attempt_meta["llm_terminal_reason"] = "llm_schema_validation_failed"
+        return None, attempt_meta
+
+    # Normal success (no repair, or unwrap-only repair). Surface an unwrap
+    # repair event so the caller emits both breaker events (mirrors legacy
+    # :192 + :278); a plain success has no repair event (caller emits one
+    # physical-ok record).
+    decision["plan_origin"] = "llm_confirmed"
+    decision["plan_execution_state"] = "confirmed"
+    attempt_meta["llm_status"] = "ok"
+    attempt_meta["llm_error_category"] = None
+    attempt_meta["llm_error_stage"] = None
+    attempt_meta["llm_error"] = None
+    attempt_meta["llm_fallback_reason"] = None
+    attempt_meta["llm_terminal_reason"] = None
+    attempt_meta["llm_repair_event"] = repair_event
+    decision.update(attempt_meta)
+    return decision, attempt_meta
+
+
+def fair_llm_call_adapter(
+    *,
+    snapshot: dict[str, Any],
+    deadline: Any,  # PerSymbolDeadline
+    breaker: Any,
+    retry_budget: Any,
+    wall_clock_budget: Any,
+    attempt: int,
+    max_attempts: int,
+    schedule_position: int | None = None,
+    schedule_round: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """07-10 R1-1: the fair-scheduler ``llm_call_fn`` adapter. Matches the
+    signature the coordinator invokes (llm_fair_scheduler.py
+    ``_run_one_attempt``: ``snapshot, deadline, breaker, retry_budget,
+    wall_clock_budget, attempt, max_attempts, schedule_position,
+    schedule_round, context``).
+
+    Does ONE provider call via the shared single-attempt unit
+    (``_run_single_llm_attempt``). It does NOT wrap the 3x retry wrapper —
+    the coordinator owns retry (next round), admission gates
+    (``retry_budget.consume`` / ``deadline.exhausted`` / ``breaker.should_call``),
+    and the breaker record. This satisfies the directive: "fair coordinator
+    调用单次-attempt adapter，不能再套内部三次 retry wrapper".
+
+    The adapter resolves the per-symbol deadline's provider timeout from
+    ``deadline.provider_timeout_ms()`` and surfaces it in the §8 envelope
+    (``llm_provider_timeout_ms``). R2 will thread it into ``_call_ga_llm`` so
+    the provider actually honors it; until then it is surfaced for
+    diagnostics only (the adapter calls ``_call_ga_llm(prompt)`` with the
+    legacy 60s read-timeout floor).
+
+    Returns ``(candidate_or_None, attempt_meta)`` exactly as the coordinator
+    contract expects: ``llm_status`` ("ok" | "failed" | "skipped"),
+    ``llm_error_category``, ``llm_fallback_reason``, ``llm_terminal_reason``,
+    ``llm_repair_event`` (True on a schema-alias / unwrap repaired success so
+    the coordinator emits BOTH breaker events — see the P0-1 fix in
+    ``_run_one_attempt``), and the §8 fields. A prompt-budget contract
+    violation returns ``llm_status="skipped"`` (P0-2: no provider call, a
+    budget skip not a failure) so the coordinator records a skip and treats
+    it as terminal non-retryable.
+    """
+    # Build a deterministic fallback for the prompt builder (it needs a
+    # baseline decision for the deterministic-reference section). Use the
+    # SOP fallback path so the prompt is well-formed even when the LLM has
+    # not yet decided. ``run_agent_sop_decision(use_llm=False)`` returns the
+    # deterministic decision WITHOUT touching the breaker / LLM.
+    fallback = run_agent_sop_decision(snapshot, use_llm=False)
+
+    # Resolve config name + model (cached on breaker, same as the retry
+    # wrapper). The adapter does NOT call breaker.record_attempt — the
+    # coordinator does — but it reads breaker.llm_config_name /
+    # breaker.llm_model so the §8 envelope carries the model name.
+    cfg_name = getattr(breaker, "llm_config_name", None)
+    if cfg_name is None:
+        try:
+            cfg_name = _resolve_llm_config_name()
+            breaker.llm_config_name = cfg_name
+        except Exception:
+            cfg_name = "unknown"
+            breaker.llm_config_name = cfg_name
+    model_name = getattr(breaker, "llm_model", None)
+    if model_name is None:
+        model_name = _resolve_llm_model(cfg_name)
+        breaker.llm_model = model_name
+
+    # Provider timeout derived from the per-symbol deadline. R2-1 threads it
+    # into ``_call_ga_llm`` (``session.read_timeout`` + ``max_retries = 0``)
+    # AND surfaces it in the §8 envelope for diagnostics / accounting.
+    provider_timeout_ms = None
+    if deadline is not None:
+        try:
+            provider_timeout_ms = deadline.provider_timeout_ms()
+        except Exception:
+            provider_timeout_ms = None
+    provider_timeout_seconds = (
+        None if provider_timeout_ms is None
+        else float(provider_timeout_ms) / 1000.0
+    )
+
+    # 07-10 S4 (P0 #3): opt the fair-path call into process-isolation hard
+    # timeout. Read from ``llm.scheduling.subprocess_hard_timeout`` (default
+    # True - the fair path's hard-timeout guarantee is the P0 #3 fix; the
+    # legacy serial path never reaches the fair adapter). Tests that patch
+    # ``_call_ga_llm`` (which REPLACES the function, so the subprocess block
+    # inside it never runs) are unaffected by this flag - it only governs
+    # whether the REAL ``_call_ga_llm`` spawns a child for the provider call.
+    subprocess_hard_timeout = _resolve_subprocess_hard_timeout()
+
+    candidate, attempt_meta = _run_single_llm_attempt(
+        snapshot=snapshot, fallback=fallback, context=context,
+        attempt=attempt, max_attempts=max_attempts, breaker=breaker,
+        cfg_name=cfg_name, model_name=model_name,
+        prompt_builders=(
+            build_llm_decision_prompt,
+            build_llm_strict_json_prompt,
+            build_llm_minimal_safe_prompt,
+        ),
+        last_category=None,  # the coordinator retries with a fresh attempt;
+        # the single-attempt unit's tier selection is by ``attempt`` index.
+        budget_violation_is_skip=True,  # P0-2: budget violation is a skip
+        provider_timeout_seconds=provider_timeout_seconds,  # R2-1: bound call
+        subprocess_hard_timeout=subprocess_hard_timeout,  # S4: hard-kill child
+    )
+
+    # Surface the per-symbol deadline's provider timeout + schedule context
+    # so the §8 envelope is complete for the fair path.
+    attempt_meta["llm_provider_timeout_ms"] = provider_timeout_ms
+    attempt_meta["llm_schedule_round"] = schedule_round
+    attempt_meta["llm_schedule_position"] = schedule_position
+
+    return candidate, attempt_meta
 
 
 def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: dict[str, Any], *, context: dict[str, Any] | None = None) -> str:
@@ -852,27 +1512,28 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
     # ``active_watches``, ``analysis_continuity``) can blow past 48 KiB
     # and exceed the LLM context window. Trim ``historical_memory``
     # first (least actionable), then ``open_positions``/``active_watches``
-    # (context-only), then ``analysis_continuity`` (decision-useful but
-    # redundant with market_snapshot), then ``modules`` (primary-TF detail
-    # — last resort because it carries decision-critical indicator
-    # values). Never trim ``market_snapshot.multi_timeframe_feature_pack``
-    # or ``deterministic_reference`` here — those are decision-critical
-    # and have their own bounded budgets.
+    # (context-only), then ``modules`` (primary-TF detail — last resort
+    # because it carries decision-critical indicator values). Never trim
+    # ``market_snapshot.multi_timeframe_feature_pack`` or
+    # ``deterministic_reference`` here — those are decision-critical and
+    # have their own bounded budgets.
+    # 07-10 R3-1 (design §5.1): ``analysis_continuity`` is PROTECTED and is
+    # NEVER a trim tier. Pre-R3 (R8 P1) the ladder popped it after
+    # open_positions/active_watches, silently breaking the cross-round
+    # continuity contract precisely when the symbol was under budget
+    # pressure. Now continuity survives every trim tier and is surfaced in
+    # the minimal-stub fallback (R3-2) as a top-level key. If the minimal
+    # stub WITH continuity still exceeds the budget, the retry wrapper's
+    # prompt-budget-contract check (§5.1) fails closed with
+    # ``prompt_budget_contract_violation`` rather than dropping continuity.
     # R6 REC-R6-1: added ``modules`` as a final trim tier so an oversized
     # primary-TF modules dict cannot silently push the prompt past budget.
     # R8 P1 fix:
-    #   - Added ``analysis_continuity`` as a trim tier (after
-    #     open_positions/active_watches, before modules). Pre-R8 an
-    #     oversized ``analysis_continuity`` (whose own 12 KiB budget is
-    #     per-block, not per-prompt) could combine with other sections
-    #     to push the prompt past 48 KiB, but the trim ladder never
-    #     touched it. Now drop it before falling back to the minimal
-    #     stub.
     #   - Final hard assertion: if every trim tier fails to bring the
     #     prompt under budget, replace the payload with a minimal safe
     #     fallback (symbol + analysis_time + hard_rules + deterministic
-    #     decision only). Pre-R8 the function returned the oversized
-    #     prompt as a last resort, blowing past the cap.
+    #     decision + continuity). Pre-R8 the function returned the
+    #     oversized prompt as a last resort, blowing past the cap.
     #   - Minimal stub ready-path: read ``m.health.ready`` (correct
     #     path — feature pack module's health is a sub-dict, not a
     #     top-level field). Pre-R8 the stub read ``m.ready`` which is
@@ -889,147 +1550,193 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             payload.pop("open_positions", None)
             payload.pop("active_watches", None)
             prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            # R8 P1 fix: trim analysis_continuity before modules. The
-            # continuity block is decision-useful but redundant with
-            # market_snapshot's per-TF view; modules carry unique
-            # primary-TF indicator values.
+            # 07-10 R3-1 (design §5.1): ``analysis_continuity`` is PROTECTED
+            # across EVERY prompt tier - it carries the cross-round grade/
+            # bias/trigger state the LLM needs to keep decisions consistent
+            # under retry pressure. Pre-R3 the ladder popped it here (before
+            # modules), silently breaking the continuity contract precisely
+            # when the symbol was under budget pressure. The pop is removed:
+            # continuity survives every trim tier and is surfaced in the
+            # minimal-stub fallback (R3-2) too. If the mandatory core
+            # (minimal stub WITH continuity) still exceeds the budget, the
+            # minimal-stub tier below emits a ``prompt_budget_contract_violation``
+            # fail-closed rather than dropping continuity.
             if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
                 market_snapshot = payload.get("market_snapshot")
+                # Last-resort trim: drop primary-TF modules. The
+                # multi_timeframe_feature_pack already carries per-TF
+                # compact views, so the LLM still has TF context.
+                # R6 REC-R6-1 fix: ``modules`` is nested under
+                # ``market_snapshot`` (set by ``_compact_snapshot``),
+                # not at the payload top level. A top-level
+                # ``payload.pop("modules")`` was a silent no-op and the
+                # oversized prompt leaked past the budget.
                 if isinstance(market_snapshot, dict):
-                    market_snapshot.pop("analysis_continuity", None)
+                    market_snapshot.pop("modules", None)
                 prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                # R7 P1 fix: final hard cap. If the prompt is STILL over
+                # budget after every trim tier, the oversized payload is
+                # ``market_snapshot.multi_timeframe_feature_pack`` or
+                # ``deterministic_reference`` - neither was trimmed above
+                # because both are decision-critical. Replace the
+                # feature pack with a minimal stub (symbol + per-TF
+                # ready flag only) and the deterministic_reference with
+                # a one-line summary. This guarantees the prompt stays
+                # under the LLM context window even when the upstream
+                # producer emits a pathological payload. Pre-R7 the
+                # function just returned the oversized prompt - a 100KB
+                # feature pack produced a 103KB prompt, blowing past
+                # the 48KB cap.
                 if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
-                    # Last-resort trim: drop primary-TF modules. The
-                    # multi_timeframe_feature_pack already carries per-TF
-                    # compact views, so the LLM still has TF context.
-                    # R6 REC-R6-1 fix: ``modules`` is nested under
-                    # ``market_snapshot`` (set by ``_compact_snapshot``),
-                    # not at the payload top level. A top-level
-                    # ``payload.pop("modules")`` was a silent no-op and the
-                    # oversized prompt leaked past the budget.
                     if isinstance(market_snapshot, dict):
-                        market_snapshot.pop("modules", None)
-                    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                    # R7 P1 fix: final hard cap. If the prompt is STILL over
-                    # budget after every trim tier, the oversized payload is
-                    # ``market_snapshot.multi_timeframe_feature_pack`` or
-                    # ``deterministic_reference`` — neither was trimmed above
-                    # because both are decision-critical. Replace the
-                    # feature pack with a minimal stub (symbol + per-TF
-                    # ready flag only) and the deterministic_reference with
-                    # a one-line summary. This guarantees the prompt stays
-                    # under the LLM context window even when the upstream
-                    # producer emits a pathological payload. Pre-R7 the
-                    # function just returned the oversized prompt — a 100KB
-                    # feature pack produced a 103KB prompt, blowing past
-                    # the 48KB cap.
-                    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
-                        if isinstance(market_snapshot, dict):
-                            mtfp = market_snapshot.get("multi_timeframe_feature_pack")
-                            if isinstance(mtfp, dict):
-                                # Replace with a minimal stub: keep only
-                                # symbol + per-TF ready/bias (decision-critical
-                                # minimum), drop all indicator details.
-                                # R8 P1 fix: ready path is ``m.health.ready``,
-                                # NOT ``m.ready``. Feature pack module
-                                # structure (decision_context.py:263):
-                                # ``m = {"health": _compact_health(health),
-                                #         "bias": ..., ...}``. Pre-R8 the stub
-                                # read ``m.ready`` which is always None in
-                                # production, hiding the real readiness
-                                # state behind a silent None.
-                                minimal_mtfp = {"symbol": mtfp.get("symbol")}
-                                modules = mtfp.get("modules") or {}
-                                if isinstance(modules, dict):
-                                    minimal_mtfp["modules"] = {
-                                        tf: {
-                                            "ready": (
-                                                (m.get("health") or {}).get("ready")
-                                                if isinstance(m, dict) else None
-                                            ),
-                                            "bias": (m.get("bias") if isinstance(m, dict) else None),
-                                        }
-                                        for tf, m in modules.items()
+                        mtfp = market_snapshot.get("multi_timeframe_feature_pack")
+                        if isinstance(mtfp, dict):
+                            # Replace with a minimal stub: keep only
+                            # symbol + per-TF ready/bias (decision-critical
+                            # minimum), drop all indicator details.
+                            # R8 P1 fix: ready path is ``m.health.ready``,
+                            # NOT ``m.ready``. Feature pack module
+                            # structure (decision_context.py:263):
+                            # ``m = {"health": _compact_health(health),
+                            #         "bias": ..., ...}``. Pre-R8 the stub
+                            # read ``m.ready`` which is always None in
+                            # production, hiding the real readiness
+                            # state behind a silent None.
+                            minimal_mtfp = {"symbol": mtfp.get("symbol")}
+                            modules = mtfp.get("modules") or {}
+                            if isinstance(modules, dict):
+                                minimal_mtfp["modules"] = {
+                                    tf: {
+                                        "ready": (
+                                            (m.get("health") or {}).get("ready")
+                                            if isinstance(m, dict) else None
+                                        ),
+                                        "bias": (m.get("bias") if isinstance(m, dict) else None),
                                     }
-                                market_snapshot["multi_timeframe_feature_pack"] = minimal_mtfp
-                        # Deterministic reference: trim to decision-critical
-                        # fields only.
-                        dr = payload.get("deterministic_reference")
-                        if isinstance(dr, dict):
-                            payload["deterministic_reference"] = {
-                                k: dr.get(k)
-                                for k in (
-                                    "decision", "signal_grade", "confidence",
-                                    "market_bias", "trend_stage", "symbol",
-                                    "analysis_time_utc",
-                                    "strategy_name", "strategy_version",
-                                )
-                                if k in dr
-                            }
-                        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                        # Final assertion: if STILL over, drop historical_memory
-                        # was already tried — drop deterministic_reference
-                        # entirely (LLM still has market_snapshot + hard_rules).
-                        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
-                            payload.pop("deterministic_reference", None)
-                            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                            # R8 P1 fix: final hard assertion. If EVERY
-                            # trim tier failed, replace the payload with
-                            # a minimal safe fallback (decision-critical
-                            # fields only) so the prompt is guaranteed
-                            # under budget. Pre-R8 the function returned
-                            # the oversized prompt as a last resort.
-                            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
-                                safe_dr = deterministic_decision or {}
-                                # R10 P1 fix: read symbol/analysis_time_utc
-                                # from ``market_snapshot`` (the actual
-                                # location) or ``deterministic_decision``,
-                                # NOT from payload top level. Pre-R10 the
-                                # code read ``payload.get("symbol")`` which
-                                # returned None — ``symbol`` and
-                                # ``analysis_time_utc`` live inside
-                                # ``payload["market_snapshot"]`` (set by
-                                # ``_compact_snapshot``). This caused the
-                                # safe_payload to emit
-                                # ``{"symbol": null, "analysis_time_utc": null}``
-                                # at the top level, violating
-                                # ``output_requirements.must_keep`` and
-                                # losing the symbol context precisely when
-                                # the prompt is under extreme budget
-                                # pressure.
-                                # R11 P2 fix: also surface
-                                # ``strategy_name``/``strategy_version``
-                                # from ``deterministic_decision`` (set by
-                                # ``ga_judge.py:631-632``). Pre-R11 the
-                                # safe_payload included
-                                # ``output_requirements.must_keep``
-                                # demanding these fields but never
-                                # provided them — a self-contradicting
-                                # prompt payload that the LLM could not
-                                # satisfy.
-                                safe_ms = payload.get("market_snapshot") or {}
-                                safe_payload = {
-                                    "symbol": safe_ms.get("symbol") or safe_dr.get("symbol"),
-                                    "analysis_time_utc": safe_ms.get("analysis_time_utc") or safe_dr.get("analysis_time_utc"),
-                                    "strategy_name": safe_dr.get("strategy_name"),
-                                    "strategy_version": safe_dr.get("strategy_version"),
-                                    "hard_rules": payload.get("hard_rules"),
-                                    "deterministic_reference": {
-                                        k: safe_dr.get(k)
-                                        for k in (
-                                            "decision", "signal_grade", "confidence",
-                                            "market_bias", "trend_stage", "symbol",
-                                            "analysis_time_utc",
-                                            "strategy_name", "strategy_version",
-                                        )
-                                        if k in safe_dr
-                                    },
-                                    "output_requirements": payload.get("output_requirements"),
-                                    "_trim_note": "prompt_over_budget_minimal_fallback",
+                                    for tf, m in modules.items()
                                 }
-                                prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(
-                                    safe_payload, ensure_ascii=False, separators=(",", ":"),
-                                )
+                            market_snapshot["multi_timeframe_feature_pack"] = minimal_mtfp
+                    # Deterministic reference: trim to decision-critical
+                    # fields only.
+                    dr = payload.get("deterministic_reference")
+                    if isinstance(dr, dict):
+                        payload["deterministic_reference"] = {
+                            k: dr.get(k)
+                            for k in (
+                                "decision", "signal_grade", "confidence",
+                                "market_bias", "trend_stage", "symbol",
+                                "analysis_time_utc",
+                                "strategy_name", "strategy_version",
+                            )
+                            if k in dr
+                        }
+                    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    # Final assertion: if STILL over, drop historical_memory
+                    # was already tried - drop deterministic_reference
+                    # entirely (LLM still has market_snapshot + hard_rules).
+                    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                        payload.pop("deterministic_reference", None)
+                        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        # R8 P1 fix: final hard assertion. If EVERY
+                        # trim tier failed, replace the payload with
+                        # a minimal safe fallback (decision-critical
+                        # fields only) so the prompt is guaranteed
+                        # under budget. Pre-R8 the function returned
+                        # the oversized prompt as a last resort.
+                        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                            safe_dr = deterministic_decision or {}
+                            # R10 P1 fix: read symbol/analysis_time_utc
+                            # from ``market_snapshot`` (the actual
+                            # location) or ``deterministic_decision``,
+                            # NOT from payload top level. Pre-R10 the
+                            # code read ``payload.get("symbol")`` which
+                            # returned None - ``symbol`` and
+                            # ``analysis_time_utc`` live inside
+                            # ``payload["market_snapshot"]`` (set by
+                            # ``_compact_snapshot``). This caused the
+                            # safe_payload to emit
+                            # ``{"symbol": null, "analysis_time_utc": null}``
+                            # at the top level, violating
+                            # ``output_requirements.must_keep`` and
+                            # losing the symbol context precisely when
+                            # the prompt is under extreme budget
+                            # pressure.
+                            # R11 P2 fix: also surface
+                            # ``strategy_name``/``strategy_version``
+                            # from ``deterministic_decision`` (set by
+                            # ``ga_judge.py:631-632``). Pre-R11 the
+                            # safe_payload included
+                            # ``output_requirements.must_keep``
+                            # demanding these fields but never
+                            # provided them - a self-contradicting
+                            # prompt payload that the LLM could not
+                            # satisfy.
+                            safe_ms = payload.get("market_snapshot") or {}
+                            safe_payload = {
+                                "symbol": safe_ms.get("symbol") or safe_dr.get("symbol"),
+                                "analysis_time_utc": safe_ms.get("analysis_time_utc") or safe_dr.get("analysis_time_utc"),
+                                "strategy_name": safe_dr.get("strategy_name"),
+                                "strategy_version": safe_dr.get("strategy_version"),
+                                "hard_rules": payload.get("hard_rules"),
+                                # 07-10 R3-2 (design §5.1): continuity is
+                                # PROTECTED across EVERY prompt tier, including
+                                # this minimal-stub fallback. Pre-R3 the stub
+                                # dropped continuity entirely, breaking the
+                                # cross-round continuity contract precisely
+                                # when the symbol was under the most budget
+                                # pressure. Surface it as a top-level key
+                                # (mirroring build_llm_minimal_safe_prompt
+                                # line ~592) so the LLM still sees prior
+                                # grade/bias/trigger state. If the stub WITH
+                                # continuity still exceeds MAX_PROMPT_BYTES,
+                                # the metadata-capture below records
+                                # continuity_included=True and the retry
+                                # wrapper's budget-contract check fails closed
+                                # with prompt_budget_contract_violation rather
+                                # than silently dropping continuity.
+                                "analysis_continuity": safe_ms.get("analysis_continuity"),
+                                "deterministic_reference": {
+                                    k: safe_dr.get(k)
+                                    for k in (
+                                        "decision", "signal_grade", "confidence",
+                                        "market_bias", "trend_stage", "symbol",
+                                        "analysis_time_utc",
+                                        "strategy_name", "strategy_version",
+                                    )
+                                    if k in safe_dr
+                                },
+                                "output_requirements": payload.get("output_requirements"),
+                                "_trim_note": "prompt_over_budget_minimal_fallback",
+                            }
+                            # Phase D §8: reassign ``payload`` so the
+                            # metadata-capture block below sees the
+                            # minimal-stub payload. R3-2 surfaces
+                            # ``analysis_continuity`` as a top-level key
+                            # in the stub, so the capture block below
+                            # reads continuity_included=True even here
+                            # (not False as pre-R3).
+                            payload = safe_payload
+                            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(
+                                safe_payload, ensure_ascii=False, separators=(",", ":"),
+                            )
+    # 07-10 Phase D §5.1/§8: stash prompt byte size + whether
+    # ``analysis_continuity`` survived the trim ladder. The retry wrapper
+    # reads this via ``_prompt_meta_snapshot()`` to persist
+    # ``llm_prompt_bytes`` / ``llm_continuity_included`` for both successes
+    # and failures. Continuity is PROTECTED (design §5.1): R3-1 removed the
+    # trim step that popped it, and R3-2 surfaces it in the minimal-stub
+    # fallback as a top-level key. So continuity survives EVERY tier; the
+    # minimal-stub path reassigns ``payload = safe_payload`` (no
+    # ``market_snapshot``) but carries ``analysis_continuity`` at the top
+    # level — check BOTH locations (mirroring build_llm_minimal_safe_prompt
+    # line ~616-619) so continuity_included is accurate for every trim
+    # outcome.
+    _cont = payload.get("analysis_continuity")
+    if _cont is None:
+        _ms = payload.get("market_snapshot")
+        _cont = _ms.get("analysis_continuity") if isinstance(_ms, dict) else None
+    _llm_call_state.prompt_bytes = len(prompt.encode("utf-8"))
+    _llm_call_state.continuity_included = _cont is not None
     return prompt
 
 
@@ -1100,14 +1807,1009 @@ def build_agent_json_task_prompt(
     return SYSTEM_PROMPT + "\n\n" + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
 
 
+# ---------------------------------------------------------------------------
+# 07-10 Phase D: generation controls + per-call metadata capture.
+#
+# Design §6: scheduled JSON analysis must not use unbounded adaptive
+# thinking. The ``llm.generation`` config segment (validated by
+# ``config/loader.py``) sets explicit thinking-budget / max-output-token /
+# temperature values for the JSON synthesis call. ``_call_ga_llm`` applies
+# them to the resolved ``llmcore`` session and stashes the EFFECTIVE values
+# (what actually landed on the session) into a thread-local so the retry
+# wrapper can persist them without changing ``_call_ga_llm``'s signature
+# (tests patch ``_call_ga_llm`` as a single-arg str→str callable; adding a
+# kwarg would break ~20 patches).
+#
+# Thread-local (not module-global) because Phase C runs provider calls
+# concurrently inside a bounded executor — each in-flight call must record
+# its own latency/effective-settings without cross-thread clobbering.
+# ---------------------------------------------------------------------------
+import threading as _threading_mod
+
+_llm_call_state = _threading_mod.local()
+
+
+def _llm_call_state_reset() -> None:
+    """Clear the per-call metadata thread-local before a provider call.
+
+    Also resets the prompt-builder metadata (``prompt_bytes`` /
+    ``continuity_included``) so a stale value from a previous build cannot
+    leak into a new attempt's persisted metadata.
+    """
+    for attr in (
+        "latency_ms", "effective_thinking_budget_tokens",
+        "effective_max_output_tokens", "effective_temperature",
+        "effective_thinking_type",
+        "prompt_bytes", "continuity_included",
+        "provider_timeout_seconds",
+        "subprocess_hard_timeout",
+    ):
+        if hasattr(_llm_call_state, attr):
+            delattr(_llm_call_state, attr)
+
+def _llm_call_effective_snapshot() -> dict[str, Any]:
+    """Return the effective generation settings stashed by ``_call_ga_llm``.
+
+    Returns an empty dict when nothing was recorded (e.g. when the test
+    patches ``_call_ga_llm`` with a bare ``return_value=...`` that never
+    touches the thread-local). The retry wrapper treats missing values as
+    ``None`` so downstream persistence is safe.
+    """
+    out: dict[str, Any] = {}
+    for attr in (
+        "latency_ms", "effective_thinking_budget_tokens",
+        "effective_max_output_tokens", "effective_temperature",
+        "effective_thinking_type",
+    ):
+        if hasattr(_llm_call_state, attr):
+            out[attr] = getattr(_llm_call_state, attr)
+    return out
+
+
+def _prompt_meta_snapshot() -> dict[str, Any]:
+    """Return the prompt-builder metadata stashed by ``build_llm_decision_prompt``.
+
+    Captures the FINAL prompt byte size and whether ``analysis_continuity``
+    survived the trim ladder (design §5.1 — continuity is protected; the
+    trim ladder only drops it as a last resort before the minimal stub).
+    Returns an empty dict when nothing was recorded.
+    """
+    out: dict[str, Any] = {}
+    for attr in ("prompt_bytes", "continuity_included"):
+        if hasattr(_llm_call_state, attr):
+            out[attr] = getattr(_llm_call_state, attr)
+    return out
+
+
+def _resolve_subprocess_hard_timeout() -> bool:
+    """07-10 S4 (P0 #3): whether the fair-path provider call runs in a child
+    process with a hard wall-clock bound.
+
+    Reads ``llm.scheduling.subprocess_hard_timeout`` from the loaded config
+    (default True - the fair path's hard-timeout guarantee is the P0 #3 fix).
+    The ``CRYPTO_GUARD_LLM_SUBPROCESS_HARD_TIMEOUT`` env var overrides the
+    config: ``0``/``false``/``no`` disables it (the S4 test uses this to
+    keep existing fair-path tests in-process while it exercises the
+    subprocess path in isolation), any other value enables it.
+
+    Only the fair adapter consults this; the legacy retry wrapper never opts
+    in, so the legacy in-process ``_call_ga_llm`` is unchanged.
+    """
+    env_val = os.environ.get("CRYPTO_GUARD_LLM_SUBPROCESS_HARD_TIMEOUT")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off", ""}
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        sched = (
+            load_config().trading_mode.get("llm", {}).get("scheduling", {})
+            or {}
+        )
+        val = sched.get("subprocess_hard_timeout", True)
+        return bool(val)
+    except Exception:
+        return True
+
+
+def _resolve_generation_config() -> dict[str, Any]:
+    """Read ``llm.generation`` from ``trading_mode.yaml`` with safe defaults.
+
+    Design §5.1/§6 contract:
+    - ``max_prompt_bytes``: mandatory-core hard cap. Exceeding it (with the
+      mandatory core still assembled) returns
+      ``prompt_budget_contract_violation`` WITHOUT a provider call.
+    - ``target_prompt_bytes``: optional-section trim target (<=32 KiB).
+    - ``max_output_tokens``: explicit output token limit for structured JSON.
+    - ``thinking_budget_tokens``: explicit thinking budget; 0 disables
+      extended thinking for the JSON synthesis call.
+    - ``temperature``: low temperature for deterministic structured JSON.
+
+    Defaults match ``config/trading_mode.yaml`` so a missing segment does not
+    change behavior (and so tests that build a minimal ``trading_mode.yaml``
+    still get sane values).
+    """
+    try:
+        from plugins.crypto_guard.config.loader import load_config
+        gen = load_config().trading_mode.get("llm", {}).get("generation", {}) or {}
+    except Exception:
+        gen = {}
+    if not isinstance(gen, dict):
+        gen = {}
+    return {
+        "max_prompt_bytes": int(gen.get("max_prompt_bytes", 48 * 1024)),
+        "target_prompt_bytes": int(gen.get("target_prompt_bytes", 32 * 1024)),
+        "max_output_tokens": int(gen.get("max_output_tokens", 4096)),
+        "thinking_budget_tokens": int(gen.get("thinking_budget_tokens", 6000)),
+        "temperature": float(gen.get("temperature", 0.2)) if gen.get("temperature") is not None else 0.2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 07-10 S4 (P0 #3): process-isolation hard timeout for the provider call.
+#
+# The fair scheduler's barrier ``fut.result(timeout=)`` (R2-2) bounds the
+# WAIT, but Python cannot kill a running thread, so a truly hung provider call
+# keeps the worker thread (and thus ``executor.shutdown(wait=True)``) alive
+# until the socket ``read_timeout`` (R2-1) eventually unblocks - which is a
+# per-packet bound, NOT a whole-call bound. A slow-but-steady stream or a
+# wedged gateway can outlast it indefinitely.
+#
+# S4 closes that hole with PROCESS isolation: when the fair adapter opts in
+# (``subprocess_hard_timeout``), ``_call_ga_llm`` runs the actual
+# ``session.raw_ask`` in a child process and ``proc.join(timeout=)`` +
+# ``terminate``/``kill`` guarantees the call is hard-bounded by the per-symbol
+# deadline's provider timeout. The child is a fresh ``multiprocessing``
+# process (Windows spawn re-imports this module), so the target MUST be a
+# module-level function (closures / lambdas are not picklable under spawn).
+#
+# 07-10 R3-P1-3 (terminal-review-repair-plan-r3 §5): the production target
+# ``_llm_subprocess_target`` MUST NOT read any test-only environment variable.
+# Pre-R3 the target read ``CRYPTO_GUARD_LLM_SUBPROC_TEST_SLEEP`` /
+# ``_RESPONSE`` / ``_RESPONSE_FILE`` to drive the S4 tests via env pollution --
+# but those same env vars, if ever set in the PRODUCTION environment (a CI
+# leak, an inherited shell, a misconfigured wrapper), would silently replace
+# the real LLM response with a canned string, bypassing the provider entirely.
+# That is an injectable-backdoor into the production LLM path. R3 removes every
+# production read of those env vars. Tests now drive the subprocess lifecycle
+# through an EXPLICIT injected module-level picklable test target
+# (``_test_subprocess_target``) passed to the generic private runner
+# ``_run_subprocess_with_target`` -- the production wrapper
+# ``_run_provider_call_in_subprocess`` ALWAYS supplies the real
+# ``_llm_subprocess_target`` and never accepts a test override through env.
+# ---------------------------------------------------------------------------
+# 07-10 R3-P1-2 (terminal-review-repair-plan-r3 §4): a single unified
+# ``_reap_child`` helper is used on EVERY subprocess exit path (normal
+# payload / child error / EOF-no-result / hard timeout / parent recv failure /
+# proc.start() failure / unexpected exception). Pre-R3 the success path did a
+# bare ``proc.join(timeout=2.0)`` with NO ``is_alive()`` check, so a child
+# that sent a valid payload but hung in interpreter shutdown (daemon thread
+# cleanup, atexit handlers, lingering socket) left an ORPHAN process whose
+# PID kept consuming resources / holding the port after the parent reported
+# success. ``_reap_child`` joins -> terminate -> join -> kill -> final join ->
+# verify-dead -> close-handle, so NO path can leave a live child.
+# ---------------------------------------------------------------------------
+
+
+# 07-10 R3-P1-3 §5: maximum accepted IPC response size. A provider that sends
+# an unbounded payload would let the child block the parent's pipe drain
+# indefinitely (the P0-2 feeder-deadlock class, just without the feeder). Cap
+# the accepted payload well above the 128 KiB regression test but below the
+# point where the child's ``Pipe.send`` could stall the parent: 2 MiB is far
+# larger than any legitimate structured GADecision JSON (the largest real
+# response is a few KiB; the 128 KiB test exercises the pipe-buffer path and
+# stays well under this cap). An oversized response FAILS CLOSED with the
+# distinct structured reason ``llm_subprocess_response_oversized`` so the
+# operator can distinguish a runaway provider from a normal large response.
+DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _safe_send(conn: Any, payload: tuple) -> None:
+    """Send ``payload`` on a Pipe write end, swallowing a broken pipe.
+
+    P0-2: when the parent times out / kills the child, it CLOSES its read end
+    of the pipe. If the child then tries to ``send`` its result, the write end
+    raises ``BrokenPipeError``. That is EXPECTED (the parent already declared a
+    hard-timeout) and must NOT mask the parent's timeout by raising a different
+    exception that the child's top-level ``except BaseException`` would wrap as
+    an ``error`` envelope -- which could then race the hard-timeout and confuse
+    the parent. So a broken/empty pipe is a silent no-op here: the child is
+    being killed regardless, and the parent's timeout decision stands.
+    """
+    try:
+        conn.send(payload)
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _measure_payload_bytes(payload: tuple) -> int:
+    """Measure the encoded byte length of the raw-response element of a
+    subprocess payload tuple, fail-safe.
+
+    The payload contract is ``("ok", raw_str, effective_dict)`` /
+    ``("error", exc_type, exc_msg)``. The byte-heavy element is the SECOND one
+    (the raw response string). We measure ITS UTF-8 byte length -- NOT the
+    whole pickled envelope -- because the raw response is what a runaway
+    provider could make unbounded; the small wrapper fields are bounded.
+    Returns 0 on any shape mismatch so the check never false-triggers.
+    """
+    try:
+        if isinstance(payload, tuple) and len(payload) > 1:
+            raw = payload[1]
+            if isinstance(raw, str):
+                return len(raw.encode("utf-8", "replace"))
+            if isinstance(raw, (bytes, bytearray)):
+                return len(raw)
+    except Exception:
+        pass
+    return 0
+
+
+def _send_subprocess_payload(
+    conn: Any,
+    payload: tuple,
+    *,
+    max_response_bytes: int = DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES,
+) -> None:
+    """07-10 R4-P1-3: send a subprocess payload, checking the encoded byte
+    length of the raw response BEFORE it crosses IPC.
+
+    Pre-R4 the 2 MiB contract was enforced ONLY on the parent side AFTER
+    ``parent_conn.recv()`` (llm_agent_judge.py ~2426). That meant an oversized
+    response had ALREADY been pickled by the child, sent across the Pipe,
+    allocated in the parent's memory, and -- critically -- the child's
+    ``Pipe.send`` could have STALLED blocking on the OS pipe buffer waiting
+    for the parent to drain, exactly the feeder-deadlock class the P0-2 Pipe
+    fix was meant to eliminate. The comment "防止 runaway IPC payload" was
+    not honored: the runaway payload had already crossed IPC by the time it
+    was rejected.
+
+    R4-P1-3 moves the FIRST line of defense into the child, BEFORE
+    ``conn.send``: if the raw response's UTF-8 byte length exceeds
+    ``max_response_bytes``, the child sends ONLY a small structured error
+    envelope -- ``("error", "llm_subprocess_response_oversized", <compact
+    reason>)`` -- instead of the oversized payload. That envelope is well
+    under the cap (a few hundred bytes), so it crosses IPC instantly and the
+    child exits cleanly. The parent then surfaces the distinct
+    ``llm_subprocess_response_oversized`` reason (terminal non-retryable,
+    R4-P0-2) instead of receiving + discarding a multi-MiB blob.
+
+    The parent KEEPS its post-``recv`` size check (in
+    ``_run_subprocess_with_target``) as defense-in-depth: a malicious /
+    buggy child that bypasses this helper would still be rejected at the
+    parent. The child-side check is the primary guard; the parent check is
+    the backstop.
+
+    ``payload`` shapes other than ``("ok", <raw>, ...)`` (e.g. the small
+    ``("error", ...)`` envelopes a child sends on its OWN exception) are
+    always tiny and are sent unchanged -- only the raw-response-bearing ``ok``
+    envelope is size-gated.
+    """
+    try:
+        _n = _measure_payload_bytes(payload)
+        if _n > int(max_response_bytes):
+            # Send a SMALL error envelope instead of the oversized payload.
+            # The parent's runner sees tag=="error" with this reason and
+            # surfaces ``llm_subprocess_response_oversized`` (non-retryable).
+            _safe_send(conn, (
+                "error", "llm_subprocess_response_oversized",
+                (
+                    f"llm_subprocess_response_oversized: child response "
+                    f"{_n} bytes exceeds the {max_response_bytes}-byte "
+                    f"contract (rejected pre-send)"
+                )[:300],
+            ))
+            return
+        _safe_send(conn, payload)
+    except (BrokenPipeError, OSError):
+        # Parent already closed the pipe (timeout/kill). Same semantics as
+        # ``_safe_send``: the child is being killed regardless; do not mask
+        # the parent's timeout decision.
+        pass
+
+
+def _reap_child(proc: Any, *, grace_seconds: float = 2.0, force: bool = False) -> bool:
+    """07-10 R3-P1-2 (terminal-review-repair-plan-r3 §4.1): unified child
+    cleanup used on EVERY subprocess exit path so NO path can leave a live
+    orphan process behind.
+
+    Sequence (§4.1):
+        join(grace)              # skipped when ``force`` (already known wedged)
+        if alive: terminate
+        join(grace)
+        if alive: kill
+        final bounded join
+        verify not alive
+        close the Process handle when supported
+
+    ``force=True`` skips the initial grace ``join`` and goes straight to
+    ``terminate`` -- used on the HARD-TIMEOUT path where the caller has already
+    established the child is wedged (the deadline elapsed with the child still
+    alive), so waiting the grace window again only delays the kill without
+    changing the outcome. The success/EOF/error paths keep ``force=False`` to
+    give a child that is finishing a clean send/return the chance to exit on
+    its own before escalation (§4.1).
+
+    Returns ``True`` iff the child is verified DEAD at the end. Returns
+    ``False`` if even after ``kill`` the child is still alive -- a terminal
+    cleanup failure (e.g. a zombie the OS will not reap, or a process owned by
+    another session). The caller MUST treat ``False`` as a terminal cleanup
+    failure and NEVER report the call as healthy on that path (§4.1 last
+    paragraph): if a complete valid payload was already received but the child
+    hangs in shutdown, reap it and THEN return the payload; if the child
+    cannot be reaped even after ``kill``, return a terminal cleanup-failure
+    reason, not a healthy result.
+
+    Preserves the P0-2 / R3 drain-before-reap design and the NON-retryable
+    hard-timeout classification: this helper only reaps; it does not change how
+    the caller classifies the outcome (the hard-timeout RuntimeError is raised
+    by the caller before/after reaping, as appropriate to the path).
+    """
+    grace = max(0.1, float(grace_seconds))
+    if not force:
+        # Step 1: grace join (give a finishing child a chance to exit cleanly).
+        try:
+            proc.join(timeout=grace)
+        except Exception:
+            pass
+        if not proc.is_alive():
+            _close_process_handle(proc)
+            return True
+    # Step 2: terminate (SIGTERM-equivalent). Re-terminate is idempotent if the
+    # first SIGTERM landed but the child ignored it; either way we then re-join
+    # and re-check before escalating to kill.
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.join(timeout=grace)
+    except Exception:
+        pass
+    if not proc.is_alive():
+        _close_process_handle(proc)
+        return True
+    # Step 3: kill (SIGKILL-equivalent). Fall back to terminate on Python <
+    # 3.7 (where Process.kill does not exist).
+    try:
+        proc.kill()
+    except AttributeError:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Step 4: final bounded join.
+    try:
+        proc.join(timeout=grace)
+    except Exception:
+        pass
+    if not proc.is_alive():
+        _close_process_handle(proc)
+        return True
+    # Terminal cleanup failure: the child survived terminate + kill. Do NOT
+    # close the handle (it may still be holding OS resources); the caller
+    # surfaces this as a structured cleanup failure.
+    return False
+
+
+def _close_process_handle(proc: Any) -> None:
+    """Close the Process handle when the platform supports it (Python 3.7+
+    exposes ``Process.close``). Swallow any error -- the child is already dead
+    so a handle-close failure is a non-fatal resource-management warning."""
+    try:
+        proc.close()
+    except AttributeError:
+        # Older Python: no close() on Process; the handle is GC'd normally.
+        pass
+    except Exception:
+        pass
+
+
+def _llm_subprocess_target(
+    prompt: str,
+    cfg_name: str,
+    provider_timeout_seconds: float,
+    child_conn: Any,
+) -> None:
+    """Module-level (picklable) child-process body for the PRODUCTION provider
+    call.
+
+    Rebuilds the llmcore session with the same generation controls + bounded
+    read_timeout / max_retries=0 as the in-process ``_call_ga_llm`` path, then
+    issues ONE ``session.raw_ask`` and SENDS the result on ``child_conn``
+    (a unidirectional ``multiprocessing.Pipe`` write end):
+
+        ("ok", raw_str, effective_settings_dict)
+        ("error", exc_type_name, exc_msg_first_300)
+
+    P0-2: this uses a ``Pipe`` (NOT a ``Queue``). ``multiprocessing.Queue`` has
+    a background feeder thread: ``put`` returns immediately and the feeder
+    flushes the pickled bytes to the underlying pipe asynchronously. If the
+    response exceeds the OS pipe buffer, the feeder thread blocks waiting for
+    the parent to drain -- and the child process will NOT exit until the feeder
+    finishes. The parent (which did ``proc.join()`` BEFORE ``queue.get()``) then
+    blocks on the join, the child blocks on the feeder, and the parent's join
+    times out -> a FALSE hard-timeout on a perfectly healthy (just large)
+    response. ``Pipe.send`` is SYNCHRONOUS in the caller's thread (no feeder),
+    so the parent can ``poll(deadline) -> recv()`` to DRAIN the pipe first, then
+    ``join`` a child that has already finished sending and is exiting cleanly.
+
+    07-10 R3-P1-3: this target is the PRODUCTION body ONLY. It reads NO
+    environment variable -- in particular it NEVER reads
+    ``CRYPTO_GUARD_LLM_SUBPROC_TEST_SLEEP`` / ``_RESPONSE`` /
+    ``_RESPONSE_FILE`` (those were the pre-R3 test backdoors that could be
+    injected into production via env pollution). The S4 / P0-2 tests now drive
+    the subprocess lifecycle through an EXPLICIT injected
+    ``_test_subprocess_target`` (see below) which is supplied to
+    ``_run_subprocess_with_target`` directly, never selected by env. A send
+    that fails (parent already closed the pipe after a timeout/kill) is
+    swallowed -- the child is being killed anyway and a BrokenPipeError here
+    must NOT mask the parent's hard-timeout.
+    """
+    try:
+        # Production path: rebuild the session exactly like ``_call_ga_llm``.
+        import llmcore  # local import; the child re-imports the package
+        gen = _resolve_generation_config()
+        session = llmcore.resolve_session(cfg_name)
+        session.system = SYSTEM_PROMPT
+        if gen["thinking_budget_tokens"] <= 0:
+            if hasattr(session, "thinking_type"):
+                try:
+                    session.thinking_type = "disabled"
+                except Exception:
+                    pass
+        else:
+            if hasattr(session, "thinking_budget_tokens"):
+                try:
+                    session.thinking_budget_tokens = gen["thinking_budget_tokens"]
+                except Exception:
+                    pass
+            if getattr(session, "thinking_type", None) == "enabled" and getattr(session, "thinking_budget_tokens", None) is None:
+                session.thinking_type = "adaptive"
+        if hasattr(session, "max_tokens"):
+            try:
+                session.max_tokens = gen["max_output_tokens"]
+            except Exception:
+                pass
+        if hasattr(session, "temperature"):
+            try:
+                session.temperature = gen["temperature"]
+            except Exception:
+                pass
+        if hasattr(session, "tools"):
+            session.tools = []
+        # Bound the socket read + kill the llmcore retry loop (R2-1), so even
+        # if the parent's join/terminate races, the child's own call is bounded.
+        try:
+            session.read_timeout = max(15, int(provider_timeout_seconds))
+        except Exception:
+            if getattr(session, "read_timeout", 0) < 60:
+                session.read_timeout = 60
+        if hasattr(session, "max_retries"):
+            try:
+                session.max_retries = 0
+            except Exception:
+                pass
+        raw = "".join(session.raw_ask(
+            [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        ))
+        effective = {
+            "effective_thinking_type": getattr(session, "thinking_type", None),
+            "effective_thinking_budget_tokens": getattr(session, "thinking_budget_tokens", None),
+            "effective_max_output_tokens": getattr(session, "max_tokens", None),
+            "effective_temperature": getattr(session, "temperature", None),
+        }
+        # 07-10 R4-P1-3: size-check the raw response BEFORE it crosses IPC.
+        # ``_send_subprocess_payload`` measures the raw response's UTF-8 byte
+        # length and, if it exceeds ``DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES``,
+        # sends ONLY a small ``error`` envelope (a few hundred bytes) carrying
+        # the structured ``llm_subprocess_response_oversized`` reason -- instead
+        # of the oversized blob. This honors the "防止 runaway IPC payload"
+        # comment at the CHILD boundary, before the payload could stall the
+        # Pipe / consume parent memory. The parent keeps a post-recv size check
+        # as defense-in-depth.
+        _send_subprocess_payload(child_conn, ("ok", raw, effective))
+    except BaseException as exc:  # noqa: BLE001 - relay ANY failure to parent
+        _safe_send(child_conn, (
+            "error", type(exc).__name__, str(exc)[:300],
+        ))
+
+
+def _test_subprocess_target(
+    control: dict,
+    child_conn: Any,
+) -> None:
+    """07-10 R3-P1-3 (§5): module-level picklable TEST child target. Replaces
+    the pre-R3 env-var test backdoors (``CRYPTO_GUARD_LLM_SUBPROC_TEST_*``).
+    Driven ONLY by an explicit ``control`` dict pickled into the spawned child
+    by the test -- never by an environment variable, so production env can
+    never select a test behavior.
+
+    ``control`` keys (all optional; absent = no-op):
+        ``sleep`` (float): real wall-clock sleep before any send (proves the
+            parent's hard-kill bounds a wedged call).
+        ``response`` (str): canned raw response to send (normal-return path).
+        ``response_file`` (str): path whose file CONTENTS are sent (unbounded
+            payload > OS env limit, for the >128 KiB pipe-buffer regression).
+        ``hang_after_send`` (bool): send the payload, THEN sleep a long time so
+            the child does NOT exit cleanly -- the parent must reap it and
+            still return the already-received payload (R3 §7.2.4).
+        ``raise_exc`` (str): raise ``RuntimeError(<str>)`` instead of sending
+            (child-error path; R3 §7.2.5).
+        ``exit_without_send`` (bool): ``os._exit(0)`` without sending anything
+            (no-result path; R3 §7.2.6).
+        ``oversized_response`` (int): send a response of this many bytes --
+            the size contract MUST reject it. R4-P1-3: the CHILD rejects
+            pre-send via ``_send_subprocess_payload``; the parent's post-recv
+            check is the backstop (R3 §7.2.8).
+        ``max_response_bytes`` (int): R4-P1-3 test override for the CHILD-side
+            pre-send size cap. When absent, the module default (2 MiB) applies.
+            Lets the ``oversized_response`` test trigger the child-side
+            rejection at a SMALL cap (e.g. 1024) instead of spawning a >2 MiB
+            child -- the production path always uses the 2 MiB default, so a
+            test override does not weaken the production contract.
+        ``effective`` (dict): effective-settings dict to relay with the
+            payload (so the normal-return test can assert the relay).
+    """
+    import os as _os
+    try:
+        _sleep = float(control.get("sleep") or 0.0)
+        if _sleep > 0:
+            time.sleep(_sleep)
+        if control.get("exit_without_send"):
+            # Exit with NO result -- distinct from an exception: the child dies
+            # cleanly, the pipe EOFs (no envelope sent), and the parent sees
+            # ``llm_subprocess_exited_without_result``. Use a plain ``return``
+            # so the multiprocessing cleanup runs and closes the child's pipe
+            # write end (sending EOF to the parent). ``os._exit`` skips that
+            # cleanup and on Windows spawn can leave the parent's poll hanging
+            # until the deadline (the child's inherited handle is not released
+            # cleanly) -- a plain return is the reliable no-result signal.
+            return
+        _raise = control.get("raise_exc")
+        if _raise:
+            raise RuntimeError(str(_raise))
+        _eff = dict(control.get("effective") or {})
+        # Default effective settings so the normal-return relay test can
+        # assert the round-trip even without an explicit ``effective`` dict.
+        _eff.setdefault("effective_thinking_type", None)
+        _eff.setdefault("effective_thinking_budget_tokens", None)
+        _eff.setdefault("effective_max_output_tokens", None)
+        _eff.setdefault("effective_temperature", None)
+        # 07-10 R4-P1-3: the child-side pre-send size cap. Production uses the
+        # 2 MiB module default; tests may override via ``control`` so the
+        # ``oversized_response`` rejection is exercisable at a small cap without
+        # spawning a >2 MiB child.
+        _max_bytes = control.get("max_response_bytes")
+        _max_bytes = int(_max_bytes) if _max_bytes else DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES
+        _resp_file = control.get("response_file")
+        if _resp_file:
+            with open(_resp_file, "r", encoding="utf-8") as _fh:
+                _canned_file = _fh.read()
+            # 07-10 R4-P1-3: route through the pre-send size guard so a
+            # file-backed response that exceeds the contract is rejected at
+            # the CHILD (small error envelope) instead of crossing IPC.
+            _send_subprocess_payload(
+                child_conn, ("ok", _canned_file, _eff),
+                max_response_bytes=_max_bytes,
+            )
+        elif "oversized_response" in control:
+            # 07-10 R3 §7.2.8 + R4-P1-3: build an oversized response to
+            # exercise the size contract. Pre-R4 this proved the PARENT rejects
+            # an oversized payload post-recv. R4-P1-3 moves the FIRST line of
+            # defense to the CHILD: ``_send_subprocess_payload`` measures the
+            # raw response's byte length and, on overflow, sends ONLY a small
+            # ``error`` envelope carrying the structured
+            # ``llm_subprocess_response_oversized`` reason. So this path now
+            # proves BOTH layers: the child rejects pre-send, and the parent's
+            # post-recv check remains as defense-in-depth for a child that
+            # bypasses the guard.
+            _n = int(control.get("oversized_response") or 0)
+            _send_subprocess_payload(
+                child_conn, ("ok", "y" * _n, _eff),
+                max_response_bytes=_max_bytes,
+            )
+        elif "response" in control:
+            _send_subprocess_payload(
+                child_conn, ("ok", str(control["response"]), _eff),
+                max_response_bytes=_max_bytes,
+            )
+        if control.get("hang_after_send"):
+            # A send already happened (above). Now hang so the child does NOT
+            # exit -- the parent must reap it (terminate/kill) and STILL return
+            # the payload it already drained. Sleep well past any grace join.
+            time.sleep(30.0)
+    except BaseException as exc:  # noqa: BLE001 - relay ANY failure to parent
+        _safe_send(child_conn, ("error", type(exc).__name__, str(exc)[:300]))
+
+
+def _run_subprocess_with_target(
+    target: Callable[..., Any],
+    target_args: tuple,
+    *,
+    provider_timeout_seconds: float,
+    max_response_bytes: int = DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES,
+) -> tuple:
+    """07-10 R3-P1-2 + R3-P1-3: generic private subprocess runner that spawns a
+    module-level ``target`` with explicit ``target_args`` and bounds it by a
+    HARD wall-clock deadline. Used by:
+
+    - the production wrapper ``_run_provider_call_in_subprocess`` (always
+      supplies ``_llm_subprocess_target`` + the real ``(prompt, cfg_name,
+      timeout, child_conn)`` args); and
+    - the tests (which supply ``_test_subprocess_target`` + a ``control`` dict
+      to drive the lifecycle paths -- R3 §7.2).
+
+    ``target_args`` MUST include the child's Pipe write end as its LAST
+    element (the runner creates the Pipe, closes the child end in the parent
+    immediately, and passes it to the child). This keeps the runner generic:
+    every target receives its own write end without the runner knowing the
+    target's other parameters.
+
+    Returns ``(tag, raw_or_exc_type, eff_or_exc_msg)`` on a drained payload, or
+    raises ``RuntimeError`` carrying a DISTINCT structured reason on:
+    - hard timeout (``llm_subprocess_hard_timeout: ...``);
+    - oversized IPC response (``llm_subprocess_response_oversized: ...``);
+    - cleanup failure (``llm_subprocess_cleanup_failed: ...`` -- the child
+      could not be reaped even after kill, §4.1 last paragraph);
+    - start failure (``llm_subprocess_start_failed: ...`` -- ``proc.start()``
+      raised, §7.2.7; both Pipe ends are closed in finally).
+
+    The caller interprets the returned tuple (``tag == "ok"`` -> raw response
+    + effective dict; ``tag == "error"`` -> child exception). The
+    NON-retryable hard-timeout classification is preserved: the hard-timeout
+    message contains "timeout" so ``_classify_llm_failure`` routes it to
+    ``llm_subprocess_hard_timeout``.
+    """
+    ctx = _mp_mod.get_context("spawn")
+    # P0-2: unidirectional Pipe (NOT Queue). See _llm_subprocess_target docstring
+    # for the feeder-deadlock rationale. The parent only reads; the child only
+    # writes. The child end is closed in the parent immediately after spawn so
+    # the only remaining writer is the child -- once it closes/exits,
+    # ``parent_conn.poll()`` returns False (EOF), the clean "done" signal.
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    # The target's args are the caller-supplied args (minus the child end) +
+    # the child write end as the LAST element.
+    full_args = tuple(target_args) + (child_conn,)
+    proc = ctx.Process(target=target, args=full_args, daemon=True)
+    # ``proc`` created -> both Pipe ends MUST be closed in finally on EVERY
+    # path (start failure, recv failure, timeout, success). Track them so the
+    # finally block can close both unconditionally (§4.1).
+    _started = False
+    try:
+        try:
+            proc.start()
+            _started = True
+        except Exception as start_exc:
+            # §7.2.7: proc.start() failed -> both Pipe endpoints close, no
+            # handle leaks. Surface a distinct start-failure reason.
+            raise RuntimeError(
+                f"llm_subprocess_start_failed: {type(start_exc).__name__}: "
+                f"{str(start_exc)[:200]}"
+            )
+        # Close the CHILD end in the parent immediately: the parent only reads.
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+
+        _deadline_s = max(1.0, float(provider_timeout_seconds))
+        _payload = None
+        _poll_eof = False  # child closed the pipe WITHOUT a real payload (EOFError)
+        # DRAIN BEFORE REAP: poll the pipe for the result up to the deadline.
+        # If the child sends and exits within the deadline, ``poll`` returns
+        # True and ``recv`` drains the envelope; we then reap a child that is
+        # ALREADY done (fast, no feeder deadlock). ``poll(timeout)`` returns
+        # False on timeout; on Windows spawn a child that closes the pipe
+        # without sending may either return False (poll blocks to deadline) OR
+        # return True and then ``recv`` raises ``EOFError``. Either way, no real
+        # payload was received. We classify AFTER refreshing the child's
+        # liveness state (see below): a dead child with no payload is
+        # ``exited_without_result`` (distinct reason); only a child that is
+        # STILL alive after the deadline is a real hard-timeout.
+        if parent_conn.poll(timeout=_deadline_s):
+            try:
+                _payload = parent_conn.recv()
+            except (EOFError, OSError):
+                _payload = None
+                _poll_eof = True
+        # else: poll timed out -> _payload stays None; classify below.
+
+        # Windows-spawn nuance: when the child dies during/after the poll window
+        # WITHOUT sending a real payload (clean no-result return, or a crash in
+        # the target), the parent's ``Process.is_alive()`` flag is STALE until a
+        # ``join`` refreshes it. Without this refresh, a just-dead child reads
+        # as alive and is misclassified as a hard-timeout. So whenever NO real
+        # payload was received (poll timed out OR recv EOFed), do a NON-blocking
+        # ``join(0)`` to refresh liveness BEFORE classifying. Only a child that
+        # is STILL alive after the refresh is a real wedged-call hard-timeout.
+        if _payload is None:
+            try:
+                proc.join(timeout=0)
+            except Exception:
+                pass
+            # If recv EOFed, the child has closed its write end -- it is exiting
+            # or already exited. A short blocking join forces the liveness
+            # refresh on platforms where ``join(0)`` is insufficient.
+            if _poll_eof:
+                try:
+                    proc.join(timeout=_deadline_s)
+                except Exception:
+                    pass
+
+        if _payload is not None:
+            # 07-10 R4-P1-3: a child ``error`` envelope carrying a REGISTERED
+            # non-retryable subprocess-fatal signature (e.g. the
+            # ``llm_subprocess_response_oversized`` envelope the child sends
+            # when its OWN pre-send size check rejects an oversized response)
+            # is re-raised as a ``RuntimeError`` carrying that signature -- so
+            # ``_run_single_llm_attempt``'s signature loop classifies it as the
+            # fatal non-retryable category (R4-P0-2) instead of returning a
+            # raw tuple the generic-runner contract normally hands back. This
+            # keeps the child-side rejection and the parent-side backstop
+            # uniformly surfaced as a structured ``RuntimeError``. A GENERIC
+            # child error envelope (R3 §7.2.5 ``raise_exc`` -- exception type
+            # is NOT a registered signature) is still returned as a tuple per
+            # the existing contract.
+            if isinstance(_payload, tuple) and _payload and \
+                    str(_payload[0]) == "error" and len(_payload) > 1:
+                _child_err_type = str(_payload[1])
+                if _child_err_type in (
+                    "llm_subprocess_response_oversized",
+                    "llm_subprocess_cleanup_failed",
+                    "llm_subprocess_start_failed",
+                    "llm_subprocess_hard_timeout",
+                ):
+                    _child_err_msg = str(_payload[2]) if len(_payload) > 2 else ""
+                    _reap_child(proc)
+                    raise RuntimeError(
+                        _child_err_msg or
+                        f"{_child_err_type}: (child-reported fatal)"
+                    )
+            # R3 §5 max-response contract: reject an oversized IPC payload with
+            # a DISTINCT structured reason BEFORE reaping (so a runaway
+            # provider cannot stall the parent). The payload's second element is
+            # the raw response string; measure its byte length.
+            _raw_len = 0
+            try:
+                if isinstance(_payload, tuple) and len(_payload) > 1:
+                    _raw = _payload[1]
+                    if isinstance(_raw, str):
+                        _raw_len = len(_raw.encode("utf-8", "replace"))
+                    elif isinstance(_raw, (bytes, bytearray)):
+                        _raw_len = len(_raw)
+            except Exception:
+                _raw_len = 0
+            if _raw_len > int(max_response_bytes):
+                # Oversized: reap the child (it may still be writing), then
+                # fail CLOSED with the distinct reason. NO healthy result.
+                _reap_child(proc)
+                raise RuntimeError(
+                    f"llm_subprocess_response_oversized: child response "
+                    f"{_raw_len} bytes exceeds the {max_response_bytes}-byte "
+                    f"contract"
+                )
+            # Child sent a valid-sized result. Reap it (R3-P1-2: the unified
+            # helper -- NOT a bare join -- so a child that hangs in shutdown
+            # after sending is still reaped and no orphan remains). If the
+            # child cannot be reaped even after kill, that is a terminal
+            # cleanup failure (§4.1): we have a valid payload but we MUST NOT
+            # report the call healthy while a live child remains.
+            _reaped_ok = _reap_child(proc)
+            if not _reaped_ok:
+                raise RuntimeError(
+                    "llm_subprocess_cleanup_failed: child sent a result but "
+                    "could not be reaped after terminate+kill (orphan risk)"
+                )
+            return _payload
+
+        # No real payload was received (poll timed out OR recv EOFed). The
+        # liveness refresh above has updated ``proc.is_alive()``. A child that
+        # is STILL alive is a wedged provider call -> HARD timeout (reap +
+        # non-retryable). A child that is now dead closed the pipe without
+        # sending -> ``exited_without_result`` (distinct reason).
+        if proc.is_alive():
+            # Hard timeout: the child is still running (wedged provider call).
+            # Reap it deterministically (terminate -> kill). ``force=True`` skips
+            # the grace join -- the deadline already elapsed, so waiting again
+            # only delays the kill. This is the P0 #3 guarantee the thread-based
+            # R2-2 barrier could NOT provide.
+            _reaped_ok = _reap_child(proc, force=True)
+            # Drain any partial result the child may have written before being
+            # killed so the pipe buffer does not leak; then close both ends.
+            try:
+                while parent_conn.poll(0):
+                    parent_conn.recv()
+            except (EOFError, OSError):
+                pass
+            if not _reaped_ok:
+                # §4.1 last paragraph: if the child cannot be reaped even after
+                # kill, return a terminal cleanup failure and NEVER leave the
+                # call reported as healthy.
+                raise RuntimeError(
+                    "llm_subprocess_hard_timeout: provider call exceeded "
+                    f"{provider_timeout_seconds}s and could not be reaped "
+                    "after terminate+kill (orphan process)"
+                )
+            raise RuntimeError(
+                "llm_subprocess_hard_timeout: provider call exceeded "
+                f"{provider_timeout_seconds}s and was killed"
+            )
+
+        # _payload is None and child is dead: exited without a result.
+        _reap_child(proc)  # idempotent on a dead child; closes the handle
+        raise RuntimeError(
+            "llm_subprocess_exited_without_result: child process ended without "
+            "returning a response"
+        )
+    finally:
+        # §4.1: close BOTH Pipe endpoints in finally on EVERY path (success,
+        # error, timeout, start failure). The child end is closed above; this
+        # is belt-and-suspenders for the start-failure path and any exception
+        # before the close. ``proc`` handle is closed by ``_reap_child`` on the
+        # success/timeout paths; for the start-failure / unexpected-exception
+        # path the handle may be unstarted -- best-effort close.
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+        if _started:
+            try:
+                _reap_child(proc)
+            except Exception:
+                pass
+
+
+def _run_provider_call_in_subprocess(
+    prompt: str,
+    *,
+    provider_timeout_seconds: float,
+    cfg_name: str,
+    effective_out: dict[str, Any],
+) -> str:
+    """07-10 S4 (P0 #3) + R3-P1-2/P1-3: run ``session.raw_ask`` in a child
+    process with a HARD wall-clock bound via the generic runner
+    ``_run_subprocess_with_target``. This is the PRODUCTION wrapper: it ALWAYS
+    supplies the real ``_llm_subprocess_target`` (never a test target, never an
+    env-var-selected target) so a test backdoor cannot be injected into the
+    production LLM path through environment pollution (R3-P1-3).
+
+    Returns the raw response string on success (and fills ``effective_out``
+    with the child's effective generation settings so the parent can persist
+    them into the §8 envelope, mirroring the in-process path).
+
+    Raises ``RuntimeError`` carrying a DISTINCT structured reason on:
+    - child error: ``llm_subprocess_error [<type>]: <msg>``;
+    - hard timeout: ``llm_subprocess_hard_timeout: ...`` (NON-retryable, maps
+      to ``llm_subprocess_hard_timeout`` category -> terminal ``symbol_timeout``);
+    - oversized response: ``llm_subprocess_response_oversized: ...``;
+    - cleanup failure: ``llm_subprocess_cleanup_failed: ...``;
+    - start failure: ``llm_subprocess_start_failed: ...``;
+    - no result: ``llm_subprocess_exited_without_result: ...``.
+
+    The caller (``_call_ga_llm``) lets these propagate so
+    ``_run_single_llm_attempt``'s existing ``except RuntimeError`` branch
+    classifies them; the hard-timeout message contains "timeout" so
+    ``_classify_llm_failure`` routes it to ``llm_subprocess_hard_timeout``.
+    """
+    _payload = _run_subprocess_with_target(
+        _llm_subprocess_target,
+        (prompt, cfg_name, float(provider_timeout_seconds)),
+        provider_timeout_seconds=provider_timeout_seconds,
+    )
+    tag = _payload[0]
+    if tag == "ok":
+        raw = _payload[1]
+        eff = _payload[2] if len(_payload) > 2 else {}
+        if isinstance(eff, dict):
+            for k, v in eff.items():
+                effective_out[k] = v
+        return raw
+    # tag == "error"
+    exc_type = _payload[1] if len(_payload) > 1 else "UnknownError"
+    exc_msg = _payload[2] if len(_payload) > 2 else ""
+    # 07-10 R4-P1-3: when the child itself rejected an oversized response
+    # (via ``_send_subprocess_payload``), it sends an ``error`` envelope whose
+    # ``exc_type`` IS the structured ``llm_subprocess_response_oversized``
+    # signature. Propagate it as the CLEAN structured reason (NOT wrapped in
+    # ``llm_subprocess_error [...]``) so ``_run_single_llm_attempt``'s
+    # signature loop classifies it as ``llm_subprocess_response_oversized``
+    # (non-retryable, R4-P0-2) rather than letting it fall through to a generic
+    # transport error. The ``exc_msg`` already carries the full structured
+    # reason; surface it verbatim.
+    #
+    # NOTE: the generic runner ``_run_subprocess_with_target`` now re-raises a
+    # REGISTERED child-fatal signature (including this one) BEFORE returning,
+    # so this branch is normally unreachable for the oversized case. It is kept
+    # as a defense-in-depth backstop: if a future caller bypasses the generic
+    # runner's re-raise, the production wrapper still surfaces the clean
+    # structured reason instead of a generic ``llm_subprocess_error [...]``.
+    if exc_type == "llm_subprocess_response_oversized":
+        raise RuntimeError(str(exc_msg)[:300] or exc_type)
+    raise RuntimeError(f"llm_subprocess_error [{exc_type}]: {exc_msg}")
+
+
 def _call_ga_llm(prompt: str) -> str:
     cfg_name = _resolve_llm_config_name()
     import llmcore
 
+    # 07-10 Phase D §6: apply explicit generation controls to the session so
+    # scheduled JSON analysis does NOT use unbounded adaptive thinking. Read
+    # from ``llm.generation`` (validated by config/loader.py) with safe
+    # defaults. Stash the EFFECTIVE values into a thread-local so the retry
+    # wrapper can persist ``llm_effective_*`` without a signature change.
+    #
+    # 07-10 R2-1 (bugfix found by test_r2_1b): ``_llm_call_state_reset()`` below
+    # DELETES ``provider_timeout_seconds`` from the thread-local. But the fair
+    # adapter / ``_run_single_llm_attempt`` stash the per-symbol deadline's
+    # provider timeout INTO that same thread-local BEFORE calling
+    # ``_call_ga_llm`` — so a naive reset here wipes it and the session never
+    # receives ``read_timeout`` / ``max_retries=0``. Capture the timeout BEFORE
+    # the reset and re-stash it after, so the R2 session-config block below can
+    # apply it. (Legacy callers without a stashed timeout keep None → 60s floor
+    # + default retries, unchanged.)
+    _provider_timeout_seconds = getattr(
+        _llm_call_state, "provider_timeout_seconds", None,
+    )
+    # 07-10 S4 (P0 #3): the fair adapter stashes a process-isolation flag
+    # alongside the provider timeout. Preserve it across the reset the same
+    # way as ``provider_timeout_seconds`` so the subprocess hard-timeout block
+    # below can act on it.
+    _subprocess_hard_timeout = getattr(
+        _llm_call_state, "subprocess_hard_timeout", False,
+    )
+    _llm_call_state_reset()
+    if _provider_timeout_seconds is not None:
+        _llm_call_state.provider_timeout_seconds = _provider_timeout_seconds
+    if _subprocess_hard_timeout:
+        _llm_call_state.subprocess_hard_timeout = True
+    gen = _resolve_generation_config()
     session = llmcore.resolve_session(cfg_name)
     session.system = SYSTEM_PROMPT
-    if getattr(session, "thinking_type", None) == "enabled" and getattr(session, "thinking_budget_tokens", None) is None:
-        session.thinking_type = "adaptive"
+    # Thinking control. ``thinking_budget_tokens=0`` disables extended
+    # thinking entirely (forces a bounded non-thinking JSON synthesis call).
+    # A non-zero budget pins the budget so adaptive-mode drift cannot starve
+    # retry attempts later in the same symbol's deadline window.
+    _eff_thinking_type = getattr(session, "thinking_type", None)
+    if gen["thinking_budget_tokens"] <= 0:
+        # Disable extended thinking for JSON synthesis.
+        if hasattr(session, "thinking_type"):
+            try:
+                session.thinking_type = "disabled"
+                _eff_thinking_type = "disabled"
+            except Exception:
+                pass
+    else:
+        if hasattr(session, "thinking_budget_tokens"):
+            try:
+                session.thinking_budget_tokens = gen["thinking_budget_tokens"]
+            except Exception:
+                pass
+        # Only switch to an explicit-thinking mode when a budget is set;
+        # leave adaptive alone if the session defaulted to it.
+        if getattr(session, "thinking_type", None) == "enabled" and getattr(session, "thinking_budget_tokens", None) is None:
+            session.thinking_type = "adaptive"
+            _eff_thinking_type = "adaptive"
+        else:
+            _eff_thinking_type = getattr(session, "thinking_type", None)
+    # Explicit output-token limit. The llmcore session exposes this as
+    # ``max_tokens`` (NOT ``max_output_tokens`` — see the session attrs probe
+    # in design investigation). Apply when supported.
+    if hasattr(session, "max_tokens"):
+        try:
+            session.max_tokens = gen["max_output_tokens"]
+        except Exception:
+            pass
+    # Explicit low temperature for deterministic structured JSON output.
+    if hasattr(session, "temperature"):
+        try:
+            session.temperature = gen["temperature"]
+        except Exception:
+            pass
     # 07-09-overtrigger P0-1: DO NOT inject the ``crypto_guard_noop``
     # placeholder tool for JSON-only market-decision prompts. With a complex
     # market prompt + an exposed (placeholder) tool, the model can choose
@@ -1118,9 +2820,116 @@ def _call_ga_llm(prompt: str) -> str:
     # leftover tools from a prior call, clear them.
     if hasattr(session, "tools"):
         session.tools = []
-    if getattr(session, "read_timeout", 0) < 60:
+    # 07-10 R2-1: thread the per-symbol deadline's provider timeout into the
+    # session so the provider call is actually bounded. The timeout is passed
+    # through the thread-local ``_llm_call_state.provider_timeout_seconds``
+    # (same channel as ``prompt_bytes`` / ``continuity_included``) rather than
+    # a signature kwarg so existing test mocks of ``_call_ga_llm(prompt)`` keep
+    # working unchanged (a kwarg would force every ``def fake_call(prompt)`` in
+    # the suite to add ``**kwargs``). Two levers:
+    #
+    # 1. ``read_timeout`` — the per-packet socket read timeout. ``requests``
+    #    resets this between packets, so for a slow-but-steady stream it does
+    #    NOT bound the total call duration. It bounds a stuck socket (gateway
+    #    hang, no bytes at all).
+    # 2. ``max_retries = 0`` — kills the llmcore internal retry loop
+    #    (``_stream_with_retry`` loops ``range(max_retries + 1)``; default
+    #    max_retries=4 -> 5 attempts with exponential backoff up to ~30s each,
+    #    letting ONE ``_call_ga_llm`` reach ~322s and blow past the 180s
+    #    per-attempt / 300s per-symbol deadline). With max_retries=0 the
+    #    llmcore loop runs EXACTLY once; the fair scheduler's barrier
+    #    ``fut.result(timeout=)`` (R2-2) bounds the total wall-clock.
+    #
+    # The legacy 60s read-timeout floor is preserved when the thread-local has
+    # no provider timeout (legacy retry-wrapper callers and ad-hoc script
+    # callers). The fair adapter stashes the per-symbol deadline's provider
+    # timeout (``PerSymbolDeadline.provider_timeout_ms()/1000``) before the
+    # call.
+    provider_timeout_seconds = getattr(
+        _llm_call_state, "provider_timeout_seconds", None,
+    )
+    if provider_timeout_seconds is not None:
+        try:
+            session.read_timeout = max(15, int(provider_timeout_seconds))
+        except Exception:
+            if getattr(session, "read_timeout", 0) < 60:
+                session.read_timeout = 60
+        if hasattr(session, "max_retries"):
+            try:
+                session.max_retries = 0
+            except Exception:
+                pass
+    elif getattr(session, "read_timeout", 0) < 60:
         session.read_timeout = 60
-    raw = "".join(session.raw_ask([{"role": "user", "content": [{"type": "text", "text": prompt}]}]))
+    # 07-10 S4 (P0 #3): when the fair adapter opts into process isolation
+    # (``subprocess_hard_timeout``), run the actual ``session.raw_ask`` in a
+    # child process with a HARD wall-clock bound via ``proc.join(timeout=)`` +
+    # ``terminate``/``kill``. This is the guarantee the R2-2 thread barrier
+    # could NOT provide: a running thread cannot be killed, so a wedged
+    # provider call could outlive the barrier wait and block
+    # ``executor.shutdown(wait=True)``. The child rebuilds its own session
+    # (same generation controls + bounded read_timeout / max_retries=0) and
+    # relays the raw response + effective settings back to the parent.
+    #
+    # ``_llm_call_state.subprocess_hard_timeout`` is stashed by the fair
+    # adapter (``fair_llm_call_adapter``) from the scheduling config. Legacy
+    # callers and the legacy retry wrapper leave it unset (False) so the
+    # in-process ``session.raw_ask`` path is byte-for-byte unchanged - the
+    # deterministic rollback target and every test that patches
+    # ``_call_ga_llm`` (which REPLACES this whole function, so the subprocess
+    # block never runs) are unaffected.
+    _subprocess_hard_timeout = bool(getattr(
+        _llm_call_state, "subprocess_hard_timeout", False,
+    ))
+    # Measure wall-clock latency of the provider call (network + gateway +
+    # model). Stash into the thread-local for the retry wrapper. Use
+    # ``time.perf_counter`` (monotonic) — NOT wall-clock ``time.time`` — so
+    # latency is unaffected by system clock jumps (design §3/§6).
+    _t0 = time.perf_counter()
+    _effective_out: dict[str, Any] = {}
+    _used_subprocess = False
+    try:
+        if _subprocess_hard_timeout and provider_timeout_seconds is not None:
+            _used_subprocess = True
+            raw = _run_provider_call_in_subprocess(
+                prompt,
+                provider_timeout_seconds=provider_timeout_seconds,
+                cfg_name=cfg_name,
+                effective_out=_effective_out,
+            )
+            # Relay the child's effective generation settings so the §8
+            # envelope is complete (the in-process path reads them off the
+            # session below; the subprocess path gets them from the child).
+            _eff_thinking_type = _effective_out.get("effective_thinking_type", _eff_thinking_type)
+        else:
+            raw = "".join(session.raw_ask([{"role": "user", "content": [{"type": "text", "text": prompt}]}]))
+    finally:
+        _latency_ms = int((time.perf_counter() - _t0) * 1000)
+        _llm_call_state.latency_ms = _latency_ms
+        _llm_call_state.effective_thinking_type = _eff_thinking_type
+        if _used_subprocess:
+            # The child rebuilt its own session; the parent's ``session``
+            # object was never asked, so read the effective settings from the
+            # child's relayed payload (None when the child did not report).
+            _llm_call_state.effective_thinking_budget_tokens = (
+                _effective_out.get("effective_thinking_budget_tokens")
+            )
+            _llm_call_state.effective_max_output_tokens = (
+                _effective_out.get("effective_max_output_tokens")
+            )
+            _llm_call_state.effective_temperature = (
+                _effective_out.get("effective_temperature")
+            )
+        else:
+            _llm_call_state.effective_thinking_budget_tokens = (
+                getattr(session, "thinking_budget_tokens", None)
+            )
+            _llm_call_state.effective_max_output_tokens = (
+                getattr(session, "max_tokens", None)
+            )
+            _llm_call_state.effective_temperature = (
+                getattr(session, "temperature", None)
+            )
     if not raw.strip():
         # 07-09-overtrigger R5/R6: distinguish "gateway empty" (no HTTP
         # response at all) from "model called a (non-existent) tool with

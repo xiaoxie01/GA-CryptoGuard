@@ -550,7 +550,11 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
     finished_at TEXT,
     error_message TEXT,
     result_json TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    claim_token TEXT,
+    lease_until TEXT,
+    defer_count INTEGER NOT NULL DEFAULT 0,
+    deferred_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_status_priority ON agent_jobs(status, priority, scheduled_at);
 

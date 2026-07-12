@@ -81,6 +81,22 @@ DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN = "deterministic_candidate_report
 RAW_GRADE_EXCEEDS_HTF_CAP = "raw_grade_exceeds_htf_cap"
 SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS = "success_batch_missing_completed_symbols"
 HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH = "hourly_report_used_partial_running_batch"
+# 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract codes.
+LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING = "llm_fair_scheduling_contract_marker_missing"
+FAIR_PATH_CONTINUITY_REAL_INJECTION = "fair_path_continuity_real_injection"
+PER_JOB_FAILURE_CONSISTENCY = "per_job_failure_consistency"
+# 07-10 P1-1 (design §10): eight formal Phase F diagnostic codes. Each
+# corresponds to a post-marker production-chain contract (design §10). These
+# are marker-cutoff-scoped: pre-marker findings demote to ``legacy_info`` via
+# ``_apply_llm_fair_scheduling_marker_cutoff`` (extended below to include them).
+LLM_FIRST_ATTEMPT_COVERAGE_LOW = "llm_first_attempt_coverage_low"
+LLM_SYMBOL_STARVATION = "llm_symbol_starvation"
+LLM_REPORT_COUNT_MISMATCH = "llm_report_count_mismatch"
+LLM_SUCCESS_MISSING_ATTEMPT_METADATA = "llm_success_missing_attempt_metadata"
+LLM_CONTINUITY_NOT_INCLUDED = "llm_continuity_not_included"
+LLM_TIMEOUT_CONFIG_OUT_OF_RANGE = "llm_timeout_config_out_of_range"
+LLM_BATCH_DEGRADED_REPORTED_HEALTHY = "llm_batch_degraded_reported_healthy"
+LLM_REPAIR_COUNTED_AS_PROVIDER_CALL = "llm_repair_counted_as_provider_call"
 
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
@@ -146,6 +162,25 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_raw_grade_exceeds_htf_cap(repo))
     issues.extend(_check_success_batch_missing_completed_symbols(repo))
     issues.extend(_check_hourly_report_used_partial_running_batch(repo))
+    # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract checks.
+    # The marker-missing check runs first so a missing contract is explicitly
+    # surfaced even when the continuity / per-job checks would otherwise pass
+    # (or skip). These verify the S1-S6 production-chain postconditions
+    # survive in persisted decisions + batch_symbol_status.
+    issues.extend(_check_llm_fair_scheduling_contract_markers_missing(repo))
+    issues.extend(_check_fair_path_continuity_real_injection(repo))
+    issues.extend(_check_per_job_failure_consistency(repo))
+    # 07-10 P1-1 (design §10): eight formal Phase F diagnostics. Each verifies
+    # a post-marker fair-scheduling + context-continuity contract on the latest
+    # batches / decisions. Marker-cutoff-scoped above.
+    issues.extend(_check_llm_first_attempt_coverage_low(repo))
+    issues.extend(_check_llm_symbol_starvation(repo))
+    issues.extend(_check_llm_report_count_mismatch(repo))
+    issues.extend(_check_llm_success_missing_attempt_metadata(repo))
+    issues.extend(_check_llm_continuity_not_included(repo))
+    issues.extend(_check_llm_timeout_config_out_of_range(repo))
+    issues.extend(_check_llm_batch_degraded_reported_healthy(repo))
+    issues.extend(_check_llm_repair_counted_as_provider_call(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -171,6 +206,12 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # the continuity marker are demoted to legacy_info; post-marker
     # errors stay error/warning.
     _apply_continuity_marker_cutoff(repo, issues)
+
+    # 07-10 S7 (P1 #7): apply the independent fair-scheduling + context-
+    # continuity marker cutoff to the two new S1-S6 contract checks. Decisions
+    # created before this marker are demoted to legacy_info; post-marker errors
+    # stay error/warning.
+    _apply_llm_fair_scheduling_marker_cutoff(repo, issues)
 
     error_count = sum(1 for i in issues if i["severity"] == "error")
     warning_count = sum(1 for i in issues if i["severity"] == "warning")
@@ -218,6 +259,17 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         RAW_GRADE_EXCEEDS_HTF_CAP: _count(issues, RAW_GRADE_EXCEEDS_HTF_CAP),
         SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS: _count(issues, SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS),
         HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH: _count(issues, HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH),
+        LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING: _count(issues, LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING),
+        FAIR_PATH_CONTINUITY_REAL_INJECTION: _count(issues, FAIR_PATH_CONTINUITY_REAL_INJECTION),
+        PER_JOB_FAILURE_CONSISTENCY: _count(issues, PER_JOB_FAILURE_CONSISTENCY),
+        LLM_FIRST_ATTEMPT_COVERAGE_LOW: _count(issues, LLM_FIRST_ATTEMPT_COVERAGE_LOW),
+        LLM_SYMBOL_STARVATION: _count(issues, LLM_SYMBOL_STARVATION),
+        LLM_REPORT_COUNT_MISMATCH: _count(issues, LLM_REPORT_COUNT_MISMATCH),
+        LLM_SUCCESS_MISSING_ATTEMPT_METADATA: _count(issues, LLM_SUCCESS_MISSING_ATTEMPT_METADATA),
+        LLM_CONTINUITY_NOT_INCLUDED: _count(issues, LLM_CONTINUITY_NOT_INCLUDED),
+        LLM_TIMEOUT_CONFIG_OUT_OF_RANGE: _count(issues, LLM_TIMEOUT_CONFIG_OUT_OF_RANGE),
+        LLM_BATCH_DEGRADED_REPORTED_HEALTHY: _count(issues, LLM_BATCH_DEGRADED_REPORTED_HEALTHY),
+        LLM_REPAIR_COUNTED_AS_PROVIDER_CALL: _count(issues, LLM_REPAIR_COUNTED_AS_PROVIDER_CALL),
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
@@ -257,6 +309,13 @@ SEMANTIC_ACCURACY_MARKER_KEY = "hourly_market_semantic_accuracy_contract_v1"
 # boundary. ``applied_at`` is the cutoff between ``legacy_info`` (pre-marker)
 # and ``error`` / ``warning`` (post-marker).
 CONTINUITY_CONTRACT_MARKER_KEY = "hourly_decision_context_continuity_contract_v1"
+
+# 07-10 S7 (P1 #7): independent fair-scheduling + context-continuity contract
+# marker. The three new S1-S6 production-chain checks use this cutoff, NOT the
+# R4 / semantic-accuracy / continuity boundary. Rows persisted before this
+# marker are demoted to ``legacy_info``; rows after are evaluated against the
+# full S1-S6 contract.
+LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY = "llm_fair_scheduling_context_contract_v1"
 
 # Phase H (07-05): default serialized size budget for the
 # MultiTimeframeFeaturePack. The builder enforces 24 KiB at construction
@@ -354,6 +413,77 @@ def _get_continuity_contract_marker_ts(repo: CryptoGuardRepository) -> str | Non
     except Exception:
         return None
     return None
+
+
+def _get_llm_fair_scheduling_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
+    """07-10 S7 (P1 #7): return the fair-scheduling + context-continuity
+    marker's applied_at, or None.
+
+    None means the marker has not been deployed - callers (the three new
+    S1-S6 contract checks) skip themselves so historical data is not flagged
+    with ``error`` severity against a contract that has not been initialized.
+    The marker-missing check
+    (_check_llm_fair_scheduling_contract_markers_missing) separately surfaces
+    the absence as an error.
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=?",
+            (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"]:
+            return str(row["applied_at"])
+    except Exception:
+        return None
+    return None
+
+
+def _apply_llm_fair_scheduling_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
+    """07-10 S7 (P1 #7): demote pre-marker fair-scheduling-contract findings
+    to ``legacy_info``.
+
+    Scoped to the three new S1-S6 contract issue types
+    (fair_path_continuity_real_injection, per_job_failure_consistency; the
+    batch_claim_ownership_integrity check lives in state_consistency.py and
+    applies its own cutoff in SQL). When the marker is absent this is a no-op
+    - the marker-missing check already surfaces the absence as an error.
+    """
+    marker_ts = _get_llm_fair_scheduling_contract_marker_ts(repo)
+    if marker_ts is None:
+        return
+    # 07-10 P1-1: the eight formal Phase F diagnostic codes (design §10) are
+    # scoped to this same marker cutoff so pre-marker findings demote to
+    # legacy_info alongside the three S1-S6 contract checks.
+    scoped = {
+        FAIR_PATH_CONTINUITY_REAL_INJECTION,
+        PER_JOB_FAILURE_CONSISTENCY,
+        LLM_FIRST_ATTEMPT_COVERAGE_LOW,
+        LLM_SYMBOL_STARVATION,
+        LLM_REPORT_COUNT_MISMATCH,
+        LLM_SUCCESS_MISSING_ATTEMPT_METADATA,
+        LLM_CONTINUITY_NOT_INCLUDED,
+        LLM_TIMEOUT_CONFIG_OUT_OF_RANGE,
+        LLM_BATCH_DEGRADED_REPORTED_HEALTHY,
+        LLM_REPAIR_COUNTED_AS_PROVIDER_CALL,
+    }
+    for issue in issues:
+        if issue.get("type") not in scoped:
+            continue
+        decision_id = (issue.get("details") or {}).get("decision_id")
+        if decision_id is None:
+            at_ms = (issue.get("details") or {}).get("analysis_time")
+            if at_ms is not None:
+                try:
+                    dt = datetime.fromtimestamp(int(at_ms) / 1000, tz=timezone.utc)
+                    decision_ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError, OSError):
+                    continue
+            else:
+                continue
+        else:
+            decision_ts = _get_decision_created_ts(repo, decision_id)
+        if decision_ts is not None and decision_ts < marker_ts:
+            _demote_to_legacy_info(issue)
 
 
 def _apply_continuity_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
@@ -2883,3 +3013,970 @@ def _check_hourly_report_used_partial_running_batch(
         "（已降级为 warning：仅当 hourly alert 创建于 running 批次 started_at 之后时触发。）",
     ))
     return issues
+
+
+# ── 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract checks ──
+# Three independent checks verifying the S1-S6 production-chain postconditions
+# survive in persisted decisions + batch_symbol_status + agent_jobs. Each uses
+# the LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY cutoff (applied by
+# _apply_llm_fair_scheduling_marker_cutoff) so pre-marker rows are demoted to
+# legacy_info and do not count against the current contract. The marker-missing
+# check runs unconditionally (always error when absent) so a missing contract
+# is never silently healthy.
+
+
+def _check_llm_fair_scheduling_contract_markers_missing(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """07-10 S7 (P1 #7): flag a missing fair-scheduling + context-continuity
+    contract marker.
+
+    Mirrors ``_check_plan_lifecycle_contract_markers_missing`` /
+    ``_check_semantic_contract_markers_missing``. The marker
+    ``llm_fair_scheduling_context_contract_v1`` must exist in
+    ``_migration_state``. If absent, emit an ``error`` issue so callers can
+    detect the missing contract rather than receiving a silently-healthy report.
+    When the marker is absent, the two data-dependent checks
+    (``_check_fair_path_continuity_real_injection`` and
+    ``_check_per_job_failure_consistency``) still run, but their findings are
+    demoted to ``legacy_info`` by ``_apply_llm_fair_scheduling_marker_cutoff``
+    (a no-op when the marker is absent, so the findings keep their original
+    severity only if the marker exists — absent marker => no demotion needed
+    because the data checks emit error only when a real S1-S6 regression is
+    observed; the marker-missing error here is the primary signal).
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+            (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if not row or not row["applied_at"]:
+        issues.append(_issue(
+            LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING, "error",
+            {
+                "marker_key": LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,
+                "contract": "llm-fair-scheduling-context-continuity",
+                "issue": "marker_absent",
+            },
+            "fair-scheduling + context-continuity contract marker 未部署。"
+            "运行 initialize_database() 部署 marker；marker 缺失时 S1-S6 "
+            "契约诊断被降级为 legacy_info，可能导致假绿（continuity 真实注入 / "
+            "per-job 失败一致性 / 归属完整性无法作为当前契约评估）。",
+        ))
+    return issues
+
+
+def _check_fair_path_continuity_real_injection(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """07-10 S7 (P1 #7, validates S1 / P0 #1): flag ga_decisions where a
+    STRICT cross-batch previous-analysis row exists for the symbol but the
+    persisted ``analysis_continuity.continuity_status`` is NOT ``ok``.
+
+    The S1 (P0 #1) fix pre-injects the real strict cross-batch previous
+    analysis into each fair-path snapshot BEFORE the LLM prompt is built, so
+    ``_compact_snapshot`` reads ``continuity_status="ok"`` (with a real
+    ``previous.analysis_time`` and non-empty ``delta.trigger_progress``)
+    rather than the lazy ``previous_row=None`` -> ``continuity_status="missing"``
+    that the production bug produced. The controller's post-decision
+    ``build_analysis_continuity`` re-derives the same status from the strict
+    row, so the persisted block is the audit-grade witness.
+
+    Detection: for the latest 200 ``ga_decisions`` rows, look up the strict
+    prior row the SAME way the controller does
+    (``latest_analysis_state_for_continuity(symbol, analysis_time_utc,
+    exclude_batch_id=batch_id)``). When a strict prior row EXISTS, the
+    persisted ``analysis_continuity.continuity_status`` MUST be ``ok``.
+    A non-``ok`` status (``missing``/``stale``/``future``/``same_batch``/
+    ``cross_symbol``) despite a qualifying prior row means the S1 pre-injection
+    regressed -> the LLM prompt was built without real prior context (the
+    original P0 #1 defect). Severity: ``error`` post-marker, ``legacy_info``
+    pre-marker (applied by ``_apply_llm_fair_scheduling_marker_cutoff``).
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
+               raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        continuity = raw.get("analysis_continuity")
+        if not isinstance(continuity, dict):
+            # A missing continuity block is already flagged by
+            # _check_missing_analysis_continuity (Phase H). Do not double-flag.
+            continue
+        status = str(continuity.get("continuity_status") or "").lower()
+        if status == "ok":
+            continue
+        # Re-derive whether a strict cross-batch prior row SHOULD have been
+        # found for this decision. Only flag when the controller COULD have
+        # produced ``ok`` (a qualifying prior row exists) but did not.
+        symbol = str(r["symbol"] or "")
+        batch_id = str(r["batch_id"] or "") or None
+        try:
+            at_utc = int(r["analysis_time"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if not symbol or at_utc <= 0:
+            continue
+        try:
+            prior = repo.latest_analysis_state_for_continuity(
+                symbol,
+                analysis_time_utc=at_utc,
+                exclude_batch_id=batch_id,
+            )
+        except Exception:
+            prior = None
+        if not prior:
+            # No qualifying prior row -> a non-ok status (e.g. "missing") is
+            # the correct first-analysis outcome. Not a defect.
+            continue
+        issues.append(_issue(
+            FAIR_PATH_CONTINUITY_REAL_INJECTION, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": symbol,
+                "batch_id": batch_id or "",
+                "grade": r["signal_grade"],
+                "decision": r["decision"],
+                "analysis_time": at_utc,
+                "observed_continuity_status": status,
+                "expected_continuity_status": "ok",
+                "prior_analysis_time": int(prior.get("analysis_time") or 0),
+            },
+            "fair 路径 continuity 真实注入回归：存在严格跨批前序 analysis_states "
+            "行但持久化 continuity_status != ok。S1 (P0 #1) 预注入被绕过 -> "
+            "LLM prompt 在无真实前序上下文下构建（生产饥饿/误判根因）。检查 "
+            "process_fair_batch 的预注入循环是否在 run_fair_batch 之前执行。",
+        ))
+    return issues
+
+
+def _check_per_job_failure_consistency(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """07-10 S7 (P1 #7, validates S6 / P1 #6): flag agent_jobs rows whose
+    ``status`` disagrees with the per-symbol outcome recorded in
+    ``batch_symbol_status`` for the same (batch_id, symbol).
+
+    The S6 (P1 #6) fix calls ``finish_job(job_id, result=,
+    error_message=str(exc) if failed else None)`` per-symbol inside
+    ``process_fair_batch``, so a symbol whose ``analyze_symbol`` raised gets
+    ``agent_jobs.status='failed'`` + a non-empty ``error_message``, while the
+    matching ``batch_symbol_status`` row is marked ``failed``. The pre-S6
+    defect ran a uniform ``finish_job(result=)`` loop in ``run_once`` that
+    marked EVERY job in the batch ``success`` regardless of per-symbol failure
+    -> failed symbols were hidden from the ops dashboard.
+
+    Detection: join ``batch_symbol_status`` (status IN ('failed','completed'))
+    to ``agent_jobs`` by (batch_id, symbol). The agent_jobs payload stores the
+    snapshot under ``$.snapshot.symbol`` (cron_scheduler builds the payload);
+    the batch_id is stored under ``$.batch_id``. A row is flagged when:
+      - ``batch_symbol_status.status='failed'`` but the matching
+        ``agent_jobs.status`` is NOT ``failed`` (the S6 mislabel defect), OR
+      - ``batch_symbol_status.status='completed'`` but the matching
+        ``agent_jobs.status='failed'`` (a job marked failed that the batch
+        considers completed — also inconsistent).
+    Severity: ``error`` post-marker, ``legacy_info`` pre-marker (applied by
+    ``_apply_llm_fair_scheduling_marker_cutoff`` via the
+    ``details.analysis_time`` fallback).
+    """
+    issues: list[dict[str, Any]] = []
+    # Pull the latest batch_symbol_status rows (limit to recent batches to
+    # bound work). analysis_time is not on batch_symbol_status, so the cutoff
+    # helper falls back to details.analysis_time derived from the agent_jobs
+    # payload's snapshot.analysis_time_utc when available.
+    bss_rows = repo.conn.execute(
+        """
+        SELECT batch_id, symbol, status, updated_at
+        FROM batch_symbol_status
+        WHERE status IN ('failed', 'completed')
+        ORDER BY updated_at DESC LIMIT 200
+        """
+    ).fetchall()
+    for bss in bss_rows:
+        batch_id = str(bss["batch_id"] or "")
+        symbol = str(bss["symbol"] or "")
+        bss_status = str(bss["status"] or "").lower()
+        if not batch_id or not symbol:
+            continue
+        # Find the matching agent_jobs row by batch_id (payload) + symbol
+        # (payload snapshot.symbol). There is exactly one per (batch, symbol)
+        # because cron_scheduler dedupes by session_id and enqueue_job_once
+        # guards re-enqueue.
+        try:
+            job_row = repo.conn.execute(
+                """
+                SELECT id, status, error_message, payload_json, finished_at
+                FROM agent_jobs
+                WHERE job_type='scheduled_market_analysis'
+                  AND json_extract(payload_json, '$.batch_id')=?
+                  AND (
+                    json_extract(payload_json, '$.symbol')=?
+                    OR json_extract(payload_json, '$.snapshot.symbol')=?
+                  )
+                ORDER BY id DESC LIMIT 1
+                """,
+                (batch_id, symbol, symbol),
+            ).fetchone()
+        except Exception:
+            job_row = None
+        if not job_row:
+            # No matching agent_jobs row — a separate concern (orphaned
+            # batch_symbol_status), not the S6 mislabel defect. Skip; the
+            # state_consistency batch_claim_ownership check covers ownership.
+            continue
+        job_status = str(job_row["status"] or "").lower()
+        # Derive analysis_time for the cutoff helper from the payload snapshot.
+        at_ms = 0
+        try:
+            payload = _safe_json(job_row["payload_json"]) or {}
+            snap = payload.get("snapshot") or {}
+            at_ms = int(snap.get("analysis_time_utc") or 0)
+        except Exception:
+            at_ms = 0
+        mismatch = None
+        if bss_status == "failed" and job_status != "failed":
+            mismatch = "batch_failed_job_not_failed"
+        elif bss_status == "completed" and job_status == "failed":
+            mismatch = "batch_completed_job_failed"
+        if mismatch is None:
+            continue
+        issues.append(_issue(
+            PER_JOB_FAILURE_CONSISTENCY, "error",
+            {
+                "batch_id": batch_id,
+                "symbol": symbol,
+                "batch_symbol_status": bss_status,
+                "agent_job_id": int(job_row["id"]),
+                "agent_job_status": job_status,
+                "agent_job_error_message": str(job_row["error_message"] or "") or None,
+                "mismatch": mismatch,
+                "analysis_time": at_ms,
+            },
+            "per-job 失败一致性回归：batch_symbol_status 与 agent_jobs.status 不一致。"
+            "S6 (P1 #6) 的 per-symbol finish_job(error_message=...) 被绕过 -> "
+            "失败品种被误标 success（或反之）。检查 process_fair_batch 是否对每个 "
+            "symbol 调用 finish_job(result=, error_message=) 而非 run_once 统一收尾。",
+        ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# 07-10 P1-1 (design §10): eight formal Phase F diagnostics. Each verifies a
+# post-marker fair-scheduling + context-continuity contract. Marker-cutoff-
+# scoped (``_apply_llm_fair_scheduling_marker_cutoff`` demotes pre-marker
+# findings to ``legacy_info``). These checks read the persisted ga_decisions
+# §8 envelope + analysis_batches.summary_json.llm_health directly so they are
+# independent of the production aggregation path.
+# ---------------------------------------------------------------------------
+
+# Config-derived bounds (mirror PerSymbolDeadline validation in llm_breaker.py
+# and config/loader.py). The per-symbol deadline caps the whole attempt chain;
+# a persisted provider_timeout_ms must be 0 (exhausted skip) or in (0, cap].
+_LLM_PER_SYMBOL_TIMEOUT_MAX_MS = 1200 * 1000  # per_symbol_timeout_seconds <= 1200
+
+
+def _recent_success_batches(repo: CryptoGuardRepository, limit: int = 10) -> list[Any]:
+    """Latest ``success`` batches (the batches the hourly report renders
+    against), most-recent first. Bounded by ``limit``."""
+    try:
+        return repo.conn.execute(
+            """
+            SELECT batch_id, primary_interval, analysis_time, status,
+                   started_at, enabled_symbols_json, completed_symbols_json,
+                   failed_symbols_json, summary_json
+            FROM analysis_batches
+            WHERE status = 'success'
+            ORDER BY started_at DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except Exception:
+        return []
+
+
+def _check_llm_first_attempt_coverage_low(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a ``success`` batch where eligible enabled
+    symbols were NOT attempted (no physical provider call) WITHOUT being
+    accounted for by ANY allowed bucket.
+
+    The starvation root cause (P0 #1/#2) meant later alphabetically-sorted
+    symbols never received a provider call under the shared 90s budget. The
+    fair scheduler (Phase C) + per-symbol deadline (Phase B) guarantee every
+    enabled symbol receives Attempt-1 unless an explicit skip accounts for it.
+    Production's ``_aggregate_batch_llm_outcomes`` buckets every no-call row
+    into one of: ``policy_skip`` (no-call, non-failed, no/gate terminal
+    reason), ``breaker_skip`` (``breaker_skipped``), ``budget_skip``
+    (``symbol_timeout`` / ``batch_deadline_skipped``), ``worker_failed``
+    (enabled symbol with NO decision row). So a correct batch satisfies
+    ``attempted + policy_skip + breaker_skip + budget_skip + worker_failed ==
+    expected``. The coverage defect is the residual: an enabled symbol that is
+    NONE of these - silently dropped with a row that has a real provider
+    ``failure`` (``llm_status="failed"``) on a ``success`` batch, OR an
+    enabled symbol whose row is missing entirely but was NOT counted as
+    worker_failed.
+
+    Detection: re-aggregate the latest ``success`` batch's decisions and
+    compute the residual ``expected - (attempted + policy_skip + breaker_skip
+    + budget_skip + worker_failed)``. These five buckets are DISJOINT (a row
+    with ``pcc>=1`` is in ``attempted`` regardless of status; the no-call
+    buckets are mutually exclusive by terminal reason). A row with
+    ``pcc==0`` AND ``llm_status="failed"`` falls into NONE of them - it is a
+    bare failure with no call and no budget/breaker reason, the silent-drop
+    signature. A strictly POSITIVE residual means a symbol is unaccounted-for
+    (the coverage gap). Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    for r in _recent_success_batches(repo, limit=5):
+        batch_id = str(r["batch_id"] or "")
+        if not batch_id:
+            continue
+        agg = _reaggregate_batch_llm_outcomes(repo, batch_id)
+        if not agg:
+            continue
+        expected = int(agg.get("expected_symbols") or 0)
+        attempted = int(agg.get("llm_symbols_attempted") or 0)
+        policy_skip = int(agg.get("llm_policy_skip_count") or 0)
+        breaker_skip = int(agg.get("llm_breaker_skip_count") or 0)
+        budget_skip = int(agg.get("llm_budget_skip_count") or 0)
+        worker_failed = int(agg.get("llm_symbols_worker_failed") or 0)
+        if expected <= 0 or attempted >= expected:
+            continue
+        # Disjoint bucket accounting (mirrors _aggregate_batch_llm_outcomes):
+        #   attempted   = rows with pcc>=1 (a call happened; any status)
+        #   policy_skip = rows with pcc==0, status!=failed, no/gate terminal
+        #   breaker_skip= rows with pcc==0, terminal=breaker_skipped
+        #   budget_skip = rows with pcc==0, terminal in {symbol_timeout,
+        #                 batch_deadline_skipped}
+        #   worker_failed = enabled symbols with NO decision row
+        # A row with pcc==0 AND status="failed" (a failure recorded with no
+        # call and no budget/breaker reason) falls into NONE of these buckets
+        # - it is the unexplained residual (a symbol silently dropped with a
+        # bare failure, the coverage-gap defect). ``failed`` is NOT added
+        # separately because a pcc>=1 failure is already in ``attempted``.
+        accounted = (
+            attempted + policy_skip + breaker_skip + budget_skip
+            + worker_failed
+        )
+        unexplained = expected - accounted
+        if unexplained <= 0:
+            # Every non-attempted symbol falls into an allowed / recorded
+            # bucket. Coverage is low but fully explained (e.g. a legitimately
+            # degraded batch with all skips recorded) - NOT the silent-drop
+            # defect.
+            continue
+        issues.append(_issue(
+            LLM_FIRST_ATTEMPT_COVERAGE_LOW, "error",
+            {
+                "batch_id": batch_id,
+                "analysis_time": int(r["analysis_time"] or 0),
+                "expected_symbols": expected,
+                "attempted_symbols": attempted,
+                "policy_skip": policy_skip,
+                "breaker_skip": breaker_skip,
+                "budget_skip": budget_skip,
+                "worker_failed": worker_failed,
+                "unexplained_unattempted": unexplained,
+            },
+            "首轮覆盖不足：success 批次存在 enabled 品种未被尝试且无法被任何允许桶"
+            "(policy/breaker/budget skip / worker_failed) 解释（典型：pcc=0 且 "
+            "status=failed 的裸失败行）。这是公平调度饥饿的回归信号（调度器静默"
+            "丢弃品种）。检查 run_fair_batch 的 attemptable_symbols 是否覆盖全部 "
+            "enabled symbol，以及每个被跳过品种是否记录了显式 terminal_reason。",
+        ))
+    return issues
+
+
+def _check_llm_symbol_starvation(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag three CONSECUTIVE eligible batches with
+    ZERO provider calls (``llm_physical_provider_calls == 0``) for the batch
+    overall.
+
+    The original production defect: the shared 90s budget was consumed by the
+    first few symbols' retry loops, leaving zero physical calls for the rest;
+    across consecutive batches the same symbols were starved. Three
+    consecutive eligible batches (each with ``expected_symbols > 0``) all
+    making zero provider calls means the LLM layer is structurally unreachable
+    for the whole batch - a total starvation, not a one-off breaker trip.
+    Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = _recent_success_batches(repo, limit=10)
+    # Walk most-recent-first; collect runs of >=3 consecutive eligible batches
+    # with zero physical provider calls.
+    run: list[Any] = []
+    for r in rows:
+        batch_id = str(r["batch_id"] or "")
+        if not batch_id:
+            continue
+        agg = _reaggregate_batch_llm_outcomes(repo, batch_id)
+        if not agg or int(agg.get("expected_symbols") or 0) <= 0:
+            run = []
+            continue
+        physical = int(agg.get("llm_physical_provider_calls") or 0)
+        if physical == 0:
+            run.append((r, agg))
+            if len(run) >= 3:
+                # Report once for the run, anchored at the most-recent batch.
+                newest_r, newest_agg = run[-1]
+                issues.append(_issue(
+                    LLM_SYMBOL_STARVATION, "error",
+                    {
+                        "batch_id": str(newest_r["batch_id"] or ""),
+                        "analysis_time": int(newest_r["analysis_time"] or 0),
+                        "consecutive_starved_batches": len(run),
+                        "batch_ids": [str(rr["batch_id"] or "") for rr, _ in run],
+                        "expected_symbols": int(newest_agg.get("expected_symbols") or 0),
+                        "physical_provider_calls": 0,
+                    },
+                    "品种饥饿：连续 >=3 个合格批次物理 provider 调用数为 0。LLM 层对整个"
+                    "批次结构性不可达（共享预算耗尽 / 调度器未派发 / breaker 常开）。"
+                    "检查公平调度器是否真正派发 Attempt-1，以及 ESTIMATED_CALL_MS 门控是否"
+                    "仍残留。",
+                ))
+                break  # report the single most-recent run once
+        else:
+            run = []
+    return issues
+
+
+def _check_llm_report_count_mismatch(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a ``success`` batch whose persisted
+    ``summary_json.llm_health`` counters DISAGREE with a fresh re-aggregation
+    from the underlying ``ga_decisions`` rows.
+
+    The original report defect: the hourly report rendered "完成 10/10" while
+    the persisted decisions only covered 3 symbols - the rendered counters
+    were computed from a stale/optimistic summary, not from the real decisions.
+    This check independently re-aggregates the batch's decisions (the source of
+    truth, mirroring ``_aggregate_batch_llm_outcomes``) and compares key
+    counters against what ``summary_json.llm_health`` claims. A mismatch means
+    the persisted summary lied (or went stale after a late decision write) ->
+    the report rendered false-healthy numbers. Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    for r in _recent_success_batches(repo, limit=5):
+        batch_id = str(r["batch_id"] or "")
+        if not batch_id:
+            continue
+        agg = _reaggregate_batch_llm_outcomes(repo, batch_id)
+        if not agg:
+            continue
+        summary = _safe_json(r["summary_json"]) or {}
+        if not isinstance(summary, dict):
+            continue
+        health = summary.get("llm_health") or {}
+        if not isinstance(health, dict) or not health:
+            # No persisted llm_health -> covered by other checks; not a
+            # mismatch (nothing to disagree with).
+            continue
+        # Compare the counters the report renderer reads (design §9). Persisted
+        # keys are the Phase E aggregate names; the re-aggregation uses the
+        # same names. Any divergence on a structural counter is the defect.
+        compared = [
+            ("expected_symbols", "expected_symbols"),
+            ("llm_symbols_attempted", "llm_symbols_attempted"),
+            ("llm_physical_provider_calls", "llm_physical_provider_calls"),
+            ("llm_symbols_success", "llm_symbols_success"),
+            ("llm_symbols_failed", "llm_symbols_failed"),
+        ]
+        mismatches: list[dict[str, Any]] = []
+        for persisted_key, agg_key in compared:
+            persisted_val = health.get(persisted_key)
+            if persisted_val is None:
+                continue
+            agg_val = agg.get(agg_key)
+            if int(persisted_val) != int(agg_val or 0):
+                mismatches.append({
+                    "field": persisted_key,
+                    "persisted": int(persisted_val),
+                    "reaggregated": int(agg_val or 0),
+                })
+        if not mismatches:
+            continue
+        issues.append(_issue(
+            LLM_REPORT_COUNT_MISMATCH, "error",
+            {
+                "batch_id": batch_id,
+                "analysis_time": int(r["analysis_time"] or 0),
+                "mismatches": mismatches,
+            },
+            "报告计数不一致：summary_json.llm_health 持久化计数与从 ga_decisions "
+            "重新聚合的计数不符。报告渲染了虚假健康数字（如完成 10/10 实为 3/10）。"
+            "检查 finish_analysis_batch 是否在所有 per-symbol 决策持久化后、用最新聚合"
+            "写入 summary_json.llm_health。",
+        ))
+    return issues
+
+
+def _check_llm_success_missing_attempt_metadata(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a decision whose ``llm_status == "ok"``
+    but whose §8 attempt-metadata envelope is missing/incomplete.
+
+    A successful LLM decision MUST carry the audit envelope (the controller
+    surfaces it at the top level of raw_decision_json via
+    ``controller_decision_from_legacy``). ``llm_status == "ok"`` with
+    ``llm_provider_call_count`` absent/None (or ``llm_latency_ms`` absent on a
+    real provider call) means a success was recorded WITHOUT the metadata that
+    proves a real provider call happened - the silent-success path that masked
+    the original starvation (the report counted symbols as "covered" with no
+    evidence of a call). Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
+               raw_decision_json
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("llm_status") or "").lower() != "ok":
+            continue
+        pcc = raw.get("llm_provider_call_count")
+        # A success must carry a non-null provider_call_count (>=0 integer).
+        # None / missing on an "ok" status is the audit-gap defect.
+        missing: list[str] = []
+        if pcc is None:
+            missing.append("llm_provider_call_count")
+        # When a physical call was made (pcc >= 1), latency + prompt bytes +
+        # continuity_included MUST be present (they are captured by
+        # _call_ga_llm's thread-local). Their absence on a real call means the
+        # success bypassed the capture path.
+        if isinstance(pcc, int) and pcc >= 1:
+            for fld in ("llm_latency_ms", "llm_prompt_bytes", "llm_continuity_included"):
+                if raw.get(fld) is None:
+                    missing.append(fld)
+        if not missing:
+            continue
+        issues.append(_issue(
+            LLM_SUCCESS_MISSING_ATTEMPT_METADATA, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": str(r["symbol"] or ""),
+                "batch_id": str(r["batch_id"] or "") or "",
+                "grade": r["signal_grade"],
+                "decision": r["decision"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_status": "ok",
+                "missing_fields": missing,
+                "llm_provider_call_count": pcc,
+            },
+            "成功决策缺少尝试元数据：llm_status=ok 但 §8 信封字段缺失。原始饥饿"
+            "缺陷正是用无证据的'成功'掩盖了未发生的 provider call。检查 controller "
+            "是否在 ok 路径透出 attempt_meta，以及 _call_ga_llm 的 thread-local 捕获"
+            "是否生效。",
+        ))
+    return issues
+
+
+def _check_llm_continuity_not_included(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a decision whose prompt was built WITHOUT
+    the analysis_continuity block, i.e. ``llm_continuity_included`` is
+    False/absent on a decision that DID make a provider call.
+
+    The S1 (P0 #1) fix pre-injects the real strict cross-batch previous
+    analysis into each fair-path snapshot so the prompt carries continuity.
+    ``llm_continuity_included`` is the §8 envelope flag the LLM call sets when
+    the prompt contained the continuity block. A real provider call
+    (``llm_provider_call_count >= 1``) with ``llm_continuity_included`` not
+    True means the prompt was built without the prior-context block - the
+    continuity regression that re-introduces the misjudgment root cause. This
+    complements ``_check_fair_path_continuity_real_injection`` (which checks
+    the persisted block's status); this check catches the prompt-level flag.
+    Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
+               raw_decision_json
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        pcc = raw.get("llm_provider_call_count")
+        if not (isinstance(pcc, int) and pcc >= 1):
+            # No physical call -> continuity flag is irrelevant (no prompt
+            # was sent). Not a defect.
+            continue
+        included = raw.get("llm_continuity_included")
+        if included is True:
+            continue
+        issues.append(_issue(
+            LLM_CONTINUITY_NOT_INCLUDED, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": str(r["symbol"] or ""),
+                "batch_id": str(r["batch_id"] or "") or "",
+                "grade": r["signal_grade"],
+                "decision": r["decision"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_provider_call_count": pcc,
+                "llm_continuity_included": included,
+            },
+            "continuity 未包含：决策进行了 provider call 但 prompt 未携带 "
+            "analysis_continuity 块。S1 (P0 #1) 预注入被绕过 -> LLM 在无前序分析"
+            "上下文下判定（误判/饥饿根因）。检查 process_fair_batch 预注入循环与 "
+            "build_llm_decision_prompt 的 continuity 拼装。",
+        ))
+    return issues
+
+
+def _check_llm_timeout_config_out_of_range(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a decision whose persisted
+    ``llm_provider_timeout_ms`` is outside the valid config range on a symbol
+    that made a real provider call.
+
+    The per-symbol deadline (Phase B) derives ``provider_timeout_ms =
+    min(per_attempt_timeout_ms, remaining_ms())``. Config validation
+    (``PerSymbolDeadline``) requires ``per_symbol_timeout_seconds ∈ [180,
+    1200]`` and ``per_attempt > 0``. So a persisted ``llm_provider_timeout_ms``
+    on a real call (``llm_provider_call_count >= 1``) MUST be in ``(0,
+    _LLM_PER_SYMBOL_TIMEOUT_MAX_MS]``. A value of 0 on a real call (deadline
+    already exhausted yet a call still happened) or a value exceeding the
+    configured cap, or a negative value, is a config/timeout regression that
+    would either let a call run unbounded or mis-bounds the hard kill. ``0``
+    on a no-call skip path is the legitimate exhausted-deadline value and is
+    NOT flagged. Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
+               raw_decision_json
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        pcc = raw.get("llm_provider_call_count")
+        if not (isinstance(pcc, int) and pcc >= 1):
+            continue
+        pt_ms = raw.get("llm_provider_timeout_ms")
+        if pt_ms is None:
+            # Missing timeout metadata on a real call is already surfaced by
+            # _check_llm_success_missing_attempt_metadata / the failed-path
+            # envelope. Skip here to avoid double-flagging.
+            continue
+        try:
+            pt = int(pt_ms)
+        except (TypeError, ValueError):
+            pt = None
+        defect = None
+        if pt is None:
+            defect = "unparseable"
+        elif pt < 0:
+            defect = "negative"
+        elif pt == 0:
+            defect = "zero_on_real_call"
+        elif pt > _LLM_PER_SYMBOL_TIMEOUT_MAX_MS:
+            defect = "exceeds_per_symbol_cap"
+        if defect is None:
+            continue
+        issues.append(_issue(
+            LLM_TIMEOUT_CONFIG_OUT_OF_RANGE, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": str(r["symbol"] or ""),
+                "batch_id": str(r["batch_id"] or "") or "",
+                "grade": r["signal_grade"],
+                "decision": r["decision"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_provider_call_count": pcc,
+                "llm_provider_timeout_ms": pt_ms,
+                "valid_range_ms": f"(0, {_LLM_PER_SYMBOL_TIMEOUT_MAX_MS}]",
+                "defect": defect,
+            },
+            "超时配置越界：真实 provider call 的 llm_provider_timeout_ms 超出有效区间 "
+            f"(0, {_LLM_PER_SYMBOL_TIMEOUT_MAX_MS}]。硬超时门控会失效（无界调用或误杀）。"
+            "检查 PerSymbolDeadline.provider_timeout_ms() 的 min(per_attempt, remaining) "
+            "推导与 config/loader.py 的 [180,1200] 校验。",
+        ))
+    return issues
+
+
+def _check_llm_batch_degraded_reported_healthy(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a batch that was capacity-degraded (first-
+    attempt coverage < 1.0 with unexplained gaps) but whose rendered report
+    claimed a healthy state.
+
+    Per design §11.2 "Batch capacity insufficient before start: mark
+    capacity-degraded and report it explicitly". A batch with
+    ``llm_coverage_degraded == True`` (coverage < 1.0) whose persisted
+    ``summary_json.llm_health`` claims full coverage
+    (``llm_first_attempt_coverage >= 1.0``) OR whose batch ``status`` is
+    ``success`` without a degraded marker is the false-healthy report defect:
+    an operator reading the report cannot see the batch was degraded. This
+    catches the case where the rendered "完成 10/10" hid a 3/10 coverage.
+    Severity: ``error`` when coverage is missing entirely; ``warning`` when
+    the degraded flag is merely not surfaced.
+    """
+    issues: list[dict[str, Any]] = []
+    for r in _recent_success_batches(repo, limit=5):
+        batch_id = str(r["batch_id"] or "")
+        if not batch_id:
+            continue
+        agg = _reaggregate_batch_llm_outcomes(repo, batch_id)
+        if not agg:
+            continue
+        expected = int(agg.get("expected_symbols") or 0)
+        attempted = int(agg.get("llm_symbols_attempted") or 0)
+        if expected <= 0:
+            continue
+        reaggregated_coverage = round(attempted / expected, 3)
+        if reaggregated_coverage >= 1.0:
+            continue  # genuinely full coverage
+        summary = _safe_json(r["summary_json"]) or {}
+        health = (summary if isinstance(summary, dict) else {}).get("llm_health") or {}
+        persisted_coverage = health.get("llm_first_attempt_coverage")
+        persisted_degraded = health.get("llm_coverage_degraded")
+        # Defect: the persisted summary claims full coverage (>=1.0) OR does
+        # NOT mark degraded, while the real re-aggregation is < 1.0.
+        false_healthy = False
+        if persisted_coverage is not None and float(persisted_coverage) >= 1.0:
+            false_healthy = True
+        elif persisted_degraded is not True:
+            false_healthy = True
+        if not false_healthy:
+            continue
+        issues.append(_issue(
+            LLM_BATCH_DEGRADED_REPORTED_HEALTHY, "error",
+            {
+                "batch_id": batch_id,
+                "analysis_time": int(r["analysis_time"] or 0),
+                "expected_symbols": expected,
+                "attempted_symbols": attempted,
+                "reaggregated_coverage": reaggregated_coverage,
+                "persisted_llm_first_attempt_coverage": persisted_coverage,
+                "persisted_llm_coverage_degraded": persisted_degraded,
+            },
+            "批次降级但报告健康：实际首轮覆盖 < 1.0 但 summary_json.llm_health 声称"
+            "全覆盖/未标降级。操作员看到'完成 10/10'无法察觉 3/10 的覆盖缺口（原始"
+            "报告缺陷）。检查 finish_analysis_batch 是否在 coverage_degraded=True 时"
+            "写入降级标记，以及 hourly_report 是否渲染（首轮覆盖不足）。",
+        ))
+    return issues
+
+
+def _check_llm_repair_counted_as_provider_call(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 P1-1 (design §10): flag a decision where a schema-alias / unwrap
+    REPAIR was counted as an additional provider call.
+
+    A repair is a LOCAL re-parse / re-validation of an ALREADY-received
+    response (``_try_repair_entry_trigger_confirmation`` operates on the
+    in-memory decision, no new network call). The repair signal persisted at
+    the top level of ``raw_decision_json`` is ``llm_terminal_reason ==
+    "schema_repaired"`` (``_LLM_REPAIR_TERMINAL_REASONS`` in controller.py;
+    set by ``_run_single_llm_attempt`` alongside ``attempt_meta["llm_repair_event"]``,
+    but only ``llm_terminal_reason`` is surfaced by the decision_schema §8
+    envelope - so this check reads the terminal reason, NOT ``llm_repair_event``).
+    The §8 envelope distinguishes ``llm_provider_call_count`` (physical network
+    calls) from ``llm_attempt_count`` (logical attempts incl. no-call skips). A
+    repaired success has ``llm_terminal_reason == "schema_repaired"``,
+    ``llm_attempt_count == 1``, ``llm_provider_call_count == 1``. The defect:
+    ``llm_provider_call_count > llm_attempt_count`` on a repaired decision (a
+    repair inflated the physical call counter) - which would over-count provider
+    calls in the breaker / report, masking real call volume. Severity:
+    ``warning``.
+    """
+    issues: list[dict[str, Any]] = []
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
+               raw_decision_json
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+        """
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        # Repair signal persisted at the top level (decision_schema §8 surfaces
+        # llm_terminal_reason, NOT llm_repair_event).
+        if str(raw.get("llm_terminal_reason") or "") != "schema_repaired":
+            continue
+        try:
+            pcc = int(raw.get("llm_provider_call_count") or 0)
+            attempt_count = int(raw.get("llm_attempt_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        # A repair must not make provider_call_count exceed attempt_count.
+        # attempt_count includes no-call skips, so pcc <= attempt_count always
+        # holds when accounting is correct; pcc > attempt_count means a repair
+        # was billed as a provider call.
+        if pcc <= attempt_count:
+            continue
+        issues.append(_issue(
+            LLM_REPAIR_COUNTED_AS_PROVIDER_CALL, "warning",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": str(r["symbol"] or ""),
+                "batch_id": str(r["batch_id"] or "") or "",
+                "grade": r["signal_grade"],
+                "decision": r["decision"],
+                "analysis_time": int(r["analysis_time"] or 0),
+                "llm_terminal_reason": "schema_repaired",
+                "llm_attempt_count": attempt_count,
+                "llm_provider_call_count": pcc,
+            },
+            "修复被计为 provider call：schema-alias/unwrap 修复（本地重解析，无网络）"
+            "被计入 llm_provider_call_count，使物理调用计数虚高。修复路径不应增加 "
+            "provider_call_count。检查 _run_single_llm_attempt 修复分支是否误增 "
+            "provider_call_count，以及 breaker 事件是否用 repairable 而非 physical 计数。",
+        ))
+    return issues
+
+
+def _reaggregate_batch_llm_outcomes(
+    repo: CryptoGuardRepository, batch_id: str
+) -> dict[str, Any]:
+    """07-10 P1-1: independently re-aggregate a batch's LLM outcomes from its
+    persisted ``ga_decisions`` §8 envelopes, mirroring the production
+    ``_aggregate_batch_llm_outcomes`` definition but living here so the
+    LLM_REPORT_COUNT_MISMATCH / coverage / starvation / degraded diagnostics
+    do NOT trust the persisted ``summary_json.llm_health`` they are auditing.
+
+    Returns an empty dict when ``batch_id`` is falsy or the batch has no
+    decisions / no enabled_symbols row (so callers skip cleanly on legacy
+    batches). The keys match the Phase E aggregate names so they are directly
+    comparable to the persisted ``llm_health`` counters.
+    """
+    if not batch_id:
+        return {}
+    try:
+        rows = repo.list_ga_decisions_for_batch(batch_id)
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+    # Expected denominator from the batch row (the authoritative enabled set).
+    enabled_symbols: list[str] = []
+    try:
+        batch_row = repo.get_analysis_batch(batch_id)
+        if batch_row is not None:
+            enabled_symbols = list(batch_row.get("enabled_symbols") or [])
+    except Exception:
+        enabled_symbols = []
+
+    covered: set[str] = set()
+    expected = 0
+    attempted = 0
+    provider_calls = 0
+    success = 0
+    failed = 0
+    budget_skip = 0
+    breaker_skip = 0
+    policy_skip = 0
+    repair = 0
+    retry_calls = 0
+    fallback_reasons: dict[str, int] = {}
+
+    _BUDGET_SKIP = {"symbol_timeout", "batch_deadline_skipped"}
+    _BREAKER_SKIP = {"breaker_skipped"}
+    _REPAIR = {"schema_repaired"}
+    # 07-10 P1-2 (terminal review): keep this set in lock-step with the
+    # production ``_LLM_POLICY_SKIP_TERMINAL_REASONS`` (controller.py). The
+    # fair coordinator's ``single_flight_skipped`` / ``missing_snapshot``
+    # terminal reasons are LEGITIMATE upstream policy skips (pcc=0,
+    # llm_status="skipped"); without this membership they would land in the
+    # coverage diagnostic's unexplained residual and false-fire as a
+    # silent-drop defect. See ``_policy_skip_result`` in llm_fair_scheduler.
+    _POLICY_SKIP = {"llm_disabled", "single_flight_skipped", "missing_snapshot"}
+
+    for row in rows:
+        row_symbol = row.get("symbol")
+        raw = row.get("raw_decision_json")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        if not row_symbol and isinstance(raw.get("symbol"), str):
+            row_symbol = raw.get("symbol")
+        if isinstance(row_symbol, str) and row_symbol:
+            covered.add(row_symbol)
+        if enabled_symbols:
+            pass
+        else:
+            expected += 1
+        status = str(raw.get("llm_status") or "").lower()
+        pcc = int(raw.get("llm_provider_call_count") or 0)
+        terminal = str(raw.get("llm_terminal_reason") or "")
+        attempt_count = int(raw.get("llm_attempt_count") or 0)
+        fallback = str(raw.get("llm_fallback_reason") or "")
+        provider_calls += pcc
+        if pcc >= 1:
+            attempted += 1
+        if status == "ok":
+            success += 1
+        elif status == "failed":
+            failed += 1
+        if terminal in _REPAIR:
+            repair += 1
+        if terminal in _BUDGET_SKIP:
+            budget_skip += 1
+        if terminal in _BREAKER_SKIP:
+            breaker_skip += 1
+        if pcc == 0 and status != "failed":
+            if terminal in _POLICY_SKIP or not terminal:
+                policy_skip += 1
+        if attempt_count > 1:
+            retry_calls += attempt_count - 1
+        if fallback:
+            fallback_reasons[fallback] = fallback_reasons.get(fallback, 0) + 1
+
+    if enabled_symbols:
+        expected = len(enabled_symbols)
+        worker_failed = len(set(enabled_symbols) - covered)
+    else:
+        worker_failed = 0
+    coverage = round(attempted / expected, 3) if expected else 0.0
+    dominant_reason = ""
+    if fallback_reasons:
+        dominant_reason = max(fallback_reasons, key=fallback_reasons.get)
+    return {
+        "expected_symbols": expected,
+        "llm_symbols_attempted": attempted,
+        "llm_physical_provider_calls": provider_calls,
+        "llm_symbols_success": success,
+        "llm_symbols_failed": failed,
+        "llm_symbols_worker_failed": worker_failed,
+        "llm_budget_skip_count": budget_skip,
+        "llm_breaker_skip_count": breaker_skip,
+        "llm_policy_skip_count": policy_skip,
+        "llm_repair_count": repair,
+        "llm_retry_calls": retry_calls,
+        "llm_first_attempt_coverage": coverage,
+        "llm_coverage_degraded": bool(expected and coverage < 1.0),
+        "dominant_llm_fallback_reason": dominant_reason,
+    }
