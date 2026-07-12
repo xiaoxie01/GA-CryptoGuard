@@ -12,7 +12,7 @@ import requests
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.utils import latest_closed_close_time_ms
 
-BASE_URL = "https://fapi.binance.com"
+BASE_URL = "https://bnapi.01010909.xyz"
 _SYMBOL_CACHE: set[str] | None = None
 LOGGER = get_logger("crypto_guard.binance")
 _HTTP = requests.Session()
