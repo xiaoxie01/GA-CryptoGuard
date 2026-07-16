@@ -36,7 +36,7 @@ def resolve_report_target(repo: CryptoGuardRepository, payload: dict[str, Any] |
     return repo.latest_feishu_target()
 
 
-def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, expected_batch_id: str | None = None, report_hour_utc: str | None = None, expected_analysis_time: int | None = None, receive_id: str | None = None, receive_id_type: str | None = None) -> dict[str, Any]:
+def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, expected_batch_id: str | None = None, report_hour_utc: str | None = None, expected_analysis_time: int | None = None, receive_id: str | None = None, receive_id_type: str | None = None, first_wait_utc: str | None = None, poll_sequence: int = 0) -> dict[str, Any]:
     # Check schema health first — pass repo.conn so a repo DB missing columns
     # is detected even when the default DB is healthy.
     schema = check_schema_health(conn=repo.conn)
@@ -76,22 +76,78 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     # Determine if we need a degraded report (FR-1)
     use_degraded = _should_use_degraded_report(batch_state)
 
-    if batch_state["incomplete"] and retry_count < max_retries:
+    # 07-13 R6-C (P0-4) + R7 (P1-2): capture the IMMUTABLE first-wait anchor
+    # the first time we observe the batch incomplete. It is carried UNCHANGED
+    # across every requeue so the deadline is anchored to the real first-wait
+    # wall-clock instant, NOT to however many fast-fired retries have run.
+    #
+    # R7-P1-2: the report MUST degrade ONLY after the REAL elapsed deadline
+    # expires. ``retry_count`` is a backstop CAP on the requeue loop, NOT a
+    # premature-degradation trigger. Pre-fix, when ``retry_count >= max_retries``
+    # the report fell through to the degraded branch even though the real
+    # deadline had not elapsed -- a fast-fired consumer (evidence §3.3) hit the
+    # count cap in ~20s and degraded a 9/10 live batch to 0/10. Now: while the
+    # batch is incomplete and the real deadline has NOT expired, ALWAYS requeue
+    # (never degrade). The count cap is enforced by CLAMPING the requeued
+    # retry_count at max_retries (it stops growing once the cap is reached), so
+    # the requeue loop is bounded but the real deadline -- not the count --
+    # decides when to degrade. Plan ref: production-incident-repair-plan-07-13.md
+    # §4 P0-4 item 5 + §7.6.
+    if first_wait_utc is None and batch_state["incomplete"]:
+        first_wait_utc = now
+
+    deadline_expired = _report_deadline_expired(
+        first_wait_utc, timeout_seconds=retry_budget["timeout_seconds"],
+    )
+    # P0-4.5 / R7-P1-2: while the batch is incomplete and the REAL deadline
+    # has NOT expired, keep requeuing regardless of retry_count (the count cap
+    # is applied by clamping the requeued count at max_retries above). Degraded
+    # renders ONLY after the real deadline expires, reading the LIVE count from
+    # batch_symbol_status so a 9/10 running batch shows 9/10, never a premature
+    # 0/10.
+    if batch_state["incomplete"] and not deadline_expired:
         # Re-enqueue self with delay; worker is freed immediately.
         from datetime import timedelta as _td
         scheduled_at = (datetime.now(timezone.utc) + _td(seconds=poll_interval)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # FR-2: identity chain — pin to the original expected batch and hour
-        session_id = f"hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{retry_count + 1}"
+        # R7-P1-2: clamp the requeued retry_count at max_retries so the count
+        # backstop bounds the requeue loop WITHOUT triggering early
+        # degradation. The count stops growing once it reaches the cap; the
+        # real deadline remains the sole degradation gate.
+        next_retry_count = min(retry_count + 1, max_retries)
+        # R8-B (P0-1): an INDEPENDENT monotonic ``poll_sequence`` carried in the
+        # retry payload. Pre-R8-B, ``session_id`` was pinned to
+        # ``next_retry_count`` alone; at the count cap (10) the id stopped
+        # changing, so ``enqueue_job_once`` returned the EXISTING ``running``
+        # retry-10 job id and created NO new pending successor -- the retry
+        # chain broke (a running retry-10 that eventually succeeded left the
+        # queue empty, so the real deadline arrived with no report pushed).
+        # ``poll_sequence`` is bumped every requeue independent of the count
+        # clamp, so the ``(retry_count, poll_sequence)`` pair is strictly
+        # monotonic and the successor can never collide with the currently-
+        # running job. Default 0 covers the legacy/first-payload case where the
+        # incoming payload carries no ``poll_sequence``.
+        next_poll_sequence = int(poll_sequence or 0) + 1
+        # FR-2: identity chain — pin to the original expected batch and hour.
+        # R8-B: include ``poll_sequence`` so the id is unique every requeue,
+        # even at the count cap.
+        session_id = f"hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{next_retry_count}:{next_poll_sequence}"
         retry_payload: dict[str, Any] = {
-            "retry_count": retry_count + 1,
+            "retry_count": next_retry_count,
             "expected_batch_id": expected_batch_id,
             "report_hour_utc": report_hour_utc,
             "expected_analysis_time": expected_analysis_time,
+            # P0-4.4: immutable first-wait/deadline anchor, carried UNCHANGED
+            # across requeues so fast-fired retries cannot exhaust the budget
+            # before the real elapsed deadline.
+            REPORT_DEADLINE_ANCHOR_FIELD: first_wait_utc,
+            # R8-B (P0-1): carry the bumped poll_sequence so the next requeue is
+            # also unique (never re-collides at the count cap).
+            "poll_sequence": next_poll_sequence,
         }
         if receive_id:
             retry_payload["receive_id"] = receive_id
             retry_payload["receive_id_type"] = receive_id_type or "chat_id"
-        repo.enqueue_job_once(
+        successor_id = repo.enqueue_job_once(
             "hourly_feishu_report",
             priority=3,
             source="hourly_report_requeue",
@@ -99,13 +155,64 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
             payload=retry_payload,
             scheduled_at=scheduled_at,
         )
+        # R8-B (P0-1) fail-closed guard: ``enqueue_job_once`` returns an EXISTING
+        # id when ``(job_type, session_id)`` already exists with status
+        # pending/running/success. With the monotonic ``poll_sequence`` this
+        # branch is UNREACHABLE in production (the successor id is always a
+        # fresh, never-seen session_id). But if a successor WERE ever returned
+        # as the currently-running job (identity collision / replay), the chain
+        # would silently break exactly as pre-R8-B -- so surface it as a
+        # structured unrecoverable error instead of returning a green-looking
+        # ``batch_incomplete_requeued``. The operator sees the collision.
+        _succ_row = repo.conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=?", (int(successor_id),),
+        ).fetchone()
+        if _succ_row is not None and _succ_row["status"] == "running":
+            LOGGER.error(
+                "hourly_report: retry_successor_collision batch=%s session_id=%s "
+                "successor_id=%s returned a running job (identity collision) -- "
+                "the retry chain cannot continue. next_retry_count=%s "
+                "next_poll_sequence=%s",
+                expected_batch_id, session_id, successor_id, next_retry_count,
+                next_poll_sequence,
+            )
+            return {
+                "ok": False,
+                "error": "retry_successor_collision",
+                "retry_count": next_retry_count,
+                "poll_sequence": next_poll_sequence,
+                "batch_id": expected_batch_id,
+                "generated_at_utc": now,
+                REPORT_DEADLINE_ANCHOR_FIELD: first_wait_utc,
+            }
         return {
             "ok": False,
             "error": "batch_incomplete_requeued",
-            "retry_count": retry_count + 1,
+            "retry_count": next_retry_count,
+            "poll_sequence": next_poll_sequence,
             "batch_id": expected_batch_id,
             "generated_at_utc": now,
+            REPORT_DEADLINE_ANCHOR_FIELD: first_wait_utc,
         }
+
+    # P0-4.5 / R7-P1-2: the batch is still incomplete AND the REAL deadline
+    # has expired -> render the degraded report. The retry_count backstop no
+    # longer triggers degradation on its own (R7-P1-2): an incomplete batch
+    # whose real deadline has NOT expired stays in the requeue loop above
+    # regardless of how high retry_count climbed. The degraded renderer reads
+    # the LIVE count from batch_symbol_status (e.g. 9/10), never the empty
+    # write-side completed_symbols_json column (evidence §3.1). A premature
+    # 0/10 is no longer possible because the gate is the real elapsed deadline.
+    if batch_state["incomplete"]:
+        LOGGER.warning(
+            "hourly_report: batch %s still incomplete after deadline "
+            "(first_wait_utc=%s, retry_count=%s/%s) -> degraded report with "
+            "live count %s/%s",
+            expected_batch_id, first_wait_utc, retry_count, max_retries,
+            batch_state.get("completed_count", 0), batch_state.get("total_count", 0),
+        )
+        degraded_state = {**batch_state, "status": "timeout_degraded"}
+        return _render_degraded_report(repo, now, degraded_state, report_hour_utc, expected_batch_id)
 
     # FR-1: degraded report path — no historical signals/analysis_states/ga_decisions
     if use_degraded:
@@ -383,6 +490,75 @@ def _compute_retry_budget(gate_cfg: dict[str, Any]) -> dict[str, Any]:
 
     max_retries = ceil(timeout_seconds / poll_interval_seconds)
     return {"max_retries": max_retries, "timeout_seconds": timeout_seconds, "poll_interval_seconds": poll_interval_seconds}
+
+
+# 07-13 R6-C (P0-4): the report retry deadline MUST be derived from an
+# IMMUTABLE first-wait timestamp + the fair-scheduler SLA, NOT from
+# ``retry_count`` alone. Evidence §3.3: a nominal 300-second report wait was
+# exhausted in ~20 seconds because the Redis consumer fired retries every ~2s
+# (claiming by id, ignoring scheduled_at) instead of every configured 30s, so
+# ``retry_count`` hit ``max_retries`` (=ceil(300/30)=10) long before the real
+# elapsed deadline expired -- producing a premature degraded 0/10 report on a
+# batch that was 9/10 live (evidence §3.1, Batch-508).
+#
+# The anchor is the UTC ISO timestamp captured the FIRST time the report
+# observed the batch incomplete and re-enqueued itself. It is carried UNCHANGED
+# across every requeue (never refreshed), so the deadline is anchored to the
+# real first-wait wall-clock instant, not to however many fast-fired retries
+# have run. The retry gate becomes: requeue only while the batch is incomplete
+# AND the real deadline has NOT expired AND retry_count < max_retries (the
+# count stays as a backstop cap so a runaway requeue loop can never exceed
+# max_retries iterations). Degraded renders only after the REAL deadline.
+REPORT_DEADLINE_ANCHOR_FIELD = "first_wait_utc"
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp (``...Z`` or ``+00:00``) into an aware
+    ``datetime``. Returns ``None`` on any parse failure so callers can treat a
+    missing/malformed anchor as "no anchor" (fail open to the retry_count
+    backstop) rather than crashing the report path.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _report_deadline_expired(first_wait_utc: str | None, *, timeout_seconds: int) -> bool:
+    """07-13 R6-C (P0-4): has the REAL elapsed deadline expired?
+
+    Returns True when ``now - first_wait_utc >= timeout_seconds`` -- i.e. the
+    fair-scheduler SLA window has actually elapsed since the immutable first
+    wait, regardless of how many fast-fired retries ran in between. Returns
+    False when the anchor is missing/malformed (the retry_count backstop still
+    caps the loop) or the window has not yet elapsed.
+
+    Plan ref: production-incident-repair-plan-07-13.md §4 P0-4.4-4.5, §7.6.
+    """
+    anchor = _parse_iso_utc(first_wait_utc)
+    if anchor is None:
+        # No anchor -> cannot prove the deadline expired -> do NOT degrade on
+        # this signal alone (the retry_count < max_retries backstop still gates).
+        return False
+    try:
+        timeout = int(timeout_seconds)
+    except Exception:
+        return False
+    if timeout <= 0:
+        # timeout_seconds == 0 means "immediate degraded, no retries" (mirrors
+        # _compute_retry_budget's max_retries=0 branch). An expired/immediate
+        # deadline is True.
+        return True
+    elapsed = (datetime.now(timezone.utc) - anchor).total_seconds()
+    return elapsed >= timeout
 
 
 def _should_use_degraded_report(batch_state: dict[str, Any]) -> bool:

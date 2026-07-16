@@ -72,6 +72,13 @@ LLM_ERROR_CATEGORIES = (
     "llm_subprocess_cleanup_failed",
     "llm_subprocess_response_oversized",
     "llm_subprocess_start_failed",
+    # 07-13 R6-D (P0-3.5 / §7.9): the model produced content but ran out of
+    # output budget mid-JSON (stop_reason=max_tokens). A DISTINCT terminal
+    # reason from a generic parse failure and from infrastructure errors so
+    # it cannot open the breaker (see ``_BREAKER_INFRA_REASONS``). A truncated
+    # Attempt 1 is retryable: a strict/minimal JSON retry inside the same
+    # per-symbol deadline often fits the budget (P0-3.6).
+    "llm_output_truncated",
 )
 
 LLM_ERROR_STAGES = ("call", "parse", "schema", "semantic", "retry_exhausted")
@@ -80,12 +87,16 @@ LLM_ERROR_STAGES = ("call", "parse", "schema", "semantic", "retry_exhausted")
 # a tool-call-only turn typically recovers on a strict-JSON retry that
 # forbids tools (see ``_call_ga_llm`` post-07-09-overtrigger - no placeholder
 # tool is injected for JSON-only market-decision prompts).
+# 07-13 R6-D: ``llm_output_truncated`` is retryable -- a strict/minimal JSON
+# retry (smaller prompt / no optional sections) often fits the output budget
+# inside the same per-symbol deadline (P0-3.6).
 _RETRYABLE_CATEGORIES = frozenset({
     "llm_transport_error",
     "llm_rate_limited",
     "llm_empty_response",
     "llm_json_parse_failed",
     "llm_tool_call_no_text",
+    "llm_output_truncated",
 })
 _NON_RETRYABLE_CATEGORIES = frozenset({
     "llm_config_error",
@@ -500,6 +511,76 @@ def _classify_llm_failure(exc: BaseException | None, raw: str | None, stage: str
 
     # Fallback
     return "llm_transport_error"
+
+
+# ---------------------------------------------------------------------------
+# 07-13 R6-D (P0-3.5 / §7.9): truncation taxonomy + breaker isolation.
+#
+# A provider response that hit the output-token cap (``stop_reason=max_tokens``
+# / ``finish_reason=length`` / ``max_output``) is a STRUCTURED terminal reason
+# (``llm_output_truncated``), NOT a generic parse failure and NOT an
+# infrastructure breaker input. The model produced content -- it simply ran out
+# of output budget mid-JSON -- so it is isolated from the breaker: one symbol's
+# truncation cannot breaker-skip the remaining symbols (AC8). A truncated
+# Attempt 1 may strict/minimal retry within the same per-symbol deadline; the
+# ``_RETRYABLE_CATEGORIES`` membership below makes that the default, and the
+# ``_NON_RETRYABLE`` / ``_terminal_reason_for`` map in the coordinator stops at
+# a deterministic fallback when the deadline is exhausted.
+# ---------------------------------------------------------------------------
+
+# stop_reason / finish_reason tokens the provider emits when the output hit the
+# max_output_tokens cap. All map to ``llm_output_truncated``. Lowercased and
+# matched as substrings so a gateway-wrapped ``"stop_reason=max_tokens"`` or an
+# OpenAI-style ``"finish_reason":"length"`` both classify the same way.
+_TRUNCATION_STOP_TOKENS = (
+    "max_tokens",
+    "max_output",
+    "length",
+)
+
+
+def _classify_stop_reason(stop_reason: str | None) -> str | None:
+    """Map a provider ``stop_reason`` / ``finish_reason`` to a structured
+    terminal reason.
+
+    07-13 R6-D (P0-3.5 / §7.9): ``stop_reason=max_tokens`` (and the
+    OpenAI-style ``finish_reason=length`` / gateway ``max_output`` variants)
+    classify as ``llm_output_truncated`` -- the model produced content but ran
+    out of output budget mid-JSON. This is a DISTINCT terminal reason from a
+    generic parse failure (``llm_json_parse_failed``) and from infrastructure
+    errors (transport / empty / config), so one symbol's truncation cannot
+    open the breaker and skip the remaining symbols (AC8).
+
+    Returns ``None`` for a non-truncation stop reason (e.g. ``stop``,
+    ``tool_use``, ``end_turn``) so the caller falls through to the normal
+    parse / classify path.
+    """
+    if not stop_reason:
+        return None
+    sr = str(stop_reason).strip().lower()
+    if not sr:
+        return None
+    for tok in _TRUNCATION_STOP_TOKENS:
+        if tok in sr:
+            return "llm_output_truncated"
+    return None
+
+
+# The categories that open the infrastructure circuit breaker (llm_breaker.py
+# ``record_attempt``): transport / empty / tool-call-no-text drive the
+# consecutive-infra path (llm_breaker.py:149), ``llm_config_error`` opens
+# immediately (:137), and ``llm_rate_limited`` drives the rate-window open
+# (:160-170). Schema / format / truncation failures are EXPLICITLY ABSENT --
+# they are model-output problems for the symbol, not gateway health signals,
+# so they cannot breaker-skip unrelated symbols (AC8). This set is the
+# authoritative source consulted by diagnostics/tests to assert the isolation.
+_BREAKER_INFRA_REASONS = frozenset({
+    "llm_transport_error",
+    "llm_empty_response",
+    "llm_tool_call_no_text",
+    "llm_config_error",
+    "llm_rate_limited",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -1130,18 +1211,45 @@ def _run_single_llm_attempt(
         raw = _call_ga_llm(prompt)
         candidate = _parse_json_object(raw)
     except json.JSONDecodeError as exc:
-        category = _classify_llm_failure(exc, raw, "parse")
-        error_str = str(exc)[:300]
-        stage = "parse"
+        # 07-13 R6-D (P0-3.5 / §7.9): a truncated response (the provider hit
+        # max_output_tokens mid-JSON -> incomplete JSON -> JSONDecodeError)
+        # MUST classify as ``llm_output_truncated``, NOT a generic
+        # ``llm_json_parse_failed``. The provider WROTE content; it ran out of
+        # output budget. ``llm_output_truncated`` is retryable (strict/minimal
+        # JSON retry) and isolated from the breaker (AC8) so one symbol's
+        # truncation cannot skip the remaining symbols. Probe the thread-local
+        # stop_reason captured by ``_call_ga_llm`` (max_tokens / length).
+        _sr = _llm_call_effective_snapshot().get("stop_reason")
+        _trunc = _classify_stop_reason(_sr)
+        if _trunc is not None:
+            category = _trunc
+            error_str = f"truncated JSON output; stop_reason={_sr} ({str(exc)[:200]})"
+            stage = "parse"
+        else:
+            category = _classify_llm_failure(exc, raw, "parse")
+            error_str = str(exc)[:300]
+            stage = "parse"
         candidate = None
     except ValueError as exc:
         err_msg = str(exc)[:300]
-        if "not a JSON object" in err_msg:
+        # 07-13 R6-D (P0-3.5 / §7.9): a truncated response may parse to a
+        # scalar / fragment (``not a JSON object``) rather than a clean
+        # JSONDecodeError -- still reclassify as ``llm_output_truncated`` when
+        # the provider's stop_reason confirms the output cap was hit.
+        _sr_v = _llm_call_effective_snapshot().get("stop_reason")
+        _trunc_v = _classify_stop_reason(_sr_v)
+        if _trunc_v is not None:
+            category = _trunc_v
+            error_str = f"truncated JSON output; stop_reason={_sr_v} ({err_msg[:200]})"
+            stage = "parse"
+        elif "not a JSON object" in err_msg:
             category = "llm_json_parse_failed"
+            error_str = err_msg
+            stage = "schema"
         else:
             category = "llm_schema_validation_failed"
-        error_str = err_msg
-        stage = "schema"
+            error_str = err_msg
+            stage = "schema"
         candidate = None
     except RuntimeError as exc:
         # 07-10 S4 (P0 #3) + R4-P0-2: a subprocess FATAL error is TERMINAL
@@ -1205,6 +1313,10 @@ def _run_single_llm_attempt(
         attempt_meta["llm_effective_thinking_budget_tokens"] = _failed_effective.get("effective_thinking_budget_tokens")
         attempt_meta["llm_effective_max_output_tokens"] = _failed_effective.get("effective_max_output_tokens")
         attempt_meta["llm_effective_temperature"] = _failed_effective.get("effective_temperature")
+        # 07-13 R6-D (P0-3.4): persist the provider's stop_reason so a
+        # truncation (max_tokens) is auditable on the decision row / Phase F
+        # diagnostics, distinct from a parse failure.
+        attempt_meta["llm_stop_reason"] = _failed_effective.get("stop_reason")
         attempt_meta["llm_status"] = "failed"
         attempt_meta["llm_error_category"] = category
         attempt_meta["llm_error_stage"] = stage
@@ -1226,6 +1338,7 @@ def _run_single_llm_attempt(
     attempt_meta["llm_effective_thinking_budget_tokens"] = _effective.get("effective_thinking_budget_tokens")
     attempt_meta["llm_effective_max_output_tokens"] = _effective.get("effective_max_output_tokens")
     attempt_meta["llm_effective_temperature"] = _effective.get("effective_temperature")
+    attempt_meta["llm_stop_reason"] = _effective.get("stop_reason")
 
     unwrapped_candidate, unwrap_changed = _unwrap_wrapped_decision(candidate)
     if unwrapped_candidate is None:
@@ -1843,6 +1956,7 @@ def _llm_call_state_reset() -> None:
         "prompt_bytes", "continuity_included",
         "provider_timeout_seconds",
         "subprocess_hard_timeout",
+        "stop_reason",
     ):
         if hasattr(_llm_call_state, attr):
             delattr(_llm_call_state, attr)
@@ -1859,7 +1973,7 @@ def _llm_call_effective_snapshot() -> dict[str, Any]:
     for attr in (
         "latency_ms", "effective_thinking_budget_tokens",
         "effective_max_output_tokens", "effective_temperature",
-        "effective_thinking_type",
+        "effective_thinking_type", "stop_reason",
     ):
         if hasattr(_llm_call_state, attr):
             out[attr] = getattr(_llm_call_state, attr)
@@ -1934,11 +2048,34 @@ def _resolve_generation_config() -> dict[str, Any]:
         gen = {}
     if not isinstance(gen, dict):
         gen = {}
+    # 07-13 R6-D (P0-3) + R7 (P1-1): safe defaults MUST be a valid pair --
+    # thinking strictly less than max_output, AND the structured-answer reserve
+    # (max_output - thinking) at least ``min_structured_answer_tokens``. The
+    # pre-fix defaults (max_output=4096, thinking=6000) violated the contract
+    # and truncated output at 4096 tokens (stop_reason=max_tokens).
+    # ``config/loader.py`` enforces both invariants at load time; these
+    # defaults are the fallback when the generation segment is absent.
+    max_out = int(gen.get("max_output_tokens", 8192))
+    think = int(gen.get("thinking_budget_tokens", 2048))
+    min_reserve = int(gen.get("min_structured_answer_tokens", 4096))
+    if think > 0 and think >= max_out:
+        # Defense in depth: the loader already rejects this, but a caller
+        # building a minimal config dict in-process (bypassing the loader
+        # validator) must not silently get a truncating pair. Disable
+        # extended thinking so the answer reserve is the full max_output.
+        think = 0
+    if think > 0 and (max_out - think) < min_reserve:
+        # Defense in depth for the reserve-minimum invariant (plan P0-3 item
+        # 1 / AC6). A caller bypassing the loader validator must not silently
+        # get a below-floor reserve. Disable thinking so the full max_output
+        # is the answer reserve.
+        think = 0
     return {
         "max_prompt_bytes": int(gen.get("max_prompt_bytes", 48 * 1024)),
         "target_prompt_bytes": int(gen.get("target_prompt_bytes", 32 * 1024)),
-        "max_output_tokens": int(gen.get("max_output_tokens", 4096)),
-        "thinking_budget_tokens": int(gen.get("thinking_budget_tokens", 6000)),
+        "max_output_tokens": max_out,
+        "thinking_budget_tokens": think,
+        "min_structured_answer_tokens": min_reserve,
         "temperature": float(gen.get("temperature", 0.2)) if gen.get("temperature") is not None else 0.2,
     }
 
@@ -2298,7 +2435,18 @@ def _llm_subprocess_target(
             "effective_thinking_budget_tokens": getattr(session, "thinking_budget_tokens", None),
             "effective_max_output_tokens": getattr(session, "max_tokens", None),
             "effective_temperature": getattr(session, "temperature", None),
+            # 07-13 R6-D (P0-3.4): relay the provider's stop_reason so the
+            # parent can classify a truncated response (max_tokens) as
+            # ``llm_output_truncated``. Probe the same attrs the in-process
+            # path uses; OpenAI-style gateways expose ``finish_reason``.
         }
+        _child_sr = None
+        for _sr_attr in ("last_stop_reason", "stop_reason", "last_finish_reason", "finish_reason"):
+            _v = getattr(session, _sr_attr, None)
+            if _v:
+                _child_sr = str(_v)
+                break
+        effective["stop_reason"] = _child_sr
         # 07-10 R4-P1-3: size-check the raw response BEFORE it crosses IPC.
         # ``_send_subprocess_payload`` measures the raw response's UTF-8 byte
         # length and, if it exceeds ``DEFAULT_MAX_SUBPROCESS_RESPONSE_BYTES``,
@@ -2820,6 +2968,19 @@ def _call_ga_llm(prompt: str) -> str:
     # leftover tools from a prior call, clear them.
     if hasattr(session, "tools"):
         session.tools = []
+    # 07-13 R6-F (P1-2): mark this JSON-only session as tool-free-by-intent so
+    # ``NativeClaudeSession.raw_ask`` suppresses the ``[ERROR] No tools
+    # provided for this session.`` diagnostic it would otherwise print on
+    # every market-decision call. Per repair-plan §5 P1-2: "make tool
+    # requirement explicit per session" rather than emitting an ERROR for an
+    # expected no-tools mode. Never restore a placeholder tool.
+    if hasattr(session, "tools_optional"):
+        session.tools_optional = True
+    else:
+        try:
+            setattr(session, "tools_optional", True)
+        except Exception:
+            pass
     # 07-10 R2-1: thread the per-symbol deadline's provider timeout into the
     # session so the provider call is actually bounded. The timeout is passed
     # through the thread-local ``_llm_call_state.provider_timeout_seconds``
@@ -2930,6 +3091,26 @@ def _call_ga_llm(prompt: str) -> str:
             _llm_call_state.effective_temperature = (
                 getattr(session, "temperature", None)
             )
+        # 07-13 R6-D (P0-3.5 / §7.9): capture the provider's stop_reason /
+        # finish_reason so a truncated JSON response (stop_reason=max_tokens)
+        # classifies as ``llm_output_truncated`` instead of a generic
+        # ``llm_json_parse_failed``. The provider WROTE content -- it ran out
+        # of output budget mid-JSON -- so this is a model-output defect for
+        # THIS symbol, isolated from the breaker (AC8). Probe the same attrs
+        # the empty-response path uses (``last_stop_reason`` /
+        # ``stop_reason`` / ``last_finish_reason``) plus the OpenAI-style
+        # ``finish_reason``. The subprocess path relays the child's stop_reason
+        # via ``_effective_out`` (see ``_llm_subprocess_target``).
+        _sr_val = None
+        if _used_subprocess:
+            _sr_val = _effective_out.get("stop_reason")
+        else:
+            for _sr_attr in ("last_stop_reason", "stop_reason", "last_finish_reason", "finish_reason"):
+                _v = getattr(session, _sr_attr, None)
+                if _v:
+                    _sr_val = str(_v)
+                    break
+        _llm_call_state.stop_reason = _sr_val
     if not raw.strip():
         # 07-09-overtrigger R5/R6: distinguish "gateway empty" (no HTTP
         # response at all) from "model called a (non-existent) tool with

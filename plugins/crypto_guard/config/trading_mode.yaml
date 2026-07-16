@@ -83,9 +83,30 @@ llm:
     target_prompt_bytes: 32768
     # Explicit output token limit for structured JSON synthesis. Replaces
     # the unbounded adaptive-thinking path.
-    max_output_tokens: 4096
+    # 07-13 R6-D (P0-3.2): raised from 4096 to 8192 so structured JSON has a
+    # non-empty answer reserve after the thinking budget. The pre-fix value
+    # (4096) was <= thinking_budget_tokens (6000), so the model spent the
+    # entire output budget on thinking and truncated the structured answer
+    # at exactly 4096 tokens (stop_reason=max_tokens).
+    max_output_tokens: 8192
     # Explicit thinking budget (tokens). 0 = extended thinking disabled.
-    thinking_budget_tokens: 6000
+    # 07-13 R6-D (P0-3.2): lowered from 6000 to 2048 so it is strictly less than
+    # max_output_tokens (8192), leaving a >= 6144-token structured-JSON
+    # reserve. ``_resolve_generation_config`` / the config loader reject a
+    # generation pair whose remaining structured-answer reserve
+    # (``max_output_tokens - thinking_budget_tokens``) is below
+    # ``min_structured_answer_tokens`` (and reject ``thinking >= max_output``
+    # outright), so this conflict cannot silently recur. Per plan P0-3 item 1
+    # and AC6: the structured-JSON reserve MUST stay at or above the configured
+    # minimum.
+    thinking_budget_tokens: 2048
+    # 07-13 R7 (P1-1): minimum structured-JSON answer reserve (tokens). When
+    # extended thinking is enabled (``thinking_budget_tokens > 0``), the loader
+    # rejects any pair where ``max_output_tokens - thinking_budget_tokens <
+    # min_structured_answer_tokens``. Production 8192/2048 leaves a 6144-token
+    # reserve, well above this floor. Plan ref: production-incident-repair-plan-
+    # 07-13.md §4 P0-3 item 1 + AC6.
+    min_structured_answer_tokens: 4096
     # Low temperature for deterministic structured JSON output.
     temperature: 0.2
 

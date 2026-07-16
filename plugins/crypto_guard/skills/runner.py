@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +16,7 @@ from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 SKILL_VERSION = "1.0"
 SKILL_ROOT = Path(__file__).resolve().parent
+_LOGGER = logging.getLogger("crypto_guard.skills.runner")
 
 
 def _parse_yaml_simple(text: str) -> dict[str, Any]:
@@ -83,8 +85,23 @@ def execute_market_skills(
     candles: list[dict[str, Any]],
     analysis_time_utc: int,
     previous_analysis_state: dict[str, Any] | None = None,
+    skill_log_sink: list[Any] | None = None,
+    batch_id: str | None = None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
-    """Execute v2 dynamic skills with deterministic tools and persistent logs."""
+    """Execute v2 dynamic skills with deterministic tools and persistent logs.
+
+    07-14 R8 P2-NEW-1: LAYERED lifecycle. When ``skill_log_sink`` is provided
+    (the producer/Phase-1 path) each skill log is written ``commit_state=
+    'prepared'`` (immediate immutable audit) and the would-be feedback payload
+    is COLLECTED into the sink (NOT written) + stashed in the log's audit JSON
+    (contract #6). The producer then marks the logs ``committed`` and writes the
+    deferred feedback inside the Phase-2 COMMIT (contract #2), or marks them
+    ``aborted_unsealed`` on a seal failure with ZERO feedback (contract #3).
+    When ``skill_log_sink`` is None (legacy/direct path) the log is written
+    ``commit_state='committed'`` and feedback is written immediately (prior
+    behavior preserved, now that the dedup-bind bug is fixed).
+    """
 
     modules: dict[str, Any] = {}
     input_summary = {
@@ -93,8 +110,8 @@ def execute_market_skills(
         "closed_candles": len(candles),
         "previous_analysis_state_id": (previous_analysis_state or {}).get("id"),
     }
-    modules["price_action"] = _run_skill(repo, "price_action", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_price_action(candles, analysis_time_utc=analysis_time_utc, timeframe=timeframe))
-    modules["momentum"] = _run_skill(repo, "momentum", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_momentum(candles, analysis_time_utc=analysis_time_utc))
+    modules["price_action"] = _run_skill(repo, "price_action", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_price_action(candles, analysis_time_utc=analysis_time_utc, timeframe=timeframe), skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
+    modules["momentum"] = _run_skill(repo, "momentum", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_momentum(candles, analysis_time_utc=analysis_time_utc), skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
     modules["trend_stage"] = _run_skill(
         repo,
         "trend_stage",
@@ -103,10 +120,11 @@ def execute_market_skills(
         analysis_time_utc,
         input_summary,
         lambda: analyze_trend_stage(modules["price_action"], modules["momentum"], analysis_time_utc=analysis_time_utc),
+        skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id,
     )
-    modules["smc"] = _run_skill(repo, "smc_orderflow", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_smc(candles, modules["price_action"], analysis_time_utc=analysis_time_utc))
-    modules["order_flow"] = _run_skill(repo, "smc_orderflow", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_order_flow(candles, analysis_time_utc=analysis_time_utc))
-    modules["chanlun"] = _run_skill(repo, "chanlun", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_chanlun(candles, analysis_time_utc=analysis_time_utc))
+    modules["smc"] = _run_skill(repo, "smc_orderflow", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_smc(candles, modules["price_action"], analysis_time_utc=analysis_time_utc), skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
+    modules["order_flow"] = _run_skill(repo, "smc_orderflow", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_order_flow(candles, analysis_time_utc=analysis_time_utc), skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
+    modules["chanlun"] = _run_skill(repo, "chanlun", symbol, timeframe, analysis_time_utc, input_summary, lambda: analyze_chanlun(candles, analysis_time_utc=analysis_time_utc), skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
     for result in modules.values():
         result["deterministic_preprocessing"] = True
         result["geometry_authority"] = True
@@ -124,6 +142,9 @@ def _run_skill(
     tool_fn: Callable[[], dict[str, Any]],
     *,
     log_name: str | None = None,
+    skill_log_sink: list[Any] | None = None,
+    batch_id: str | None = None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
     tool_result = tool_fn()
     contract = _load_skill_contract(skill_name)
@@ -155,21 +176,55 @@ def _run_skill(
     effective_name = log_name or skill_name
     confidence = final.get("confidence")
 
-    log_id = repo.save_skill_execution_log(
-        skill_name=effective_name,
-        skill_version=SKILL_VERSION,
-        symbol=symbol,
-        timeframe=timeframe,
-        analysis_time=analysis_time_utc,
-        input_summary=input_summary,
-        tool_result=tool_result,
-        ga_interpretation=interpretation,
-        final_result=final,
-        confidence=confidence,
+    # 07-14 R8 P2-NEW-1: collect the would-be feedback WITHOUT writing it. On
+    # the producer/Phase-1 path (sink provided) the payload is deferred to the
+    # Phase-2 COMMIT and stashed into the audit JSON (contract #6); on the
+    # legacy/direct path it is written immediately.
+    feedback_payload = _collect_skill_feedback(
+        effective_name, symbol, timeframe, confidence, schema_errors, final,
     )
 
-    # Write feedback entry when confidence is low or schema errors detected
-    _maybe_write_skill_feedback(repo, effective_name, symbol, timeframe, confidence, schema_errors, final, log_id)
+    if skill_log_sink is not None:
+        # Producer/Phase-1 path: immutable audit row marked 'prepared'. The
+        # deferred feedback intent is stashed in the audit JSON so it is
+        # inspectable without polluting the active memory table (contract #6).
+        if feedback_payload is not None:
+            final["pending_feedback"] = feedback_payload
+        log_id = repo.save_skill_execution_log(
+            skill_name=effective_name,
+            skill_version=SKILL_VERSION,
+            symbol=symbol,
+            timeframe=timeframe,
+            analysis_time=analysis_time_utc,
+            input_summary=input_summary,
+            tool_result=tool_result,
+            ga_interpretation=interpretation,
+            final_result=final,
+            confidence=confidence,
+            commit_state="prepared",
+            batch_id=batch_id,
+            attempt_id=attempt_id,
+        )
+        # Hand (log_id, payload) to the producer; it writes the feedback inside
+        # the Phase-2 COMMIT (contract #2) or drops it on a seal failure (#3).
+        skill_log_sink.append((log_id, feedback_payload))
+    else:
+        # Legacy/direct path: log is immediately 'committed' and feedback is
+        # written now (prior behavior, now that the dedup-bind bug is fixed).
+        log_id = repo.save_skill_execution_log(
+            skill_name=effective_name,
+            skill_version=SKILL_VERSION,
+            symbol=symbol,
+            timeframe=timeframe,
+            analysis_time=analysis_time_utc,
+            input_summary=input_summary,
+            tool_result=tool_result,
+            ga_interpretation=interpretation,
+            final_result=final,
+            confidence=confidence,
+        )
+        if feedback_payload is not None:
+            _write_skill_feedback(repo, log_id, feedback_payload)
 
     return final
 
@@ -256,17 +311,21 @@ def _load_skill_contract(skill_name: str) -> dict[str, Any]:
     return contract
 
 
-def _maybe_write_skill_feedback(
-    repo: CryptoGuardRepository,
+def _collect_skill_feedback(
     skill_name: str,
     symbol: str,
     timeframe: str,
     confidence: float | None,
     schema_errors: list[str],
     result: dict[str, Any],
-    source_id: int,
-) -> None:
-    """Write lightweight feedback entry when skill output needs attention."""
+) -> dict[str, Any] | None:
+    """Collect the would-be feedback payload WITHOUT writing it.
+
+    07-14 R8 P2-NEW-1: split out of the old ``_maybe_write_skill_feedback`` so
+    the producer/Phase-1 path can DEFER the write to the Phase-2 COMMIT
+    (contract #2) while still stashing the intent in the audit JSON (contract
+    #6). Returns the feedback payload dict, or None when no finding fires.
+    """
     findings: list[str] = []
 
     # Low confidence threshold
@@ -289,18 +348,89 @@ def _maybe_write_skill_feedback(
             findings.append("late_stage_risk_active")
 
     if not findings:
-        return
+        return None
 
+    return {
+        "skill_name": skill_name,
+        "skill_version": SKILL_VERSION,
+        "feedback_type": "auto_analysis",
+        "source_type": "skill_execution",
+        "finding": f"[{symbol}/{timeframe}] {'; '.join(findings)}",
+        "suggested_adjustment": {"symbol": symbol, "timeframe": timeframe, "findings": findings},
+    }
+
+
+def _write_skill_feedback(
+    repo: CryptoGuardRepository,
+    source_id: int,
+    payload: dict[str, Any],
+    *,
+    strict: bool = False,
+) -> None:
+    """Persist a collected feedback payload pointing at ``source_id``.
+
+    07-14 R8 P2-NEW-1: the dedup-bind bug in ``save_skill_feedback_memory`` is
+    fixed, so this now actually persists on the auto_analysis path. Called from
+    the Phase-2 COMMIT (producer) and the legacy/direct path.
+
+    07-15 R9-P1a: ``strict`` selects the failure contract.
+      * ``strict=False`` (default -- the legacy/direct path and the
+        non-transactional callers): best-effort. An exception is LOGGED (never
+        silently swallowed -- R9-P1a forbids silent ``pass``) but does NOT
+        propagate, preserving prior behavior for callers that do not run
+        inside a transaction.
+      * ``strict=True`` (the producer Phase-2 COMMIT path): the exception is
+        RE-RAISED so it propagates into the caller's ``BEGIN IMMEDIATE`` ->
+        ``ROLLBACK``. The batch/snapshot/module/feedback all revert and the
+        prepared skill log is terminalized to ``aborted_unsealed``. A feedback
+        write is part of the atomic Phase-2 contract, so it MUST NOT be silently
+        dropped on the producer path.
+    """
     try:
         repo.save_skill_feedback_memory(
-            skill_name=skill_name,
-            skill_version=SKILL_VERSION,
-            feedback_type="auto_analysis",
-            source_type="skill_execution",
+            skill_name=payload["skill_name"],
+            skill_version=payload["skill_version"],
+            feedback_type=payload["feedback_type"],
+            source_type=payload["source_type"],
             source_id=source_id,
-            finding=f"[{symbol}/{timeframe}] {'; '.join(findings)}",
-            suggested_adjustment={"symbol": symbol, "timeframe": timeframe, "findings": findings},
+            finding=payload["finding"],
+            suggested_adjustment=payload.get("suggested_adjustment"),
         )
     except Exception:
-        # Feedback writing is non-critical; swallow errors silently
-        pass
+        if strict:
+            # Producer Phase-2 path: a feedback-write failure MUST propagate so
+            # the surrounding transaction rolls back and the prepared log is
+            # aborted. Re-raise the original exception.
+            raise
+        # Legacy/direct path: best-effort. Log so the failure is observable,
+        # but do NOT crash a non-transactional caller (prior behavior preserved
+        # -- only the silent ``pass`` is removed).
+        _LOGGER.exception(
+            "skills.runner: best-effort feedback write failed for source_id=%s "
+            "skill_name=%s (non-strict path; not propagated).",
+            source_id, payload.get("skill_name"),
+        )
+
+
+def _maybe_write_skill_feedback(
+    repo: CryptoGuardRepository,
+    skill_name: str,
+    symbol: str,
+    timeframe: str,
+    confidence: float | None,
+    schema_errors: list[str],
+    result: dict[str, Any],
+    source_id: int,
+) -> None:
+    """Legacy/direct-path convenience: collect + immediately write feedback.
+
+    07-14 R8 P2-NEW-1: retained for any caller that still drives
+    ``_run_skill`` without a sink (the non-producer path). The producer path
+    uses ``_collect_skill_feedback`` (defer) + ``_write_skill_feedback`` (commit)
+    so feedback lands inside the Phase-2 transaction.
+    """
+    payload = _collect_skill_feedback(
+        skill_name, symbol, timeframe, confidence, schema_errors, result,
+    )
+    if payload is not None:
+        _write_skill_feedback(repo, source_id, payload)

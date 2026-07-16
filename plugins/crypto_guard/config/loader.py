@@ -288,9 +288,57 @@ def _validate_llm_scheduling(trading_mode: dict[str, Any]) -> None:
             raise ValueError(
                 f"llm.generation.{key} 必须 >= {minimum}；got {val}"
             )
+    # 07-13 R7 (P1-1): ``min_structured_answer_tokens`` is OPTIONAL with a
+    # default of 4096 - legacy configs that predate the reserve-minimum
+    # contract still load and get the floor applied. When present it must be
+    # an integer (bool/float/str rejected) >= 0. Plan ref:
+    # production-incident-repair-plan-07-13.md §4 P0-3 item 1 + AC6.
+    _msa_raw = gen.get("min_structured_answer_tokens", 4096)
+    if isinstance(_msa_raw, bool) or not isinstance(_msa_raw, int):
+        raise ValueError(
+            f"llm.generation.min_structured_answer_tokens 必须是整数；got {_msa_raw!r}"
+        )
+    if _msa_raw < 0:
+        raise ValueError(
+            f"llm.generation.min_structured_answer_tokens 必须 >= 0；got {_msa_raw}"
+        )
     if gen.get("target_prompt_bytes") > gen.get("max_prompt_bytes"):
         raise ValueError(
             "llm.generation.target_prompt_bytes 必须 <= max_prompt_bytes"
+        )
+    # 07-13 R6-D (P0-3.1) + R7 (P1-1): when extended thinking is enabled
+    # (thinking_budget_tokens > 0), it MUST be strictly less than
+    # max_output_tokens so structured JSON has a non-empty answer reserve, AND
+    # the remaining structured-answer reserve
+    # (``max_output_tokens - thinking_budget_tokens``) MUST be at least
+    # ``min_structured_answer_tokens``. The pre-fix production config
+    # (thinking=6000, max_output=4096) let thinking consume the entire output
+    # budget, truncating the structured answer at exactly 4096 tokens
+    # (stop_reason=max_tokens). thinking=0 (disabled) is always allowed
+    # regardless of max_output (the whole max_output is the answer reserve).
+    # Plan ref: production-incident-repair-plan-07-13.md §4 P0-3 item 1 + AC6.
+    _think = int(gen.get("thinking_budget_tokens", 0) or 0)
+    _max_out = int(gen.get("max_output_tokens", 0) or 0)
+    _min_reserve = int(_msa_raw)
+    if _think > 0 and _think >= _max_out:
+        raise ValueError(
+            f"llm.generation.thinking_budget_tokens ({_think}) 必须 < "
+            f"max_output_tokens ({_max_out}) when thinking is enabled (>0); "
+            f"otherwise structured JSON has no answer reserve and output is "
+            f"truncated at max_output_tokens (stop_reason=max_tokens). "
+            f"Set thinking_budget_tokens=0 to disable extended thinking, or "
+            f"raise max_output_tokens above the thinking budget."
+        )
+    if _think > 0 and (_max_out - _think) < _min_reserve:
+        raise ValueError(
+            f"llm.generation structured-JSON reserve "
+            f"(max_output_tokens ({_max_out}) - thinking_budget_tokens "
+            f"({_think}) = {_max_out - _think}) must be >= "
+            f"min_structured_answer_tokens ({_min_reserve}) when thinking is "
+            f"enabled (>0); otherwise the model can spend the reserve on "
+            f"thinking and truncate the structured answer "
+            f"(stop_reason=max_tokens). Raise max_output_tokens, lower "
+            f"thinking_budget_tokens, or lower min_structured_answer_tokens."
         )
     temp = gen.get("temperature")
     if temp is not None:

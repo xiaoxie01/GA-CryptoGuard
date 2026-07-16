@@ -26,6 +26,56 @@ def _compute_initial_risk_usdt(order: dict[str, Any], entry_price: float) -> flo
         return None
 
 
+def validate_job_identity(jp: dict[str, Any]) -> str | None:
+    """R8-A (P0-2): the SHARED authoritative-symbol identity contract.
+
+    Returns the authoritative ``payload.symbol`` ONLY when the payload passes
+    the full identity contract; otherwise returns ``None`` (the caller
+    fail-closes). The contract is:
+
+      * ``jp`` is a mapping.
+      * ``jp["symbol"]`` is a non-empty string (the authoritative symbol).
+      * ``jp["snapshot"]`` is a mapping (a missing / non-dict snapshot is an
+        identity failure -- the job cannot prove which symbol its snapshot
+        describes -> fail closed).
+      * ``jp["snapshot"]["symbol"]`` is a non-empty string STRICTLY EQUAL to
+        ``jp["symbol"]``. A swapped / cross-symbol snapshot is corruption ->
+        fail closed.
+
+    Pre-R8 the seal only cross-checked ``payload.symbol == payload.snapshot.
+    symbol`` WHEN ``snapshot.symbol`` was present, so a MISSING snapshot (or a
+    snapshot with no symbol) SKIPPED the check and sealed successfully
+    (fail-open -- the user's in-memory ``seal_missing_snapshot=True`` repro).
+    The worker preferred ``snapshot.symbol`` over the authoritative
+    ``payload.symbol`` (cross-symbol corruption). This single helper is the
+    one source of truth wired into seal / claim / worker so the contract cannot
+    drift between them.
+
+    The helper returns the authoritative symbol (not just True/False) so the
+    caller (seal/claim) can build the enabled-set membership / cardinality
+    check from the SAME validated value the worker will use -- eliminating any
+    window where the worker could diverge from the seal/claim view.
+    """
+    if not isinstance(jp, dict):
+        return None
+    sym = jp.get("symbol")
+    if not isinstance(sym, str) or not sym:
+        return None
+    snap = jp.get("snapshot")
+    if not isinstance(snap, dict):
+        # A missing / non-dict snapshot cannot prove identity -> fail closed.
+        # Pre-R8 the seal skipped this check (the fail-open gap).
+        return None
+    snap_sym = snap.get("symbol")
+    if not isinstance(snap_sym, str) or not snap_sym:
+        # A snapshot with no symbol cannot prove identity -> fail closed.
+        return None
+    if snap_sym != sym:
+        # Swapped / cross-symbol snapshot -> corruption -> fail closed.
+        return None
+    return sym
+
+
 class CryptoGuardRepository:
     """Repository 层隔离所有 SQL，业务模块不直接拼 SQL。"""
 
@@ -402,6 +452,127 @@ class CryptoGuardRepository:
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
+    def seal_analysis_batch(self, batch_id: str) -> bool:
+        """07-13 R6-B (P0-1): seal a batch so it becomes claimable.
+
+        The producer calls this AFTER inserting every enabled-symbol job +
+        batch_symbol_status row. This method validates EXACT set equality:
+
+            job_symbols(batch_id) == batch_symbol_status(batch_id) == enabled_symbols
+
+        and only on success stamps ``claim_ready_at`` + ``sealed_at``. A batch
+        that is missing a symbol, has a duplicate, has a foreign (cross-batch)
+        symbol, or is otherwise malformed stays UNSEALED (claim_ready_at IS
+        NULL) so ``claim_next_batch`` skips it -- fail closed without claiming
+        a prefix.
+
+        Returns True if sealed; False if validation failed (batch stays
+        non-claimable). Idempotent: re-sealing an already-sealed batch whose
+        set still validates is a no-op (keeps the original sealed_at).
+
+        Plan ref: production-incident-repair-plan-07-13.md §4 P0-1.1-1.6.
+        """
+        row = self.conn.execute(
+            "SELECT enabled_symbols_json FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if not row:
+            # No batch row -- nothing to seal. The producer must call
+            # start_analysis_batch first. Fail closed.
+            return False
+        try:
+            enabled = json.loads(row["enabled_symbols_json"] or "[]")
+        except Exception:
+            enabled = []
+        enabled_set = set(enabled)
+        if not enabled_set:
+            # No enabled symbols declared -- nothing to seal. Fail closed.
+            return False
+        # 07-13 R7 (P0-1): job symbols are derived from the AUTHORITATIVE
+        # ``payload.symbol`` field, NOT from the ``<batch_id>:<symbol>`` prefix
+        # of ``session_id``. The production session_id format is
+        # ``system:scheduled:{interval}:{symbol}:{time}`` (cron_scheduler.py),
+        # which the legacy prefix-strip parser mangled into the full
+        # ``system:scheduled:...`` string and never matched the enabled set ->
+        # production batches never sealed. ``payload.symbol`` is format-
+        # independent and the single source of truth. We ALSO cross-check
+        # identity consistency: each job's ``payload.symbol`` MUST equal
+        # ``payload.snapshot.symbol`` (the snapshot it carries), and MUST be a
+        # member of ``enabled_set`` (a foreign/cross-batch symbol fails). A job
+        # whose ``payload.symbol`` is missing/mismatched fails the WHOLE batch
+        # closed -- no prefix is claimed.
+        job_rows = self.conn.execute(
+            """
+            SELECT session_id, payload_json
+            FROM agent_jobs
+            WHERE job_type='scheduled_market_analysis'
+              AND json_extract(payload_json, '$.batch_id')=?
+            """,
+            (str(batch_id),),
+        ).fetchall()
+        job_symbols_list: list[str] = []
+        for r in job_rows:
+            try:
+                jp = json.loads(r["payload_json"] or "{}")
+            except Exception:
+                # Malformed payload_json -> cannot prove identity -> fail closed.
+                return False
+            # 07-15 R8-A (P0-2): delegate to the SHARED identity contract. The
+            # helper requires ``payload.symbol`` be a non-empty string, the
+            # ``snapshot`` be a dict whose ``symbol`` is a non-empty string
+            # STRICTLY equal to ``payload.symbol``. Pre-R8 the seal only
+            # cross-checked snapshot consistency WHEN ``snapshot.symbol`` was
+            # present, so a MISSING snapshot / no-symbol snapshot SKIPPED the
+            # check and sealed (fail-open -- the user's in-memory
+            # ``seal_missing_snapshot=True`` repro). The shared helper makes a
+            # missing/no-symbol/swapped snapshot fail the WHOLE batch closed.
+            sym = validate_job_identity(jp)
+            if sym is None:
+                return False
+            # Identity consistency: the symbol MUST belong to this batch's
+            # enabled set (a foreign/cross-batch symbol pointing at this
+            # batch_id is corruption -> fail closed).
+            if sym not in enabled_set:
+                return False
+            job_symbols_list.append(sym)
+        job_symbols = set(job_symbols_list)
+        # batch_symbol_status symbols for this batch (list, to catch dups).
+        bss_rows = self.conn.execute(
+            "SELECT symbol FROM batch_symbol_status WHERE batch_id=?",
+            (batch_id,),
+        ).fetchall()
+        bss_symbols_list = [r["symbol"] for r in bss_rows]
+        bss_symbols = set(bss_symbols_list)
+        # EXACT set equality + cardinality (no duplicates, no missing, no
+        # foreign/cross-symbol). A duplicate job inflates len(job_symbols_list)
+        # above len(enabled) while the set still matches -- the cardinality
+        # check rejects it. A missing symbol fails the set check. A foreign
+        # symbol fails the set check (not in enabled).
+        if len(job_symbols_list) != len(enabled_set):
+            return False
+        if job_symbols != enabled_set:
+            return False
+        if len(bss_symbols_list) != len(enabled_set):
+            return False
+        if bss_symbols != enabled_set:
+            return False
+        # Idempotent: if already sealed, do not refresh the timestamp.
+        already = self.conn.execute(
+            "SELECT sealed_at FROM analysis_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if already and already["sealed_at"]:
+            return True
+        self.conn.execute(
+            """
+            UPDATE analysis_batches
+            SET sealed_at=CURRENT_TIMESTAMP, claim_ready_at=CURRENT_TIMESTAMP
+            WHERE batch_id=?
+            """,
+            (batch_id,),
+        )
+        return True
+
     def mark_batch_symbol_completed(self, *, batch_id: str, symbol: str, failed: bool = False, status: str | None = None) -> None:
         """Mark a symbol as completed/failed/pending for a batch.
 
@@ -652,11 +823,18 @@ class CryptoGuardRepository:
         return row["signal_grade"] if row else None
 
     def latest_skill_result_refs(self, symbol: str, analysis_time_utc: int) -> dict[str, int]:
+        # 07-14 R8 P2-NEW-1 (point 5 & 7): only 'committed'/'legacy_committed'
+        # skill logs are handed to the live SkillOrchestrator. A 'prepared'
+        # (in-flight Phase 1), 'aborted_unsealed' (seal failure), or 'aborted'
+        # (crash-recovered) audit row must NEVER point the orchestrator at a
+        # dead/failed tick. Legacy rows (NULL commit_state) read as
+        # legacy_committed (COALESCE) -- no production-history backfill.
         rows = self.conn.execute(
             """
             SELECT skill_name, MAX(id) AS id
             FROM skill_execution_logs
             WHERE symbol=? AND analysis_time=?
+              AND COALESCE(commit_state, 'legacy_committed') IN ('committed', 'legacy_committed')
             GROUP BY skill_name
             """,
             (symbol, int(analysis_time_utc)),
@@ -792,14 +970,24 @@ class CryptoGuardRepository:
         ga_interpretation: dict[str, Any],
         final_result: dict[str, Any],
         confidence: float | None = None,
+        commit_state: str = "committed",
+        batch_id: str | None = None,
+        attempt_id: int | None = None,
     ) -> int:
+        # 07-14 R8 P2-NEW-1: the layered lifecycle stamps commit_state at write
+        # time. Phase 1 writes 'prepared' (immediate immutable audit); Phase 2
+        # flips it to 'committed' (success) or 'aborted_unsealed' (seal failure).
+        # Legacy callers (default 'committed') preserve prior behavior so a NULL
+        # commit_state never appears from this path; old historical rows keep
+        # NULL and read as legacy_committed.
         self.conn.execute(
             """
             INSERT INTO skill_execution_logs(
                 skill_name, skill_version, symbol, timeframe, analysis_time,
-                input_summary_json, tool_result_json, ga_interpretation_json, final_result_json, confidence
+                input_summary_json, tool_result_json, ga_interpretation_json, final_result_json, confidence,
+                commit_state, batch_id, attempt_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 skill_name,
@@ -812,6 +1000,9 @@ class CryptoGuardRepository:
                 json.dumps(ga_interpretation, ensure_ascii=False),
                 json.dumps(final_result, ensure_ascii=False),
                 confidence,
+                commit_state,
+                batch_id,
+                attempt_id,
             ),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
@@ -831,7 +1022,12 @@ class CryptoGuardRepository:
         suggested_adjustment: dict[str, Any] | None = None,
         status: str = "candidate",
     ) -> int:
-        # Dedup: skip auto_analysis if same (skill_name, finding) written in last 24h
+        # Dedup: skip auto_analysis if same (skill_name, feedback_type, finding) written in last 24h.
+        # 07-14 R8 P2-NEW-1 prerequisite: the SELECT has THREE placeholders
+        # (skill_name, feedback_type, finding) but historically bound only two
+        # -> sqlite3.ProgrammingError (swallowed by _maybe_write_skill_feedback's
+        # broad except) -> auto_analysis feedback NEVER persisted. Fixed to bind
+        # all three so the deferred-feedback-write contract is observable.
         if feedback_type == "auto_analysis":
             existing = self.conn.execute(
                 """
@@ -840,7 +1036,7 @@ class CryptoGuardRepository:
                   AND created_at > datetime('now', '-1 day')
                 LIMIT 1
                 """,
-                (skill_name, finding),
+                (skill_name, feedback_type, finding),
             ).fetchone()
             if existing:
                 return int(existing["id"])
@@ -1268,6 +1464,10 @@ class CryptoGuardRepository:
             WHERE job_type='scheduled_market_analysis'
               AND status='pending'
               AND datetime(scheduled_at) <= datetime('now')
+              AND json_extract(payload_json, '$.batch_id') IN (
+                  SELECT batch_id FROM analysis_batches
+                  WHERE claim_ready_at IS NOT NULL
+              )
             ORDER BY priority ASC, scheduled_at ASC, id ASC
             LIMIT 1
             """
@@ -1283,23 +1483,184 @@ class CryptoGuardRepository:
             # A scheduled_market_analysis job without a batch_id is a legacy
             # pre-batch job; leave it for the serial claim_next_job path.
             return None
-        # S3 (P0 #4): unique ownership token per claim. Stamped on every row
-        # this claim flips to running, so the re-SELECT can PROVE these rows
-        # belong to THIS worker (never a row another worker flipped in a race).
+        # 07-13 R7 (P0-2): the whole claim is ONE atomic write transaction.
+        # The connection is autocommit (sqlite_db.py isolation_level=None), so
+        # without an explicit BEGIN the re-validation SELECTs and the UPDATE
+        # would be independent transactions -- a job inserted BETWEEN them
+        # (post-seal pollution) would slip past the re-check and get claimed.
+        # BEGIN IMMEDIATE acquires the write lock up front so the re-validation
+        # + UPDATE + re-SELECT run as an indivisible group. COMMIT/ROLLBACK
+        # below owns the transaction (no inner method commits).
         token = secrets.token_hex(16)
-        # Atomic flip of the whole batch's pending rows to running. The
-        # started_at=CURRENT_TIMESTAMP pin records when this batch was claimed
-        # (used by recover_stale_running_jobs' age fallback for pre-S3 rows);
-        # it is NOT used to match the re-SELECT below, because SQLite
-        # CURRENT_TIMESTAMP has one-second resolution and a wall-clock-second
-        # boundary straddle between this UPDATE and the re-SELECT would make
-        # started_at=CURRENT_TIMESTAMP match nothing -> false idle (reviewer
-        # P2). The re-SELECT keys on claim_token=? (this worker's unique token)
-        # which is time-stable and proves ownership. Safe due to the head-SELECT
-        # invariant: the head row was pending, and a prior claim on this batch
-        # would have atomically flipped ALL its rows to running (none left
-        # pending for the head SELECT) - so every row this UPDATE flips belongs
-        # to THIS worker's claim_token.
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            # 07-13 R6-B (P0-1): belt-and-suspenders sealing gate. Even though
+            # the head-SELECT above only returns jobs whose batch is sealed,
+            # re-check claim_ready_at HERE (inside the write transaction) so a
+            # batch un-sealed between the head SELECT and this point cannot be
+            # claimed. An unsealed batch fails closed -- no prefix is claimed.
+            sealed_row = self.conn.execute(
+                "SELECT claim_ready_at, enabled_symbols_json FROM analysis_batches WHERE batch_id=?",
+                (str(batch_id),),
+            ).fetchone()
+            if not sealed_row or not sealed_row["claim_ready_at"]:
+                self.conn.execute("ROLLBACK")
+                return None
+            try:
+                enabled = json.loads(sealed_row["enabled_symbols_json"] or "[]")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                return None
+            enabled_set = set(enabled)
+            if not enabled_set:
+                self.conn.execute("ROLLBACK")
+                return None
+
+            # 07-13 R7 (P0-2): re-validate the EXACT enabled set against the
+            # batch's CURRENT job rows BEFORE flipping anything. The seal
+            # validated the set at seal time, but a job inserted AFTER the seal
+            # (post-seal pollution: a duplicate symbol row, or a foreign symbol
+            # not in enabled) would be flipped by a naive
+            # ``UPDATE ... WHERE batch_id=? AND status='pending'`` and claimed
+            # together with the legitimate rows. Re-deriving symbols from the
+            # AUTHORITATIVE ``payload.symbol`` field (same source as the seal)
+            # and enforcing exact cardinality + set equality against
+            # ``enabled_set`` makes the claim fail closed on pollution -- no
+            # prefix is claimed.
+            #
+            # The check counts ALL jobs of this batch (any status), so a batch
+            # mid-flight after a crash+recover (some rows terminal success, some
+            # reset to pending) still validates: total job symbols == enabled.
+            # A duplicate (2 rows for one symbol) inflates the row count above
+            # ``len(enabled_set)`` -> cardinality mismatch -> fail closed. A
+            # foreign symbol fails the set-equality check. A missing symbol
+            # (row deleted) also fails set equality.
+            all_job_rows = self.conn.execute(
+                """
+                SELECT payload_json
+                FROM agent_jobs
+                WHERE job_type='scheduled_market_analysis'
+                  AND json_extract(payload_json, '$.batch_id')=?
+                """,
+                (str(batch_id),),
+            ).fetchall()
+            all_symbols: list[str] = []
+            for r in all_job_rows:
+                try:
+                    jp = json.loads(r["payload_json"] or "{}")
+                except Exception:
+                    # Malformed payload -> cannot prove identity -> fail closed.
+                    self.conn.execute("ROLLBACK")
+                    return None
+                # 07-15 R8-A (P0-2): delegate to the SHARED identity contract so
+                # the claim re-validates ``payload.symbol == payload.snapshot.
+                # symbol`` (the consistency the seal enforced). Pre-R8 the claim
+                # only checked ``payload.symbol`` was a non-empty string and
+                # derived the set from it -- a swapped-snapshot job whose
+                # ``payload.symbol`` matched the enabled set was claimed, and
+                # the poison pill reached the worker. The helper makes a
+                # missing/no-symbol/swapped snapshot fail the claim closed
+                # (ROLLBACK, return None) before any row is flipped to running.
+                sym = validate_job_identity(jp)
+                if sym is None:
+                    self.conn.execute("ROLLBACK")
+                    return None
+                all_symbols.append(sym)
+            all_symbols_set = set(all_symbols)
+            if len(all_symbols) != len(enabled_set):
+                # Cardinality mismatch -> duplicate job (or extra/missing row).
+                self.conn.execute("ROLLBACK")
+                return None
+            if all_symbols_set != enabled_set:
+                # Set mismatch -> foreign or missing symbol.
+                self.conn.execute("ROLLBACK")
+                return None
+
+            # S3 (P0 #4): unique ownership token per claim. Stamped on every row
+            # this claim flips to running, so the re-SELECT can PROVE these rows
+            # belong to THIS worker (never a row another worker flipped in a
+            # race). Atomic flip of the whole batch's pending rows to running.
+            # The started_at=CURRENT_TIMESTAMP pin records when this batch was
+            # claimed (used by recover_stale_running_jobs' age fallback for
+            # pre-S3 rows); it is NOT used to match the re-SELECT below, because
+            # SQLite CURRENT_TIMESTAMP has one-second resolution and a
+            # wall-clock-second boundary straddle between this UPDATE and the
+            # re-SELECT would make started_at=CURRENT_TIMESTAMP match nothing ->
+            # false idle (reviewer P2). The re-SELECT keys on claim_token=?
+            # (this worker's unique token) which is time-stable and proves
+            # ownership. Safe due to the head-SELECT invariant: the head row was
+            # pending, and a prior claim on this batch would have atomically
+            # flipped ALL its rows to running (none left pending for the head
+            # SELECT) - so every row this UPDATE flips belongs to THIS worker's
+            # claim_token.
+            cur = self.conn.execute(
+                """
+                UPDATE agent_jobs
+                SET status='running',
+                    started_at=CURRENT_TIMESTAMP,
+                    claim_token=?,
+                    lease_until=datetime('now', '+30 minutes')
+                WHERE job_type='scheduled_market_analysis'
+                  AND status='pending'
+                  AND datetime(scheduled_at) <= datetime('now')
+                  AND json_extract(payload_json, '$.batch_id')=?
+                """,
+                (token, str(batch_id)),
+            )
+            if cur.rowcount <= 0:
+                # Lost the race - another worker claimed this batch between the
+                # head SELECT and the UPDATE. Signal idle so the caller loops.
+                self.conn.execute("ROLLBACK")
+                return None
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM agent_jobs
+                WHERE job_type='scheduled_market_analysis'
+                  AND status='running'
+                  AND claim_token=?
+                ORDER BY priority ASC, scheduled_at ASC, id ASC
+                """,
+                (token,),
+            ).fetchall()
+            self.conn.execute("COMMIT")
+            if not rows:
+                return None
+            return [dict(r) for r in rows]
+        except Exception:
+            # Any unexpected error: roll back so no half-claimed state is left.
+            # Swallow the secondary ROLLBACK error if no transaction is active.
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def claim_job_by_id_cas(self, *, job_id: int, expected_status: str = "pending") -> bool:
+        """07-13 R6-C (P0-2): Redis-acceleration consumer CAS.
+
+        The Redis queue is an acceleration channel; SQLite is the sole
+        ownership authority. Before a Redis-popped payload can flip its row to
+        ``running``, this single CAS statement verifies ALL of:
+
+            id = <job_id>                      (identity / expected row)
+            status = <expected_status>         (still claimable, not racing)
+            datetime(scheduled_at) <= datetime('now')   (due-time gate)
+
+        If ANY predicate fails, the UPDATE hits 0 rows and this returns False
+        -- the consumer must NOT execute the job (evidence §3.3: a future
+        ``scheduled_at`` Redis payload flipped a row to running early, exhausting
+        a 300s report wait in ~20s). Future jobs remain deferred WITHOUT
+        consuming retry budget; a stale/duplicate Redis payload that lost the
+        SQLite CAS race also fails closed.
+
+        Stamps ``claim_token`` + ``lease_until`` so the row is provably owned by
+        this consumer (mirrors ``claim_next_batch``'s ownership model), and
+        ``recover_stale_running_jobs`` can reclaim it on a crash.
+
+        Plan ref: production-incident-repair-plan-07-13.md §4 P0-2, §7.5.
+        """
+        token = secrets.token_hex(16)
         cur = self.conn.execute(
             """
             UPDATE agent_jobs
@@ -1307,31 +1668,13 @@ class CryptoGuardRepository:
                 started_at=CURRENT_TIMESTAMP,
                 claim_token=?,
                 lease_until=datetime('now', '+30 minutes')
-            WHERE job_type='scheduled_market_analysis'
-              AND status='pending'
+            WHERE id=?
+              AND status=?
               AND datetime(scheduled_at) <= datetime('now')
-              AND json_extract(payload_json, '$.batch_id')=?
             """,
-            (token, str(batch_id)),
+            (token, int(job_id), expected_status),
         )
-        if cur.rowcount <= 0:
-            # Lost the race — another worker claimed this batch between the
-            # head SELECT and the UPDATE. Signal idle so the caller loops.
-            return None
-        rows = self.conn.execute(
-            """
-            SELECT *
-            FROM agent_jobs
-            WHERE job_type='scheduled_market_analysis'
-              AND status='running'
-              AND claim_token=?
-            ORDER BY priority ASC, scheduled_at ASC, id ASC
-            """,
-            (token,),
-        ).fetchall()
-        if not rows:
-            return None
-        return [dict(r) for r in rows]
+        return cur.rowcount == 1
 
     def defer_claimed_job(
         self, job_id: int, claim_token: str, *,

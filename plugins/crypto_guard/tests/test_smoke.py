@@ -344,11 +344,18 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertIn("无法获取 Binance public 行情数据", result["text"])
 
     def test_hourly_report_renders(self) -> None:
+        from datetime import datetime, timedelta, timezone
         from plugins.crypto_guard.notify.hourly_report import build_hourly_report
 
-        # P0 (R4): With no batch, report re-enqueues. Use high retry_count
-        # to force rendering even when batch is absent/incomplete.
-        report = build_hourly_report(self.repo, retry_count=99)
+        # R7-P1-2: the REAL elapsed deadline is the sole degradation/render
+        # gate; a high retry_count no longer forces rendering. With no batch
+        # the report would otherwise requeue (batch_incomplete_requeued).
+        # Pass an EXPIRED first_wait_utc (>timeout_seconds=300 in the past) so
+        # the deadline has truly elapsed and the (degraded) report renders.
+        expired_anchor = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(self.repo, retry_count=99, first_wait_utc=expired_anchor)
         self.assertTrue(report["ok"])
         self.assertIn("每小时简报", report["text"])
         self.assertIn("模拟盘", report["text"])
@@ -14321,6 +14328,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             _apply_stop_loss_adjustment_dedup,
             _apply_paper_trade_logs_dedupe_key_migration,
             _apply_hourly_report_accuracy_migration,
+            apply_r10_attempt_counter_migration,
         )
         _apply_phase_01_02_migrations(self.conn)
         _apply_phase_13_migrations(self.conn)
@@ -14338,6 +14346,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         _apply_stop_loss_adjustment_dedup(self.conn)
         _apply_hourly_report_accuracy_migration(self.conn)
         _apply_paper_trade_logs_dedupe_key_migration(self.conn)
+        # 07-15 R10-F: _analysis_attempt_counter is now in check_schema_health's
+        # required_tables (reviewer P2-1). diagnose_state_consistency ->
+        # _check_schema_health_as_issues -> check_schema_health runs against
+        # this in-memory DB, so the table MUST exist (mirror what
+        # initialize_database creates), mirroring the contract-marker lines
+        # below.
+        apply_r10_attempt_counter_migration(self.conn)
         # Write BTC#9 contract marker so cutoff-gated diagnostics can run
         from plugins.crypto_guard.storage.migrations import _ensure_btc9_trade_gate_contract_marker
         _ensure_btc9_trade_gate_contract_marker(self.conn)
@@ -16963,12 +16978,21 @@ class ShadowVTLifecycleTest(unittest.TestCase):
     def test_mark_price_fallback_uses_updated_at(self) -> None:
         """Issue 2: Fallback reads paper_positions.updated_at, not price_as_of."""
         from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
         from plugins.crypto_guard.paper.mark_price import get_mark_price_with_fallback
+
+        # Anchor updated_at to "now" (minus a small skew) so the fallback
+        # age-check against max_cache_age_seconds stays well within bounds on
+        # any run date. A hard-coded past date would age out once wall-clock
+        # time advances past it, silently fail-closing the fallback, and
+        # turn this into a flaky date-sensitive test.
+        updated_at_dt = datetime.now(timezone.utc) - timedelta(seconds=60)
+        updated_at_iso = updated_at_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
         # Insert a paper_position with current_price and updated_at
         self.conn.execute(
             "INSERT INTO paper_positions(account_id, symbol, side, entry_price, quantity, status, current_price, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (1, "BTCUSDT", "LONG", 64000.0, 1.0, "open", 65000.0, "2026-06-27T10:00:00Z"),
+            (1, "BTCUSDT", "LONG", 64000.0, 1.0, "open", 65000.0, updated_at_iso),
         )
         self.conn.commit()
 
@@ -16984,7 +17008,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             self.assertTrue(result["ok"], f"Fallback should succeed: {result}")
             self.assertEqual(result["mark_price"], 65000.0)
             self.assertEqual(result["price_source"], "paper_position_cache")
-            self.assertEqual(result["price_as_of"], "2026-06-27T10:00:00Z")
+            self.assertEqual(result["price_as_of"], updated_at_iso)
 
     def test_mark_price_validates_positive(self) -> None:
         """Issue 3: mark_price <= 0 is rejected, falls through to except."""
@@ -18797,8 +18821,14 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     # ── P0-1 (Round 3): max retries → renders with incomplete ─────────
 
     def test_hourly_report_max_retries_renders_incomplete(self) -> None:
-        """P0-1: When retry_count >= max (12), build_hourly_report renders
-        normally even though the batch is incomplete."""
+        """R7-P1-2: an incomplete batch renders (degraded) ONLY after the
+        REAL elapsed deadline expires, NOT when retry_count >= max. Before
+        R7-P1-2 a fast-fired consumer could hit the retry_count cap (~20s)
+        and degrade a 9/10 live batch to 0/10. Now retry_count is a backstop
+        CAP only; the real deadline (first_wait_utc + timeout_seconds) is the
+        sole gate. Pass an expired first_wait_utc (>timeout_seconds=300) so
+        the deadline has truly elapsed and the degraded report renders."""
+        from datetime import datetime, timedelta, timezone
         from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
         at = latest_closed_close_time_ms("15m", utc_ms())
         batch_id = f"15m:{at}"
@@ -18806,12 +18836,258 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             batch_id=batch_id, primary_interval="15m",
             analysis_time=at, enabled_symbols=["BTCUSDT"],
         )
-        # Batch incomplete, but retry_count=12 → should render anyway
+        # Batch incomplete; retry_count=12 exceeds max_retries(=10) but the
+        # count cap alone no longer renders -- the real deadline does.
         from plugins.crypto_guard.notify.hourly_report import build_hourly_report
-        report = build_hourly_report(self.repo, retry_count=12)
+        # Without an expired anchor the report would requeue. Use an anchor
+        # well past timeout_seconds=300 so the deadline is genuinely expired.
+        expired_anchor = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(
+            self.repo, retry_count=12, first_wait_utc=expired_anchor,
+        )
         self.assertTrue(report["ok"])
 
-    # ── P0-2 (Round 3): ROW_NUMBER window query prevents cross-batch contamination ─
+    # ── R7-P1-2 (Round 7): high retry_count + NON-expired deadline requeues ──
+
+    def test_r7_p1_2_high_retry_count_non_expired_deadline_requeues(self) -> None:
+        """R7-P1-2: ``retry_count >= max_retries`` alone MUST NOT trigger
+        degradation -- only the REAL elapsed report deadline does. The core
+        contract boundary ``retry_count`` high + batch incomplete + deadline
+        NOT expired was previously untested (every high-retry_count test passed
+        an EXPIRED anchor; every low-retry_count test passed ``first_wait_utc=
+        None``). This test pins the load-bearing boundary: a future anchor
+        (``now + 300s``) makes ``_report_deadline_expired`` return False, so
+        even ``retry_count=12`` (above ``max_retries=ceil(300/30)=10``) requeues
+        instead of rendering the degraded report. The requeued count is CLAMPED
+        at ``max_retries`` (``min(12+1, 10) == 10``) so the requeue loop is
+        bounded but the count never degrades on its own.
+
+        Revert-fail: restore the pre-fix guard
+        ``if batch_state["incomplete"] and not (deadline_expired or retry_count >= max_retries):``
+        -> ``retry_count=12 >= max_retries=10`` makes the guard False -> the
+        requeue branch is skipped -> the report falls through to the degraded
+        branch (``ok=True``) -> the ``batch_incomplete_requeued`` assertion
+        fails. Also proves the clamp: removing ``min(...,max_retries)`` makes
+        ``next_retry_count=13`` -> the ``== 10`` assertion fails.
+        """
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        # Only BTC completed; ETH pending -> incomplete.
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        # A FUTURE anchor (now + 300s): elapsed = -300s < timeout_seconds=300
+        # -> _report_deadline_expired returns False -> requeue (NOT degrade).
+        future_anchor = (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(
+            self.repo, retry_count=12, first_wait_utc=future_anchor,
+        )
+        # Degraded render would set ok=True; the requeue path sets ok=False +
+        # error=batch_incomplete_requeued. The high retry_count must NOT have
+        # degraded the report on its own.
+        self.assertFalse(
+            report["ok"],
+            "R7-P1-2: retry_count=12 (>= max_retries) with a NON-expired real "
+            "deadline must requeue, NOT degrade. Got %r" % (report,),
+        )
+        self.assertEqual(report["error"], "batch_incomplete_requeued")
+        # The requeued count is clamped at max_retries (=10), proving the count
+        # backstop bounds the loop WITHOUT triggering degradation.
+        self.assertEqual(
+            report["retry_count"], 10,
+            "R7-P1-2: the requeued retry_count must be clamped at max_retries "
+            "(=10) when retry_count=12. Got %r" % (report.get("retry_count"),),
+        )
+
+    # ── R8-B (P0-1): report retry chain breaks at the count cap ──────────────
+
+    def test_r8_b_retry_chain_leaves_distinct_pending_successor_at_count_cap(self) -> None:
+        """R8-B (P0-1): the report retry chain MUST NOT break when ``retry_count``
+        is clamped at ``max_retries``. Pre-fix, ``session_id`` was pinned to
+        ``next_retry_count = min(retry_count+1, max_retries)``; at the cap (10)
+        the id stopped changing. ``enqueue_job_once`` returns the EXISTING
+        ``running`` job id when ``(job_type, session_id)`` already exists with
+        status ``running`` -- so when retry-10 was still running, the requeue
+        created NO new pending successor. That running job eventually succeeded
+        -> nothing left in the queue -> the deadline arrived with no report
+        pushed. The pre-R7-P1-2 test only asserted the RETURN VALUE
+        (``retry_count==10``); it never checked that a distinct pending
+        successor ROW existed in ``agent_jobs``. That was the false green.
+
+        Production shape: retry-10 is ALREADY ``running`` (simulated by
+        enqueueing the retry-10 job and flipping it to ``running``), then a
+        requeue fires with ``retry_count=10``. The requeue MUST leave a DISTINCT
+        ``pending`` successor row whose ``session_id`` differs from the running
+        retry-10 job's id -- i.e. the chain continues, it does not collapse onto
+        the running job.
+
+        Revert-fail: drop ``poll_sequence`` from the session_id -> the successor
+        session_id collides with the running retry-10 session_id ->
+        ``enqueue_job_once`` returns the running job's id (no new pending row) ->
+        the "distinct pending successor exists" assertion fails.
+        """
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        # Only BTC completed; ETH pending -> incomplete (requeue path).
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+
+        # PRODUCTION SHAPE: retry-10 is ALREADY running when the requeue fires.
+        # Pre-fix the retry-10 session_id is
+        # ``hourly_report_retry:<hour>:<batch>:10``; the requeue at the cap
+        # produces the SAME id -> enqueue_job_once returns this running row.
+        running_session_id = f"hourly_report_retry:{batch_id}:{batch_id}:10"
+        running_job_id = self.repo.enqueue_job_once(
+            "hourly_feishu_report", priority=3, source="hourly_report_requeue",
+            session_id=running_session_id,
+            payload={"retry_count": 10, "expected_batch_id": batch_id,
+                     "report_hour_utc": batch_id, "expected_analysis_time": at},
+        )
+        # Flip the retry-10 job to ``running`` (a worker claimed it but has not
+        # finished) -- this is the exact production hazard.
+        self.repo.conn.execute(
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=?",
+            (running_job_id,),
+        )
+
+        future_anchor = (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        # The requeue fires with retry_count=10 (already at the cap) and the
+        # production ``poll_sequence`` carried from the running job.
+        report = build_hourly_report(
+            self.repo, retry_count=10, expected_batch_id=batch_id,
+            report_hour_utc=batch_id, expected_analysis_time=at,
+            first_wait_utc=future_anchor, poll_sequence=0,
+        )
+        # The requeue path must fire (not degrade) -- the real deadline has not
+        # elapsed.
+        self.assertFalse(
+            report["ok"], "R8-B: a non-expired deadline must requeue, not degrade."
+        )
+        self.assertEqual(report["error"], "batch_incomplete_requeued")
+        self.assertEqual(
+            report["retry_count"], 10,
+            "R8-B: the clamped count stays at max_retries=10 at the cap.",
+        )
+        # THE LOAD-BEARING ASSERTION (the false green): a DISTINCT pending
+        # successor row MUST exist whose session_id differs from the running
+        # retry-10 job and whose status is ``pending``. Pre-fix, none existed.
+        rows = [
+            dict(r) for r in self.repo.conn.execute(
+                "SELECT id, status, session_id FROM agent_jobs "
+                "WHERE job_type='hourly_feishu_report' ORDER BY id ASC"
+            ).fetchall()
+        ]
+        self.assertEqual(len(rows), 2, "R8-B: a successor row must be created: %r" % (rows,))
+        running_row = [r for r in rows if r["id"] == running_job_id]
+        self.assertEqual(len(running_row), 1)
+        self.assertEqual(running_row[0]["status"], "running")
+        successor_rows = [r for r in rows if r["id"] != running_job_id]
+        self.assertEqual(len(successor_rows), 1, "R8-B: exactly one distinct successor: %r" % (rows,))
+        successor = successor_rows[0]
+        self.assertEqual(
+            successor["status"], "pending",
+            "R8-B: the successor must be a fresh ``pending`` job, not the running "
+            "retry-10. Got %r" % (rows,),
+        )
+        self.assertNotEqual(
+            successor["session_id"], running_session_id,
+            "R8-B: the successor session_id MUST differ from the running retry-10 "
+            "session_id (otherwise the chain collapses onto the running job). "
+            "Got %r" % (rows,),
+        )
+        # The successor carries the bumped poll_sequence so the NEXT requeue is
+        # also unique.
+        import json as _json
+        successor_payload = _json.loads(
+            self.repo.conn.execute(
+                "SELECT payload_json FROM agent_jobs WHERE id=?", (successor["id"],),
+            ).fetchone()["payload_json"]
+        )
+        self.assertEqual(
+            successor_payload.get("poll_sequence"), 1,
+            "R8-B: the successor must carry poll_sequence=1 (bumped from 0) so the "
+            "chain never re-collides at the count cap. Got %r" % (successor_payload,),
+        )
+
+    def test_r8_b_retry_successor_collision_is_fail_closed(self) -> None:
+        """R8-B (P0-1) fail-closed guard: ``enqueue_job_once`` returns the
+        EXISTING ``running`` job id when ``(job_type, session_id)`` already
+        exists with status ``running``. With the monotonic ``poll_sequence`` the
+        successor session_id is ALWAYS fresh so this branch is unreachable in
+        production -- but if a successor WERE ever returned as a running job
+        (identity collision / replay), the chain would silently break exactly
+        as pre-R8-B. The guard surfaces it as a structured
+        ``retry_successor_collision`` error so the operator sees the collision
+        instead of a green-looking ``batch_incomplete_requeued``.
+
+        This test forces the collision directly: enqueue a job with the EXACT
+        session_id the requeue will produce (``poll_sequence=1``), flip it to
+        ``running``, then call ``build_hourly_report`` with ``poll_sequence=0``
+        so the requeue computes ``next_poll_sequence=1`` and collides. The guard
+        MUST return ``retry_successor_collision`` (NOT a silent green requeue).
+        """
+        from datetime import datetime, timedelta, timezone
+        from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+        at = latest_closed_close_time_ms("15m", utc_ms())
+        batch_id = f"15m:{at}"
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=at, enabled_symbols=["BTCUSDT", "ETHUSDT"],
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT")
+        # Pre-create the EXACT successor session_id the requeue will emit
+        # (retry_count clamps to 10, poll_sequence bumps 0->1) and flip it running.
+        collision_session_id = f"hourly_report_retry:{batch_id}:{batch_id}:10:1"
+        collision_id = self.repo.enqueue_job_once(
+            "hourly_feishu_report", priority=3, source="hourly_report_requeue",
+            session_id=collision_session_id,
+            payload={"retry_count": 10, "expected_batch_id": batch_id,
+                     "report_hour_utc": batch_id, "expected_analysis_time": at,
+                     "poll_sequence": 1},
+        )
+        self.repo.conn.execute(
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=?",
+            (collision_id,),
+        )
+        future_anchor = (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        # poll_sequence=0 -> requeue computes next_poll_sequence=1 -> collides
+        # with the running collision_session_id above.
+        report = build_hourly_report(
+            self.repo, retry_count=10, expected_batch_id=batch_id,
+            report_hour_utc=batch_id, expected_analysis_time=at,
+            first_wait_utc=future_anchor, poll_sequence=0,
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["error"], "retry_successor_collision",
+            "R8-B: an identity collision (successor returned as the running job) "
+            "MUST surface as a structured unrecoverable error, NOT a silent "
+            "batch_incomplete_requeued. Got %r" % (report,),
+        )
+        self.assertEqual(report["retry_count"], 10)
+        self.assertEqual(report["poll_sequence"], 1)
+
+
 
     def test_latest_decisions_row_number_no_cross_batch(self) -> None:
         """P0-2: latest_ga_decisions_by_symbol with ROW_NUMBER correctly
@@ -19385,8 +19661,17 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertEqual(state["status"], "absent")
         self.assertTrue(state["incomplete"])
 
-        # Build report: should be degraded, not showing historical signals
-        report = build_hourly_report(self.repo, retry_count=99)  # exceed retries to force degraded
+        # Build report: should be degraded, not showing historical signals.
+        # R7-P1-2: an absent (incomplete) batch degrades ONLY after the REAL
+        # elapsed deadline expires; a high retry_count alone no longer forces
+        # degradation (it is a backstop CAP, not a trigger). Pass an expired
+        # first_wait_utc (>timeout_seconds=300) so the deadline is genuinely
+        # past and the degraded report renders.
+        from datetime import datetime, timedelta, timezone
+        expired_anchor = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(self.repo, retry_count=99, first_wait_utc=expired_anchor)
         self.assertTrue(report.get("degraded"), "Absent batch should produce degraded report")
         self.assertEqual(report.get("latest_signals"), [])
         self.assertEqual(report.get("ga_decisions"), [])
@@ -19424,21 +19709,35 @@ class HourlyReportAccuracyTest(unittest.TestCase):
 
     def test_fr1_degraded_report_contains_no_history_banner(self) -> None:
         """FR-1: Degraded report contains the explicit no-history statement."""
+        from datetime import datetime, timedelta, timezone
         from plugins.crypto_guard.notify.hourly_report import build_hourly_report
 
-        report = build_hourly_report(self.repo, retry_count=99)
+        # R7-P1-2: degraded renders only after the REAL deadline expires.
+        # Pass an expired first_wait_utc (>timeout_seconds=300) so an absent
+        # batch degrades instead of requeueing.
+        expired_anchor = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(self.repo, retry_count=99, first_wait_utc=expired_anchor)
         self.assertTrue(report.get("degraded"))
         text = report.get("text", "")
         self.assertIn("当前行情分析不可用，本报告未采用历史信号代替", text)
 
     def test_fr1_degraded_report_no_legacy_signals(self) -> None:
         """FR-1: Degraded report must not contain legacy signals, analysis_states, or ga_decisions."""
+        from datetime import datetime, timedelta, timezone
         from plugins.crypto_guard.notify.hourly_report import build_hourly_report
 
         # Seed some historical data that must NOT appear in degraded report
         self._seed_ga_decision(symbol="BTCUSDT", grade="S", final_summary="历史可执行机会")
 
-        report = build_hourly_report(self.repo, retry_count=99)
+        # R7-P1-2: degraded renders only after the REAL deadline expires.
+        # Pass an expired first_wait_utc (>timeout_seconds=300) so an absent
+        # batch degrades instead of requeueing.
+        expired_anchor = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        report = build_hourly_report(self.repo, retry_count=99, first_wait_utc=expired_anchor)
         self.assertTrue(report.get("degraded"))
         self.assertEqual(report.get("latest_signals"), [])
         self.assertEqual(report.get("analysis_states"), [])
@@ -19494,7 +19793,14 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertEqual(payload.get("receive_id_type"), "chat_id")
 
     def test_fr2_retry_session_id_format(self) -> None:
-        """FR-2: Retry session_id follows hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{retry_count}."""
+        """FR-2: Retry session_id follows hourly_report_retry:{report_hour_utc}:{expected_batch_id}:{retry_count}:{poll_sequence}.
+
+        R8-B (P0-1): a monotonic ``poll_sequence`` is appended so the
+        ``(retry_count, poll_sequence)`` pair is strictly monotonic and the
+        successor can never collide with the currently-running retry job at the
+        count cap. The first requeue from a legacy/first payload (poll_sequence
+        absent -> 0) emits next_retry_count=1, poll_sequence=1.
+        """
         from plugins.crypto_guard.notify.hourly_report import build_hourly_report
 
         result = build_hourly_report(
@@ -19507,7 +19813,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             "SELECT session_id FROM agent_jobs WHERE job_type='hourly_feishu_report' AND source='hourly_report_requeue' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(job)
-        expected_sid = "hourly_report_retry:2026-06-29T11:00:00Z:15m:99999:1"
+        expected_sid = "hourly_report_retry:2026-06-29T11:00:00Z:15m:99999:1:1"
         self.assertEqual(job["session_id"], expected_sid)
 
     def test_fr2_replaying_same_retry_creates_one_child(self) -> None:
@@ -19524,9 +19830,13 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             self.repo, retry_count=0,
             expected_batch_id="15m:55555", report_hour_utc="2026-06-29T12:00:00Z",
         )
-        # Should have only one requeue job
+        # Should have only one requeue job. R8-B: both replays compute
+        # next_poll_sequence=1 (same incoming poll_sequence absent -> 0), so the
+        # successor session_id is identical and enqueue_job_once dedupes to one
+        # child job -- the R8-B monotonic sequence preserves the FR-2 dedup
+        # contract.
         count = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='hourly_report_retry:2026-06-29T12:00:00Z:15m:55555:1'"
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='hourly_report_retry:2026-06-29T12:00:00Z:15m:55555:1:1'"
         ).fetchone()["cnt"]
         self.assertLessEqual(count, 1, "Replaying same retry state should not create duplicate child")
 
@@ -44152,30 +44462,151 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
     # -- helpers shared by the e2e tests --
 
-    def _enqueue_batch_jobs(self, batch_id: str, symbols: list[str]) -> None:
+    def _prod_session_id(self, symbol: str, *, analysis_time_ms: int | None = None) -> str:
+        """The REAL producer ``session_id`` format that
+        ``cron_scheduler.enqueue_market_analysis`` writes:
+
+            system:scheduled:{primary_interval}:{symbol}:{analysis_time}
+
+        (cron_scheduler.py: ``f"system:scheduled:{primary_interval}:{symbol}:
+        {analysis_time}"``). R7-P0-1 made ``payload.symbol`` the authoritative
+        job-symbol field, but the ``session_id`` still carries the symbol in
+        this position; tests that select a job by ``session_id`` (e.g. to read
+        its final status) MUST use this production format, NOT the legacy
+        ``f"{batch_id}:{sym}"`` prefix the pre-R7 helper used -- the pre-R7
+        format is no longer what the producer writes, so a legacy-format
+        query returns zero rows and a test would pass vacuously.
+        """
+        at = analysis_time_ms if analysis_time_ms is not None else self._PROD_BATCH_MS
+        return f"system:scheduled:15m:{symbol}:{at}"
+
+    def _enqueue_batch_jobs(self, batch_id: str, symbols: list[str], *,
+                            seal: bool = True) -> None:
         """Enqueue one ``scheduled_market_analysis`` job per symbol into
         ``agent_jobs`` (status='pending', scheduled_at=now) exactly like
-        ``cron_scheduler.enqueue_market_analysis`` does, and start the
-        ``analysis_batches`` row with ``enabled_symbols`` set."""
+        ``cron_scheduler.enqueue_market_analysis`` does, and start + (by
+        default) SEAL the ``analysis_batches`` row so it is claimable.
+
+        Mirrors the R7-P0-1/R7-P0-2 production producer contract:
+          * ``session_id`` is the production ``system:scheduled:15m:{sym}:{t}``
+            format (NOT the legacy ``f"{batch_id}:{sym}"`` prefix).
+          * the payload carries the AUTHORITATIVE ``payload.symbol`` top-level
+            field (plus ``primary_interval``), the single source of truth the
+            seal (``seal_analysis_batch``) and the claim (``claim_next_batch``)
+            re-derive each job's symbol from. Identity consistency
+            ``payload.symbol == payload.snapshot.symbol`` is enforced by the
+            seal, so the snapshot built here carries the same symbol.
+          * 07-15 R8-D (P1-1): EVERY write -- the batch row, every job INSERT,
+            every ``batch_symbol_status`` row, the snapshot persistence, the
+            exact-set validation, and the seal stamp -- runs inside ONE
+            ``BEGIN IMMEDIATE`` transaction (exactly like the producer Phase 2),
+            so a happy-path batch is sealed-and-claimable in one call AND a
+            mid-transaction failure (e.g. a seal exact-set mismatch) leaves ZERO
+            residue (no half-built batch, no orphan jobs, no orphan snapshots).
+            Pre-R8-D this helper wrote all rows BEFORE the ``BEGIN IMMEDIATE``
+            and wrapped only ``seal_analysis_batch`` in the transaction -- the
+            "atomic transaction" docstring was FALSE (a seal failure left the
+            batch + jobs + snapshots behind). Tests that need to inject
+            post-seal pollution or build an unsealed/partial batch pass
+            ``seal=False`` and mutate the rows themselves AFTER the transaction
+            commits.
+        """
+        # R8-D: build the snapshots in memory OUTSIDE the write lock (read-only
+        # market-state construction, mirroring the producer Phase 1), then
+        # persist + enqueue + register + seal ALL inside the ``BEGIN IMMEDIATE``.
+        prepared: list[dict] = []
         for sym in symbols:
             snapshot = self._build_snapshot(
                 symbol=sym, analysis_time_ms=self._PROD_BATCH_MS,
             )
-            snapshot_id = self.repo.save_market_snapshot(snapshot)
-            self.repo.enqueue_job(
-                job_type="scheduled_market_analysis",
-                priority=1, source="cron", session_id=f"{batch_id}:{sym}",
-                payload={
-                    "snapshot": snapshot,
-                    "snapshot_id": snapshot_id,
-                    "batch_id": batch_id,
-                    "allow_realtime_signal_alert": False,
-                },
+            prepared.append({"symbol": sym, "snapshot": snapshot})
+        # The connection is autocommit (sqlite_db.py ``isolation_level=None``),
+        # so an explicit BEGIN/COMMIT owns the transaction. Commit any pending
+        # state first so the BEGIN starts a clean transaction.
+        self.conn.commit()
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.repo.start_analysis_batch(
+                batch_id=batch_id, primary_interval="15m",
+                analysis_time=self._PROD_BATCH_MS, enabled_symbols=symbols,
             )
-        self.repo.start_analysis_batch(
-            batch_id=batch_id, primary_interval="15m",
-            analysis_time=self._PROD_BATCH_MS, enabled_symbols=symbols,
+            for item in prepared:
+                sym = item["symbol"]
+                # R8-D (P1-2): persist the snapshot INSIDE the transaction so a
+                # seal failure rolls the snapshot row back with the batch -- no
+                # orphan (mirrors the production producer Phase 2).
+                snapshot_id = self.repo.save_market_snapshot(item["snapshot"])
+                self.repo.enqueue_job(
+                    "scheduled_market_analysis",
+                    1, "cron", self._prod_session_id(sym),
+                    payload={
+                        "snapshot": item["snapshot"],
+                        "snapshot_id": snapshot_id,
+                        "primary_interval": "15m",
+                        "batch_id": batch_id,
+                        "symbol": sym,
+                    },
+                )
+                self.repo.mark_batch_symbol_completed(
+                    batch_id=batch_id, symbol=sym, status="pending",
+                )
+            if not seal:
+                # An unsealed/partial batch is intentionally left committed so
+                # the test can mutate the rows itself (inject post-seal
+                # pollution, etc.). This mirrors a producer that builds the
+                # batch row + jobs but never seals.
+                self.conn.execute("COMMIT")
+                return
+            sealed = self.repo.seal_analysis_batch(batch_id)
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        if not sealed:
+            raise AssertionError(
+                "_enqueue_batch_jobs seal failed for batch %r -- the exact-set "
+                "(jobs == batch_symbol_status == enabled) did not validate." %
+                (batch_id,)
+            )
+
+    def _cleanup_prior_scheduled_jobs(self) -> None:
+        """07-14 R7-P0-2: R5-P0 / R4-P0-1 defer tests loop over per-config
+        ``_cases`` (pst in {180, 300, 1200}) reusing the SAME ``_PROD_BATCH_MS``
+        and the SAME held symbol across cases. The production ``session_id``
+        format ``system:scheduled:15m:{symbol}:{analysis_time}`` therefore
+        collides across cases: each case's ``_enqueue_batch_jobs`` INSERTS a
+        fresh row with the SAME session_id as the prior case's row (there is no
+        DB-level UNIQUE on (job_type, session_id) -- see migrations.py
+        ``_apply_daily_review_idempotency_migration``).
+
+        A prior case leaves rows behind for the SAME production session_id. The
+        tests then key BOTH the seed ``UPDATE ... WHERE session_id=?`` AND the
+        final ``SELECT ... WHERE session_id=?`` by session_id ALONE, so any
+        surviving prior-case row with the same session_id makes the seed UPDATE
+        mutate MULTIPLE rows (corrupting the prior row AND the fresh row) and the
+        final assertion read a row other than the one this case just processed.
+        Marking survivors 'failed' is NOT enough: ``WHERE session_id=?`` still
+        matches the failed row, and ``claim_next_batch`` still groups ALL rows
+        of a sealed batch by batch_id (a prior ``failed`` job in a prior batch_id
+        would not be re-claimed, but a prior PENDING one would -- and the seed
+        UPDATE has no way to target only the fresh row).
+
+        ``agent_jobs`` has NO foreign-key dependents (no ``job_id`` column in any
+        other table references it; verified in schema.sql), so DELETE is safe and
+        is the only way to make the session_id-keyed seed UPDATE and final SELECT
+        deterministically target ONLY this case's freshly-enqueued row. This
+        helper is session_id-FORMAT-INDEPENDENT: it deletes every leftover
+        ``scheduled_market_analysis`` row so the next case's
+        ``claim_next_batch`` only sees its own freshly-enqueued jobs, and the
+        session_id-keyed seed UPDATE / final SELECT see exactly one row. Call it
+        at the TOP of each case iteration (after ``lease.clear()``)."""
+        self.conn.execute(
+            "DELETE FROM agent_jobs WHERE job_type='scheduled_market_analysis'"
         )
+        self.conn.commit()
 
     def _patched_call_ga_llm(self, *, call_log: list[str],
                              captured_prompts: list[str],
@@ -44848,10 +45279,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Enqueue the real batch into SQLite (these are the authority rows).
         self._enqueue_batch_jobs(batch_id, symbols)
         # Read one of the SQLite job ids so the stale Redis payload can point at
-        # it (mimicking a pre-S2 enqueued item).
+        # it (mimicking a pre-S2 enqueued item). R7-P0-1: the producer writes
+        # the production session_id format (see ``_prod_session_id``).
         stale_sqlite_id = self.conn.execute(
             "SELECT id FROM agent_jobs WHERE session_id=? LIMIT 1",
-            (f"{batch_id}:{symbols[0]}",),
+            (self._prod_session_id(symbols[0]),),
         ).fetchone()["id"]
 
         call_log: list[str] = []
@@ -44879,7 +45311,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "job_type": "scheduled_market_analysis",
             "priority": 3,
             "source": "cron",
-            "session_id": f"{batch_id}:{symbols[0]}",
+            "session_id": self._prod_session_id(symbols[0]),
             "payload": {
                 "snapshot": self._build_snapshot(
                     symbol=symbols[0], analysis_time_ms=self._PROD_BATCH_MS,
@@ -46342,7 +46774,10 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         self.assertEqual(len(rows), len(symbols))
         by_session = {r["session_id"]: r for r in rows}
         # The failing symbol's job MUST be 'failed' with a non-empty error.
-        fail_session = "%s:%s" % (batch_id, failing_symbol)
+        # R7-P0-1: the producer writes the production session_id format
+        # ``system:scheduled:15m:{sym}:{t}`` (see ``_prod_session_id``), NOT
+        # the legacy ``f"{batch_id}:{sym}"`` prefix.
+        fail_session = self._prod_session_id(failing_symbol)
         self.assertIn(fail_session, by_session)
         self.assertEqual(
             by_session[fail_session]["status"], "failed",
@@ -46362,7 +46797,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         for sym in symbols:
             if sym == failing_symbol:
                 continue
-            sess = "%s:%s" % (batch_id, sym)
+            sess = self._prod_session_id(sym)
             self.assertIn(sess, by_session)
             self.assertEqual(
                 by_session[sess]["status"], "success",
@@ -47637,7 +48072,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         job_row = self.conn.execute(
             "SELECT status, claim_token, lease_until, started_at, error_message, "
             "scheduled_at FROM agent_jobs WHERE session_id=?",
-            (f"{batch_id}:{held_sym}",),
+            (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertIsNotNone(job_row, "R3-P0-1: the held symbol's job must exist")
         self.assertEqual(
@@ -47756,7 +48191,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         self.conn.execute(
             "UPDATE agent_jobs SET scheduled_at=datetime('now','-1 hour') "
             "WHERE session_id=?",
-            (f"{batch_id}:{held_sym}",),
+            (self._prod_session_id(held_sym),),
         )
         self.conn.commit()
         call_log.clear()
@@ -47812,7 +48247,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The deferred job is now finished (success), NOT left pending/running.
         job_row = self.conn.execute(
             "SELECT status FROM agent_jobs WHERE session_id=?",
-            (f"{batch_id}:{held_sym}",),
+            (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertEqual(
             str(job_row["status"]), "success",
@@ -47969,7 +48404,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 _seed_count,
                 "2020-01-01 00:00:00",  # far past -> absolute window exhausted
                 "single_flight_deferred:%d" % _seed_count,
-                f"{batch_id}:{held_sym}",
+                self._prod_session_id(held_sym),
             ),
         )
         self.conn.commit()
@@ -48025,7 +48460,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The job is finished failed with the exhaustion reason.
         job_row = self.conn.execute(
             "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
-            (f"{batch_id}:{held_sym}",),
+            (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertEqual(str(job_row["status"]), "failed")
         self.assertIn(
@@ -48141,6 +48576,12 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # breaker maps + use a unique batch_id per case.)
             lease.clear()
             run_ga_workers._batch_breakers.clear()
+            # 07-14 R7-P0-2: the held symbol's PRODUCTION session_id collides
+            # across cases (same symbol + same _PROD_BATCH_MS); a prior case's
+            # deferred job would be re-claimed here and inflate defer_count.
+            # Mark every leftover scheduled_market_analysis job terminal so this
+            # case's claim_next_batch only sees its own freshly-enqueued jobs.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r4p01_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -48165,7 +48606,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     3,  # far under the R5-P0 dynamic max_defers
                     _seed_at_str,  # elapsed = window - 30s (short of the bound)
                     "single_flight_deferred:3",
-                    f"{batch_id}:{held_sym}",
+                    self._prod_session_id(held_sym),
                 ),
             )
             self.conn.commit()
@@ -48223,7 +48664,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             job_after = self.conn.execute(
                 "SELECT status, defer_count, deferred_at, error_message "
                 "FROM agent_jobs WHERE session_id=?",
-                (f"{batch_id}:{held_sym}",),
+                (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
                 int(job_after["defer_count"]), 4,
@@ -48461,16 +48902,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # jobs and groups them by batch_id, so without cleanup the prior
             # case's deferred job would be re-claimed here, re-deferred
             # (inflating its defer_count past 8), and evaluated against THIS
-            # case's window -- contaminating the case. Mark every prior
-            # ``r5p0_*`` pending/running job terminal so this case's
-            # ``claim_next_batch`` only sees its own freshly-enqueued jobs.
-            self.conn.execute(
-                "UPDATE agent_jobs SET status='failed', "
-                "error_message='test_isolation_cleanup' "
-                "WHERE session_id LIKE '15m:r5p0_%' "
-                "AND status IN ('pending','running')",
-            )
-            self.conn.commit()
+            # case's window -- contaminating the case.
+            #
+            # 07-14 R7-P0-2: the helper now enqueues jobs with the PRODUCTION
+            # session_id format ``system:scheduled:15m:{symbol}:{t}`` (NOT the
+            # legacy ``f"{batch_id}:{symbol}"``), so the OLD ``WHERE session_id
+            # LIKE '15m:r5p0_%'`` cleanup matched NOTHING -> a prior case's
+            # held-symbol job (same symbol + same _PROD_BATCH_MS -> SAME
+            # production session_id across cases) survived pending with its
+            # accumulated defer_count and was re-claimed HERE, re-deferred, and
+            # inflated past 8 (the exact contamination the comment warns about).
+            # ``_cleanup_prior_scheduled_jobs`` is session_id-FORMAT-INDEPENDENT
+            # (marks every leftover scheduled_market_analysis pending/running job
+            # terminal), so the isolation survives the production-format refactor.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r5p0_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -48542,14 +48987,14 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     "WHERE session_id=?",
                     (datetime.fromtimestamp(_now_ts / 1000, tz=timezone.utc)
                      .strftime("%Y-%m-%d %H:%M:%S"),
-                     f"{batch_id}:{held_sym}"),
+                     self._prod_session_id(held_sym)),
                 )
                 self.conn.commit()
                 # Inspect the job state after this tick's CAS.
                 job_row = self.conn.execute(
                     "SELECT status, defer_count, deferred_at "
                     "FROM agent_jobs WHERE session_id=?",
-                    (f"{batch_id}:{held_sym}",),
+                    (self._prod_session_id(held_sym),),
                 ).fetchone()
                 self.assertEqual(
                     int(job_row["defer_count"]), tick,
@@ -48656,6 +49101,13 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             window = _case["window"]
             lease.clear()
             run_ga_workers._batch_breakers.clear()
+            # 07-14 R7-P0-2: production session_id collides across cases (same
+            # held symbol + same _PROD_BATCH_MS); mark every leftover
+            # scheduled_market_analysis job terminal so the prior case's deferred
+            # held-symbol job is not re-claimed here (would inflate defer_count
+            # past the seeded 8 and contaminate this case). See
+            # ``_cleanup_prior_scheduled_jobs``.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r5p0w1s_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -48677,7 +49129,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
                 "error_message=? WHERE session_id=?",
                 (8, _seed_at_str, "single_flight_deferred:8",
-                 f"{batch_id}:{held_sym}"),
+                 self._prod_session_id(held_sym)),
             )
             self.conn.commit()
 
@@ -48709,7 +49161,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_after = self.conn.execute(
                 "SELECT status, defer_count FROM agent_jobs WHERE session_id=?",
-                (f"{batch_id}:{held_sym}",),
+                (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
                 int(job_after["defer_count"]), 9,
@@ -48776,6 +49228,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             window = _case["window"]
             lease.clear()
             run_ga_workers._batch_breakers.clear()
+            # 07-14 R7-P0-2: production session_id collides across cases (same
+            # held symbol + same _PROD_BATCH_MS); mark every leftover
+            # scheduled_market_analysis job terminal so the prior case's job is
+            # not re-claimed here. See ``_cleanup_prior_scheduled_jobs``.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r5p0term_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -48794,7 +49251,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
                 "error_message=? WHERE session_id=?",
                 (2, _seed_at_str, "single_flight_deferred:2",
-                 f"{batch_id}:{held_sym}"),
+                 self._prod_session_id(held_sym)),
             )
             self.conn.commit()
             before = self._r3_p0_1_drain_baseline_counts(batch_id, held_sym)
@@ -48818,7 +49275,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             job_after = self.conn.execute(
                 "SELECT status, defer_count, error_message "
                 "FROM agent_jobs WHERE session_id=?",
-                (f"{batch_id}:{held_sym}",),
+                (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
                 str(job_after["status"]), "failed",
@@ -48918,6 +49375,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             pst = _case["pst"]
             lease.clear()
             run_ga_workers._batch_breakers.clear()
+            # 07-14 R7-P0-2: production session_id collides across cases (same
+            # held symbol + same _PROD_BATCH_MS); mark every leftover
+            # scheduled_market_analysis job terminal so the prior case's job is
+            # not re-claimed here. See ``_cleanup_prior_scheduled_jobs``.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r5p0unparse_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -48941,7 +49403,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "error_message=? WHERE session_id=?",
                 (_seed_count, "not-a-timestamp",
                  "single_flight_deferred:%d" % _seed_count,
-                 f"{batch_id}:{held_sym}"),
+                 self._prod_session_id(held_sym)),
             )
             self.conn.commit()
             before = self._r3_p0_1_drain_baseline_counts(batch_id, held_sym)
@@ -48966,7 +49428,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             job_after = self.conn.execute(
                 "SELECT status, defer_count, error_message "
                 "FROM agent_jobs WHERE session_id=?",
-                (f"{batch_id}:{held_sym}",),
+                (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
                 str(job_after["status"]), "failed",
@@ -49057,6 +49519,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             window = _case["window"]
             lease.clear()
             run_ga_workers._batch_breakers.clear()
+            # 07-14 R7-P0-2: production session_id collides across cases (same
+            # held symbol + same _PROD_BATCH_MS); mark every leftover
+            # scheduled_market_analysis job terminal so the prior case's job is
+            # not re-claimed here. See ``_cleanup_prior_scheduled_jobs``.
+            self._cleanup_prior_scheduled_jobs()
             batch_id = "15m:r5p0revert_%d_%d" % (pst, self._PROD_BATCH_MS)
             symbols = list(self._SYMBOLS[:2])
             held_sym = symbols[0]
@@ -49073,7 +49540,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
                 "error_message=? WHERE session_id=?",
                 (8, _seed_at_str, "single_flight_deferred:8",
-                 f"{batch_id}:{held_sym}"),
+                 self._prod_session_id(held_sym)),
             )
             self.conn.commit()
 
@@ -49109,7 +49576,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_after = self.conn.execute(
                 "SELECT status, defer_count FROM agent_jobs WHERE session_id=?",
-                (f"{batch_id}:{held_sym}",),
+                (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
                 int(job_after["defer_count"]), 9,
@@ -49486,7 +49953,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         job_row = self.conn.execute(
             "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
-            (f"{batch_id}:{sym}",),
+            (self._prod_session_id(sym),),
         ).fetchone()
         self.assertEqual(str(job_row["status"]), "failed")
         self.assertIn(
@@ -49500,44 +49967,54 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "symbol must be complete.",
         )
 
-    # ------------------------------------------------------------------
-    # P1-3 (terminal review): a malformed scheduled_market_analysis job whose
-    # payload has NO symbol is a poison pill. ``claim_next_batch`` already
-    # flipped it to ``status='running'``, so the pre-P1-3 code's bare
-    # ``continue`` left it ``running`` -> lease expires -> recover resets to
-    # ``pending`` -> re-claimed -> re-skipped -> infinite loop, NEVER surfaced
-    # as failed. P1-3 marks it ``failed`` immediately with
-    # ``invalid_scheduled_payload`` and syncs the batch status so it does NOT
-    # render ``success`` with a crashed ingest job.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 07-14 R7 (P0-2): the R6-P1-3 worker-side malformed-job handling is
+    # SUPERSEDED by the R7-P0-2 claim-side exact-set contract. R7-P0-1 made
+    # ``payload.symbol`` the authoritative job-symbol field; R7-P0-2 requires
+    # "an incomplete, duplicate, extra, cross-symbol, or malformed set fail-closed
+    # and is NOT claimed". A sealed batch carrying a job whose payload has NO
+    # ``symbol`` therefore fails the claim-side re-validation: ``claim_next_batch``
+    # returns None, the whole batch is left unclaimed (jobs stay ``pending``), and
+    # the worker never sees the poison pill. The R6-P1-3 ``invalid_scheduled_payload``
+    # worker marking in ``process_fair_batch`` is retained as defense-in-depth for
+    # any path that still delivers a no-symbol job to the worker (it is covered by
+    # the direct unit test below, independent of the batch-claim path).
+    # ----------------------------------------------------------------------
     def test_p1_3_malformed_job_marked_failed_and_batch_synced(self) -> None:
-        """P1-3: a scheduled_market_analysis job with no symbol is immediately
-        marked ``agent_jobs.status='failed'`` + ``error_message`` containing
-        ``invalid_scheduled_payload``, and the batch's final status is
-        ``partial_failed`` (NOT ``success``) when at least one malformed job is
-        present alongside clean symbols. The malformed job must NOT re-enter the
-        queue (status stays ``failed``, not ``pending``/``running``).
+        """R7-P0-2: a sealed batch that carries a malformed (no-symbol) job
+        alongside clean symbols FAIL-CLOSES at the claim side.
+        ``claim_next_batch`` re-validates the exact set in ONE write transaction:
+        it derives every job's symbol from the authoritative ``payload.symbol``
+        field and requires ``job_symbols == enabled_symbols`` (same cardinality,
+        same set). A job whose payload has NO symbol aborts the re-validation
+        (ROLLBACK) and the claim returns None. The batch is NOT claimed: every job
+        (clean + malformed) stays ``pending`` with no claim_token, and the batch
+        remains sealed-but-unclaimable rather than being silently processed with a
+        crashed ingest job.
 
-        Revert-fail: restore the bare ``continue`` (skip the malformed job) ->
-        the job stays ``running`` -> the ``status='failed'`` assertion fails,
-        and the batch renders ``success`` -> the ``partial_failed`` assertion
-        fails.
+        This supersedes the R6-P1-3 model where ``claim_next_batch`` blindly
+        claimed every job in a sealed batch (including the malformed one) and the
+        worker marked the malformed job ``failed`` afterwards. Under R7-P0-2 the
+        claim side is the authoritative gate; the malformed job never reaches the
+        worker via the batch-claim path.
+
+        Revert-fail: neutralize the claim-side cardinality+set guards (claim every
+        pending job regardless of payload.symbol) -> ``claim_next_batch`` returns
+        the batch and the ``returns None`` assertion fails; the malformed job is
+        flipped to ``running`` (claim_token set), contradicting "stays pending".
         """
-        from plugins.crypto_guard import run_ga_workers
-        from plugins.crypto_guard.reasoning import llm_agent_judge as _laj
-        from unittest.mock import patch
-
         batch_id = self._PROD_BATCH_ID
         clean_symbols = list(self._SYMBOLS[:2])
-        # Enqueue the clean jobs (each with a real snapshot/symbol).
+        # Enqueue the clean jobs (each with a real snapshot/symbol) and SEAL the
+        # batch exactly like the real producer.
         self._enqueue_batch_jobs(batch_id, clean_symbols)
-        # Append a MALFORMED job: scheduled_market_analysis with a payload that
-        # has NO symbol (neither snapshot.symbol nor a top-level symbol). It
-        # shares the same batch_id so claim_next_batch groups it with the
-        # clean jobs and flips it to running.
+        # Append a MALFORMED job: scheduled_market_analysis with a payload that has
+        # NO symbol (neither snapshot.symbol nor a top-level symbol). It shares the
+        # same batch_id so it is grouped with the clean jobs by claim_next_batch.
         self.repo.enqueue_job(
             job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=f"{batch_id}:MALFORMED",
+            priority=1, source="cron",
+            session_id=self._prod_session_id("MALFORMED"),
             payload={
                 "snapshot": {},  # no symbol
                 "batch_id": batch_id,
@@ -49545,164 +50022,886 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             },
         )
         self.conn.commit()
-        # Capture the malformed job's id (the last scheduled_market_analysis job
-        # we enqueued).
+
+        # The batch is sealed-but-polluted: claim_next_batch must FAIL-CLOSE.
+        claimed = self.repo.claim_next_batch()
+        self.assertIsNone(
+            claimed,
+            "R7-P0-2: a sealed batch carrying a no-symbol (malformed) job must "
+            "fail-closed at the claim side and NOT be claimed. Got %r" % (claimed,),
+        )
+        # No job was flipped to running / given a claim_token: the whole batch
+        # stays pending (clean + malformed alike).
+        running = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_jobs "
+            "WHERE job_type='scheduled_market_analysis' AND status='running'",
+        ).fetchone()["n"]
+        self.assertEqual(
+            running, 0,
+            "R7-P0-2: the fail-closed claim must leave ZERO jobs running. "
+            "Got %d." % (running,),
+        )
+        token_rows = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_jobs "
+            "WHERE job_type='scheduled_market_analysis' AND claim_token IS NOT NULL",
+        ).fetchone()["n"]
+        self.assertEqual(
+            token_rows, 0,
+            "R7-P0-2: the fail-closed claim must stamp NO claim_token. Got %d." %
+            (token_rows,),
+        )
+        # The malformed job is NOT marked failed by the worker (the worker never
+        # ran): it stays pending. The R6-P1-3 worker marking no longer fires on
+        # the batch-claim path.
         malformed_row = self.conn.execute(
-            "SELECT id FROM agent_jobs WHERE session_id=? ORDER BY id DESC LIMIT 1",
-            (f"{batch_id}:MALFORMED",),
+            "SELECT status, error_message FROM agent_jobs "
+            "WHERE session_id=?",
+            (self._prod_session_id("MALFORMED"),),
         ).fetchone()
-        self.assertIsNotNone(malformed_row, "P1-3: malformed job must be enqueued")
-        malformed_job_id = malformed_row["id"]
-
-        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "1"
-        os.environ["CRYPTO_GUARD_DB"] = str(self._tmp / "phase_a.db")
-
-        def _fake_call(prompt: str) -> str:
-            sym = None
-            for s in clean_symbols:
-                if s in prompt:
-                    sym = s
-                    break
-            return self._make_llm_response(
-                symbol=sym or clean_symbols[0],
-                analysis_time_ms=self._PROD_BATCH_MS,
-            )
-
-        with patch.object(_laj, "_call_ga_llm", side_effect=_fake_call):
-            result = run_ga_workers.run_once(background=True)
-        self.assertEqual(result.get("queue"), "fair_pool")
-        batch_result = result.get("result") or {}
-
-        # (a) the malformed job is marked FAILED with invalid_scheduled_payload.
-        job_row = self.conn.execute(
-            "SELECT status, error_message FROM agent_jobs WHERE id=?",
-            (malformed_job_id,),
-        ).fetchone()
-        self.assertIsNotNone(job_row, "P1-3: malformed job row must exist")
+        self.assertIsNotNone(malformed_row, "R7-P0-2: the malformed job must exist")
         self.assertEqual(
-            str(job_row["status"]), "failed",
-            "P1-3: the malformed job must be marked 'failed' immediately (not "
-            "left 'running' to re-loop). Got status=%r" % (job_row["status"],),
+            str(malformed_row["status"]), "pending",
+            "R7-P0-2: the malformed job stays pending (claim fail-closed before "
+            "the worker). Got %r." % (malformed_row["status"],),
         )
-        self.assertIn(
-            "invalid_scheduled_payload", str(job_row["error_message"] or ""),
-            "P1-3: the malformed job's error_message must cite "
-            "invalid_scheduled_payload. Got %r" % (job_row["error_message"],),
-        )
-
-        # (b) the malformed job did NOT re-enter the queue (still failed, not
-        # pending/running) and the clean symbols were still processed.
-        self.assertEqual(
-            str(job_row["status"]), "failed",
-            "P1-3: the malformed job must remain 'failed' (not re-queued).",
-        )
-        self.assertGreaterEqual(
-            int(batch_result.get("symbols") or -1), 2,
-            "P1-3: the clean symbols must still be processed. Got symbols=%r" %
-            (batch_result.get("symbols"),),
+        self.assertFalse(
+            bool(malformed_row["error_message"]),
+            "R7-P0-2: the malformed job's error_message stays NULL (worker never "
+            "ran). Got %r." % (malformed_row["error_message"],),
         )
 
-        # (c) the batch status reflects the malformed failure (NOT success).
-        batch_row = self.conn.execute(
-            "SELECT status, summary_json FROM analysis_batches WHERE batch_id=?",
-            (batch_id,),
-        ).fetchone()
-        self.assertIsNotNone(batch_row, "P1-3: batch row must exist")
-        self.assertNotEqual(
-            str(batch_row["status"]), "success",
-            "P1-3: a batch with a malformed job must NOT render 'success'. "
-            "Got status=%r" % (batch_row["status"],),
-        )
-        self.assertIn(
-            str(batch_row["status"]), {"partial_failed", "failed"},
-            "P1-3: batch status must be partial_failed/failed when a malformed "
-            "job is present. Got %r" % (batch_row["status"],),
-        )
-        # The malformed job list is carried in the batch summary.
-        summary = json.loads(batch_row["summary_json"] or "{}")
-        malformed_in_summary = summary.get("malformed_jobs") or []
-        self.assertTrue(
-            any(m.get("job_id") == malformed_job_id for m in malformed_in_summary),
-            "P1-3: the batch summary must carry the malformed job id. Got %r" %
-            (malformed_in_summary,),
-        )
-
-    # ------------------------------------------------------------------
-    # P1-3 (cont): when EVERY job in a batch is malformed (no symbols at all),
-    # the batch is marked ``failed`` (NOT left pending / re-looping) and the
-    # malformed jobs are all ``failed``. This is the all-malformed edge case.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 07-14 R7 (P0-2) cont: the all-malformed edge case.
+    # ----------------------------------------------------------------------
     def test_p1_3_all_malformed_batch_marked_failed(self) -> None:
-        """P1-3: a batch where every job is malformed (no symbol) is marked
-        ``failed`` and returns ``processed=True`` with ``symbols=0``. The jobs
-        are all ``failed`` (not re-looping).
+        """R7-P0-2: a sealed batch where EVERY job's payload lacks a symbol
+        fail-closes at the claim side. ``claim_next_batch`` derives zero valid
+        symbols from the payloads; the set ``{}`` != ``enabled_symbols`` -> the
+        re-validation aborts (ROLLBACK) and the claim returns None. No job is
+        flipped to running; the batch is NOT processed (the worker never runs).
 
-        Revert-fail: restore the bare ``continue`` + the old ``no_symbols``
-        early-return -> the batch is never finished (stays ``running``) and the
-        jobs stay ``running`` -> the ``status='failed'`` assertions fail.
+        This supersedes the R6-P1-3 all-malformed model where the worker marked
+        every job ``failed`` and the batch ``failed``. Under R7-P0-2 the claim
+        side rejects the batch before the worker sees it.
+
+        Revert-fail: neutralize the claim-side set guard -> claim_next_batch
+        returns the all-malformed batch -> the ``returns None`` assertion fails.
         """
-        from plugins.crypto_guard import run_ga_workers
-
         batch_id = "15m:all_malformed_%d" % self._PROD_BATCH_MS
-        for i in range(2):
+        bad_syms = ["BADUSDT0", "BADUSDT1"]
+        for sym in bad_syms:
             self.repo.enqueue_job(
                 job_type="scheduled_market_analysis",
-                priority=1, source="cron", session_id=f"{batch_id}:bad{i}",
+                priority=1, source="cron",
+                session_id=self._prod_session_id(sym),
+                # MALFORMED PAYLOAD: snapshot has no symbol and there is no
+                # top-level symbol -> payload.symbol is missing.
                 payload={"snapshot": {}, "batch_id": batch_id},
+            )
+            self.repo.mark_batch_symbol_completed(
+                batch_id=batch_id, symbol=sym, status="pending",
             )
         self.repo.start_analysis_batch(
             batch_id=batch_id, primary_interval="15m",
-            analysis_time=self._PROD_BATCH_MS, enabled_symbols=[],
+            analysis_time=self._PROD_BATCH_MS, enabled_symbols=bad_syms,
         )
+        self.repo.seal_analysis_batch(batch_id)
         self.conn.commit()
-        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "1"
-        os.environ["CRYPTO_GUARD_DB"] = str(self._tmp / "phase_a.db")
 
-        result = run_ga_workers.run_once(background=True)
-        self.assertEqual(result.get("queue"), "fair_pool")
-        batch_result = result.get("result") or {}
-        # NOTE: ``batch_result.get("symbols") or -1`` would coerce a real 0 to
-        # -1 (falsy 0); use an explicit None check so the all-malformed count
-        # of 0 survives.
-        _sym_count = batch_result.get("symbols")
-        self.assertEqual(-1 if _sym_count is None else int(_sym_count), 0)
-        self.assertTrue(
-            bool(batch_result.get("malformed_jobs")),
-            "P1-3: all-malformed batch must report malformed_jobs. Got %r" %
-            (batch_result.get("malformed_jobs"),),
+        # Every job is malformed: claim_next_batch must FAIL-CLOSE.
+        claimed = self.repo.claim_next_batch()
+        self.assertIsNone(
+            claimed,
+            "R7-P0-2: an all-malformed (no payload.symbol) sealed batch must "
+            "fail-closed at the claim side. Got %r" % (claimed,),
         )
-
-        # Batch is failed (not left running/pending).
+        running = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_jobs "
+            "WHERE job_type='scheduled_market_analysis' AND status='running'",
+        ).fetchone()["n"]
+        self.assertEqual(running, 0)
+        token_rows = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_jobs "
+            "WHERE job_type='scheduled_market_analysis' AND claim_token IS NOT NULL",
+        ).fetchone()["n"]
+        self.assertEqual(token_rows, 0)
+        # The batch is sealed but unclaimable: status stays 'sealed' (NOT
+        # 'failed'/'success'/'running') because the worker never ran.
         batch_row = self.conn.execute(
             "SELECT status FROM analysis_batches WHERE batch_id=?",
             (batch_id,),
         ).fetchone()
         self.assertIsNotNone(batch_row)
-        self.assertEqual(
-            str(batch_row["status"]), "failed",
-            "P1-3: all-malformed batch must be 'failed'. Got %r" %
+        self.assertNotEqual(
+            str(batch_row["status"]), "success",
+            "R7-P0-2: an all-malformed batch must NOT render 'success'. Got %r." %
             (batch_row["status"],),
         )
-        # Every malformed job is failed (not running/pending).
-        bad_rows = self.conn.execute(
-            "SELECT status FROM agent_jobs WHERE session_id LIKE ?",
-            (f"{batch_id}:%",),
+
+    # ----------------------------------------------------------------------
+    # 07-14 R7 (P0-2) defense-in-depth: the R6-P1-3 worker-side marking is
+    # retained for any path that still delivers a no-symbol job to the worker
+    # (the batch-claim path now rejects such batches, so this is exercised by
+    # calling ``process_fair_batch`` directly with a hand-built malformed jobs
+    # list, bypassing ``claim_next_batch``).
+    # ----------------------------------------------------------------------
+    def test_p1_3_worker_marks_no_symbol_job_failed_defense_in_depth(self) -> None:
+        """R7-P0-2 defense-in-depth: the R6-P1-3 worker-side
+        ``invalid_scheduled_payload`` marking in ``process_fair_batch`` is retained
+        for any path that still delivers a no-symbol job to the worker (the
+        batch-claim path now rejects such batches, so this is exercised by calling
+        ``process_fair_batch`` directly with a hand-built malformed jobs list,
+        bypassing ``claim_next_batch``). A no-symbol job is marked ``failed``
+        immediately with ``invalid_scheduled_payload`` and does NOT re-enter the
+        queue.
+
+        Revert-fail: restore the bare ``continue`` (skip the malformed job without
+        finishing it) -> the job stays ``running`` -> the ``status='failed'``
+        assertion fails.
+        """
+        from plugins.crypto_guard.run_ga_workers import process_fair_batch
+
+        batch_id = "15m:p1_3_worker_%d" % self._PROD_BATCH_MS
+        bad_sym = "BADUSDT0"
+        # Build a no-symbol job and flip it to running (mimicking a path that
+        # delivered it to the worker outside the batch-claim gate).
+        self.repo.enqueue_job(
+            job_type="scheduled_market_analysis",
+            priority=1, source="cron", session_id=self._prod_session_id(bad_sym),
+            payload={"snapshot": {}, "batch_id": batch_id},
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP "
+            "WHERE job_type='scheduled_market_analysis' AND session_id=?",
+            (self._prod_session_id(bad_sym),),
+        )
+        self.conn.commit()
+        jobs = self.conn.execute(
+            "SELECT * FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+            "AND status='running'",
         ).fetchall()
-        self.assertEqual(len(bad_rows), 2)
-        for r in bad_rows:
-            self.assertEqual(
-                str(r["status"]), "failed",
-                "P1-3: every malformed job must be 'failed'. Got statuses=%r" %
-                ([row["status"] for row in bad_rows],),
-            )
+        self.assertEqual(len(jobs), 1)
+        # process_fair_batch marks the no-symbol job failed and finishes the batch.
+        result = process_fair_batch(self.repo, [dict(j) for j in jobs],
+                                    send_message=None)
+        self.assertEqual(result.get("queue"), "fair_pool")
+        self.assertTrue(
+            bool(result.get("malformed_jobs")),
+            "P1-3 defense-in-depth: the worker must report malformed_jobs. "
+            "Got %r" % (result.get("malformed_jobs"),),
+        )
+        job_row = self.conn.execute(
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            (self._prod_session_id(bad_sym),),
+        ).fetchone()
+        self.assertIsNotNone(job_row)
+        self.assertEqual(
+            str(job_row["status"]), "failed",
+            "P1-3 defense-in-depth: the no-symbol job must be 'failed' (not "
+            "re-looping 'running'). Got %r." % (job_row["status"],),
+        )
+        self.assertIn(
+            "invalid_scheduled_payload", str(job_row["error_message"] or ""),
+            "P1-3 defense-in-depth: error_message must cite "
+            "invalid_scheduled_payload. Got %r." % (job_row["error_message"],),
+        )
 
     # ------------------------------------------------------------------
-    # Exception path: one symbol's post-decision pipeline raises. The batch
-    # must still finish, that symbol is 'failed', expected_symbols stays N
-    # (NOT N-1), worker_failed==1, coverage is degraded, and the report names
-    # the failed symbol. This also fixes the P2-5 expected==3 bug.
+    # 07-15 R8-A (P0-2): the authoritative-symbol contract must thread
+    # through seal / claim / worker via ONE shared identity-validation helper.
+    # Pre-R8 the seal only cross-checked ``payload.symbol == payload.snapshot.
+    # symbol`` WHEN ``snapshot.symbol`` was present -- a MISSING snapshot or a
+    # snapshot with no symbol SKIPPED the check and sealed successfully
+    # (fail-open). The user reproduced this in-memory as
+    # ``seal_missing_snapshot=True``. The worker preferred ``snapshot.symbol``
+    # over the authoritative ``payload.symbol``. These RED tests pin the
+    # contract before the fix lands; they fail today and pass once the shared
+    # ``_validate_job_identity`` helper is wired into seal/claim/worker.
     # ------------------------------------------------------------------
-    def test_r5_5_fair_batch_production_chain_one_symbol_raises(self) -> None:
+
+    def test_r8_a_seal_missing_snapshot_fail_closed(self) -> None:
+        """R8-A (P0-2): a job whose payload carries NO snapshot (or a snapshot
+        with no symbol) MUST fail the seal closed (``seal_analysis_batch`` returns
+        ``False``). Pre-R8 the seal only cross-checked
+        ``payload.symbol == payload.snapshot.symbol`` when ``snapshot.symbol``
+        was present, so a missing snapshot skipped the check and the batch
+        sealed -- the in-memory ``seal_missing_snapshot=True`` repro. The
+        shared identity contract requires the snapshot be a dict whose
+        ``symbol`` is a non-empty string strictly equal to ``payload.symbol``;
+        any less fails the whole batch closed (the batch stays unsealed +
+        unclaimable, never partially claimed).
+
+        Revert-fail: restore the ``if snap_sym is not None and snap_sym != sym:
+        return False`` guarded check -> a missing snapshot skips the check ->
+        the seal returns True -> the ``assertNotSealed`` assertion fails.
+        """
+        batch_id = "15m:r8a_missing_%d" % self._PROD_BATCH_MS
+        sym = "BTCUSDT"
+        # A job that carries the authoritative ``payload.symbol`` but a snapshot
+        # that is an EMPTY dict (no symbol inside). This is the missing-snapshot
+        # repro: payload.symbol present, snapshot.symbol absent.
+        self.repo.enqueue_job(
+            job_type="scheduled_market_analysis",
+            priority=1, source="cron", session_id=self._prod_session_id(sym),
+            payload={"snapshot": {}, "batch_id": batch_id, "symbol": sym},
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
+        )
+        self.conn.commit()
+        sealed = self.repo.seal_analysis_batch(batch_id)
+        self.assertFalse(
+            sealed,
+            "R8-A (P0-2): a batch whose job carries a snapshot with NO symbol "
+            "must NOT seal (fail-closed identity check). Got sealed=%r. This is "
+            "the user's in-memory seal_missing_snapshot=True repro." % (sealed,),
+        )
+        # The batch stays unsealed -> claim_next_batch never picks it up.
+        claimed = self.repo.claim_next_batch()
+        self.assertIsNone(
+            claimed,
+            "R8-A (P0-2): an unsealed (missing-snapshot) batch must NOT be "
+            "claimed. Got %r" % (claimed,),
+        )
+
+    def test_r8_a_seal_swapped_snapshot_fail_closed(self) -> None:
+        """R8-A (P0-2): a job whose ``payload.snapshot.symbol`` differs from the
+        authoritative ``payload.symbol`` (a swapped / cross-symbol snapshot) MUST
+        fail the seal closed. Pre-R8 the seal DID catch this when the snapshot
+        had a symbol (the ``snap_sym != sym`` branch), so this test should ALREADY
+        pass for the seal -- it pins the existing behavior so the shared helper
+        refactor does not regress it. The NEW failure surface is the missing-
+        snapshot path (test_r8_a_seal_missing_snapshot_fail_closed); this test
+        guards the swapped path stays fail-closed under the refactor.
+
+        Revert-fail: if the shared helper stops checking ``snapshot.symbol``
+        equality (e.g. only checks ``payload.symbol``) -> the swapped batch
+        seals -> the assertion fails.
+        """
+        batch_id = "15m:r8a_swapped_%d" % self._PROD_BATCH_MS
+        sym = "BTCUSDT"
+        # payload.symbol = BTCUSDT but snapshot.symbol = ETHUSDT (swapped).
+        self.repo.enqueue_job(
+            job_type="scheduled_market_analysis",
+            priority=1, source="cron", session_id=self._prod_session_id(sym),
+            payload={
+                "snapshot": {"symbol": "ETHUSDT"},  # swapped!
+                "batch_id": batch_id, "symbol": sym,
+            },
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
+        )
+        self.conn.commit()
+        sealed = self.repo.seal_analysis_batch(batch_id)
+        self.assertFalse(
+            sealed,
+            "R8-A (P0-2): a batch whose job has payload.symbol != snapshot.symbol "
+            "(swapped snapshot) must NOT seal. Got sealed=%r." % (sealed,),
+        )
+
+    def test_r8_a_claim_rejects_swapped_snapshot_batch(self) -> None:
+        """R8-A (P0-2): ``claim_next_batch`` re-validates the authoritative set
+        from ``payload.symbol`` (R7-P0-2) but must ALSO re-check
+        ``payload.symbol == payload.snapshot.symbol``. A batch carrying a
+        swapped-snapshot job must fail the claim closed (return None), even if
+        the ``payload.symbol`` set itself matches the enabled set. Pre-R8 the
+        claim only checked the ``payload.symbol`` set, so a swapped-snapshot
+        batch whose ``payload.symbol`` set matched would be claimed -- the
+        poison pill reaches the worker via a clean claim.
+
+        We build a sealed-but-swapped batch by enqueuing the swapped job and
+        then hand-sealing (the seal itself rejects swapped, so this test
+        targets the claim-side re-check directly: it manually stamps the seal
+        columns to simulate a seal that passed, then asserts claim_next_batch
+        still rejects via the snapshot-consistency re-check). If the seal now
+        rejects swapped (test_r8_a_seal_swapped_snapshot_fail_closed), the
+        claim-side re-check is the defense for any batch that reaches claim
+        time with a swapped snapshot (e.g. a hand-built / migrated batch).
+        """
+        batch_id = "15m:r8a_claim_swapped_%d" % self._PROD_BATCH_MS
+        sym = "BTCUSDT"
+        self.repo.enqueue_job(
+            job_type="scheduled_market_analysis",
+            priority=1, source="cron", session_id=self._prod_session_id(sym),
+            payload={
+                "snapshot": {"symbol": "ETHUSDT"},  # swapped
+                "batch_id": batch_id, "symbol": sym,
+            },
+        )
+        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
+        )
+        # Hand-stamp the seal columns so the batch is "sealed" from claim_next_
+        # batch's perspective, simulating a batch that reached claim time with a
+        # swapped snapshot despite the seal (the claim-side re-check is the
+        # authoritative defense-in-depth gate).
+        self.conn.execute(
+            "UPDATE analysis_batches SET sealed_at=CURRENT_TIMESTAMP, "
+            "claim_ready_at=CURRENT_TIMESTAMP WHERE batch_id=?",
+            (batch_id,),
+        )
+        self.conn.commit()
+        claimed = self.repo.claim_next_batch()
+        self.assertIsNone(
+            claimed,
+            "R8-A (P0-2): claim_next_batch must re-check "
+            "payload.symbol == payload.snapshot.symbol and reject a swapped-"
+            "snapshot batch (return None). Got %r" % (claimed,),
+        )
+
+    def test_r8_a_worker_swapped_snapshot_marked_failed_not_analyzed(self) -> None:
+        """R8-A (P0-2): the worker ``process_fair_batch`` must use ONLY
+        ``payload.symbol`` as the authoritative symbol. If ``payload.symbol`` is
+        missing OR ``payload.snapshot.symbol != payload.symbol``, the job is
+        marked ``failed`` (``invalid_scheduled_payload``) and NOT analyzed -- no
+        LLM call, no decision persisted. Pre-R8 the worker derived
+        ``sym = str(snap.get("symbol") or payload.get("symbol") or "")`` which
+        PREFERS ``snapshot.symbol`` over the authoritative ``payload.symbol`` --
+        a swapped snapshot would make the worker analyze the WRONG symbol under
+        the running job's identity (cross-symbol corruption).
+
+        This is exercised by calling ``process_fair_batch`` directly with a
+        hand-flipped swapped-snapshot job (bypassing the batch-claim gate), the
+        same pattern as ``test_p1_3_worker_marks_no_symbol_job_failed_defense_in_
+        depth``. The NEW assertion: a SWAPPED (not missing) snapshot is ALSO
+        treated as malformed, and the worker uses ``payload.symbol`` (so the
+        finished job's record is tied to the authoritative symbol, not the
+        swapped snapshot symbol).
+
+        Revert-fail: restore ``sym = str(snap.get("symbol") or payload.get("symbol") or "")``
+        -> the worker takes ``snapshot.symbol`` (ETHUSDT) as the symbol, does
+        NOT detect the mismatch, and proceeds to analysis -> no malformed_jobs,
+        the job is NOT marked failed -> the assertion fails.
+        """
+        from plugins.crypto_guard.run_ga_workers import process_fair_batch
+
+        batch_id = "15m:r8a_worker_swapped_%d" % self._PROD_BATCH_MS
+        sym = "BTCUSDT"
+        # payload.symbol = BTCUSDT, snapshot.symbol = ETHUSDT (swapped).
+        self.repo.enqueue_job(
+            job_type="scheduled_market_analysis",
+            priority=1, source="cron", session_id=self._prod_session_id(sym),
+            payload={
+                "snapshot": {"symbol": "ETHUSDT"},  # swapped
+                "batch_id": batch_id, "symbol": sym,
+            },
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP "
+            "WHERE job_type='scheduled_market_analysis' AND session_id=?",
+            (self._prod_session_id(sym),),
+        )
+        self.conn.commit()
+        jobs = self.conn.execute(
+            "SELECT * FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+            "AND status='running'",
+        ).fetchall()
+        self.assertEqual(len(jobs), 1)
+        result = process_fair_batch(self.repo, [dict(j) for j in jobs],
+                                    send_message=None)
+        self.assertEqual(result.get("queue"), "fair_pool")
+        self.assertTrue(
+            bool(result.get("malformed_jobs")),
+            "R8-A (P0-2): a swapped-snapshot job must be reported as malformed. "
+            "Got %r" % (result.get("malformed_jobs"),),
+        )
+        job_row = self.conn.execute(
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            (self._prod_session_id(sym),),
+        ).fetchone()
+        self.assertIsNotNone(job_row)
+        self.assertEqual(
+            str(job_row["status"]), "failed",
+            "R8-A (P0-2): a swapped-snapshot job must be 'failed' (not analyzed "
+            "under the wrong symbol). Got %r." % (job_row["status"],),
+        )
+        self.assertIn(
+            "invalid_scheduled_payload", str(job_row["error_message"] or ""),
+            "R8-A (P0-2): error_message must cite invalid_scheduled_payload. "
+            "Got %r." % (job_row["error_message"],),
+        )
+
+    # ------------------------------------------------------------------
+    # 07-15 R8-C (P1-2): the production producer must persist the snapshot
+    # INSIDE the ``BEGIN IMMEDIATE`` so a seal failure rolls the snapshot row
+    # back WITH the batch. Pre-R8-C ``enqueue_market_analysis`` called
+    # ``repo.save_market_snapshot(snapshot)`` in Phase 1 (BEFORE ``BEGIN
+    # IMMEDIATE``); the autocommit connection auto-committed the snapshot row,
+    # so a seal-failure ``ROLLBACK`` reverted the batch/jobs/status but LEFT the
+    # snapshot row behind -- an orphan. The Phase-1 comment ("snapshots roll back
+    # with the batch") was wrong. These RED tests pin the no-orphan contract.
+    # ------------------------------------------------------------------
+
+    def test_r8_c_producer_seal_failure_leaves_no_orphan_snapshot(self) -> None:
+        """R8-C (P1-2): a seal failure MUST leave ZERO ``market_snapshots``
+        rows for the batch's symbols/analysis_time. Pre-R8-C the snapshot was
+        persisted in Phase 1 (before ``BEGIN IMMEDIATE``) so the autocommit
+        connection committed it, and the seal-failure ``ROLLBACK`` reverted the
+        batch/jobs/status but NOT the snapshot -> an orphan row survived. The
+        Phase-1 comment claimed "snapshots roll back with the batch" which was
+        false. R8-C moves ``save_market_snapshot`` inside the transaction so the
+        snapshot row rolls back with everything else on a seal failure.
+
+        Production shape: call the REAL ``enqueue_market_analysis`` and force a
+        seal failure by patching ``CryptoGuardRepository.seal_analysis_batch`` to
+        raise (the controlled-rollback branch). ``build_market_state_snapshot`` is
+        patched to a canned snapshot builder (no network, no candle reads) so
+        the real producer path runs end-to-end up to the seal. Assert: the
+        producer returned ``ok=False`` + ``sealed=False`` AND zero
+        ``market_snapshots`` rows exist for the tick's symbols/analysis_time
+        (no orphan). Pre-fix exactly one orphan row survived per symbol.
+
+        Revert-fail: move ``save_market_snapshot`` back out of the transaction
+        -> the snapshot row auto-commits -> the "zero rows" assertion fails.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        # A canned snapshot the real producer persists. Must carry the fields
+        # ``save_market_snapshot`` reads (symbol, analysis_time_utc, mode). It
+        # also accepts R8 P2-2's ``module_result_sink`` and appends a couple of
+        # deferred ``module_analysis_results`` tuples so the P2-2 orphan
+        # assertion (zero module_analysis_results rows on seal failure) is
+        # exercised through the real producer's Phase-2 persist path.
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes, module_result_sink=None, skill_log_sink=None, batch_id=None, attempt_id=None, **_kwargs):
+            if module_result_sink is not None:
+                module_result_sink.append(
+                    (symbol, "15m", int(analysis_time_utc), "trend_stage", {"trend_stage": "up"}, 0.8)
+                )
+                module_result_sink.append(
+                    (symbol, "multi", int(analysis_time_utc), "market_regime", {"regime": "trend"}, 0.7)
+                )
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot), \
+                 patch.object(
+                     type(self.repo), "seal_analysis_batch",
+                     side_effect=RuntimeError("injected seal failure (R8-C)"),
+                 ):
+                # ``enqueue_market_analysis`` creates its OWN conn + repo (so
+                # the seal_analysis_batch patch applies to the new repo's class
+                # via type(self.repo)). A seal RuntimeError is a GENUINE crash
+                # path here -> the except branch re-raises. That is fine: the
+                # assertion is that NO snapshot rows survive the rollback, and a
+                # re-raised exception still hits the ``except`` ROLLBACK.
+                result = None
+                raised = None
+                try:
+                    result = enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:  # the injected seal-failure re-raise
+                    raised = exc
+            # The seal failure must NOT produce an ok=True/sealed=True result.
+            if result is not None:
+                self.assertFalse(
+                    result.get("ok", True),
+                    "R8-C: a seal failure must report ok=False. Got %r" % (result,),
+                )
+                self.assertFalse(
+                    result.get("sealed", True),
+                    "R8-C: a seal failure must report sealed=False. Got %r" % (result,),
+                )
+            # THE LOAD-BEARING ASSERTION (the orphan): zero market_snapshots rows
+            # for this tick's symbols/analysis_time. Pre-fix one orphan survived
+            # per symbol (auto-committed in Phase 1, left behind by ROLLBACK).
+            orphan_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(
+                orphan_count, 0,
+                "R8-C (P1-2): a seal failure MUST leave ZERO orphan market_snapshots "
+                "rows (the snapshot must roll back WITH the batch). Found %d orphan "
+                "row(s). raised=%r result=%r" % (orphan_count, raised, result),
+            )
+            # The batch row must also be gone (no half-built batch).
+            batch_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                (f"15m:{analysis_time}",),
+            ).fetchone()[0])
+            self.assertEqual(
+                batch_count, 0,
+                "R8-C: a seal failure must roll the analysis_batches row back too. "
+                "Found %d." % (batch_count,),
+            )
+            # The jobs must be gone too (no orphan jobs).
+            job_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+                "AND session_id LIKE ?",
+                (f"system:scheduled:15m:%:{analysis_time}",),
+            ).fetchone()[0])
+            self.assertEqual(
+                job_count, 0,
+                "R8-C: a seal failure must roll every scheduled_market_analysis job "
+                "back. Found %d." % (job_count,),
+            )
+            # R8 P2-2 (07-14): the deferred ``module_analysis_results`` writes
+            # (the sink tuples the canned builder appended) must ALSO roll back
+            # with the batch. Pre-P2-2 ``build_market_state_snapshot`` persisted
+            # these in autocommit Phase 1, so a Phase-2 seal-failure ROLLBACK
+            # left them behind as orphans. Now they persist inside the BEGIN
+            # IMMEDIATE (Phase 2, before save_market_snapshot) so they roll back
+            # too. Assert ZERO module_analysis_results rows for this tick.
+            module_orphan_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(
+                module_orphan_count, 0,
+                "R8 P2-2: a seal failure MUST leave ZERO orphan module_analysis_results "
+                "rows (they persist inside the BEGIN IMMEDIATE and roll back with the "
+                "batch). Found %d orphan row(s). raised=%r" % (module_orphan_count, raised),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    # ------------------------------------------------------------------
+    # 07-15 R8-D (P1-1): a REAL producer e2e test that drives the actual
+    # ``enqueue_market_analysis`` -> ``seal_analysis_batch`` -> ``claim_next_batch``
+    # chain (mocking ONLY the external snapshot-build / network boundary), and a
+    # residue test that a mid-transaction exception leaves zero batch/job/status
+    # rows. Pre-R8-D no test called the real producer end-to-end; the test helper
+    # ``_enqueue_batch_jobs`` falsely claimed an atomic transaction but wrote
+    # rows BEFORE the ``BEGIN IMMEDIATE``. These tests pin the real contract.
+    # ------------------------------------------------------------------
+
+    def test_r8_d_real_producer_e2e_seals_and_claims_exact_enabled_set(self) -> None:
+        """R8-D (P1-1): the REAL production chain
+        ``enqueue_market_analysis`` -> ``seal_analysis_batch`` -> ``claim_next_batch``
+        must work end-to-end (mocking ONLY ``build_market_state_snapshot`` and
+        no network), producing N real-format ``session_id``s, N authoritative
+        ``payload.symbol``s, a sealed batch, and a single ``claim_next_batch``
+        that returns the EXACT enabled set.
+
+        Pre-R8-D no test called the real producer; the ``_enqueue_batch_jobs``
+        helper wrote snapshots/jobs/batch/status BEFORE the ``BEGIN IMMEDIATE``
+        and only wrapped ``seal_analysis_batch`` in the transaction -- it
+        FALSELY claimed an atomic transaction. This test drives the REAL
+        producer so the atomicity, identity, and claim contracts are exercised
+        on production-shaped code, not a hand-rolled approximation.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        enabled = list(self._SYMBOLS)  # the 10 active symbols
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes, module_result_sink=None, skill_log_sink=None, batch_id=None, attempt_id=None, **_kwargs):
+            # R8 P2-2: accept the deferred module_results sink (the real producer
+            # passes it). Append a couple of tuples so the e2e path also proves
+            # the deferred module_analysis_results persist on the SUCCESS path
+            # (they land inside the BEGIN IMMEDIATE and survive the COMMIT).
+            if module_result_sink is not None:
+                module_result_sink.append(
+                    (symbol, "15m", int(analysis_time_utc), "trend_stage", {"trend_stage": "up"}, 0.8)
+                )
+                module_result_sink.append(
+                    (symbol, "multi", int(analysis_time_utc), "market_regime", {"regime": "trend"}, 0.7)
+                )
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot):
+                result = enqueue_market_analysis(
+                    analysis_time_utc=analysis_time, primary_interval="15m",
+                    timeframes=["15m"],
+                )
+            # The real producer must report ok=True + sealed=True.
+            self.assertTrue(
+                result.get("ok"),
+                "R8-D: the real producer must report ok=True for a full enabled set. "
+                "Got %r" % (result,),
+            )
+            self.assertTrue(
+                result.get("sealed"),
+                "R8-D: the real producer must seal the batch. Got %r" % (result,),
+            )
+            self.assertEqual(result.get("queued"), len(enabled))
+            batch_id = result["batch_id"]
+            self.assertEqual(batch_id, f"15m:{analysis_time}")
+
+            # N real-format session_ids: ``system:scheduled:15m:{sym}:{time}``.
+            rows = [
+                dict(r) for r in self.conn.execute(
+                    "SELECT session_id, payload_json FROM agent_jobs "
+                    "WHERE job_type='scheduled_market_analysis' ORDER BY id ASC"
+                ).fetchall()
+            ]
+            self.assertEqual(len(rows), len(enabled))
+            expected_sessions = {f"system:scheduled:15m:{s}:{analysis_time}" for s in enabled}
+            actual_sessions = {r["session_id"] for r in rows}
+            self.assertEqual(
+                actual_sessions, expected_sessions,
+                "R8-D: every job must use the production session_id format. "
+                "Got %r" % (actual_sessions,),
+            )
+            # N authoritative payload.symbol values, each equal to its job's
+            # session_id symbol, AND a snapshot whose symbol matches (identity).
+            import json as _json
+            sym_set = set(enabled)
+            for r in rows:
+                payload = _json.loads(r["payload_json"])
+                sym = payload.get("symbol")
+                self.assertIn(
+                    sym, sym_set,
+                    "R8-D: payload.symbol must be one of the enabled symbols. Got %r" % (sym,),
+                )
+                self.assertEqual(
+                    sym, payload.get("snapshot", {}).get("symbol"),
+                    "R8-D: payload.symbol must equal payload.snapshot.symbol (identity). "
+                    "Got payload.symbol=%r snapshot.symbol=%r" % (sym, payload.get("snapshot", {}).get("symbol")),
+                )
+                self.assertEqual(payload.get("batch_id"), batch_id)
+                self.assertIsNotNone(payload.get("snapshot_id"))
+
+            # The batch row must be sealed (claim_ready_at stamped).
+            batch_row = self.conn.execute(
+                "SELECT claim_ready_at, enabled_symbols_json FROM analysis_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            self.assertIsNotNone(batch_row)
+            self.assertIsNotNone(
+                batch_row["claim_ready_at"],
+                "R8-D: a sealed batch must have claim_ready_at stamped.",
+            )
+            import json as _json2
+            self.assertEqual(
+                set(_json2.loads(batch_row["enabled_symbols_json"] or "[]")), set(enabled),
+            )
+
+            # 07-14 R8 Recommended-1: POSITIVE persistence assertion that the
+            # deferred ``module_analysis_results`` rows (the sink tuples the
+            # canned builder appended per symbol) actually land in the DB on the
+            # SUCCESS path. Pre-Recommended-1 this test only asserted session
+            # identity / claim semantics -- it never checked that the module rows
+            # were persisted, so a narrow revert that "collected the sink but
+            # removed the Phase-2 persist loop" (cron_scheduler.py Phase-2
+            # ``for ... save_module_result(...)``) would still pass GREEN while
+            # silently dropping every module_analysis_results row. The canned
+            # builder appends 2 tuples per symbol (trend_stage + market_regime),
+            # so the exact expected count is 2 * len(enabled) = 20 for the
+            # 10-symbol enabled set. This pins the success-path persist contract.
+            module_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(
+                module_count, 2 * len(enabled),
+                "R8 Recommended-1: the deferred module_analysis_results MUST persist "
+                "on the success path (2 tuples per enabled symbol). Expected %d, got "
+                "%d. A revert that collects the sink but removes the Phase-2 persist "
+                "loop would leave 0." % (2 * len(enabled), module_count),
+            )
+
+            # ONE ``claim_next_batch`` returns the EXACT enabled set (all N rows,
+            # all running, every symbol present exactly once).
+            claimed = self.repo.claim_next_batch()
+            self.assertIsNotNone(
+                claimed, "R8-D: a sealed batch must be claimable in one call."
+            )
+            self.assertEqual(
+                len(claimed), len(enabled),
+                "R8-D: claim_next_batch must return exactly N rows (the enabled set). "
+                "Got %d." % (len(claimed),),
+            )
+            claimed_symbols = set()
+            for c in claimed:
+                self.assertEqual(
+                    str(c["status"]), "running",
+                    "R8-D: every claimed row must be flipped to running. Got %r" % (c["status"],),
+                )
+                cp = _json.loads(c["payload_json"])
+                claimed_symbols.add(cp.get("symbol"))
+            self.assertEqual(
+                claimed_symbols, set(enabled),
+                "R8-D: the claimed symbol set must equal the enabled set exactly. "
+                "Got %r" % (claimed_symbols,),
+            )
+            # A second claim returns None (no other sealed+pending batch).
+            self.assertIsNone(self.repo.claim_next_batch())
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r8_d_real_producer_mid_transaction_exception_leaves_zero_residue(self) -> None:
+        """R8-D (P1-1): if the producer transaction fails AFTER ``BEGIN
+        IMMEDIATE`` (e.g. a seal crash), the ``ROLLBACK`` must leave ZERO
+        residue -- no batch row, no jobs, no ``batch_symbol_status`` rows, no
+        snapshot rows. Pre-R8-D the helper wrote rows before the transaction so
+        a mid-transaction failure left them behind (the false atomic-transaction
+        claim). The REAL producer wraps EVERYTHING in the ``BEGIN IMMEDIATE``,
+        so a crash reverts all of it.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes, module_result_sink=None, skill_log_sink=None, batch_id=None, attempt_id=None, **_kwargs):
+            # R8 P2-2: accept the deferred module_results sink (the real producer
+            # passes it) and append tuples so the crash branch's zero-residue
+            # assertion also covers module_analysis_results (they must roll back
+            # with the batch on the injected mid-transaction crash).
+            if module_result_sink is not None:
+                module_result_sink.append(
+                    (symbol, "15m", int(analysis_time_utc), "trend_stage", {"trend_stage": "up"}, 0.8)
+                )
+                module_result_sink.append(
+                    (symbol, "multi", int(analysis_time_utc), "market_regime", {"regime": "trend"}, 0.7)
+                )
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot), \
+                 patch.object(
+                     type(self.repo), "seal_analysis_batch",
+                     side_effect=RuntimeError("injected mid-transaction crash (R8-D)"),
+                 ):
+                raised = None
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            self.assertIsInstance(
+                raised, RuntimeError,
+                "R8-D: the injected mid-transaction crash must propagate.",
+            )
+            batch_id = f"15m:{analysis_time}"
+            # ZERO residue across every table the producer touched.
+            batch_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?", (batch_id,),
+            ).fetchone()[0])
+            job_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
+            ).fetchone()[0])
+            bss_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=?", (batch_id,),
+            ).fetchone()[0])
+            snap_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            # R8 P2-2: the deferred module_analysis_results rows persist inside
+            # the BEGIN IMMEDIATE (before save_market_snapshot), so the injected
+            # mid-transaction crash must roll them back too -- zero residue.
+            module_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(batch_count, 0, "R8-D: no batch row residue. Got %d." % batch_count)
+            self.assertEqual(job_count, 0, "R8-D: no job row residue. Got %d." % job_count)
+            self.assertEqual(bss_count, 0, "R8-D: no batch_symbol_status residue. Got %d." % bss_count)
+            self.assertEqual(snap_count, 0, "R8-D: no snapshot residue. Got %d." % snap_count)
+            self.assertEqual(module_count, 0, "R8-D P2-2: no module_analysis_results residue. Got %d." % module_count)
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r8_d_enqueue_batch_jobs_helper_is_atomic_zero_residue_on_seal_fail(self) -> None:
+        """R8-D (P1-1): the rewritten ``_enqueue_batch_jobs`` helper must write
+        the batch row + every job + every ``batch_symbol_status`` row + every
+        snapshot + the seal stamp ALL inside ONE ``BEGIN IMMEDIATE``. A forced
+        seal failure must ``ROLLBACK`` the ENTIRE helper -- ZERO residue
+        (no batch, no jobs, no batch_symbol_status, no snapshots).
+
+        Pre-R8-D the helper wrote all rows BEFORE the ``BEGIN IMMEDIATE`` and
+        wrapped only ``seal_analysis_batch`` in the transaction; its
+        "atomic transaction" docstring was FALSE -- a seal failure left the
+        batch + jobs + snapshots behind. This test pins the honest helper: a
+        mid-transaction seal failure leaves nothing.
+
+        Revert-fail: revert the helper to write rows before the BEGIN IMMEDIATE
+        -> the seal failure leaves N jobs + N snapshots + 1 batch + N bss rows
+        -> the residue assertions fail (counts != 0).
+        """
+        from unittest.mock import patch
+        batch_id = f"15m:{self._PROD_BATCH_MS}"
+        symbols = list(self._SYMBOLS)
+
+        # Force a seal failure (exact-set mismatch is a real production failure
+        # mode). The helper's except branch must ROLLBACK everything.
+        with patch.object(
+            type(self.repo), "seal_analysis_batch",
+            side_effect=RuntimeError("injected helper seal crash (R8-D)"),
+        ):
+            raised = None
+            try:
+                self._enqueue_batch_jobs(batch_id, symbols)
+            except RuntimeError as exc:
+                raised = exc
+        self.assertIsInstance(
+            raised, RuntimeError,
+            "R8-D: the helper must propagate the injected seal crash.",
+        )
+        # ZERO residue across every table the helper wrote.
+        batch_count = int(self.conn.execute(
+            "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?", (batch_id,),
+        ).fetchone()[0])
+        job_count = int(self.conn.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+            "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
+        ).fetchone()[0])
+        bss_count = int(self.conn.execute(
+            "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=?", (batch_id,),
+        ).fetchone()[0])
+        snap_count = int(self.conn.execute(
+            "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+            (int(self._PROD_BATCH_MS),),
+        ).fetchone()[0])
+        self.assertEqual(batch_count, 0, "R8-D helper: no batch residue. Got %d." % batch_count)
+        self.assertEqual(job_count, 0, "R8-D helper: no job residue. Got %d." % job_count)
+        self.assertEqual(bss_count, 0, "R8-D helper: no bss residue. Got %d." % bss_count)
+        self.assertEqual(snap_count, 0, "R8-D helper: no snapshot residue. Got %d." % snap_count)
+
+    def test_r5_5_worker_crash_surfaces_expected_symbols_and_degraded_coverage(self) -> None:
         """When the Nth symbol's ``analyze_symbol`` post-decision pipeline
         raises, the batch must still complete with:
 
@@ -49931,21 +51130,30 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     and "STATUS='RUNNING'" in sql_text
                     and "AGENT_JOBS" in sql_text
                 ):
-                    # The claim's UPDATE just committed. Backdate started_at on
-                    # the flipped rows to simulate the UPDATE having happened at
-                    # a past second (the straddle: re-SELECT now runs at a NEW
-                    # second, so started_at=CURRENT_TIMESTAMP would not match).
+                    # The claim's UPDATE just ran (inside claim_next_batch's
+                    # R7-P0-2 BEGIN IMMEDIATE..COMMIT transaction). Backdate
+                    # started_at on the flipped rows to simulate the UPDATE
+                    # having happened at a past second (the straddle: re-SELECT
+                    # now runs at a NEW second, so started_at=CURRENT_TIMESTAMP
+                    # would not match). We issue this backdate on the SAME real
+                    # connection WITHOUT committing -- R7-P0-2 owns the
+                    # transaction (the outer BEGIN IMMEDIATE is still open), so a
+                    # commit here would break the claim's own COMMIT below.
                     real_conn.execute(
                         "UPDATE agent_jobs SET started_at=datetime('now','-5 seconds') "
                         "WHERE status='running' AND json_extract(payload_json,'$.batch_id')=?",
                         (batch_id,),
                     )
-                    real_conn.commit()
                     straddle_applied["done"] = True
                 return result
 
             def commit(self):
-                real_conn.commit()
+                # R7-P0-2: the claim_next_batch transaction is owned by its own
+                # BEGIN IMMEDIATE..COMMIT. Forwarding a commit here would double-
+                # commit (the proxy execute already forwards the claim's COMMIT
+                # to real_conn). No-op so the claim's COMMIT is the single
+                # authority.
+                pass
 
         self.repo.conn = _StraddleConn()
         try:
@@ -49977,6 +51185,2745 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "every claimed row must belong to the target batch_id",
             )
             self.assertEqual(r["status"], "running")
+
+    # ------------------------------------------------------------------
+    # 07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle. The reviewer found
+    # that ``execute_market_skills`` (called by ``build_market_state_snapshot``
+    # during the producer's Phase 1) writes ``skill_execution_logs`` AND
+    # ``skill_feedback_memory`` in autocommit Phase 1. The schema shows these
+    # tables are architecturally DECOUPLED from snapshots (no ``snapshot_id``
+    # FK -- verified migrations.py: only ``module_analysis_results`` got the
+    # snapshot_id column; the skill-log tables never did), keyed by
+    # (symbol, timeframe, analysis_time), with their own retention policy
+    # (logs 30d, feedback indefinite -- designed to accumulate across batches
+    # as a learning/audit store). So the fix is NOT to defer-and-rollback the
+    # audit logs like P2-2 did for module results; instead it is a LAYERED
+    # lifecycle:
+    #   * ``skill_execution_logs`` stays an immutable audit row, but gains a
+    #     ``commit_state`` column ('prepared' in Phase 1, 'committed' after a
+    #     successful Phase-2 seal, 'aborted_unsealed' on seal failure). The row
+    #     is RETAINED on failure (audit) but MARKED so learning consumers can
+    #     exclude it.
+    #   * ``skill_feedback_memory`` (the learning signal) is DEFERRED to the
+    #     Phase-2 COMMIT -- written ONLY on a successful seal. A seal failure
+    #     leaves ZERO new feedback rows so a failed batch never pollutes future
+    #     learning/decisions.
+    #   * ``latest_skill_result_refs`` (live orchestration) only reads
+    #     ``commit_state IN ('committed','legacy_committed')`` so an
+    #     aborted/prepared log never points the orchestrator at dead data.
+    #   * Legacy rows (NULL commit_state) read as ``legacy_committed``; no
+    #     production-history backfill.
+    # These RED tests pin the contract. They assert the TARGET state and fail
+    # against the pre-fix code (no commit_state column, logs auto-committed
+    # with no state, feedback never written on the auto_analysis path because
+    # of the pre-existing dedup-bind bug, no consumer gating).
+    # ------------------------------------------------------------------
+
+    def test_r8_p2new1_seal_failure_marks_skill_logs_aborted_and_zero_new_feedback(self) -> None:
+        """R8 P2-NEW-1 contract point 1 & 3: a forced seal failure MUST
+        (a) leave the Phase-1 ``skill_execution_logs`` rows RETAINED (immutable
+        audit) but MARKED ``commit_state='aborted_unsealed'``, and (b) leave
+        ZERO new ``skill_feedback_memory`` rows (the learning signal is deferred
+        to the Phase-2 COMMIT, which never happens on a seal failure).
+
+        Production shape: call the REAL ``enqueue_market_analysis`` (the real
+        ``build_market_state_snapshot`` -> real ``execute_market_skills`` ->
+        real ``_run_skill`` path runs and writes the prepared skill logs in
+        Phase 1). Force a seal failure by patching
+        ``CryptoGuardRepository.seal_analysis_batch`` to raise. Assert: the
+        producer returned ok=False/sealed=False; the skill_execution_logs rows
+        for this tick's symbols/analysis_time are all
+        ``commit_state='aborted_unsealed'``; and COUNT(*) FROM
+        skill_feedback_memory WHERE analysis_time-derivable matches == 0.
+
+        Revert-fail: if Phase 1 writes feedback directly (pre-fix behavior)
+        the zero-feedback assertion fails; if the aborted-marking is removed
+        the commit_state assertion fails.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            # Force a seal failure on the REAL producer path (the canned
+            # builder is NOT patched here -- the real build_market_state_snapshot
+            # runs, so real execute_market_skills writes real prepared logs).
+            with patch.object(
+                type(self.repo), "seal_analysis_batch",
+                side_effect=RuntimeError("injected seal failure (R8 P2-NEW-1)"),
+            ):
+                result = None
+                raised = None
+                try:
+                    result = enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            # The seal failure must NOT report ok=True/sealed=True.
+            if result is not None:
+                self.assertFalse(
+                    result.get("ok", True),
+                    "R8 P2-NEW-1: a seal failure must report ok=False. Got %r" % (result,),
+                )
+                self.assertFalse(
+                    result.get("sealed", True),
+                    "R8 P2-NEW-1: a seal failure must report sealed=False. Got %r" % (result,),
+                )
+            # (a) skill_execution_logs rows for this tick MUST exist (the real
+            # execute_market_skills ran in Phase 1) AND be marked aborted_unsealed.
+            log_rows = [
+                dict(r) for r in self.conn.execute(
+                    "SELECT id, commit_state FROM skill_execution_logs "
+                    "WHERE analysis_time=? ORDER BY id",
+                    (int(analysis_time),),
+                ).fetchall()
+            ]
+            self.assertTrue(
+                len(log_rows) > 0,
+                "R8 P2-NEW-1: the real execute_market_skills path must have written "
+                "prepared skill_execution_logs rows in Phase 1. Found 0. raised=%r" % (raised,),
+            )
+            aborted_count = sum(1 for r in log_rows if r.get("commit_state") == "aborted_unsealed")
+            self.assertEqual(
+                aborted_count, len(log_rows),
+                "R8 P2-NEW-1 (point 3): EVERY skill_execution_logs row from a "
+                "failed-seal tick must be marked commit_state='aborted_unsealed' "
+                "(retained as audit, but excluded from learning). Found %d of %d "
+                "aborted. rows=%r raised=%r" % (aborted_count, len(log_rows), log_rows, raised),
+            )
+            # (b) ZERO new skill_feedback_memory rows attributable to this tick's
+            # analysis_time window. The feedback learning signal is DEFERRED to the
+            # Phase-2 COMMIT, which never happens on a seal failure. skill_feedback_memory
+            # has no analysis_time column, so we gate by source_id IN (this tick's
+            # log ids) -- the deferred feedback would have pointed at these logs.
+            log_ids = [r["id"] for r in log_rows]
+            placeholders = ",".join("?" for _ in log_ids)
+            feedback_count = int(self.conn.execute(
+                f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
+                log_ids,
+            ).fetchone()[0]) if log_ids else 0
+            self.assertEqual(
+                feedback_count, 0,
+                "R8 P2-NEW-1 (point 3): a seal failure MUST leave ZERO new "
+                "skill_feedback_memory rows (feedback is deferred to the Phase-2 "
+                "COMMIT, which never runs on a seal failure). Found %d row(s) "
+                "pointing at the failed tick's skill logs. raised=%r" % (feedback_count, raised),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r8_p2new1_success_marks_logs_committed_and_feedback_written_once(self) -> None:
+        """R8 P2-NEW-1 contract point 2: a SUCCESSFUL seal MUST (a) mark every
+        Phase-1 ``skill_execution_logs`` row ``commit_state='committed'`` and
+        (b) write the deferred ``skill_feedback_memory`` rows exactly once (the
+        learning signal now lands inside the Phase-2 COMMIT).
+
+        Production shape: call the REAL ``enqueue_market_analysis`` with NO seal
+        injection -> ok=True/sealed=True. Assert: the skill_execution_logs rows
+        for this tick are all ``commit_state='committed'``; and the
+        skill_feedback_memory rows pointing at those logs exist (the deferred
+        feedback was persisted on the COMMIT). Because this exercises the real
+        low-confidence feedback path (price_action returns confidence=0.0 on
+        empty candles -> _maybe_write_skill_feedback fires), the committed
+        feedback count must be > 0.
+
+        Revert-fail: if feedback is still deferred-to-nowhere (pre-fix the
+        auto_analysis path never wrote feedback at all due to the dedup-bind
+        bug), the >0 assertion fails.
+        """
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            result = enqueue_market_analysis(
+                analysis_time_utc=analysis_time, primary_interval="15m",
+                timeframes=["15m"],
+            )
+            self.assertTrue(result.get("ok"), "R8 P2-NEW-1: success path must report ok=True. Got %r" % (result,))
+            self.assertTrue(result.get("sealed"), "R8 P2-NEW-1: success path must seal. Got %r" % (result,))
+            # (a) every skill_execution_logs row for this tick is committed.
+            log_rows = [
+                dict(r) for r in self.conn.execute(
+                    "SELECT id, commit_state FROM skill_execution_logs "
+                    "WHERE analysis_time=? ORDER BY id",
+                    (int(analysis_time),),
+                ).fetchall()
+            ]
+            self.assertTrue(len(log_rows) > 0, "R8 P2-NEW-1: success path must write skill logs.")
+            committed_count = sum(1 for r in log_rows if r.get("commit_state") == "committed")
+            self.assertEqual(
+                committed_count, len(log_rows),
+                "R8 P2-NEW-1 (point 2): EVERY skill log row on a successful seal "
+                "must be commit_state='committed'. Found %d of %d. rows=%r"
+                % (committed_count, len(log_rows), log_rows),
+            )
+            # (b) deferred feedback written exactly once on the COMMIT. The real
+            # low-confidence path (price_action conf=0.0 on empty candles) fires
+            # _maybe_write_skill_feedback, so the deferred feedback MUST land.
+            log_ids = [r["id"] for r in log_rows]
+            placeholders = ",".join("?" for _ in log_ids)
+            feedback_count = int(self.conn.execute(
+                f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
+                log_ids,
+            ).fetchone()[0]) if log_ids else 0
+            self.assertGreater(
+                feedback_count, 0,
+                "R8 P2-NEW-1 (point 2): a successful seal MUST write the deferred "
+                "skill_feedback_memory rows (the learning signal lands on the Phase-2 "
+                "COMMIT). Found 0 rows pointing at this tick's committed logs. "
+                "(The real low-confidence feedback path should fire on empty-candle "
+                "price_action conf=0.0.)",
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r8_p2new1_orchestrator_excludes_aborted_logs_from_learning(self) -> None:
+        """R8 P2-NEW-1 contract point 5: ``latest_skill_result_refs`` (the live
+        orchestration consumer) MUST only return refs to ``commit_state IN
+        ('committed','legacy_committed')`` skill logs. An aborted_unsealed or
+        prepared log must NEVER be handed to the SkillOrchestrator -- otherwise a
+        failed-seal tick's dead skill output points the orchestrator at stale
+        data.
+
+        Shape: seed BOTH a committed log AND an aborted_unsealed log for the same
+        (symbol, skill_name, analysis_time) -- the aborted one with a HIGHER id
+        (it would win a plain MAX(id)). Assert latest_skill_result_refs returns
+        the COMMITTED log's id, not the aborted one's.
+        """
+        repo = self.repo
+        analysis_time = 1_783_999_999_999
+        # A committed price_action log (the one learning should see).
+        committed_id = repo.save_skill_execution_log(
+            skill_name="price_action", skill_version="1.0", symbol="BTCUSDT",
+            timeframe="15m", analysis_time=analysis_time,
+            input_summary={}, tool_result={}, ga_interpretation={},
+            final_result={"skill": "price_action", "confidence": 0.5}, confidence=0.5,
+        )
+        # Flip it to committed (save_skill_execution_log defaults to committed
+        # for legacy callers, but pin it explicitly here).
+        repo.conn.execute(
+            "UPDATE skill_execution_logs SET commit_state='committed' WHERE id=?",
+            (committed_id,),
+        )
+        # An aborted_unsealed log with a HIGHER id (would win MAX(id) if unguarded).
+        aborted_id = repo.save_skill_execution_log(
+            skill_name="price_action", skill_version="1.0", symbol="BTCUSDT",
+            timeframe="15m", analysis_time=analysis_time,
+            input_summary={}, tool_result={}, ga_interpretation={},
+            final_result={"skill": "price_action", "confidence": 0.0}, confidence=0.0,
+        )
+        repo.conn.execute(
+            "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' WHERE id=?",
+            (aborted_id,),
+        )
+        self.assertGreater(aborted_id, committed_id)
+        refs = repo.latest_skill_result_refs("BTCUSDT", analysis_time)
+        self.assertEqual(
+            refs.get("price_action"), committed_id,
+            "R8 P2-NEW-1 (point 5): latest_skill_result_refs must return the COMMITTED "
+            "log id (%d), not the aborted_unsealed log id (%d) even though the aborted "
+            "row has a higher id. refs=%r" % (committed_id, aborted_id, refs),
+        )
+
+    def test_r8_p2new1_phase1_crash_prepared_excluded_until_recovered_to_aborted(self) -> None:
+        """R8 P2-NEW-1 contract point 4: a ``prepared`` skill log left behind by
+        a producer that crashed between Phase 1 (prepared log write) and Phase 2
+        (commit/abort) must (a) be EXCLUDED from the learning context
+        (``latest_skill_result_refs`` must NOT return it) and (b) be terminalized
+        to ``commit_state='aborted'`` by the recovery hook so diagnostics can
+        report it.
+
+        Shape: write a prepared price_action log directly (simulating the crash
+        residue). Assert: (1) latest_skill_result_refs returns NO ref for it
+        (prepared is excluded -- only committed/legacy_committed are read); (2)
+        recover_stale_prepared_skill_logs terminalizes it to 'aborted'; (3)
+        latest_skill_result_refs STILL returns no ref (aborted is also excluded);
+        (4) the recovery summary reports the terminalized count.
+        """
+        from plugins.crypto_guard.scheduler.cron_scheduler import recover_stale_prepared_skill_logs
+
+        repo = self.repo
+        analysis_time = 1_783_999_999_998
+        # Simulate a crash-residue prepared log (Phase 1 wrote it, Phase 2 never
+        # ran). save_skill_execution_log with commit_state='prepared' mirrors the
+        # producer's Phase-1 write exactly.
+        prepared_id = repo.save_skill_execution_log(
+            skill_name="price_action", skill_version="1.0", symbol="BTCUSDT",
+            timeframe="15m", analysis_time=analysis_time,
+            input_summary={}, tool_result={}, ga_interpretation={},
+            final_result={"skill": "price_action", "confidence": 0.5}, confidence=0.5,
+            commit_state="prepared", batch_id="15m:1783999999998", attempt_id=1,
+        )
+        # (1) A prepared log must NOT enter the learning context.
+        refs = repo.latest_skill_result_refs("BTCUSDT", analysis_time)
+        self.assertNotIn(
+            "price_action", refs,
+            "R8 P2-NEW-1 (point 4): a 'prepared' skill log (crash residue) must "
+            "NOT enter the learning context (latest_skill_result_refs must exclude "
+            "it). refs=%r" % (refs,),
+        )
+        # (2) Backdate the row so the stale threshold fires, then recover.
+        repo.conn.execute(
+            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            (prepared_id,),
+        )
+        summary = recover_stale_prepared_skill_logs(repo.conn, stale_after_seconds=1)
+        self.assertEqual(
+            summary.get("terminalized_prepared_to_aborted"), 1,
+            "R8 P2-NEW-1 (point 4): the recovery hook must terminalize 1 stale "
+            "prepared log to 'aborted'. summary=%r" % (summary,),
+        )
+        # (3) The recovered 'aborted' log is STILL excluded from learning.
+        row = dict(repo.conn.execute(
+            "SELECT commit_state FROM skill_execution_logs WHERE id=?", (prepared_id,),
+        ).fetchone())
+        self.assertEqual(row["commit_state"], "aborted")
+        refs2 = repo.latest_skill_result_refs("BTCUSDT", analysis_time)
+        self.assertNotIn(
+            "price_action", refs2,
+            "R8 P2-NEW-1 (point 4): a recovered 'aborted' skill log must STILL "
+            "be excluded from learning. refs=%r" % (refs2,),
+        )
+
+    def _r9_p0_snapshot_db(self) -> dict:
+        """Snapshot the DB rows that ``start_all_services`` must NOT touch on a
+        non-owner reject path: total counts for agent_jobs / skill_execution_logs
+        / _migration_state, plus the committed-state + status of the seeded
+        crash-residue rows. Used by ``test_r9_p0_non_owner_start_zero_db_change``
+        to assert ZERO DB change when a live external owner holds the lease.
+        """
+        snap: dict = {}
+        snap["agent_jobs_total"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM agent_jobs"
+        ).fetchone()["c"])
+        snap["agent_jobs_running"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM agent_jobs WHERE status='running'"
+        ).fetchone()["c"])
+        snap["skill_logs_total"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM skill_execution_logs"
+        ).fetchone()["c"])
+        snap["skill_logs_prepared"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM skill_execution_logs WHERE commit_state='prepared'"
+        ).fetchone()["c"])
+        snap["skill_logs_aborted"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM skill_execution_logs WHERE commit_state='aborted'"
+        ).fetchone()["c"])
+        # _migration_state carries every contract marker ``initialize_database``
+        # writes. A non-owner MUST NOT add a marker row. Capture every key +
+        # the set of keys so a re-run of initialize_database (which would
+        # re-assert all markers via INSERT OR IGNORE) cannot add rows under us.
+        marker_keys = [
+            str(r["key"]) for r in self.conn.execute(
+                "SELECT key FROM _migration_state ORDER BY key"
+            ).fetchall()
+        ]
+        snap["migration_state_keys"] = set(marker_keys)
+        snap["migration_state_total"] = len(marker_keys)
+        # Tables that should not gain rows on a non-owner path.
+        snap["paper_accounts_total"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM paper_accounts"
+        ).fetchone()["c"])
+        snap["symbols_total"] = int(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM symbols"
+        ).fetchone()["c"])
+        return snap
+
+    def test_r9_p0_non_owner_start_zero_db_change(self) -> None:
+        """07-15 R9-P0 (ownership-first startup): a DUPLICATE non-owner
+        ``start_all_services`` (a live external owner holds the lease) MUST
+        return ``already_started_external`` AND make ZERO DB change -- no full
+        schema migrations, no job recovery, no skill-log recovery.
+
+        Pre-R9 the sequence was ``initialize_database() ->
+        recover_stale_running_jobs -> recover_stale_prepared_skill_logs ->
+        acquire_service_ownership``: a non-owner ran ALL migrations + seed +
+        marker writes and mutated agent_jobs/skill_execution_logs, and ONLY THEN
+        returned ``already_started_external``. This test freezes the corrected
+        contract: it seeds a stale ``prepared`` skill log + a stale ``running``
+        agent_job (both backdated so the recovery hooks WOULD terminalize/reset
+        them if they ran), snapshots baseline counts/states, stubs
+        ``acquire_service_ownership`` to return ``already_started_external``,
+        calls ``start_all_services``, and asserts the reject return + that
+        EVERY seeded row is UNCHANGED (the prepared log stays ``prepared``, the
+        running job stays ``running``) + NO new rows/markers in any table.
+
+        Revert-fail: restoring the pre-R9 order (initialize_database before
+        ownership) makes this test FAIL -- ``initialize_database`` runs for the
+        non-owner, the recovery hooks terminalize/reset the seeded rows, and the
+        marker set / row counts change.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard import service_manager as sm
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+
+        # Seed a crash-residue prepared skill log, backdated past the 600s
+        # staleness threshold so the recovery hook WOULD terminalize it to
+        # ``aborted`` IF it ran. On the non-owner path it MUST stay ``prepared``.
+        analysis_time = 1_783_999_999_996
+        prepared_id = self.repo.save_skill_execution_log(
+            skill_name="momentum", skill_version="1.0", symbol="ETHUSDT",
+            timeframe="15m", analysis_time=analysis_time,
+            input_summary={}, tool_result={}, ga_interpretation={},
+            final_result={"skill": "momentum", "confidence": 0.4}, confidence=0.4,
+            commit_state="prepared", batch_id="15m:1783999999996", attempt_id=1,
+        )
+        self.repo.conn.execute(
+            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            (prepared_id,),
+        )
+        # Seed a stale running agent_job (pre-S3 legacy: no lease_until, old
+        # started_at) so recover_stale_running_jobs WOULD reset it to pending IF
+        # it ran. On the non-owner path it MUST stay ``running``.
+        self.repo.conn.execute(
+            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
+            "payload_json, status, started_at) "
+            "VALUES ('scheduled_market_analysis', 5, 'test', "
+            "'r9p0:stale:15m:1783999999996', '{}', 'running', "
+            "datetime('now','-31 minutes'))"
+        )
+        self.repo.conn.commit()
+
+        before = self._r9_p0_snapshot_db()
+        self.assertEqual(
+            before["skill_logs_prepared"], 1,
+            "fixture: exactly one backdated prepared skill log must exist "
+            "before start_all_services. got %r" % (before,),
+        )
+        self.assertEqual(
+            before["agent_jobs_running"], 1,
+            "fixture: exactly one stale running agent_job must exist before "
+            "start_all_services. got %r" % (before,),
+        )
+
+        # Stub the ownership acquire to the non-owner reject path. Also stub
+        # the two recovery hooks to spies so we can prove they were NOT called
+        # (the non-owner must not even attempt recovery). ``initialize_database``
+        # is stubbed too so a revert (pre-R9 order) cannot mutate the DB via the
+        # real migrations -- the spy records the call so the revert-fail proof
+        # is unambiguous (on the FIXED code initialize_database is NEVER reached
+        # for a non-owner; on the reverted code it IS reached).
+        sm._STARTED = False
+        sm._OWNERSHIP_LEASE = None
+        skill_spy_calls: list[dict] = []
+        real_skill_hook = cron_mod.recover_stale_prepared_skill_logs
+
+        def skill_spy(conn, *, stale_after_seconds=600):
+            skill_spy_calls.append({"stale_after_seconds": int(stale_after_seconds)})
+            return real_skill_hook(conn, stale_after_seconds=stale_after_seconds)
+
+        jobs_spy_calls: list[dict] = []
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository as _Repo
+        real_recover = _Repo.recover_stale_running_jobs
+
+        def jobs_spy(self_repo, *, older_than_minutes=30):
+            jobs_spy_calls.append({"older_than_minutes": int(older_than_minutes)})
+            return real_recover(self_repo, older_than_minutes=older_than_minutes)
+
+        init_spy_calls: list[dict] = []
+        # service_manager binds initialize_database at import time
+        # (``from ...migrations import initialize_database``), so patching
+        # ``migrations.initialize_database`` would NOT intercept the call inside
+        # ``start_all_services`` (it uses the bound ``sm.initialize_database``).
+        # Patch the service_manager attribute instead so the spy fires on the
+        # reverted (pre-R9) code path that calls initialize_database before
+        # ownership.
+        real_init = sm.initialize_database
+
+        def init_spy(config=None):
+            init_spy_calls.append({"called": True})
+            return real_init(config)
+
+        try:
+            with patch.object(cron_mod, "recover_stale_prepared_skill_logs", skill_spy), \
+                 patch.object(_Repo, "recover_stale_running_jobs", jobs_spy), \
+                 patch.object(sm, "initialize_database", init_spy), \
+                 patch.object(
+                     sm, "acquire_service_ownership",
+                     return_value={"acquired": False, "reason": "already_started_external",
+                                   "owner_pid": 999999, "owner_db_path": "test",
+                                   "owner_release_commit": "x", "owner_identity": "y"},
+                 ):
+                result = sm.start_all_services()
+
+            # 1. The non-owner MUST return already_started_external.
+            self.assertEqual(
+                result.get("reason"), "already_started_external",
+                "R9-P0: a non-owner start_all_services must return "
+                "already_started_external. got %r" % (result,),
+            )
+            # 2. ZERO DB change: no full migrations ran for the non-owner.
+            self.assertEqual(
+                init_spy_calls, [],
+                "R9-P0: initialize_database MUST NOT run for a non-owner (it "
+                "mutates schema/seeds/markers). If this spy fired, the pre-R9 "
+                "order is still in place. got %r" % (init_spy_calls,),
+            )
+            # 3. ZERO DB change: no job recovery ran for the non-owner.
+            self.assertEqual(
+                jobs_spy_calls, [],
+                "R9-P0: recover_stale_running_jobs MUST NOT run for a non-owner. "
+                "got %r" % (jobs_spy_calls,),
+            )
+            # 4. ZERO DB change: no skill-log recovery ran for the non-owner.
+            self.assertEqual(
+                skill_spy_calls, [],
+                "R9-P0: recover_stale_prepared_skill_logs MUST NOT run for a "
+                "non-owner. got %r" % (skill_spy_calls,),
+            )
+            # 5. The seeded stale prepared log MUST stay ``prepared`` (NOT
+            #    terminalized to aborted by the recovery hook).
+            row = dict(self.conn.execute(
+                "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                (prepared_id,),
+            ).fetchone())
+            self.assertEqual(
+                row["commit_state"], "prepared",
+                "R9-P0: the stale prepared skill log must stay 'prepared' on a "
+                "non-owner path (no recovery ran). got %r" % (row,),
+            )
+            # 6. The seeded stale running job MUST stay ``running`` (NOT reset
+            #    to pending by the recovery hook).
+            job_row = dict(self.conn.execute(
+                "SELECT status FROM agent_jobs WHERE session_id=?",
+                ("r9p0:stale:15m:1783999999996",),
+            ).fetchone())
+            self.assertEqual(
+                job_row["status"], "running",
+                "R9-P0: the stale running agent_job must stay 'running' on a "
+                "non-owner path (no recovery ran). got %r" % (job_row,),
+            )
+            # 7. Aggregate ZERO DB change: row counts + marker keys unchanged.
+            after = self._r9_p0_snapshot_db()
+            self.assertEqual(
+                after, before,
+                "R9-P0: ZERO DB change on a non-owner path. snapshot must be "
+                "identical before/after. before=%r after=%r" % (before, after),
+            )
+        finally:
+            sm._STARTED = False
+            sm._OWNERSHIP_LEASE = None
+
+    def test_r8_p2new1_recovery_hook_wired_into_startup_terminalizes_stale_prepared(self) -> None:
+        """R8 P2-NEW-1 contract point 4 (wiring) + 07-15 R9-P0 (ownership-first):
+        the crash-recovery hook ``recover_stale_prepared_skill_logs`` must be
+        invoked by ``service_manager.start_all_services`` so a process restart
+        terminalizes crash-residue ``prepared`` skill logs to ``aborted`` --
+        but ONLY when THIS process is the OWNER. R9-P0 moved ownership
+        acquisition to BEFORE the recovery block, so the recovery hooks now run
+        ONLY on the owner path (``acquired: True``).
+
+        This test freezes the CORRECTED wiring: it seeds a stale ``prepared``
+        log, makes ``acquire_service_ownership`` return ``acquired: True`` (this
+        process owns), and asserts the recovery hook IS called once (with the
+        600s default) AND the seeded row is terminalized to ``aborted``. The
+        non-owner reject path (zero DB change) is covered by
+        ``test_r9_p0_non_owner_start_zero_db_change``.
+
+        To keep this a wiring test (no real threads spawned), the thread-spawn
+        boundary is stubbed: ``_spawn`` is patched to a recorder so the owner
+        path proceeds past the ownership gate and through the recovery block but
+        never starts a real thread. ``market_data_warmup`` is also patched out
+        so the warmup target (called inside the spawned thread's body, which we
+        never actually run) would not touch the network even if reached.
+
+        Revert-fail: removing the ``recover_stale_prepared_skill_logs`` call from
+        ``start_all_services`` (owner path) makes the spy assertion fail
+        (call_count == 0) and the row stays ``prepared``.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard import service_manager as sm
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+
+        # Seed a crash-residue prepared log, backdated past the staleness
+        # threshold so the hook (default 600s) terminalizes it.
+        analysis_time = 1_783_999_999_997
+        prepared_id = self.repo.save_skill_execution_log(
+            skill_name="momentum", skill_version="1.0", symbol="ETHUSDT",
+            timeframe="15m", analysis_time=analysis_time,
+            input_summary={}, tool_result={}, ga_interpretation={},
+            final_result={"skill": "momentum", "confidence": 0.4}, confidence=0.4,
+            commit_state="prepared", batch_id="15m:1783999999997", attempt_id=1,
+        )
+        self.repo.conn.execute(
+            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            (prepared_id,),
+        )
+        self.repo.conn.commit()
+
+        # Owner path: acquire_service_ownership returns acquired: True so the
+        # function proceeds past the ownership gate and runs the recovery
+        # block. _STARTED must be False so the function enters the locked body.
+        sm._STARTED = False
+        sm._OWNERSHIP_LEASE = None
+        spy_calls: list[dict] = []
+        real_hook = cron_mod.recover_stale_prepared_skill_logs
+
+        def spy(conn, *, stale_after_seconds=600):
+            spy_calls.append({"stale_after_seconds": int(stale_after_seconds)})
+            return real_hook(conn, stale_after_seconds=stale_after_seconds)
+
+        spawn_calls: list[tuple] = []
+
+        def fake_spawn(name, target, arg):
+            spawn_calls.append((name, target, arg))
+
+        try:
+            with patch.object(cron_mod, "recover_stale_prepared_skill_logs", spy), \
+                 patch.object(
+                     sm, "acquire_service_ownership",
+                     return_value={"acquired": True},
+                 ), \
+                 patch.object(sm, "_spawn", fake_spawn), \
+                 patch.object(sm, "_set_warmup_started", lambda: None):
+                result = sm.start_all_services()
+            # The owner path proceeds to spawn threads (stubbed), so started=True.
+            self.assertTrue(
+                result.get("started"),
+                "R8 P2-NEW-1 (wiring): the OWNER path must proceed past the "
+                "ownership gate and reach thread spawn. got %r" % (result,),
+            )
+            # The recovery hook MUST have been invoked once by the owner path.
+            self.assertEqual(
+                len(spy_calls), 1,
+                "R8 P2-NEW-1 (wiring): recover_stale_prepared_skill_logs MUST be "
+                "called once by start_all_services (OWNER path only). "
+                "spy_calls=%r. If 0, the hook is NOT wired into the production "
+                "startup path (contract #4 broken)." % (spy_calls,),
+            )
+            self.assertEqual(
+                spy_calls[0]["stale_after_seconds"], 600,
+                "R8 P2-NEW-1 (wiring): the startup hook must use the 600s default "
+                "staleness threshold. spy_calls=%r" % (spy_calls,),
+            )
+            # The seeded stale prepared log MUST now be terminalized to aborted.
+            row = dict(self.conn.execute(
+                "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                (prepared_id,),
+            ).fetchone())
+            self.assertEqual(
+                row["commit_state"], "aborted",
+                "R8 P2-NEW-1 (wiring): the startup recovery hook must terminalize "
+                "the stale prepared log to 'aborted'. Got %r" % (row,),
+            )
+            # Thread spawn was stubbed: the owner path reached it (proves it
+            # proceeded past the gate) but no real daemon thread started.
+            self.assertTrue(
+                len(spawn_calls) >= 1,
+                "R8 P2-NEW-1 (wiring): the owner path must reach _spawn (the "
+                "ownership gate was passed). spawn_calls=%r" % (spawn_calls,),
+            )
+        finally:
+            sm._STARTED = False
+            sm._OWNERSHIP_LEASE = None
+
+    def test_r8_p2new1_diagnostic_surfaces_long_prepared_skill_logs(self) -> None:
+        """R8 P2-NEW-1 contract point 4 (diagnostic): the report-accuracy
+        diagnostic must surface long-``prepared`` skill_execution_logs so an
+        operator can see stuck producer state WITHOUT a restart.
+
+        The restart recovery hook terminalizes stale rows on the next start, but
+        a node that has not yet restarted (or a row younger than the hook's
+        threshold but older than a real tick) leaves stuck state invisible. This
+        diagnostic makes it visible. Shape: seed a backdated ``prepared`` log,
+        run ``diagnose_report_accuracy``, assert exactly one
+        ``stuck_prepared_skill_logs`` warning issue naming the symbol/count.
+
+        Revert-fail: removing ``_check_stuck_prepared_skill_logs`` from the
+        diagnostic runner (or neutering its query) makes the issue-count
+        assertion fail (0 instead of >=1).
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+            STUCK_PREPARED_SKILL_LOGS,
+        )
+
+        analysis_time = 1_783_999_999_996
+        # Seed TWO stale prepared logs for the same symbol/analysis_time so the
+        # aggregate (symbol, analysis_time) group has stuck_count=2.
+        for skill in ("price_action", "momentum"):
+            log_id = self.repo.save_skill_execution_log(
+                skill_name=skill, skill_version="1.0", symbol="SOLUSDT",
+                timeframe="15m", analysis_time=analysis_time,
+                input_summary={}, tool_result={}, ga_interpretation={},
+                final_result={"skill": skill, "confidence": 0.3}, confidence=0.3,
+                commit_state="prepared", batch_id="15m:1783999999996", attempt_id=1,
+            )
+            self.repo.conn.execute(
+                "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+                (log_id,),
+            )
+        self.repo.conn.commit()
+
+        report = diagnose_report_accuracy(self.repo)
+        stuck = [i for i in report["issues"] if i["type"] == STUCK_PREPARED_SKILL_LOGS]
+        self.assertGreaterEqual(
+            len(stuck), 1,
+            "R8 P2-NEW-1 (diagnostic): the diagnostic MUST surface long-prepared "
+            "skill_execution_logs as a stuck_prepared_skill_logs warning. Found 0 "
+            "issues. report issues=%r" % ([i["type"] for i in report["issues"]],),
+        )
+        issue = stuck[0]
+        self.assertEqual(
+            issue["severity"], "warning",
+            "R8 P2-NEW-1 (diagnostic): stuck-prepared is a warning (excluded from "
+            "learning, not a correctness error). Got %r" % (issue["severity"],),
+        )
+        self.assertEqual(
+            issue["details"]["symbol"], "SOLUSDT",
+            "R8 P2-NEW-1 (diagnostic): the stuck-prepared issue must name the symbol. "
+            "details=%r" % (issue["details"],),
+        )
+        self.assertEqual(
+            issue["details"]["stuck_log_count"], 2,
+            "R8 P2-NEW-1 (diagnostic): the aggregate issue must report stuck_log_count=2 "
+            "for the two prepared logs on this symbol/analysis_time. details=%r"
+            % (issue["details"],),
+        )
+
+    def test_r8_p2new1_seal_failure_zero_feedback_revert_fail(self) -> None:
+        """R8 P2-NEW-1 contract point 3 revert-fail anchor: restoring the
+        Phase-1 DIRECT feedback write (the pre-fix behavior) makes the
+        zero-increment-on-seal-failure contract UNTESTABLE -- the seal-failure
+        test would find feedback rows pointing at the failed tick's logs.
+
+        This is a meta-test that PROVES the deferred-feedback-write is
+        load-bearing by re-introducing the direct write (via a patched
+        ``_run_skill`` that writes feedback in Phase 1) and asserting the
+        seal-failure path then has > 0 feedback rows. It is the structural
+        mirror of the manual revert-fail probe, kept in-suite so the contract
+        cannot regress silently.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+        from plugins.crypto_guard.skills import runner
+
+        analysis_time = self._PROD_BATCH_MS  # distinct tick via fresh per-test DB
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            # Re-introduce the pre-fix Phase-1 direct feedback write: patch
+            # _run_skill to write feedback IMMEDIATELY (not defer) regardless of
+            # the sink. This mirrors the bug the layered lifecycle fixed.
+            orig_run = runner._run_skill
+
+            def direct_feedback_run(repo, skill_name, symbol, timeframe, analysis_time_utc, input_summary, tool_fn, *, log_name=None, skill_log_sink=None, batch_id=None, attempt_id=None):
+                final = orig_run(repo, skill_name, symbol, timeframe, analysis_time_utc, input_summary, tool_fn, log_name=log_name, skill_log_sink=skill_log_sink, batch_id=batch_id, attempt_id=attempt_id)
+                # Force a feedback write NOW (Phase 1) pointing at this tick's
+                # most-recent log for this symbol -- the exact pre-fix pollution
+                # path. The real _run_skill deferred it; this re-introduces the
+                # direct write so a seal failure leaves feedback behind.
+                last_log = int(repo.conn.execute(
+                    "SELECT MAX(id) AS id FROM skill_execution_logs WHERE symbol=? AND analysis_time=?",
+                    (symbol, int(analysis_time_utc)),
+                ).fetchone()["id"])
+                payload = runner._collect_skill_feedback(
+                    log_name or skill_name, symbol, timeframe,
+                    final.get("confidence"), final.get("schema_validation_errors") or [], final,
+                )
+                if payload is not None:
+                    runner._write_skill_feedback(repo, last_log, payload)
+                return final
+
+            with patch.object(runner, "_run_skill", direct_feedback_run), patch.object(
+                type(self.repo), "seal_analysis_batch",
+                side_effect=RuntimeError("injected seal failure (R8 P2-NEW-1 revert-fail)"),
+            ):
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception:
+                    # The injected seal failure re-raises on the crash branch.
+                    pass
+            # With the direct Phase-1 write, feedback rows DO point at the failed
+            # tick's logs (the regression). This test ASSERTS that pollution
+            # happened (proving the revert breaks the contract) -- so a future
+            # regression that re-introduces the direct write would make this
+            # assertion's premise false and surface here, not silently. The
+            # fresh per-test DB guarantees every skill_execution_logs row belongs
+            # to THIS tick, so no analysis_time snap ambiguity.
+            log_ids = [
+                int(r["id"]) for r in self.conn.execute(
+                    "SELECT id FROM skill_execution_logs ORDER BY id"
+                ).fetchall()
+            ]
+            self.assertTrue(
+                len(log_ids) > 0,
+                "R8 P2-NEW-1 revert-fail anchor: the real producer must have written "
+                "prepared skill logs in Phase 1 (found 0). The direct-write patch "
+                "cannot be evaluated without logs.",
+            )
+            placeholders = ",".join("?" for _ in log_ids)
+            feedback_count = int(self.conn.execute(
+                f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
+                log_ids,
+            ).fetchone()[0])
+            self.assertGreater(
+                feedback_count, 0,
+                "R8 P2-NEW-1 revert-fail anchor: re-introducing the Phase-1 direct "
+                "feedback write MUST pollute skill_feedback_memory on a seal failure "
+                "(>0 rows). If this is 0, either the direct-write patch is inert or "
+                "the deferred-write contract has been re-broken in a way that hides "
+                "the regression. feedback_count=%d" % (feedback_count,),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    # ==================================================================
+    # 07-15 R9-P1a: strict feedback write on producer Phase-2 COMMIT
+    # ==================================================================
+    def test_r9_p1a_feedback_failure_rolls_back_batch(self) -> None:
+        """07-15 R9-P1a: the producer Phase-2 COMMIT writes the deferred
+        ``skill_feedback_memory`` rows via a STRICT write. If
+        ``save_skill_feedback_memory`` raises, the exception MUST propagate into
+        the Phase-2 ``except`` -> ``ROLLBACK`` so the batch/snapshot/module/
+        feedback all revert, and the prepared skill logs are terminalized to
+        ``commit_state='aborted_unsealed'`` (NOT ``committed``).
+
+        Pre-R9-P1a ``_write_skill_feedback`` caught ALL exceptions and ``pass``
+        -- so the batch sealed + log committed while this tick's feedback was
+        SILENTLY missing, breaking cross-round continuity. This test freezes the
+        corrected contract: a feedback-write failure is a transaction failure.
+
+        Production shape: call the REAL ``enqueue_market_analysis`` (the real
+        ``build_market_state_snapshot`` -> real ``execute_market_skills`` ->
+        real ``_run_skill`` path runs and writes prepared skill logs in Phase 1,
+        then the seal SUCCEEDS, then ``_commit_skill_log_lifecycle`` runs the
+        CAS-commit + the strict feedback write). Patch
+        ``save_skill_feedback_memory`` to raise so the strict write propagates.
+
+        Contract implemented: a strict feedback-raise inside ``BEGIN IMMEDIATE``
+        triggers the inner ``except`` -> ``ROLLBACK`` + ``_abort_unsealed_skill_logs``
+        + re-raise (genuine crash, ``seal_failed`` is False because the seal
+        succeeded). So the producer RAISES. We catch it and assert the rollback
+        + abort state.
+
+        Revert-fail: restore the silent ``except: pass`` in
+        ``_write_skill_feedback`` (strict=False behavior / no propagation) -> the
+        batch commits, the log is ``committed``, and feedback is silently
+        missing -> the zero-batch / aborted_unsealed / zero-feedback assertions
+        FAIL.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository as _Repo
+
+        analysis_time = self._PROD_BATCH_MS
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            # Patch save_skill_feedback_memory to raise on the STRICT producer
+            # path. The real build_market_state_snapshot runs (writing prepared
+            # skill logs in Phase 1), the seal succeeds, then the strict
+            # feedback write inside _commit_skill_log_lifecycle raises.
+            with patch.object(
+                _Repo, "save_skill_feedback_memory",
+                side_effect=RuntimeError("injected feedback-write failure (R9-P1a)"),
+            ):
+                raised = None
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            # Contract: the strict feedback-raise propagates (genuine crash after
+            # a successful seal -> re-raise, not ok=False).
+            self.assertIsInstance(
+                raised, RuntimeError,
+                "R9-P1a: a strict feedback-write failure MUST propagate (raise) "
+                "so the Phase-2 transaction rolls back. Got raised=%r" % (raised,),
+            )
+            batch_id = f"15m:{analysis_time}"
+            # ZERO analysis_batches row for this batch_id (rolled back).
+            batch_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()[0])
+            self.assertEqual(
+                batch_count, 0,
+                "R9-P1a: a feedback-write failure MUST roll back the batch -- "
+                "ZERO analysis_batches rows. Got %d." % batch_count,
+            )
+            # ZERO market_snapshots rows for this batch (rolled back, no orphan).
+            snap_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(
+                snap_count, 0,
+                "R9-P1a: a feedback-write failure MUST roll back snapshots -- "
+                "ZERO market_snapshots rows. Got %d." % snap_count,
+            )
+            # ZERO module_analysis_results rows for this batch (rolled back).
+            module_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                (int(analysis_time),),
+            ).fetchone()[0])
+            self.assertEqual(
+                module_count, 0,
+                "R9-P1a: a feedback-write failure MUST roll back module rows -- "
+                "ZERO module_analysis_results rows. Got %d." % module_count,
+            )
+            # The prepared skill_execution_logs rows exist (Phase 1 ran) and are
+            # ALL commit_state='aborted_unsealed' (NOT 'committed').
+            log_rows = [
+                dict(r) for r in self.conn.execute(
+                    "SELECT id, commit_state FROM skill_execution_logs "
+                    "WHERE analysis_time=? ORDER BY id",
+                    (int(analysis_time),),
+                ).fetchall()
+            ]
+            self.assertTrue(
+                len(log_rows) > 0,
+                "R9-P1a: the real execute_market_skills path must have written "
+                "prepared skill_execution_logs rows in Phase 1. Found 0.",
+            )
+            committed_count = sum(1 for r in log_rows if r.get("commit_state") == "committed")
+            self.assertEqual(
+                committed_count, 0,
+                "R9-P1a: a feedback-write failure MUST NOT leave any log "
+                "'committed' (the CAS-commit UPDATE rolled back). Found %d "
+                "committed of %d." % (committed_count, len(log_rows)),
+            )
+            aborted_count = sum(1 for r in log_rows if r.get("commit_state") == "aborted_unsealed")
+            self.assertEqual(
+                aborted_count, len(log_rows),
+                "R9-P1a: EVERY skill log from a feedback-failed tick MUST be "
+                "'aborted_unsealed'. Found %d of %d." % (aborted_count, len(log_rows)),
+            )
+            # ZERO new skill_feedback_memory rows (the strict write raised before
+            # any INSERT committed; the ROLLBACK reverted any partial state).
+            log_ids = [r["id"] for r in log_rows]
+            placeholders = ",".join("?" for _ in log_ids)
+            feedback_count = int(self.conn.execute(
+                f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
+                log_ids,
+            ).fetchone()[0]) if log_ids else 0
+            self.assertEqual(
+                feedback_count, 0,
+                "R9-P1a: a feedback-write failure MUST leave ZERO new "
+                "skill_feedback_memory rows. Got %d." % feedback_count,
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    # ==================================================================
+    # 07-15 R9-P1b: Phase-1 mid-loop exception aborts prepared logs
+    # ==================================================================
+    def test_r9_p1b_phase1_midloop_exception_aborts_first_symbol(self) -> None:
+        """07-15 R9-P1b: a Phase-1 mid-loop symbol-N build failure MUST
+        immediately terminalize the prepared skill logs already created this
+        tick (symbols 1..N-1) to ``commit_state='aborted_unsealed'``.
+
+        Pre-R9-P1b the outer ``try`` had ONLY ``finally`` (no ``except``), so a
+        Phase-1 exception propagated straight through, BYPASSING
+        ``_abort_unsealed_skill_logs`` -- symbols 1..N-1 prepared logs survived
+        as ``prepared`` (stuck until the startup recovery hook ran). The fix
+        unifies Phase 1 + Phase 2 under ONE outer lifecycle ``try/except`` so
+        any symbol-build exception immediately aborts the prepared logs.
+
+        Shape: two enabled symbols; patch ``build_market_state_snapshot`` so the
+        FIRST symbol builds fine (writes a prepared skill log via skill_sink) and
+        the SECOND symbol raises. Assert after ``enqueue_market_analysis``
+        (catching the raised exception): the first symbol's prepared
+        ``skill_execution_logs`` row is ``commit_state='aborted_unsealed'`` (NOT
+        left ``prepared``), and no batch/snapshot/job residue for either symbol.
+
+        Revert-fail: remove the outer except's ``_abort_unsealed_skill_logs``
+        call (or revert to finally-only) -> the first symbol's log stays
+        ``prepared`` -> the aborted_unsealed assertion FAILS.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        # Two enabled symbols only (reduce noise). Re-seed the symbols table so
+        # active_analysis_symbols returns exactly these two in this order.
+        self.conn.execute("DELETE FROM symbols")
+        two_symbols = ["ADAUSDT", "AVAXUSDT"]
+        for sym in two_symbols:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+                (sym,),
+            )
+        self.conn.commit()
+
+        first_symbol = two_symbols[0]
+        second_symbol = two_symbols[1]
+        call_count = {"n": 0}
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes,
+                           module_result_sink=None, skill_log_sink=None,
+                           batch_id=None, attempt_id=None, **_kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2 and symbol == second_symbol:
+                raise RuntimeError("injected Phase-1 build failure (R9-P1b)")
+            # First symbol: build a valid snapshot + a prepared skill log entry
+            # via the sink so there IS a prepared log to terminalize.
+            if skill_log_sink is not None:
+                # Append a (log_id, feedback_payload) tuple mirroring what the
+                # real _run_skill producer path does. We write the prepared log
+                # directly here so the abort path has something to flip.
+                log_id = repo.save_skill_execution_log(
+                    skill_name="price_action", skill_version="1.0",
+                    symbol=symbol, timeframe="15m",
+                    analysis_time=int(analysis_time_utc),
+                    input_summary={}, tool_result={}, ga_interpretation={},
+                    final_result={"skill": "price_action", "confidence": 0.0},
+                    confidence=0.0, commit_state="prepared",
+                    batch_id=batch_id, attempt_id=attempt_id,
+                )
+                skill_log_sink.append((log_id, None))
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot):
+                raised = None
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            # The Phase-1 build failure MUST propagate (genuine crash -> re-raise).
+            self.assertIsInstance(
+                raised, RuntimeError,
+                "R9-P1b: a Phase-1 mid-loop exception MUST propagate (raise). "
+                "Got raised=%r" % (raised,),
+            )
+            batch_id = f"15m:{analysis_time}"
+            # No batch/snapshot/job residue (Phase 1 never reached the Phase-2
+            # transaction).
+            batch_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()[0])
+            self.assertEqual(
+                batch_count, 0,
+                "R9-P1b: a Phase-1 exception must leave ZERO batch rows. Got %d."
+                % batch_count,
+            )
+            job_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
+            ).fetchone()[0])
+            self.assertEqual(
+                job_count, 0,
+                "R9-P1b: a Phase-1 exception must leave ZERO job rows. Got %d."
+                % job_count,
+            )
+            # The FIRST symbol's prepared skill log MUST be immediately
+            # terminalized to 'aborted_unsealed' (NOT left 'prepared').
+            first_log = self.conn.execute(
+                "SELECT id, commit_state FROM skill_execution_logs "
+                "WHERE symbol=? AND analysis_time=? ORDER BY id",
+                (first_symbol, int(analysis_time)),
+            ).fetchall()
+            self.assertEqual(
+                len(first_log), 1,
+                "R9-P1b: the first symbol must have exactly one prepared skill "
+                "log from Phase 1. Got %d." % len(first_log),
+            )
+            self.assertEqual(
+                str(first_log[0]["commit_state"]), "aborted_unsealed",
+                "R9-P1b: the first symbol's prepared skill log MUST be "
+                "terminalized to 'aborted_unsealed' on a Phase-1 mid-loop "
+                "exception (NOT left 'prepared'). Got %r."
+                % (first_log[0]["commit_state"],),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r10_p1_current_symbol_partial_skill_log_aborted_on_build_raise(self) -> None:
+        """07-15 R10-P1 #2 (current-symbol partial skill logs left ``prepared``):
+
+        ``cron_scheduler.enqueue_market_analysis`` Phase-1 per-symbol loop creates
+        ``skill_sink`` at cron_scheduler.py:318, calls ``build_market_state_snapshot``
+        (:322, which runs the skills sequentially -- runner.py:113-127 each
+        ``_run_skill`` appends its (log_id, feedback) tuple to the sink
+        IMMEDIATELY via ``save_skill_execution_log(... commit_state='prepared')``),
+        and only registers the item into ``prepared`` at :347 AFTER the whole
+        build returns. If a skill in the CURRENT symbol writes a prepared log to
+        the sink and a LATER skill (or the build itself) then RAISES, that
+        partial log is in the LOCAL ``skill_sink`` but the item was NEVER
+        appended to ``prepared`` -> the outer ``_abort_unsealed_skill_logs``
+        (cron_scheduler.py:550) never sees it -> it survives as ``prepared``
+        until the startup recovery hook runs (stuck-state, excluded from
+        learning, no immediate failure signal).
+
+        The R9-P1b test only proved that PRIOR COMPLETE symbols' logs are
+        aborted (it made symbol-1 finish fully, then symbol-2 raise on ENTRY
+        before writing any log). It never covered the current-symbol partial
+        write. This is the gap.
+
+        Fix contract: register the skill_sink-bearing item into ``prepared``
+        BEFORE calling ``build_market_state_snapshot`` (pre-registration), so a
+        mid-build exception's partial logs are already in the abort list.
+
+        Shape: ONE enabled symbol; patch ``build_market_state_snapshot`` so it
+        writes ONE prepared skill log to the sink, THEN raises. Assert after
+        ``enqueue_market_analysis`` (catching the raised exception): the partial
+        ``skill_execution_logs`` row is ``commit_state='aborted_unsealed'`` (NOT
+        left ``prepared``), and no batch/snapshot/job residue.
+
+        Revert-fail: move the ``prepared.append`` back to AFTER the build (or
+        remove the pre-registration) -> the partial log stays ``prepared`` ->
+        the aborted_unsealed assertion FAILS.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        # ONE enabled symbol only -- the defect is within a single symbol's
+        # build, not across symbols.
+        self.conn.execute("DELETE FROM symbols")
+        solo_symbol = "ADAUSDT"
+        self.conn.execute(
+            "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+            (solo_symbol,),
+        )
+        self.conn.commit()
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes,
+                           module_result_sink=None, skill_log_sink=None,
+                           batch_id=None, attempt_id=None, **_kwargs):
+            # Write ONE prepared skill log to the sink (mirrors _run_skill's
+            # immediate append), THEN raise mid-build. This log is in the LOCAL
+            # skill_sink but the item is NOT yet in `prepared` (pre-fix appends
+            # only after the build returns).
+            if skill_log_sink is not None:
+                log_id = repo.save_skill_execution_log(
+                    skill_name="price_action", skill_version="1.0",
+                    symbol=symbol, timeframe="15m",
+                    analysis_time=int(analysis_time_utc),
+                    input_summary={}, tool_result={}, ga_interpretation={},
+                    final_result={"skill": "price_action", "confidence": 0.0},
+                    confidence=0.0, commit_state="prepared",
+                    batch_id=batch_id, attempt_id=attempt_id,
+                )
+                skill_log_sink.append((log_id, None))
+            raise RuntimeError("injected mid-build failure AFTER partial skill log (R10-P1#2)")
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot):
+                raised = None
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            # The mid-build failure MUST propagate (genuine crash -> re-raise).
+            self.assertIsInstance(
+                raised, RuntimeError,
+                "R10-P1#2: a current-symbol mid-build exception MUST propagate "
+                "(raise). Got raised=%r" % (raised,),
+            )
+            batch_id = f"15m:{analysis_time}"
+            # No batch/snapshot/job residue (Phase 1 never reached the Phase-2
+            # transaction).
+            batch_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()[0])
+            self.assertEqual(
+                batch_count, 0,
+                "R10-P1#2: a Phase-1 current-symbol exception must leave ZERO "
+                "batch rows. Got %d." % batch_count,
+            )
+            job_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
+                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
+            ).fetchone()[0])
+            self.assertEqual(
+                job_count, 0,
+                "R10-P1#2: a Phase-1 current-symbol exception must leave ZERO "
+                "job rows. Got %d." % job_count,
+            )
+            # The CURRENT symbol's partial prepared skill log MUST be immediately
+            # terminalized to 'aborted_unsealed' (NOT left 'prepared').
+            partial_logs = self.conn.execute(
+                "SELECT id, commit_state FROM skill_execution_logs "
+                "WHERE symbol=? AND analysis_time=? ORDER BY id",
+                (solo_symbol, int(analysis_time)),
+            ).fetchall()
+            self.assertEqual(
+                len(partial_logs), 1,
+                "R10-P1#2: the current symbol must have exactly one partial "
+                "prepared skill log written before the raise. Got %d."
+                % len(partial_logs),
+            )
+            self.assertEqual(
+                str(partial_logs[0]["commit_state"]), "aborted_unsealed",
+                "R10-P1#2: the current symbol's PARTIAL prepared skill log "
+                "(written to the local skill_sink but never registered into "
+                "`prepared` before the raise) MUST be terminalized to "
+                "'aborted_unsealed' on the mid-build exception (NOT left "
+                "'prepared' stuck until startup recovery). Got %r."
+                % (partial_logs[0]["commit_state"],),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    # ==================================================================
+    # 07-15 R9-P2: CAS state/batch/attempt on skill log commit
+    # ==================================================================
+    def test_r9_p2_attempt_id_unique_across_retries(self) -> None:
+        """07-15 R9-P2: ``attempt_id`` is a per-producer-call monotonic identity
+        derived from the dedicated ``_analysis_attempt_counter`` table under
+        ``BEGIN IMMEDIATE`` (R10-P2 atomic allocation; pre-R10 was
+        ``COALESCE(MAX(attempt_id),0)+1`` which raced under concurrency -- two
+        producers could read the same MAX before either wrote). A retry / second
+        call for the SAME batch_id MUST get a DIFFERENT (higher) attempt_id, not
+        the hardcoded ``1``.
+
+        Pre-R9-P2 ``attempt_id`` was a hardcoded literal ``1`` at every call, so
+        an exception-recovery retry of the same batch could not be distinguished
+        from the original attempt in the audit trail, and a stale/aborted row
+        could be silently re-marked ``committed``.
+
+        Shape: force the FIRST call's seal to FAIL (so no jobs are left pending
+        -- the batch rolls back and the prepared logs are aborted). Then call the
+        producer a SECOND time for the SAME batch_id -- because the first call
+        left no pending jobs (they rolled back), Phase 1 re-runs and captures a
+        fresh attempt_id. The two calls MUST capture DIFFERENT attempt_ids
+        (monotonic: 1, then 2), proving the identity is not a hardcoded literal.
+
+        Revert-fail: revert attempt_id to the hardcoded literal ``1`` -> both
+        calls stamp attempt_id=1 -> the DIFFERENT assertion FAILS.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+        from plugins.crypto_guard.storage.repository import CryptoGuardRepository as _Repo
+
+        analysis_time = self._PROD_BATCH_MS
+        # Note: the producer calls ``initialize_database`` internally, which
+        # re-seeds ``symbols`` from ``cfg`` (INSERT ... ON CONFLICT DO UPDATE SET
+        # enabled=excluded.enabled), so the enabled set the producer actually
+        # sees is ``cfg.default_universe.symbols`` -- NOT whatever we narrow to
+        # here. So the captured list may hold N values per call (one per active
+        # symbol), all equal within a call (the per-call attempt_id). The test
+        # groups by call and asserts the per-call attempt_id differs across the
+        # two calls (monotonic), which is the actual R9-P2 contract.
+
+        call1_attempt_ids: list[int] = []
+        call2_attempt_ids: list[int] = []
+        # Mutable sink the fake snapshot appends into; reassigned per call so we
+        # can group captures by producer call even though the producer calls the
+        # snapshot once per active symbol (the enabled set is re-seeded by the
+        # producer's internal ``initialize_database`` from ``cfg``, so there may
+        # be N symbols per call -- all sharing the SAME per-call attempt_id).
+        current_sink: list[list[int]] = [call1_attempt_ids]
+        captured_attempt_ids: list[int] = []  # flat (kept for diagnostics)
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes,
+                           module_result_sink=None, skill_log_sink=None,
+                           batch_id=None, attempt_id=None, **_kwargs):
+            aid = int(attempt_id) if attempt_id is not None else 0
+            captured_attempt_ids.append(aid)
+            current_sink[0].append(aid)
+            if skill_log_sink is not None:
+                log_id = repo.save_skill_execution_log(
+                    skill_name="price_action", skill_version="1.0",
+                    symbol=symbol, timeframe="15m",
+                    analysis_time=int(analysis_time_utc),
+                    input_summary={}, tool_result={}, ga_interpretation={},
+                    final_result={"skill": "price_action", "confidence": 0.0},
+                    confidence=0.0, commit_state="prepared",
+                    batch_id=batch_id, attempt_id=attempt_id,
+                )
+                skill_log_sink.append((log_id, None))
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            # First call: force the seal to FAIL so the batch rolls back (no
+            # pending jobs left behind). The prepared logs are aborted. Phase 1
+            # still runs and captures attempt_id.
+            current_sink[0] = call1_attempt_ids
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot), \
+                 patch.object(_Repo, "seal_analysis_batch",
+                              side_effect=RuntimeError("injected seal failure (R9-P2 call 1)")):
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception:
+                    pass  # seal failure re-raises
+            # Second call for the SAME batch_id: the first call's batch rolled
+            # back (no pending jobs), so Phase 1 re-runs and captures a fresh
+            # attempt_id (should be 2, since the DB now has attempt_id=1 logs).
+            current_sink[0] = call2_attempt_ids
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot), \
+                 patch.object(_Repo, "seal_analysis_batch",
+                              side_effect=RuntimeError("injected seal failure (R9-P2 call 2)")):
+                try:
+                    enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception:
+                    pass
+            # Both calls must have actually captured attempt_ids.
+            self.assertTrue(
+                call1_attempt_ids,
+                "R9-P2: first call captured no attempt_ids. flat=%r" % (captured_attempt_ids,),
+            )
+            self.assertTrue(
+                call2_attempt_ids,
+                "R9-P2: second call captured no attempt_ids. flat=%r" % (captured_attempt_ids,),
+            )
+            # Within a call every symbol shares the SAME attempt_id (per-call
+            # identity); across the two calls the attempt_id MUST differ and be
+            # monotonic (1 then 2), proving it is NOT a hardcoded literal.
+            call1_attempt = call1_attempt_ids[0]
+            call2_attempt = call2_attempt_ids[0]
+            self.assertTrue(
+                all(a == call1_attempt for a in call1_attempt_ids),
+                "R9-P2: all symbols within call 1 must share one attempt_id. Got %r" % (call1_attempt_ids,),
+            )
+            self.assertTrue(
+                all(a == call2_attempt for a in call2_attempt_ids),
+                "R9-P2: all symbols within call 2 must share one attempt_id. Got %r" % (call2_attempt_ids,),
+            )
+            self.assertNotEqual(
+                call1_attempt, call2_attempt,
+                "R9-P2: attempt_id MUST differ across retries of the same batch "
+                "(monotonic). Both were %r." % (captured_attempt_ids,),
+            )
+            self.assertGreater(
+                call2_attempt, call1_attempt,
+                "R9-P2: the second call's attempt_id MUST be higher (monotonic). "
+                "Got %r." % (captured_attempt_ids,),
+            )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    def test_r9_p2_cas_mismatch_fail_closed(self) -> None:
+        """07-15 R9-P2: the Phase-2 commit UPDATE is a CAS keyed on
+        ``(commit_state='prepared', batch_id, attempt_id)`` with a
+        ``rowcount==1`` guard. If the prepared log was already aborted (e.g. by
+        recovery) before the commit lifecycle runs, the CAS MUST fail (rowcount
+        0) and the producer MUST fail-closed (raise / ok=False) -- the log MUST
+        NOT be silently re-marked ``committed``.
+
+        Shape: pre-abort a prepared skill log for this batch (set
+        ``commit_state='aborted_unsealed'``) with a matching attempt_id, then run
+        ``enqueue_market_analysis`` whose commit lifecycle tries to CAS-commit
+        that same log id. The fake snapshot reuses the SAME log id (by inserting
+        a prepared log and then we pre-flip it to aborted_unsealed BEFORE the
+        Phase-2 commit runs). The CAS-commit finds commit_state='aborted_unsealed'
+        (not 'prepared') -> rowcount 0 -> raise -> ROLLBACK -> abort.
+
+        Revert-fail: revert the UPDATE to id-only (no CAS, no rowcount check) ->
+        the CAS-mismatch is ignored and the log gets re-committed -> the
+        'stays aborted_unsealed' assertion FAILS.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+        from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_market_analysis
+        from plugins.crypto_guard.service_manager import _set_warmup_ready, get_warmup_state
+
+        analysis_time = self._PROD_BATCH_MS
+        self.conn.execute("DELETE FROM symbols")
+        single = ["ADAUSDT"]
+        self.conn.execute(
+            "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+            (single[0],),
+        )
+        self.conn.commit()
+        batch_id = f"15m:{analysis_time}"
+
+        # The fake snapshot writes a prepared log, then IMMEDIATELY pre-aborts
+        # it to 'aborted_unsealed' (simulating a recovery race that aborted the
+        # log between Phase 1 write and Phase 2 commit). The Phase-2 CAS-commit
+        # will then find commit_state='aborted_unsealed' -> rowcount 0 -> raise.
+        pre_aborted_log_ids: list[int] = []
+
+        def _fake_snapshot(repo, *, symbol, analysis_time_utc, mode, timeframes,
+                           module_result_sink=None, skill_log_sink=None,
+                           batch_id=None, attempt_id=None, **_kwargs):
+            log_id = repo.save_skill_execution_log(
+                skill_name="price_action", skill_version="1.0",
+                symbol=symbol, timeframe="15m",
+                analysis_time=int(analysis_time_utc),
+                input_summary={}, tool_result={}, ga_interpretation={},
+                final_result={"skill": "price_action", "confidence": 0.0},
+                confidence=0.0, commit_state="prepared",
+                batch_id=batch_id, attempt_id=attempt_id,
+            )
+            # Pre-abort: flip to 'aborted_unsealed' NOW (simulating a recovery
+            # race). The Phase-2 CAS-commit will fail on this row.
+            repo.conn.execute(
+                "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' "
+                "WHERE id=?",
+                (log_id,),
+            )
+            pre_aborted_log_ids.append(int(log_id))
+            if skill_log_sink is not None:
+                skill_log_sink.append((log_id, None))
+            return {
+                "symbol": symbol,
+                "analysis_time_utc": int(analysis_time_utc),
+                "mode": mode or "scheduled",
+                "modules": {},
+                "data_quality": {},
+            }
+
+        old_warmup = get_warmup_state()
+        try:
+            _set_warmup_ready()
+            with patch.object(cron_mod, "build_market_state_snapshot", _fake_snapshot):
+                raised = None
+                result = None
+                try:
+                    result = enqueue_market_analysis(
+                        analysis_time_utc=analysis_time, primary_interval="15m",
+                        timeframes=["15m"],
+                    )
+                except Exception as exc:
+                    raised = exc
+            # Contract: the CAS mismatch MUST fail-closed. Either the producer
+            # raises (genuine crash after successful seal -> re-raise) or returns
+            # ok=False. Either way the log MUST stay 'aborted_unsealed'.
+            ok_val = result.get("ok") if result is not None else None
+            self.assertTrue(
+                raised is not None or (result is not None and not ok_val),
+                "R9-P2: a CAS-commit mismatch MUST fail-closed (raise or "
+                "ok=False). Got raised=%r result=%r" % (raised, result),
+            )
+            # The pre-aborted log MUST stay 'aborted_unsealed' (NOT re-committed).
+            self.assertTrue(
+                len(pre_aborted_log_ids) > 0,
+                "R9-P2: the fake snapshot must have written a pre-aborted log.",
+            )
+            for log_id in pre_aborted_log_ids:
+                row = dict(self.conn.execute(
+                    "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                    (log_id,),
+                ).fetchone())
+                self.assertEqual(
+                    str(row["commit_state"]), "aborted_unsealed",
+                    "R9-P2: a CAS-mismatched log MUST stay 'aborted_unsealed' "
+                    "(NOT be re-marked 'committed'). log_id=%d got %r"
+                    % (log_id, row["commit_state"]),
+                )
+        finally:
+            if old_warmup == "ready":
+                _set_warmup_ready()
+
+    # ==================================================================
+    # 07-15 R10-P2: atomic attempt_id allocation (concurrent producer
+    # uniqueness). The reviewer (R9 terminal rejection) flagged P2 #3:
+    #   ``attempt_id`` was computed at cron_scheduler.py:256 as
+    #   ``COALESCE(MAX(attempt_id), 0) + 1`` OUTSIDE any transaction. Two
+    #   concurrent producers can both read the same MAX -> both stamp the same
+    #   attempt_id, violating per-call-unique-monotonic. The Phase-2 CAS
+    #   includes the log ``id`` so there is no direct data OVERWRITE (hence P2),
+    #   but the audit identity collides.
+    # Fix: allocate attempt_id atomically (dedicated attempt counter row under
+    # ``BEGIN IMMEDIATE``, or a truly-unique token). Required: dual-connection
+    # concurrency test proving distinct attempt_ids. Revert-fail.
+    # ==================================================================
+    def test_r10_p2_concurrent_attempt_id_allocation_is_distinct(self) -> None:
+        """07-15 R10-P2: ``attempt_id`` allocation MUST be atomic under
+        concurrency. Pre-R10 the allocation was ``COALESCE(MAX(attempt_id),0)+1``
+        read OUTSIDE any transaction (cron_scheduler.py:256). Two concurrent
+        producers (two connections, e.g. the 5m + 15m crons firing together, or
+        a retry overlap) can BOTH read the same MAX before either writes -> both
+        stamp the same ``attempt_id`` -> audit-identity collision (the Phase-2
+        CAS includes the log ``id`` so no direct data overwrite, hence P2, but
+        the per-call-unique-monotonic contract is broken).
+
+        Fix contract: the allocation MUST be atomic so two concurrent callers
+        for the SAME batch_id get DISTINCT attempt_ids (a dedicated attempt
+        counter row under ``BEGIN IMMEDIATE``, or a truly-unique token). This
+        test drives the allocation primitive ``_allocate_attempt_id(conn,
+        batch_id)`` from two concurrent threads, each on its OWN connection,
+        and asserts the two returned attempt_ids are DISTINCT (and both are
+        positive integers).
+
+        Revert-fail: revert the allocator to the non-atomic ``MAX+1`` read (no
+        ``BEGIN IMMEDIATE``, no counter row) -> both threads read the same MAX
+        (0) before either commits -> both return 1 -> the DISTINCT assertion
+        FAILS.
+
+        Note: this is a UNIT test of the allocation primitive in isolation, NOT
+        a full ``enqueue_market_analysis`` concurrency test (the producer also
+        holds an in-process single-flight mutex + a cross-process ownership
+        lease that would serialize it). The allocator itself is the surface the
+        reviewer flagged; it must be atomic on its own.
+        """
+        import threading
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+
+        batch_id = f"15m:{self._PROD_BATCH_MS}"
+        results: list[int] = []
+        errors: dict[str, BaseException] = {}
+        # Barrier so both threads attempt the allocation at the SAME instant
+        # (maximizing the race window the non-atomic MAX+1 read loses).
+        barrier = threading.Barrier(2)
+
+        def _allocate(tag: str) -> None:
+            try:
+                conn = connect_db(self.cfg.database_path)
+                try:
+                    barrier.wait()  # release both threads together
+                    aid = cron_mod._allocate_attempt_id(conn, batch_id)
+                    results.append(int(aid))
+                finally:
+                    conn.close()
+            except BaseException as exc:  # noqa: BLE001
+                errors[tag] = exc
+
+        t1 = threading.Thread(target=_allocate, args=("A",))
+        t2 = threading.Thread(target=_allocate, args=("B",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        self.assertFalse(
+            errors,
+            "R10-P2: neither concurrent allocation should raise: %r" % (errors,),
+        )
+        self.assertEqual(
+            len(results), 2,
+            "R10-P2: both concurrent allocations must return an attempt_id. "
+            "Got results=%r errors=%r" % (results, errors),
+        )
+        a, b = results[0], results[1]
+        self.assertGreater(
+            a, 0,
+            "R10-P2: attempt_id must be a positive integer. Got a=%r" % (a,),
+        )
+        self.assertGreater(
+            b, 0,
+            "R10-P2: attempt_id must be a positive integer. Got b=%r" % (b,),
+        )
+        self.assertNotEqual(
+            a, b,
+            "R10-P2: two CONCURRENT attempt_id allocations for the same batch_id "
+            "MUST be DISTINCT (atomic allocation). Both were %r -- the "
+            "non-atomic MAX+1 read raced and both read the same MAX. "
+            "results=%r" % (a, results),
+        )
+
+    def test_r10_p2_attempt_id_monotonic_across_sequential_calls(self) -> None:
+        """07-15 R10-P2 (companion): the atomic allocator MUST preserve the R9-P2
+        monotonic-per-batch contract -- SEQUENTIAL allocations for the same
+        batch_id must be strictly increasing (1, 2, 3, ...), and a DIFFERENT
+        batch_id must NOT share the counter (per-batch isolation). This guards
+        against an over-broad global counter that would break the per-batch
+        monotonic semantics the R9-P2 audit relies on.
+        """
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
+
+        batch_a = f"15m:{self._PROD_BATCH_MS}"
+        batch_b = "15m:1783641600000"  # a different analysis_time -> different batch
+        conn = connect_db(self.cfg.database_path)
+        try:
+            a1 = int(cron_mod._allocate_attempt_id(conn, batch_a))
+            a2 = int(cron_mod._allocate_attempt_id(conn, batch_a))
+            a3 = int(cron_mod._allocate_attempt_id(conn, batch_a))
+            b1 = int(cron_mod._allocate_attempt_id(conn, batch_b))
+        finally:
+            conn.close()
+        # Same batch: strictly increasing.
+        self.assertEqual(
+            [a1, a2, a3], [1, 2, 3],
+            "R10-P2: SEQUENTIAL allocations for the same batch_id must be "
+            "strictly increasing (1,2,3). Got %r" % ([a1, a2, a3],),
+        )
+        # Different batch: independent counter (must start at 1, not continue
+        # from batch_a's 3).
+        self.assertEqual(
+            b1, 1,
+            "R10-P2: a DIFFERENT batch_id must have its OWN attempt counter "
+            "(per-batch isolation), starting at 1. Got b1=%r (expected 1)." % (b1,),
+        )
+
+    # ==================================================================
+    # 07-15 R10-F: reviewer P2-1 -- the R10-P2 ``_analysis_attempt_counter``
+    # table MUST be covered by ``check_schema_health``'s ``required_tables``.
+    # A production DB initialized before the R10 migration (or a half-run
+    # migration) would be MISSING this table, and the producer's
+    # ``_allocate_attempt_id`` would then fail with ``no such table`` at tick
+    # time. ``start_all_services`` runs ``check_schema_health`` and
+    # ``acquire_service_ownership`` fail-closes on the health gate, so the
+    # missing table MUST surface as ``ok=False`` -- otherwise an unhealthy DB
+    # silently passes the gate and the producer dies at runtime.
+    # Fix contract: ``_analysis_attempt_counter`` is in
+    # ``required_tables`` (migrations.py:2066). A DB missing it reports
+    # ``ok=False`` with a missing-table issue naming the table.
+    # Revert-fail: remove ``_analysis_attempt_counter`` from ``required_tables``
+    # -> dropping the table no longer flips ``ok`` False -> the ``assertFalse``
+    # FAILS (health reports green on a DB missing the table).
+    # ==================================================================
+    def test_r10_f_schema_health_flags_missing_attempt_counter_table(self) -> None:
+        """07-15 R10-F (reviewer P2-1): ``check_schema_health`` MUST flag a DB
+        that is MISSING the R10-P2 ``_analysis_attempt_counter`` table.
+
+        The producer's atomic ``_allocate_attempt_id`` reads/writes this table;
+        if a production DB was initialized before the R10 migration (or a
+        migration was interrupted) the table is absent and the producer dies at
+        runtime with ``no such table``. Because ``start_all_services`` gates
+        ownership on ``check_schema_health``, the missing table MUST surface as
+        ``ok=False``.
+
+        Shape: the ``setUp`` initializes a fresh DB (the migration created the
+        table). We DROP it (simulating a pre-R10 / interrupted-migration DB),
+        then call the REAL ``check_schema_health`` against this connection and
+        assert ``ok`` is False AND that a missing-table issue names
+        ``_analysis_attempt_counter``.
+
+        Revert-fail: remove ``_analysis_attempt_counter`` from
+        ``required_tables`` -> the dropped table is no longer required ->
+        ``ok`` stays True -> the ``assertFalse(ok)`` FAILS.
+        """
+        from plugins.crypto_guard.storage.migrations import check_schema_health
+
+        # Sanity: the table EXISTS after initialize_database (the migration ran).
+        pre = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='_analysis_attempt_counter'"
+        ).fetchone()
+        self.assertIsNotNone(
+            pre,
+            "R10-F: the migration must create _analysis_attempt_counter. "
+            "If this sanity check fails, the migration wiring is broken.",
+        )
+        baseline = check_schema_health(conn=self.conn)
+        self.assertTrue(
+            baseline["ok"],
+            "R10-F: a fully-initialized DB MUST pass schema health. "
+            "Got ok=%r missing=%r" % (baseline["ok"], baseline.get("missing_columns")),
+        )
+
+        # Simulate a pre-R10 / interrupted-migration DB: the table is absent.
+        self.conn.execute("DROP TABLE _analysis_attempt_counter")
+        self.conn.commit()
+
+        result = check_schema_health(conn=self.conn)
+        self.assertFalse(
+            result["ok"],
+            "R10-F (reviewer P2-1): a DB MISSING _analysis_attempt_counter MUST "
+            "report ok=False (the producer's atomic allocator reads this table; "
+            "an unhealthy DB must NOT silently pass the start_all_services health "
+            "gate). Got ok=%r missing=%r" % (result["ok"], result.get("missing_columns")),
+        )
+        # And the missing-table issue MUST name the table explicitly (so an
+        # operator sees WHICH table is missing, not just a boolean).
+        missing = result.get("missing_columns") or []
+        named = any(
+            (str(item.get("table")) == "_analysis_attempt_counter")
+            and (str(item.get("column")) == "(table)")
+            for item in missing
+        )
+        self.assertTrue(
+            named,
+            "R10-F: the missing-table issue MUST name _analysis_attempt_counter "
+            "with column '(table)'. Got missing=%r" % (missing,),
+        )
+
+
+class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
+    """R7-P0-3: service-ownership lease must be acquired atomically (BEGIN
+    IMMEDIATE CAS) and kept alive by a periodic heartbeat so a long-running
+    owner's lease never expires while alive, and a second process cannot
+    silently spawn a duplicate service set.
+
+    These tests exercise ``acquire_service_ownership`` + the
+    ``_renew_service_ownership_lease`` heartbeat directly against a fresh DB,
+    using the injectable PID-liveness probe to simulate live/dead external
+    owners. They do NOT call ``start_all_services`` (no real threads spawned),
+    do NOT modify hub.pyw, and do NOT touch a production DB.
+    """
+
+    def setUp(self) -> None:
+        import tempfile as _tempfile
+        from pathlib import Path
+        from plugins.crypto_guard.config import load_config
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from plugins.crypto_guard import service_manager as sm
+
+        self._tmp = Path(_tempfile.mkdtemp(prefix="cg_r7p03_"))
+        db_path = self._tmp / "r7p03.db"
+        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
+        self.cfg = load_config()
+        initialize_database(self.cfg)
+        self.sm = sm
+        # Reset the in-process lease cache + liveness probe + ownership-lost
+        # latch between tests so a prior test's lease / lost-latch does not
+        # leak into this one (R8-E: _OWNERSHIP_LOST is a module-level Event).
+        sm._OWNERSHIP_LEASE = None
+        sm._OWNERSHIP_LOST.clear()
+        sm.set_pid_liveness_probe(None)
+        self.conn = connect_db(self.cfg.database_path)
+
+    def tearDown(self) -> None:
+        import shutil
+        sm = self.sm
+        sm._OWNERSHIP_LEASE = None
+        sm._OWNERSHIP_LOST.clear()
+        sm.set_pid_liveness_probe(None)
+        self.conn.close()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        os.environ.pop("CRYPTO_GUARD_DB", None)
+
+    def _ownership_row(self) -> dict | None:
+        row = self.conn.execute(
+            "SELECT pid, started_at_ms, db_path, release_commit, owner_identity, "
+            "lease_until_ms, owner_token FROM _service_ownership WHERE key=?",
+            (self.sm.OWNERSHIP_LEASE_KEY,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def test_r7_p0_3_acquire_is_atomic_only_one_wins_concurrent(self) -> None:
+        """R7-P0-3: two "processes" (two connections, two simulated PIDs)
+        acquiring the lease must end with EXACTLY ONE ``acquired: True``; the
+        second must return ``already_started_external`` (a live external owner)
+        and MUST NOT overwrite the winner's row. Pre-fix the read-then-
+        ``INSERT OR REPLACE`` let both read a stale row and both win the write
+        -> both ``acquired: True`` -> two service sets.
+
+        Within one Python process the in-process ``_OWNERSHIP_LOCK`` serializes
+        the two calls, so this is effectively a sequential contract test that
+        proves the SECOND caller observes the FIRST's freshly written owner
+        (BEGIN IMMEDIATE + re-SELECT) and blocks rather than overwriting. The
+        true cross-process race (both reading the stale row) can only occur
+        between two OS processes each with their own lock; the BEGIN IMMEDIATE
+        RESERVED lock is what serializes THEM, and this test asserts the
+        observable post-condition that serializes to: one winner, one
+        structured block, row carries the winner's pid + a non-empty
+        owner_token.
+        """
+        import threading
+        sm = self.sm
+
+        conn_a = self.sm_module_conn()
+        conn_b = self.sm_module_conn()
+
+        # Both PIDs "alive": liveness probe returns True for any pid, so the
+        # deciding factor is the BEGIN IMMEDIATE atomicity + owner row, NOT PID
+        # liveness.
+        sm.set_pid_liveness_probe(lambda pid: True)
+
+        results: dict[str, dict] = {}
+        errors: dict[str, BaseException] = {}
+
+        def _acquire(tag: str, conn, pid: int) -> None:
+            try:
+                with _patch_getpid(pid):
+                    results[tag] = sm.acquire_service_ownership(conn, str(self.cfg.database_path))
+            except BaseException as exc:  # noqa: BLE001
+                errors[tag] = exc
+
+        # Run A then B sequentially (the in-process lock serializes anyway).
+        _acquire("A", conn_a, 10101)
+        _acquire("B", conn_b, 20202)
+
+        self.assertFalse(errors, "neither acquire should raise: %r" % (errors,))
+        self.assertTrue(results["A"].get("acquired"),
+                        "A (first caller) must win the lease; got %r" % (results["A"],))
+        self.assertFalse(results["B"].get("acquired"),
+                         "R7-P0-3: B (second caller) must NOT win -- a live "
+                         "external owner already holds the lease; got %r "
+                         "(pre-fix B would also acquire via non-atomic INSERT OR "
+                         "REPLACE)." % (results["B"],))
+        self.assertEqual(results["B"].get("reason"), "already_started_external")
+        self.assertEqual(results["B"].get("owner_pid"), 10101)
+        # The single lease row is authoritative: winner's pid + non-empty token.
+        row = self._ownership_row()
+        self.assertIsNotNone(row, "exactly one _service_ownership row must exist")
+        self.assertTrue(str(row["owner_token"]),
+                        "R7-P0-3: the lease row must carry a per-process owner_token")
+        self.assertEqual(int(row["pid"]), 10101)
+        conn_a.close()
+        conn_b.close()
+
+    def test_r7_p0_3_lease_does_not_expire_while_owner_alive_heartbeat(self) -> None:
+        """R7-P0-3: a long-running owner's lease must NOT expire while it is
+        alive. Pre-fix ``start_all_services`` acquired ONCE at startup and
+        never renewed, so after the 5-min TTL a second process reclaimed and
+        spawned a duplicate service set. The heartbeat
+        (``_renew_service_ownership_lease``) extends the lease on each tick.
+
+        We acquire once, capture the original ``lease_until_ms``, then run the
+        heartbeat with an advanced clock and assert the lease_until_ms moved
+        forward (renewed) AND that a second process cannot reclaim while the
+        owner is alive.
+        """
+        import time as _time
+        sm = self.sm
+
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_getpid(30303):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+        row0 = self._ownership_row()
+        assert row0 is not None
+        orig_lease = int(row0["lease_until_ms"])
+        orig_token = str(row0["owner_token"])
+        self.assertTrue(orig_token)
+
+        # Simulate the owner running the heartbeat later (clock advanced by
+        # more than the TTL would pass; the heartbeat re-extends by a full TTL
+        # from "now"). Patch time.time so lease_until = now + TTL.
+        future = orig_lease + 10 * 60 * 1000  # 10 min later
+        with _patch_time(future / 1000.0):
+            with _patch_getpid(30303):
+                hb = sm._renew_service_ownership_lease(self.conn)
+        self.assertTrue(hb.get("renewed"), "heartbeat must renew the live owner's "
+                                           "lease; got %r" % (hb,))
+        # Renewed lease is future + TTL, strictly after orig_lease.
+        self.assertGreater(hb["lease_until_ms"], orig_lease)
+        row1 = self._ownership_row()
+        assert row1 is not None
+        self.assertEqual(int(row1["lease_until_ms"]), hb["lease_until_ms"])
+        self.assertEqual(str(row1["owner_token"]), orig_token,
+                         "heartbeat must not change owner_token")
+
+        # A second process (different pid, live) must STILL be blocked from
+        # reclaiming because the renewed lease is unexpired and the owner is
+        # alive. It must NOT get acquired: True.
+        conn_b = self.sm_module_conn()
+        sm.set_pid_liveness_probe(lambda pid: True)  # both alive
+        with _patch_time(future / 1000.0):
+            with _patch_getpid(40404):
+                dup = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+        self.assertFalse(dup.get("acquired"),
+                         "R7-P0-3: after heartbeat renewal, a second live process "
+                         "must NOT reclaim; got %r (pre-fix it would, because the "
+                         "lease was never renewed)." % (dup,))
+        self.assertEqual(dup.get("reason"), "already_started_external")
+        # The lease row is unchanged (still the live owner).
+        row2 = self._ownership_row()
+        assert row2 is not None
+        self.assertEqual(int(row2["pid"]), 30303)
+        conn_b.close()
+
+    def test_r7_p0_3_expired_lease_without_heartbeat_reclaimable(self) -> None:
+        """R7-P0-3: if the owner's lease expires (no heartbeat ran) the lease
+        is reclaimable by a new process (crash/restart recovery). This is the
+        positive recovery path -- a dead or absent owner should not permanently
+        lock the DB. A new process acquires and the old owner's heartbeat
+        (if it were still cached) must then report ``lost``.
+        """
+        sm = self.sm
+
+        # Owner A acquires.
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_getpid(50505):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+
+        # Time passes beyond the TTL with NO heartbeat. Owner A is now DEAD
+        # (probe says so), lease expired.
+        row0 = self._ownership_row()
+        assert row0 is not None
+        expired_now = int(row0["lease_until_ms"]) + 60 * 1000  # past expiry
+        sm.set_pid_liveness_probe(lambda pid: False)  # owner A dead
+        conn_b = self.sm_module_conn()
+        with _patch_time(expired_now / 1000.0):
+            with _patch_getpid(60606):
+                reclaimed = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+        self.assertTrue(reclaimed.get("acquired"),
+                        "R7-P0-3: an expired + dead-owner lease must be reclaimable; "
+                        "got %r" % (reclaimed,))
+        # New owner row reflects process B.
+        row1 = self._ownership_row()
+        assert row1 is not None
+        self.assertEqual(int(row1["pid"]), 60606)
+        self.assertNotEqual(str(row1["owner_token"]), str(row0["owner_token"]))
+
+        # If the old owner's cached lease is still around and it tries to
+        # heartbeat, it must report "lost" (its token no longer matches the row).
+        sm._OWNERSHIP_LEASE = {
+            "pid": 50505, "db_path": str(self.cfg.database_path),
+            "owner_token": str(row0["owner_token"]), "lease_until_ms": int(row0["lease_until_ms"]),
+        }
+        with _patch_getpid(50505):
+            hb = sm._renew_service_ownership_lease(conn_b)
+        self.assertFalse(hb.get("renewed"))
+        self.assertEqual(hb.get("reason"), "lost",
+                         "R7-P0-3: a reclaim-overwritten owner's heartbeat must "
+                         "report lost, not silently extend a lease it no longer owns.")
+        conn_b.close()
+
+    def test_r7_p0_3_pid_recycle_different_token_cannot_renew_live_owner(self) -> None:
+        """R7-P0-3: PID alone is unsafe -- an OS may recycle a dead PID onto a
+        NEW process. That new process must NOT be able to RENEW (extend) the
+        live owner's lease by heartbeating it, because its ``owner_token``
+        differs from the row's token. The heartbeat CAS keys on
+        ``key + pid + owner_token``; a token mismatch matches 0 rows -> the
+        renewal fails with reason ``lost`` and the live owner's lease row is
+        UNCHANGED. Pre-fix (PID-only CAS) the recycled process's heartbeat
+        ``WHERE key=? AND pid=70707`` would match the live owner's row and
+        silently extend a lease it does not own, masquerading as the owner.
+
+        We do NOT assert the recycled process cannot ACQUIRE a live owner's
+        lease: if the original owner is ALIVE the OS cannot recycle its PID to
+        another process, so that acquire case cannot arise. (If the owner is
+        DEAD and its PID is recycled to a new process, the new process SHOULD
+        reclaim -- that is correct crash recovery, see
+        ``test_r7_p0_3_expired_lease_without_heartbeat_reclaimable``.)
+        """
+        sm = self.sm
+
+        # Owner A acquires with pid 70707 and token T_A; A stays ALIVE.
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_getpid(70707):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+        row0 = self._ownership_row()
+        assert row0 is not None
+        token_a = str(row0["owner_token"])
+        lease0 = int(row0["lease_until_ms"])
+
+        # A NEW process fabricated a cache that claims to own this lease but
+        # with its OWN (different) token -- the PID-recycle impersonation
+        # attempt against the heartbeat.
+        import secrets as _secrets
+        token_b = _secrets.token_hex(16)
+        self.assertNotEqual(token_b, token_a)
+        sm._OWNERSHIP_LEASE = {
+            "pid": 70707, "db_path": str(self.cfg.database_path),
+            "owner_token": token_b, "lease_until_ms": lease0,
+        }
+        # Its heartbeat CAS must match 0 rows (token mismatch) -> lost. Run
+        # under the SAME pid (70707) so the ONLY difference from the live owner
+        # is the owner_token -- this isolates the token-CAS protection (a
+        # PID-only CAS would match the row and wrongly extend the lease).
+        with _patch_getpid(70707):
+            hb = sm._renew_service_ownership_lease(self.conn)
+        self.assertFalse(hb.get("renewed"))
+        self.assertEqual(hb.get("reason"), "lost",
+                         "R7-P0-3: a process with a different owner_token must "
+                         "NOT renew the live owner's lease; got %r" % (hb,))
+        # The live owner's lease row is UNCHANGED (still token_a, same lease).
+        row1 = self._ownership_row()
+        assert row1 is not None
+        self.assertEqual(str(row1["owner_token"]), token_a,
+                         "the failed heartbeat must not have changed owner_token")
+        self.assertEqual(int(row1["lease_until_ms"]), lease0,
+                         "the failed heartbeat must not have changed the live "
+                         "owner's lease_until_ms")
+        # The fabricated cache was cleared (lost) -- the impersonator does not
+        # retain a cached lease it failed to renew.
+        self.assertIsNone(sm._OWNERSHIP_LEASE)
+
+        # Positive control: the REAL owner (token_a, pid 70707) heartbeat DOES
+        # renew the lease -- the matching pid+token CAS hits the row.
+        sm._OWNERSHIP_LEASE = {
+            "pid": 70707, "db_path": str(self.cfg.database_path),
+            "owner_token": token_a, "lease_until_ms": lease0,
+        }
+        later = lease0 + 30 * 1000
+        with _patch_getpid(70707):
+            with _patch_time(later / 1000.0):
+                hb2 = sm._renew_service_ownership_lease(self.conn)
+        self.assertTrue(hb2.get("renewed"),
+                        "positive control: the matching-token owner must renew; "
+                        "got %r" % (hb2,))
+        self.assertGreater(hb2["lease_until_ms"], lease0)
+
+    def test_r7_p0_3_reentrant_same_process_already_started_idempotent(self) -> None:
+        """R7-P0-3: the same process reentering (in-process reentrant start)
+        returns the idempotent ``already_started`` path and refreshes
+        lease_until_ms via the cached owner_token CAS (not a fresh token). This
+        is the in-process fast path; it must NOT generate a new owner_token or
+        clobber the row.
+        """
+        sm = self.sm
+
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_getpid(80808):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+        row0 = self._ownership_row()
+        assert row0 is not None
+        token0 = str(row0["owner_token"])
+        lease0 = int(row0["lease_until_ms"])
+
+        # Reentrant call same process, later clock -> already_started + renewed.
+        later = lease0 + 30 * 1000
+        with _patch_time(later / 1000.0):
+            with _patch_getpid(80808):
+                again = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertFalse(again.get("acquired"))
+        self.assertEqual(again.get("reason"), "already_started")
+        row1 = self._ownership_row()
+        assert row1 is not None
+        self.assertEqual(str(row1["owner_token"]), token0,
+                         "reentrant acquire must NOT mint a new owner_token")
+        self.assertGreater(int(row1["lease_until_ms"]), lease0,
+                           "reentrant acquire must refresh lease_until_ms")
+
+    def test_r7_p0_3_live_pid_expired_lease_not_silently_reclaimed(self) -> None:
+        """R7-P0-3 (core fix): a LIVE external owner whose lease has EXPIRED
+        (e.g. its heartbeat stalled) must NOT be silently reclaimed by a second
+        process -- that would spawn a duplicate service set while the original
+        owner's threads are still running. The second process must be blocked
+        (already_started_external with ``lease_expired: True``) so the operator
+        reconciles (kill the hung owner; its PID then dies and reclaim
+        succeeds). Pre-fix the acquire branch was
+        ``if external and owner_live and not lease_expired:`` -- so an expired
+        lease fell through to reclaim -> second service set.
+
+        Revert-fail: restore the ``and not lease_expired`` clause and this
+        test fails (the second process reclaims -> acquired: True).
+        """
+        sm = self.sm
+
+        # Owner A acquires; A stays ALIVE.
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_getpid(90909):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+        row0 = self._ownership_row()
+        assert row0 is not None
+        token_a = str(row0["owner_token"])
+
+        # The lease EXPIRES (no heartbeat ran). A is still ALIVE.
+        expired_now = int(row0["lease_until_ms"]) + 60 * 1000  # past expiry
+        conn_b = self.sm_module_conn()
+        # A (pid 90909) is live; B is a different pid.
+        sm.set_pid_liveness_probe(lambda pid: True)
+        with _patch_time(expired_now / 1000.0):
+            with _patch_getpid(100100):
+                dup = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+        self.assertFalse(
+            dup.get("acquired"),
+            "R7-P0-3: a LIVE owner with an EXPIRED lease must NOT be silently "
+            "reclaimed -- that spawns a duplicate service set. Got %r "
+            "(pre-fix the ``and not lease_expired`` clause let this reclaim.)"
+            % (dup,),
+        )
+        self.assertEqual(dup.get("reason"), "already_started_external")
+        self.assertEqual(dup.get("owner_pid"), 90909)
+        self.assertTrue(dup.get("lease_expired"),
+                        "the block must surface lease_expired=True so the "
+                        "operator knows the owner's heartbeat stalled")
+        # The lease row is UNCHANGED: still A's token, still A's pid. The
+        # second process did NOT clobber it.
+        row1 = self._ownership_row()
+        assert row1 is not None
+        self.assertEqual(str(row1["owner_token"]), token_a)
+        self.assertEqual(int(row1["pid"]), 90909)
+        conn_b.close()
+
+    # ---- helpers ----
+
+    def sm_module_conn(self):
+        """A fresh connection to the test DB (simulates a second process)."""
+        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        return connect_db(self.cfg.database_path)
+
+    # ------------------------------------------------------------------
+    # 07-15 R8-E (P1-3): ownership-lost must be FAIL-CLOSED. When the
+    # heartbeat reports ``reason="lost"`` the owner must STOP dispatching due
+    # jobs (scheduler) and STOP claiming worker jobs (user + background loops).
+    # Pre-R8-E the scheduler only logged + set a local flag then KEPT running
+    # due_jobs, and the two worker loops had NO ownership awareness at all --
+    # a second process that reclaimed the lease left the old owner's three
+    # loops still claiming work (dual owner). The fix is a module-level
+    # ``_OWNERSHIP_LOST`` Event set on ``lost`` and checked at the top of all
+    # three loops.
+    # ------------------------------------------------------------------
+
+    def test_r8_e_renew_lost_sets_ownership_lost_event(self) -> None:
+        """R8-E (P1-3): a heartbeat that reports ``reason="lost"`` must set the
+        module-level ``_OWNERSHIP_LOST`` Event so the loops can observe it.
+
+        Revert-fail: remove the ``_OWNERSHIP_LOST.set()`` from the lost branch
+        -> the Event stays clear after a lost heartbeat -> this assertion fails.
+        """
+        sm = self.sm
+        # Reset state.
+        sm._OWNERSHIP_LOST.clear()
+        sm._OWNERSHIP_LEASE = None
+        sm.set_pid_liveness_probe(lambda pid: True)
+
+        # Owner A acquires, then B reclaims (expired + dead A).
+        with _patch_getpid(110011):
+            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+        self.assertTrue(got.get("acquired"))
+        row0 = self._ownership_row()
+        assert row0 is not None
+
+        # B reclaims (expired lease + dead A).
+        expired_now = int(row0["lease_until_ms"]) + 60 * 1000
+        sm.set_pid_liveness_probe(lambda pid: False)  # A dead
+        conn_b = self.sm_module_conn()
+        with _patch_time(expired_now / 1000.0):
+            with _patch_getpid(120012):
+                reclaimed = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+        self.assertTrue(reclaimed.get("acquired"))
+
+        # Restore A's cached lease (as if A is still running with a stale cache)
+        # and heartbeat -> must report lost AND set the Event.
+        sm._OWNERSHIP_LEASE = {
+            "pid": 110011, "db_path": str(self.cfg.database_path),
+            "owner_token": str(row0["owner_token"]),
+            "lease_until_ms": int(row0["lease_until_ms"]),
+        }
+        self.assertFalse(
+            sm._OWNERSHIP_LOST.is_set(),
+            "R8-E: precondition - the Event must be clear before the lost heartbeat.",
+        )
+        with _patch_getpid(110011):
+            hb = sm._renew_service_ownership_lease(conn_b)
+        self.assertFalse(hb.get("renewed"))
+        self.assertEqual(hb.get("reason"), "lost")
+        self.assertTrue(
+            sm._OWNERSHIP_LOST.is_set(),
+            "R8-E: a lost heartbeat must set _OWNERSHIP_LOST so the loops stop "
+            "claiming. Pre-R8-E the scheduler only logged a lost lease and kept "
+            "running due_jobs (dual owner).",
+        )
+        conn_b.close()
+
+    def test_r8_e_scheduler_loop_stops_dispatching_when_ownership_lost(self) -> None:
+        """R8-E (P1-3): when ``_OWNERSHIP_LOST`` is set, ``_scheduler_loop``
+        must NOT dispatch due jobs (it skips the dispatch + heartbeat and
+        breaks out of the loop). Pre-R8-E the scheduler only set a local
+        ``heartbeat_warned_lost`` flag and then KEPT running every due job --
+        a reclaimed owner kept ticking the scheduler (dual owner).
+
+        This exercises the loop body directly via the probeable single-
+        iteration hook so no real threads / real sleeps are needed.
+        """
+        sm = self.sm
+        sm._OWNERSHIP_LOST.clear()
+
+        dispatched: list[str] = []
+        renewed_seen: list[dict] = []
+
+        # Probeable renew: report lost only when the Event is set (the loop
+        # itself sets the Event on lost, so we drive it externally here to
+        # simulate a lost lease detected mid-loop).
+        def _fake_renew(conn):
+            renewed_seen.append({"called": True})
+            return {"renewed": False, "reason": "lost"}
+
+        # Probeable due-jobs dispatch counter.
+        orig_due = sm._due_scheduler_jobs
+
+        def _fake_due(now):
+            dispatched.append("dispatch")
+            return ["fake_job"]
+
+        run_job_calls: list[str] = []
+
+        def _fake_run_job(name):
+            run_job_calls.append(name)
+
+        # The loop body must, when lost, NOT call run_job. We run a bounded
+        # number of iterations by patching time.sleep to raise StopIteration
+        # (a sentinel) so the ``while True`` exits after the body.
+        import contextlib
+
+        sm._OWNERSHIP_LOST.set()  # simulate a lost lease already detected
+        with contextlib.ExitStack() as stack:
+            stack.callback(setattr, sm, "_due_scheduler_jobs", orig_due)
+            sm._due_scheduler_jobs = _fake_due  # type: ignore[assignment]
+            stack.callback(setattr, sm, "run_job", sm.run_job)
+            sm.run_job = _fake_run_job  # type: ignore[assignment]
+            # No db_path -> no heartbeat path; the loop should still see the
+            # Event and skip dispatch. Patch time.sleep to break the loop.
+            real_sleep = sm.time.sleep
+            calls = {"n": 0}
+
+            def _breaking_sleep(seconds):
+                calls["n"] += 1
+                if calls["n"] >= 1:
+                    raise StopIteration  # break out of while True
+                real_sleep(seconds)
+
+            stack.callback(setattr, sm.time, "sleep", real_sleep)
+            sm.time.sleep = _breaking_sleep  # type: ignore[assignment]
+            # ``_scheduler_loop(None)`` has no db_path -> no heartbeat; the
+            # Event check is what must suppress dispatch.
+            try:
+                sm._scheduler_loop(None)
+            except StopIteration:
+                pass
+        # The loop MUST NOT have dispatched (Event was set) nor called run_job.
+        self.assertEqual(
+            dispatched, [],
+            "R8-E: the scheduler must NOT dispatch due jobs when ownership is "
+            "lost. Pre-R8-E it kept running them (dual owner). Got %r" % (dispatched,),
+        )
+        self.assertEqual(
+            run_job_calls, [],
+            "R8-E: the scheduler must NOT run_job when ownership is lost. "
+            "Got %r" % (run_job_calls,),
+        )
+
+    def test_r8_e_scheduler_loop_stops_dispatching_when_heartbeat_lost_mid_iteration(self) -> None:
+        """R8-E P1-1 (07-14 follow-up): the scheduler must NOT dispatch due
+        jobs in the SAME iteration where its own heartbeat reports
+        ``reason="lost"``.
+
+        The top-of-loop ``_OWNERSHIP_LOST.is_set()`` check runs BEFORE the
+        heartbeat. If that check is the only guard, a heartbeat that detects a
+        lost lease mid-iteration sets the Event but the loop still falls through
+        to ``_due_scheduler_jobs`` + ``run_job`` -- a one-tick dual-owner window
+        where this (now-disowned) process ticks the scheduler while the new
+        owner is also dispatching. The fix is a SECOND ``is_set()`` check
+        immediately after the heartbeat block.
+
+        This test exercises the real heartbeat path: ``db_path`` is a real DB
+        so ``connect_db`` + ``_renew_service_ownership_lease`` run, and the
+        probeable renew returns ``lost`` (and sets the Event, as production
+        does). The Event is CLEAR on entry -- the only thing that sets it is
+        the heartbeat DURING this iteration. Without the post-heartbeat check
+        the loop dispatches ``fake_job`` -> ``run_job_calls`` non-empty -> FAIL.
+
+        Revert-fail: remove the post-heartbeat ``_OWNERSHIP_LOST.is_set()``
+        check -> the loop dispatches in the lost iteration -> ``run_job_calls``
+        non-empty -> assertion fails.
+        """
+        sm = self.sm
+        sm._OWNERSHIP_LOST.clear()  # CLEAR on entry -- the heartbeat sets it.
+
+        renewed_seen: list[dict] = []
+        run_job_calls: list[str] = []
+        dispatched: list[str] = []
+
+        # Probeable renew that mimics a LOST heartbeat: it sets the latch (as
+        # the real ``_renew_service_ownership_lease`` does on the lost branch)
+        # and returns lost. The Event being set by THIS call mid-iteration is
+        # exactly the race the post-heartbeat check must catch.
+        def _fake_renew_lost(conn):
+            renewed_seen.append({"called": True})
+            sm._OWNERSHIP_LOST.set()  # mirror production lost branch
+            return {"renewed": False, "reason": "lost"}
+
+        orig_due = sm._due_scheduler_jobs
+
+        def _fake_due(now):
+            dispatched.append("dispatch")
+            return ["fake_job"]
+
+        def _fake_run_job(name):
+            run_job_calls.append(name)
+
+        import contextlib
+        real_sleep = sm.time.sleep
+        calls = {"n": 0}
+
+        def _breaking_sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] >= 1:
+                raise StopIteration  # break out of while True after one body
+            real_sleep(seconds)
+
+        with contextlib.ExitStack() as stack:
+            stack.callback(setattr, sm, "_due_scheduler_jobs", orig_due)
+            sm._due_scheduler_jobs = _fake_due  # type: ignore[assignment]
+            stack.callback(setattr, sm, "run_job", sm.run_job)
+            sm.run_job = _fake_run_job  # type: ignore[assignment]
+            stack.callback(setattr, sm, "_renew_service_ownership_lease",
+                           sm._renew_service_ownership_lease)
+            sm._renew_service_ownership_lease = _fake_renew_lost  # type: ignore[assignment]
+            stack.callback(setattr, sm.time, "sleep", real_sleep)
+            sm.time.sleep = _breaking_sleep  # type: ignore[assignment]
+            # Real db_path -> the heartbeat path (connect_db + renew) runs.
+            try:
+                sm._scheduler_loop(str(self.cfg.database_path))
+            except StopIteration:
+                pass
+        # The heartbeat MUST have run (lost path exercised).
+        self.assertEqual(
+            len(renewed_seen), 1,
+            "R8-E P1-1: the heartbeat must run on this iteration (real db_path). "
+            "Got %d renew calls." % (len(renewed_seen),),
+        )
+        self.assertTrue(
+            sm._OWNERSHIP_LOST.is_set(),
+            "R8-E P1-1: the lost heartbeat must set _OWNERSHIP_LOST (precondition).",
+        )
+        # THE LOAD-BEARING ASSERTION: despite the Event being set DURING this
+        # iteration (after the top-of-loop check), the loop must NOT dispatch.
+        self.assertEqual(
+            dispatched, [],
+            "R8-E P1-1: the scheduler must NOT dispatch due jobs in the same "
+            "iteration where the heartbeat reports lost. The top-of-loop check "
+            "runs BEFORE the heartbeat; only the post-heartbeat check catches "
+            "this. Got dispatched=%r." % (dispatched,),
+        )
+        self.assertEqual(
+            run_job_calls, [],
+            "R8-E P1-1: the scheduler must NOT run_job in the lost iteration. "
+            "Got %r." % (run_job_calls,),
+        )
+
+    def test_r8_e_user_worker_loop_stops_claiming_when_ownership_lost(self) -> None:
+        """R8-E (P1-3): ``_user_worker_loop`` had NO ownership awareness -- it
+        called ``run_once`` forever. When ``_OWNERSHIP_LOST`` is set it must
+        STOP calling ``run_once`` (break out). A ``run_once`` already in flight
+        is allowed to finish; only NEW claims stop. Here the Event is set
+        BEFORE the loop body runs, so ``run_once`` is never called.
+        """
+        sm = self.sm
+        sm._OWNERSHIP_LOST.clear()
+
+        run_once_calls: list[dict] = []
+
+        def _fake_run_once(**kwargs):
+            run_once_calls.append(kwargs)
+            return {"processed": False}
+
+        sm._OWNERSHIP_LOST.set()  # lost lease already detected
+        real_sleep = sm.time.sleep
+        calls = {"n": 0}
+
+        def _breaking_sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] >= 1:
+                raise StopIteration
+            real_sleep(seconds)
+
+        orig_run_once = sm.run_once
+        sm.run_once = _fake_run_once  # type: ignore[assignment]
+        sm.time.sleep = _breaking_sleep  # type: ignore[assignment]
+        try:
+            try:
+                sm._user_worker_loop(send_message=None)
+            except StopIteration:
+                pass
+        finally:
+            sm.run_once = orig_run_once  # type: ignore[assignment]
+            sm.time.sleep = real_sleep  # type: ignore[assignment]
+            sm._OWNERSHIP_LOST.clear()
+        self.assertEqual(
+            run_once_calls, [],
+            "R8-E: _user_worker_loop must NOT call run_once when ownership is "
+            "lost. Pre-R8-E it had no ownership awareness and claimed forever "
+            "(dual owner). Got %r" % (run_once_calls,),
+        )
+
+    def test_r8_e_background_worker_loop_stops_claiming_when_ownership_lost(self) -> None:
+        """R8-E (P1-3): ``_background_worker_loop`` had NO ownership awareness.
+        When ``_OWNERSHIP_LOST`` is set it must STOP calling ``run_once``.
+        Mirrors the user-worker test for the background loop.
+        """
+        sm = self.sm
+        sm._OWNERSHIP_LOST.clear()
+
+        run_once_calls: list[dict] = []
+
+        def _fake_run_once(**kwargs):
+            run_once_calls.append(kwargs)
+            return {"processed": False}
+
+        sm._OWNERSHIP_LOST.set()  # lost lease already detected
+        real_sleep = sm.time.sleep
+        calls = {"n": 0}
+
+        def _breaking_sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] >= 1:
+                raise StopIteration
+            real_sleep(seconds)
+
+        orig_run_once = sm.run_once
+        sm.run_once = _fake_run_once  # type: ignore[assignment]
+        sm.time.sleep = _breaking_sleep  # type: ignore[assignment]
+        try:
+            try:
+                sm._background_worker_loop(send_message=None)
+            except StopIteration:
+                pass
+        finally:
+            sm.run_once = orig_run_once  # type: ignore[assignment]
+            sm.time.sleep = real_sleep  # type: ignore[assignment]
+            sm._OWNERSHIP_LOST.clear()
+        self.assertEqual(
+            run_once_calls, [],
+            "R8-E: _background_worker_loop must NOT call run_once when "
+            "ownership is lost. Got %r" % (run_once_calls,),
+        )
+
+    def test_r8_e_loops_claim_when_ownership_not_lost(self) -> None:
+        """R8-E (P1-3) positive control: when ``_OWNERSHIP_LOST`` is CLEAR the
+        loops must CONTINUE claiming (the fail-closed must not be over-eager).
+        A single iteration of EACH loop -- user worker, background worker, and
+        scheduler -- must call its claim/dispatch function once. Pre-follow-up
+        only the user-worker positive control existed; the background and
+        scheduler positive controls were missing (07-14 Recommended-1).
+        """
+        sm = self.sm
+        sm._OWNERSHIP_LOST.clear()  # NOT lost
+
+        real_sleep = sm.time.sleep
+
+        def _make_breaking_sleep():
+            calls = {"n": 0}
+
+            def _breaking_sleep(seconds):
+                calls["n"] += 1
+                if calls["n"] >= 1:
+                    raise StopIteration
+                real_sleep(seconds)
+            return _breaking_sleep
+
+        # --- User worker positive control ---
+        user_calls: list[dict] = []
+
+        def _fake_user(**kwargs):
+            user_calls.append(kwargs)
+            return {"processed": False}
+
+        orig_run_once = sm.run_once
+        sm.run_once = _fake_user  # type: ignore[assignment]
+        sm.time.sleep = _make_breaking_sleep()  # type: ignore[assignment]
+        try:
+            try:
+                sm._user_worker_loop(send_message=None)
+            except StopIteration:
+                pass
+        finally:
+            sm.run_once = orig_run_once  # type: ignore[assignment]
+            sm.time.sleep = real_sleep  # type: ignore[assignment]
+        self.assertEqual(
+            len(user_calls), 1,
+            "R8-E positive control: _user_worker_loop must claim once when NOT "
+            "lost. Got %d calls." % (len(user_calls),),
+        )
+
+        # --- Background worker positive control (07-14 Recommended-1) ---
+        bg_calls: list[dict] = []
+
+        def _fake_bg(**kwargs):
+            bg_calls.append(kwargs)
+            return {"processed": False}
+
+        orig_run_once = sm.run_once
+        sm.run_once = _fake_bg  # type: ignore[assignment]
+        sm.time.sleep = _make_breaking_sleep()  # type: ignore[assignment]
+        try:
+            try:
+                sm._background_worker_loop(send_message=None)
+            except StopIteration:
+                pass
+        finally:
+            sm.run_once = orig_run_once  # type: ignore[assignment]
+            sm.time.sleep = real_sleep  # type: ignore[assignment]
+        self.assertEqual(
+            len(bg_calls), 1,
+            "R8-E positive control: _background_worker_loop must claim once when "
+            "NOT lost. Got %d calls." % (len(bg_calls),),
+        )
+
+        # --- Scheduler positive control (07-14 Recommended-1) ---
+        # ``db_path=None`` skips the heartbeat path (no heartbeat on a worker
+        # that never acquired ownership); with the Event CLEAR the scheduler
+        # must dispatch one due job. ``_due_scheduler_jobs`` returns one fake
+        # job and ``run_job`` is spied.
+        sched_run_job_calls: list[str] = []
+        orig_due = sm._due_scheduler_jobs
+        orig_run_job = sm.run_job
+
+        def _fake_due_one(now):
+            return ["fake_job"]
+
+        def _fake_run_job(name):
+            sched_run_job_calls.append(name)
+
+        sm._due_scheduler_jobs = _fake_due_one  # type: ignore[assignment]
+        sm.run_job = _fake_run_job  # type: ignore[assignment]
+        sm.time.sleep = _make_breaking_sleep()  # type: ignore[assignment]
+        try:
+            try:
+                sm._scheduler_loop(None)
+            except StopIteration:
+                pass
+        finally:
+            sm._due_scheduler_jobs = orig_due  # type: ignore[assignment]
+            sm.run_job = orig_run_job  # type: ignore[assignment]
+            sm.time.sleep = real_sleep  # type: ignore[assignment]
+        self.assertEqual(
+            len(sched_run_job_calls), 1,
+            "R8-E positive control: _scheduler_loop must dispatch one due job "
+            "when NOT lost (and no heartbeat path with db_path=None). Got %d "
+            "run_job calls." % (len(sched_run_job_calls),),
+        )
+
+    def test_r10_p1_init_failure_releases_lease_second_start_reacquires(self) -> None:
+        """07-15 R10-P1 (ownership release on init failure): ``start_all_services``
+        acquires the lease at service_manager.py:544 (REAL acquire, which stamps
+        the ``_service_ownership`` DB row + populates the ``_OWNERSHIP_LEASE``
+        cache), then runs ``initialize_database()`` (:571) + recovery hooks
+        (:575/:589) BEFORE spawning threads. If init/recovery RAISES, the lease
+        row + the ``_OWNERSHIP_LEASE`` cache MUST be released so the process is
+        not locked out. Pre-R10 NOTHING released them: the exception propagated,
+        the DB lease row survived stamped with this PID, and the in-process
+        ``_OWNERSHIP_LEASE`` cache stayed populated. The NEXT
+        ``start_all_services`` call hit ``acquire_service_ownership``'s
+        same-process fast path (:218 -- ``_OWNERSHIP_LEASE.pid == my_pid``) and
+        returned ``already_started`` -- but threads were NEVER started. The
+        process was permanently locked out of its own service set. (Recent
+        project history has a real ``initialize_database()`` failure, so this is
+        not theoretical.)
+
+        Fix contract: ALL exception paths between lease-acquire (:544) and
+        thread-spawn must release the lease via a ``pid + owner_token`` CAS
+        release (clear the DB row + clear ``_OWNERSHIP_LEASE`` under
+        ``_OWNERSHIP_LOCK``) and re-raise. Then a second ``start_all_services``
+        call re-acquires (fresh owner_token) and proceeds to spawn threads.
+
+        Shape: let the REAL ``acquire_service_ownership`` run (so it populates
+        the DB row + cache -- this is the leak surface the fix must clean).
+        Stub ONLY ``initialize_database`` to RAISE on the FIRST call and SUCCEED
+        on the second, plus the thread-spawn + warmup boundaries so no real
+        thread starts. Assert: (1) the first ``start_all_services`` RE-RAISES
+        the init error; (2) the lease DB row is GONE (released) after the
+        failure; (3) the ``_OWNERSHIP_LEASE`` cache is None after the failure;
+        (4) the SECOND ``start_all_services`` call returns ``started=True``
+        (re-acquired + proceeded) -- it did NOT get stuck on the stale fast path.
+
+        Revert-fail: remove the release call from the init-failure except path
+        (or restore the pre-R10 code where the init block has no try/except)
+        -> the lease row survives + ``_OWNERSHIP_LEASE`` stays populated -> the
+        second call hits the fast path and returns ``already_started`` (started
+        = False), so assertion (4) FAILS. (Also assertion (2)/(3) FAIL.)
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard import service_manager as sm
+
+        sm._STARTED = False
+        sm._OWNERSHIP_LEASE = None
+        sm._OWNERSHIP_LOST.clear()
+        # Ensure no prior owner row from setUp / a sibling test.
+        self.conn.execute("DELETE FROM _service_ownership WHERE key=?", (sm.OWNERSHIP_LEASE_KEY,))
+        self.conn.commit()
+        # Ensure autostart is ON (start_all_services early-returns if
+        # CRYPTO_GUARD_AUTOSTART is 0/false/no). Save/restore so we don't leak.
+        _prev_autostart = os.environ.get("CRYPTO_GUARD_AUTOSTART")
+        os.environ["CRYPTO_GUARD_AUTOSTART"] = "1"
+
+        init_calls = {"n": 0}
+
+        def _init_spy(cfg=None):
+            init_calls["n"] += 1
+            if init_calls["n"] == 1:
+                raise RuntimeError("injected initialize_database failure (R10-P1)")
+            return None
+
+        spawn_calls: list[tuple] = []
+
+        def _fake_spawn(name, target, arg):
+            spawn_calls.append((name, target, arg))
+
+        try:
+            # --- First start_all_services: REAL acquire (sets row + cache),
+            # then initialize_database raises. ---
+            with patch.object(sm, "initialize_database", _init_spy), \
+                 patch.object(sm, "_spawn", _fake_spawn), \
+                 patch.object(sm, "_set_warmup_started", lambda: None):
+                raised = None
+                try:
+                    sm.start_all_services()
+                except Exception as exc:
+                    raised = exc
+            # (1) The init failure MUST propagate (not swallowed).
+            self.assertIsInstance(
+                raised, RuntimeError,
+                "R10-P1: an initialize_database failure after lease acquire MUST "
+                "propagate (re-raise). Got raised=%r" % (raised,),
+            )
+            # (2) The lease DB row MUST be released (gone) after the failure.
+            row_after_failure = self._ownership_row()
+            self.assertIsNone(
+                row_after_failure,
+                "R10-P1: the _service_ownership lease row MUST be released "
+                "(cleared) when init fails after acquire, so the process is "
+                "not locked out. Got row=%r" % (row_after_failure,),
+            )
+            # (3) The in-process _OWNERSHIP_LEASE cache MUST be cleared.
+            self.assertIsNone(
+                sm._OWNERSHIP_LEASE,
+                "R10-P1: _OWNERSHIP_LEASE cache MUST be cleared when init fails "
+                "after acquire, else the next start_all_services hits the "
+                "same-process fast path and returns already_started without "
+                "spawning threads. Got %r" % (sm._OWNERSHIP_LEASE,),
+            )
+            # No threads spawned on the failed call.
+            self.assertEqual(
+                spawn_calls, [],
+                "R10-P1: no threads must spawn on the failed (init-raise) call. "
+                "Got %r" % (spawn_calls,),
+            )
+            # Defensive: reset _STARTED (the failed call did not set it).
+            sm._STARTED = False
+
+            # --- Second start_all_services: init now succeeds; must RE-ACQUIRE
+            # (not hit the stale fast path) and proceed to spawn threads. ---
+            spawn_calls.clear()
+            with patch.object(sm, "initialize_database", _init_spy), \
+                 patch.object(sm, "_spawn", _fake_spawn), \
+                 patch.object(sm, "_set_warmup_started", lambda: None):
+                result2 = sm.start_all_services()
+            # (4) The second call MUST re-acquire + proceed (started=True), NOT
+            # get stuck on the stale fast path (which would return
+            # already_started, started=False).
+            self.assertTrue(
+                result2.get("started"),
+                "R10-P1: after a released init-failure lease, a second "
+                "start_all_services MUST re-acquire and proceed (started=True). "
+                "If this is already_started/started=False, the stale "
+                "_OWNERSHIP_LEASE fast path trapped the retry. Got %r" % (result2,),
+            )
+            # The second call re-acquired (fresh owner_token) and proceeded past
+            # init to spawn threads.
+            self.assertEqual(
+                init_calls["n"], 2,
+                "R10-P1: initialize_database must run exactly twice (once "
+                "raised, once succeed). Got %d" % (init_calls["n"],),
+            )
+            self.assertTrue(
+                spawn_calls,
+                "R10-P1: the second (successful) start_all_services must spawn "
+                "threads. Got %r" % (spawn_calls,),
+            )
+        finally:
+            sm._STARTED = False
+            sm._OWNERSHIP_LEASE = None
+            sm._OWNERSHIP_LOST.clear()
+            # Restore autostart env var.
+            if _prev_autostart is None:
+                os.environ.pop("CRYPTO_GUARD_AUTOSTART", None)
+            else:
+                os.environ["CRYPTO_GUARD_AUTOSTART"] = _prev_autostart
+            # Clean any lease row this test created.
+            self.conn.execute("DELETE FROM _service_ownership WHERE key=?", (sm.OWNERSHIP_LEASE_KEY,))
+            self.conn.commit()
+
+
+class _patch_getpid:
+    """Context manager that temporarily patches ``os.getpid`` to a fixed pid.
+
+    ``acquire_service_ownership`` / ``_renew_service_ownership_lease`` read
+    ``os.getpid()`` to stamp the lease row and key the CAS. Tests patch it to
+    simulate distinct processes in one Python interpreter (real multi-process
+    tests would require spawning and are environment-fragile).
+    """
+
+    _active_pid: int | None = None  # set while inside a patch block
+
+    def __init__(self, pid: int):
+        self._pid = pid
+        self._orig = os.getpid
+
+    def __enter__(self):
+        _patch_getpid._active_pid = self._pid
+        os.getpid = lambda *a, **k: _patch_getpid._active_pid  # type: ignore[assignment]
+        return self
+
+    def __exit__(self, *exc):
+        os.getpid = self._orig  # type: ignore[assignment]
+        _patch_getpid._active_pid = None
+
+
+class _patch_time:
+    """Context manager that temporarily patches ``time.time`` to a fixed epoch.
+
+    The lease math uses ``int(time.time() * 1000)``. Tests patch ``time.time``
+    (and ``service_manager.time.time``) to advance the clock deterministically
+    without real sleeps.
+    """
+
+    def __init__(self, epoch_seconds: float):
+        self._epoch = epoch_seconds
+        self._orig_sm_time = None
+
+    def __enter__(self):
+        import time as _t
+        self._orig_sm_time = self._sm_time()
+        # Patch the service_manager module's `time` attribute to a shim whose
+        # `time()` returns the fixed epoch but other attrs forward to the real
+        # module (time.sleep etc. must still work).
+        sm = self._sm()
+        orig_mod = sm.time
+
+        class _T:
+            def __init__(self, mod, epoch):
+                self._mod = mod
+                self._epoch = epoch
+
+            def time(self):
+                return self._epoch
+
+            def __getattr__(self, name):
+                return getattr(self._mod, name)
+
+        sm.time = _T(orig_mod, self._epoch)
+        return self
+
+    def __exit__(self, *exc):
+        sm = self._sm()
+        if self._orig_sm_time is not None:
+            sm.time = self._orig_sm_time
+
+    @staticmethod
+    def _sm():
+        from plugins.crypto_guard import service_manager as _sm
+        return _sm
+
+    @staticmethod
+    def _sm_time():
+        from plugins.crypto_guard import service_manager as _sm
+        return _sm.time
 
 
 class TestPhaseB07_10ConfigAndDeadlinePrimitives(unittest.TestCase):
@@ -50173,6 +54120,73 @@ class TestPhaseB07_10ConfigAndDeadlinePrimitives(unittest.TestCase):
         gen = cfg.trading_mode.get("llm", {}).get("generation", {})
         self.assertEqual(gen.get("max_prompt_bytes"), 49152)
         self.assertEqual(gen.get("target_prompt_bytes"), 32768)
+
+    # ── R7-P1-1 (Round 7): structured-JSON token reserve validation ──
+
+    def test_r7_p1_1_reserve_below_minimum_rejected(self) -> None:
+        """R7-P1-1: when thinking is enabled (``thinking_budget_tokens > 0``)
+        the structured-JSON reserve ``max_output_tokens - thinking_budget_tokens``
+        must be ``>= min_structured_answer_tokens``. Here reserve = 4096 - 2048
+        = 2048 < 4096, so ``load_config`` must raise ``ValueError``. This is the
+        core R6-P0-3 / AC6 contract that R6 P2-1 closure mistakenly marked as
+        "no reserve check" (it relied on a nonexistent test); R7-P1-1 restores
+        the real check and pins it with a behavioral test.
+
+        Revert-fail: remove the ``if _think > 0 and (_max_out - _think) <
+        _min_reserve`` block (loader.py) -> this config loads without raising ->
+        the assertRaises fails.
+        """
+        from plugins.crypto_guard.config.loader import _validate_llm_scheduling
+        trading_mode = {
+            "llm": {
+                "scheduling": {
+                    "mode": "fair_pool",
+                    "max_concurrency": 4,
+                    "per_symbol_timeout_seconds": 300,
+                    "per_attempt_timeout_seconds": 180,
+                    "batch_completion_guard_seconds": 60,
+                    "rotate_start_symbol": True,
+                },
+                "generation": {
+                    "thinking_budget_tokens": 2048,
+                    "max_output_tokens": 4096,
+                    "min_structured_answer_tokens": 4096,
+                    "max_prompt_bytes": 49152,
+                    "target_prompt_bytes": 32768,
+                },
+            },
+        }
+        with self.assertRaises(ValueError) as cm:
+            _validate_llm_scheduling(trading_mode)
+        self.assertIn("min_structured_answer_tokens", str(cm.exception))
+
+    def test_r7_p1_1_reserve_at_or_above_minimum_accepted(self) -> None:
+        """R7-P1-1 positive case: ``thinking=2048, max_output=8192, min=4096``
+        -> reserve = 8192 - 2048 = 6144 >= 4096 -> loads without error. Also
+        confirms ``thinking_budget_tokens < max_output_tokens`` is enforced
+        (2048 < 8192). Guards against the reserve check being too strict."""
+        from plugins.crypto_guard.config.loader import _validate_llm_scheduling
+        trading_mode = {
+            "llm": {
+                "scheduling": {
+                    "mode": "fair_pool",
+                    "max_concurrency": 4,
+                    "per_symbol_timeout_seconds": 300,
+                    "per_attempt_timeout_seconds": 180,
+                    "batch_completion_guard_seconds": 60,
+                    "rotate_start_symbol": True,
+                },
+                "generation": {
+                    "thinking_budget_tokens": 2048,
+                    "max_output_tokens": 8192,
+                    "min_structured_answer_tokens": 4096,
+                    "max_prompt_bytes": 49152,
+                    "target_prompt_bytes": 32768,
+                },
+            },
+        }
+        # Must not raise.
+        _validate_llm_scheduling(trading_mode)
 
     # ---- PerSymbolDeadline: injected clock, provider timeout ----
 

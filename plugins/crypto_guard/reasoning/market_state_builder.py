@@ -30,6 +30,10 @@ def _analyze_timeframe(
     previous_analysis_state: dict[str, Any] | None,
     *,
     read_limit: int | None = None,
+    module_result_sink: list | None = None,
+    skill_log_sink: list | None = None,
+    batch_id: str | None = None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
     """Analyze one timeframe.
 
@@ -37,6 +41,28 @@ def _analyze_timeframe(
     ``cfg.market_data.analysis_window[timeframe]`` (250/250/250/200/150).
     R4.1: when a gap exists, callers pass ``contiguous_count`` as the limit so
     indicators only receive the post-gap suffix (no gap-crossing).
+
+    R8 P2-2 (07-14): ``module_result_sink`` defers the per-TF
+    ``save_module_result`` writes. When ``None`` (default, every legacy caller
+    that runs in autocommit) the module results persist immediately, exactly as
+    before. When a sink list is provided (the cron-scheduler Phase-1 build),
+    the writes are NOT issued here; instead each
+    ``(symbol, timeframe, analysis_time_utc, module, result, confidence)``
+    tuple is appended so the caller persists them INSIDE the Phase-2
+    ``BEGIN IMMEDIATE``. That way a Phase-2 seal-failure ``ROLLBACK`` reverts
+    the ``module_analysis_results`` rows WITH the snapshot/batch (no orphan),
+    which the autocommit Phase-1 write could not.
+
+    R8 P2-NEW-1 (07-14): ``skill_log_sink`` is the LAYERED-lifecycle analog for
+    the decoupled audit tables. When ``None`` (legacy autocommit callers) the
+    skill log is written ``commit_state='committed'`` and feedback writes
+    immediately, exactly as before. When a sink list is provided (the
+    cron-scheduler Phase-1 build) the skill log is written
+    ``commit_state='prepared'`` (immediate immutable audit) and each
+    ``(log_id, feedback_payload_or_None)`` tuple is appended so the caller
+    marks the logs ``committed`` + writes the deferred feedback INSIDE the
+    Phase-2 ``BEGIN IMMEDIATE`` (contract #2), or marks them
+    ``aborted_unsealed`` with ZERO feedback on a seal failure (contract #3).
     """
     limit = read_limit if read_limit is not None else 120
     candles = repo.get_candles(symbol, timeframe, analysis_time_utc=analysis_time_utc, limit=limit)
@@ -47,9 +73,16 @@ def _analyze_timeframe(
         candles=candles,
         analysis_time_utc=analysis_time_utc,
         previous_analysis_state=previous_analysis_state,
+        skill_log_sink=skill_log_sink,
+        batch_id=batch_id,
+        attempt_id=attempt_id,
     )
     for name, result in modules.items():
-        repo.save_module_result(symbol, timeframe, analysis_time_utc, name, result, result.get("confidence"))
+        confidence = result.get("confidence")
+        if module_result_sink is None:
+            repo.save_module_result(symbol, timeframe, analysis_time_utc, name, result, confidence)
+        else:
+            module_result_sink.append((symbol, timeframe, analysis_time_utc, name, result, confidence))
     return {
         "timeframe": timeframe,
         "candles_count": len(candles),
@@ -66,7 +99,36 @@ def build_market_state_snapshot(
     analysis_time_utc: int,
     mode: str,
     timeframes: list[str] | None = None,
+    module_result_sink: list | None = None,
+    skill_log_sink: list | None = None,
+    batch_id: str | None = None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
+    """Build the full market-state snapshot for one symbol.
+
+    R8 P2-2 (07-14): ``module_result_sink`` defers ALL ``module_analysis_results``
+    writes (per-TF modules + the ``multi`` ``trend_stage_fusion`` and
+    ``market_regime`` rows). When ``None`` (default -- every legacy caller that
+    runs in autocommit: backtest, historical_replay, ga_crypto_tools ad_hoc, the
+    tests) the three ``save_module_result`` calls persist immediately, exactly as
+    before. When a sink list is provided (the cron-scheduler Phase-1 build) the
+    writes are NOT issued here; each tuple is appended for the caller to persist
+    INSIDE the Phase-2 ``BEGIN IMMEDIATE`` so a seal-failure ``ROLLBACK`` reverts
+    them with the snapshot/batch (no orphan). The snapshot dict itself is
+    identical in both modes; only the timing of the side-effect write changes.
+
+    R8 P2-NEW-1 (07-14): ``skill_log_sink`` is the LAYERED-lifecycle analog for
+    the decoupled ``skill_execution_logs`` / ``skill_feedback_memory`` tables.
+    When ``None`` (default -- legacy autocommit callers) the skill logs are
+    written ``commit_state='committed'`` and feedback writes immediately, exactly
+    as before. When a sink list is provided (the cron-scheduler Phase-1 build)
+    the skill logs are written ``commit_state='prepared'`` (immediate immutable
+    audit) and each ``(log_id, feedback_payload_or_None)`` tuple is appended for
+    the caller to terminalize INSIDE the Phase-2 transaction: ``committed`` +
+    deferred feedback on success (contract #2), ``aborted_unsealed`` + ZERO
+    feedback on a seal failure (contract #3). ``batch_id``/``attempt_id`` are
+    stamped on the prepared rows for diagnostics.
+    """
     tfs = timeframes or DEFAULT_TIMEFRAMES
     cfg = load_config()
     market_data_cfg = cfg.market_data
@@ -132,6 +194,10 @@ def build_market_state_snapshot(
         result = _analyze_timeframe(
             repo, symbol, tf, analysis_time_utc, previous_analysis_state,
             read_limit=read_limit,
+            module_result_sink=module_result_sink,
+            skill_log_sink=skill_log_sink,
+            batch_id=batch_id,
+            attempt_id=attempt_id,
         )
         # Set loaded_count in health (4-field split)
         health_by_tf[tf]["loaded_count"] = len(result["candles"])
@@ -184,8 +250,17 @@ def build_market_state_snapshot(
         }
     primary_modules["trend_stage"] = fused_trend
     primary_modules["market_regime"] = market_regime
-    repo.save_module_result(symbol, "multi", analysis_time_utc, "trend_stage_fusion", fused_trend, fused_trend.get("confidence"))
-    repo.save_module_result(symbol, "multi", analysis_time_utc, "market_regime", market_regime, 0.7)
+    # R8 P2-2 (07-14): defer the ``multi`` module-result writes when a sink is
+    # provided (cron-scheduler Phase-1 build) so they persist inside the Phase-2
+    # transaction and roll back with the batch on a seal failure. When no sink
+    # is given (legacy autocommit callers) persist immediately as before.
+    _fusion_conf = fused_trend.get("confidence")
+    if module_result_sink is None:
+        repo.save_module_result(symbol, "multi", analysis_time_utc, "trend_stage_fusion", fused_trend, _fusion_conf)
+        repo.save_module_result(symbol, "multi", analysis_time_utc, "market_regime", market_regime, 0.7)
+    else:
+        module_result_sink.append((symbol, "multi", analysis_time_utc, "trend_stage_fusion", fused_trend, _fusion_conf))
+        module_result_sink.append((symbol, "multi", analysis_time_utc, "market_regime", market_regime, 0.7))
 
     # R4: market_bias = "unknown" when degraded (stricter than "neutral" per follow-up §4)
     if data_quality_degraded:

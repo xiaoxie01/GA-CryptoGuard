@@ -81,6 +81,11 @@ DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN = "deterministic_candidate_report
 RAW_GRADE_EXCEEDS_HTF_CAP = "raw_grade_exceeds_htf_cap"
 SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS = "success_batch_missing_completed_symbols"
 HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH = "hourly_report_used_partial_running_batch"
+# 07-10 R6-E (P1-4): a batch whose status is still 'running' but every enabled
+# symbol has a terminal row (completed or failed) in batch_symbol_status is a
+# terminalization leak - finish_analysis_batch never flipped the batch to a
+# terminal status (success/failed). See plan §4 P1-4 / AC5.
+BATCH_STUCK_RUNNING_ALL_TERMINAL = "batch_stuck_running_all_terminal"
 # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract codes.
 LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING = "llm_fair_scheduling_contract_marker_missing"
 FAIR_PATH_CONTINUITY_REAL_INJECTION = "fair_path_continuity_real_injection"
@@ -97,6 +102,18 @@ LLM_CONTINUITY_NOT_INCLUDED = "llm_continuity_not_included"
 LLM_TIMEOUT_CONFIG_OUT_OF_RANGE = "llm_timeout_config_out_of_range"
 LLM_BATCH_DEGRADED_REPORTED_HEALTHY = "llm_batch_degraded_reported_healthy"
 LLM_REPAIR_COUNTED_AS_PROVIDER_CALL = "llm_repair_counted_as_provider_call"
+# 07-14 R8 P2-NEW-1 (contract #4): crash-residue diagnostic. A producer that
+# died between Phase 1 (prepared skill-execution log autocommit write) and
+# Phase 2 (the BEGIN IMMEDIATE commit/abort) leaves ``skill_execution_logs``
+# rows stuck at ``commit_state='prepared'``. The restart recovery hook
+# (``recover_stale_prepared_skill_logs`` wired in ``start_all_services``)
+# terminalizes long-prepared rows to ``aborted``, but a prepared row that is
+# NOT yet stale (younger than the threshold) -- or a row on a node where the
+# restart hook has not yet run -- signals an in-flight / mid-crash producer.
+# This runtime diagnostic surfaces ANY long-prepared row so an operator can
+# see stuck state without restarting; it is NOT marker-cutoff-scoped (it is
+# a live runtime invariant, not a historical contract).
+STUCK_PREPARED_SKILL_LOGS = "stuck_prepared_skill_logs"
 
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
@@ -162,6 +179,10 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_raw_grade_exceeds_htf_cap(repo))
     issues.extend(_check_success_batch_missing_completed_symbols(repo))
     issues.extend(_check_hourly_report_used_partial_running_batch(repo))
+    # 07-10 R6-E (P1-4): a running batch whose every enabled symbol is
+    # terminal is a terminalization leak. Runtime diagnostic (no marker
+    # cutoff), scoped to the latest 24h. See plan §4 P1-4 / AC5.
+    issues.extend(_check_batch_stuck_running_all_terminal(repo))
     # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract checks.
     # The marker-missing check runs first so a missing contract is explicitly
     # surfaced even when the continuity / per-job checks would otherwise pass
@@ -181,6 +202,12 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_llm_timeout_config_out_of_range(repo))
     issues.extend(_check_llm_batch_degraded_reported_healthy(repo))
     issues.extend(_check_llm_repair_counted_as_provider_call(repo))
+    # 07-14 R8 P2-NEW-1 (contract #4): surface long-prepared skill_execution_logs
+    # left behind by a producer that crashed between Phase 1 and Phase 2. This is
+    # a live runtime invariant (no marker cutoff): a prepared row older than the
+    # staleness threshold means a stuck producer the restart hook has not yet
+    # recovered. It is NOT historical audit -- every prepared row is in-flight.
+    issues.extend(_check_stuck_prepared_skill_logs(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -259,6 +286,7 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         RAW_GRADE_EXCEEDS_HTF_CAP: _count(issues, RAW_GRADE_EXCEEDS_HTF_CAP),
         SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS: _count(issues, SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS),
         HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH: _count(issues, HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH),
+        BATCH_STUCK_RUNNING_ALL_TERMINAL: _count(issues, BATCH_STUCK_RUNNING_ALL_TERMINAL),
         LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING: _count(issues, LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING),
         FAIR_PATH_CONTINUITY_REAL_INJECTION: _count(issues, FAIR_PATH_CONTINUITY_REAL_INJECTION),
         PER_JOB_FAILURE_CONSISTENCY: _count(issues, PER_JOB_FAILURE_CONSISTENCY),
@@ -275,6 +303,32 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         "legacy_info_count": legacy_info_count,
         "layer_counts": layer_counts,
     }
+    # 07-10 R6-E (P1-3 #6): reproducibility contract. The explicit per-code keys
+    # above are a hand-maintained allowlist that historically drifted -- the
+    # three semantic-accuracy structured-state codes (MISSING_STRUCTURED_FIELD,
+    # CANONICAL_SUMMARY_DRIFT, RENDERED_SUMMARY_DRIFT) are emitted by
+    # _check_summary_structured_state_mismatch yet were never indexed into the
+    # summary, so their counts were silently lost AND never rendered in the
+    # hourly report (the §3.6 "rendered summary counters disagree with the real
+    # decisions" defect class). The authoritative reproducible view is
+    # ``per_code``: derived directly from ``issues`` so it can never drift, and
+    # every code present in issues is lifted to the top-level summary so the
+    # hourly-report renderer (which iterates summary items and prints
+    # ``{code}={count}``) surfaces every fired code. Existing explicit keys are
+    # preserved for backward compatibility and pinned to their recount.
+    per_code: dict[str, int] = {}
+    for i in issues:
+        per_code[i["type"]] = per_code.get(i["type"], 0) + 1
+    summary["per_code"] = per_code
+    for _code, _recount in per_code.items():
+        # Pin every existing explicit key to its recount (defense-in-depth: a
+        # future allowlist drift surfaces loudly here, not silently).
+        if _code in summary and summary[_code] != _recount:
+            summary[_code] = _recount
+        # Lift any fired code that the allowlist forgot to the top level so the
+        # renderer displays it (fixes the three structured-state codes).
+        elif _code not in summary:
+            summary[_code] = _recount
     return {
         "ok": error_count == 0,
         "issues": issues,
@@ -393,6 +447,41 @@ def _get_semantic_accuracy_marker_ts(repo: CryptoGuardRepository) -> str | None:
     return None
 
 
+def _semantic_check_created_at_lower_bound(repo: CryptoGuardRepository) -> str:
+    """07-10 R6-E (P1-3 #4): lower bound on ``ga_decisions.created_at`` for
+    the five semantic-accuracy checks, applied in SQL BEFORE ``LIMIT``.
+
+    When the semantic-accuracy marker is deployed, the bound is the marker's
+    ``applied_at`` — only post-marker rows are current; pre-marker rows are
+    historical audit and MUST NOT be fetched at all. The pre-fix SQL
+    ``ORDER BY id DESC LIMIT 200`` had no time/marker bound, so on a fresh DB
+    (no marker, no demotion) it fetched 200 historical rows and emitted them as
+    current ``error`` — the ``bias_stage_semantic_conflict=200`` noise in the
+    incident report.
+
+    When the marker is absent (fresh DB / pre-deployment), the bound is
+    ``now_utc - 24h`` — the same window the Phase-I LLM-attempt checks use
+    (``_LLM_DIAGNOSTIC_WINDOW_MS``). This prevents a stale historical conflict
+    row from being fetched and emitted as a current ``error`` against a
+    contract that has not been initialized.
+
+    Returns an ISO-ish timestamp string. Callers compare with
+    ``datetime(created_at) >= datetime(?)`` so the bound is format-agnostic:
+    SQLite ``datetime()`` normalizes both ``YYYY-MM-DD HH:MM:SS`` (the
+    ``CURRENT_TIMESTAMP`` default) and ``YYYY-MM-DDTHH:MM:SSZ`` (ISO-8601) to
+    ``YYYY-MM-DD HH:MM:SS`` before comparing, so a raw string comparison
+    cannot be fooled by the separator/zone difference. With the SQL bound in
+    place, ``_apply_semantic_marker_cutoff`` becomes a redundant safety net
+    (pre-marker rows are no longer fetched) — it is retained as
+    defense-in-depth and stays a no-op.
+    """
+    marker_ts = _get_semantic_accuracy_marker_ts(repo)
+    if marker_ts is not None:
+        return marker_ts
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    return datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _get_continuity_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
     """Phase H: return the decision-context-continuity marker's applied_at, or None.
 
@@ -436,6 +525,43 @@ def _get_llm_fair_scheduling_contract_marker_ts(repo: CryptoGuardRepository) -> 
     except Exception:
         return None
     return None
+
+
+def _llm_attempt_check_created_at_lower_bound(repo: CryptoGuardRepository) -> str:
+    """07-10 R6-E (P1-3 #4 second half): lower bound on
+    ``ga_decisions.created_at`` for the attempt-metadata checks
+    (_check_llm_success_missing_attempt_metadata,
+    _check_llm_continuity_not_included, _check_llm_timeout_config_out_of_range,
+    _check_llm_repair_counted_as_provider_call), applied in SQL BEFORE
+    ``LIMIT``.
+
+    The attempt-metadata checks read ``ga_decisions ORDER BY id DESC LIMIT 200``
+    with no time/marker bound and relied SOLELY on
+    ``_apply_llm_fair_scheduling_marker_cutoff`` to demote pre-marker rows to
+    ``legacy_info`` after fetch. But the per-code summary count
+    ``_count(issues, CODE)`` counts ALL severities (including ``legacy_info``),
+    so pre-marker rows still inflated the rendered summary count - the
+    ``llm_success_missing_attempt_metadata=32`` cumulative-count noise in the
+    incident report (§3.6 "report diagnostics mix current failures with
+    history").
+
+    This bound mirrors ``_semantic_check_created_at_lower_bound`` but uses the
+    fair-scheduling contract marker: when the marker is deployed, the bound is
+    the marker's ``applied_at`` (only post-marker rows are current; pre-marker
+    rows are historical audit and MUST NOT be fetched). When the marker is
+    absent (fresh DB / pre-deployment), the bound is ``now_utc - 24h``
+    (``_LLM_DIAGNOSTIC_WINDOW_MS``) so a stale historical row is not fetched and
+    emitted as a current ``error`` against an uninitialized contract.
+
+    With the SQL bound in place, ``_apply_llm_fair_scheduling_marker_cutoff``
+    becomes a redundant safety net (pre-marker rows are no longer fetched) - it
+    is retained as defense-in-depth and stays a no-op for these codes.
+    """
+    marker_ts = _get_llm_fair_scheduling_contract_marker_ts(repo)
+    if marker_ts is not None:
+        return marker_ts
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    return datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _apply_llm_fair_scheduling_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
@@ -1482,14 +1608,20 @@ def _check_bias_stage_semantic_conflict(repo: CryptoGuardRepository) -> list[dic
     (applied by ``_apply_semantic_marker_cutoff``).
     """
     issues: list[dict[str, Any]] = []
+    # 07-10 R6-E (P1-3 #4): apply the marker/time bound BEFORE LIMIT so a
+    # stale historical conflict row is not fetched at all. See
+    # _semantic_check_created_at_lower_bound for the rationale.
+    bound = _semantic_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, market_bias, trend_stage, created_at
         FROM ga_decisions
         WHERE market_bias IN ('neutral', 'mixed', 'unknown')
           AND trend_stage IN ('early', 'middle', 'late')
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         bias = str(r["market_bias"] or "").lower()
@@ -1528,15 +1660,18 @@ def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[
     """
     from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
     issues: list[dict[str, Any]] = []
+    # 07-10 R6-E (P1-3 #4): marker/time bound BEFORE LIMIT.
+    bound = _semantic_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, signal_grade, confidence, market_bias,
                raw_decision_json, created_at
         FROM ga_decisions
         WHERE confidence >= ?
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
         """,
-        (MIN_CONFIDENCE_FOR_PAPER_ORDER,),
+        (MIN_CONFIDENCE_FOR_PAPER_ORDER, bound),
     ).fetchall()
     for r in rows:
         conf = float(r["confidence"] or 0)
@@ -1656,14 +1791,18 @@ def _check_summary_structured_state_mismatch(repo: CryptoGuardRepository) -> lis
     """
     import re as _re
     issues: list[dict[str, Any]] = []
+    # 07-10 R6-E (P1-3 #4): marker/time bound BEFORE LIMIT.
+    bound = _semantic_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, signal_grade, market_bias, trend_stage, decision,
                confidence, analysis_time, final_summary, rendered_summary,
                raw_decision_json, created_at
         FROM ga_decisions
+        WHERE datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     # Match grade letters with optional Chinese "级" suffix or ASCII space.
     # We look for explicit grade-letter mentions like "A 级", "S级", "B 级".
@@ -1781,16 +1920,20 @@ def _check_observation_reason_missing_market_context(repo: CryptoGuardRepository
     (the diagnostic must surface the gap, but it is not a hard error).
     """
     issues: list[dict[str, Any]] = []
+    # 07-10 R6-E (P1-3 #4): marker/time bound BEFORE LIMIT.
+    bound = _semantic_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, signal_grade, decision, market_bias, trend_stage,
                final_summary, rendered_summary, created_at
         FROM ga_decisions
-        WHERE decision IN ('monitor_only', 'opportunity_watch', 'no_edge',
+        WHERE (decision IN ('monitor_only', 'opportunity_watch', 'no_edge',
                            'watch_only', 'add_to_watchlist', 'ignore')
-           OR decision NOT IN ('create_paper_order', 'trade_plan_available')
+           OR decision NOT IN ('create_paper_order', 'trade_plan_available'))
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         text = (r["final_summary"] or "") + " " + (r["rendered_summary"] or "")
@@ -1836,15 +1979,19 @@ def _check_no_edge_reason_coverage_mismatch(repo: CryptoGuardRepository) -> list
     reason. Severity: ``warning`` per design §7.
     """
     issues: list[dict[str, Any]] = []
+    # 07-10 R6-E (P1-3 #4): marker/time bound BEFORE LIMIT.
+    bound = _semantic_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, signal_grade, decision, batch_id,
                final_summary, rendered_summary, analysis_time, created_at
         FROM ga_decisions
-        WHERE signal_grade IN ('C', 'D')
-           OR decision = 'no_edge'
+        WHERE (signal_grade IN ('C', 'D')
+           OR decision = 'no_edge')
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 300
-        """
+        """,
+        (bound,),
     ).fetchall()
     # Group by a 15-minute time bucket (900000 ms). This mirrors how the
     # hourly report renders C/D symbols — by time window, not by exact
@@ -2679,23 +2826,34 @@ def _check_llm_circuit_breaker_open(repo: CryptoGuardRepository) -> list[dict[st
 def _check_deterministic_candidate_reported_as_trade_plan(
     repo: CryptoGuardRepository,
 ) -> list[dict[str, Any]]:
-    """Flag decisions that have a rule candidate but ``plan_execution_state``
-    is NOT ``confirmed`` and NOT ``no_candidate`` — i.e., the candidate is
-    being held but not confirmed, which the hourly report must NOT render as
-    "候选计划已生成（LLM 已确认）".
+    """Flag decisions where an executable plan was persisted
+    (``has_trade_plan=True``) but ``plan_execution_state`` is NOT
+    ``confirmed`` — i.e. the row is rendered/executable as a trade plan while
+    the lifecycle state says it was never confirmed. This is the genuine
+    report contradiction.
 
-    Per PRD AC18 / R4 and design §11.1, this diagnostic is data-driven: it
-    reads ``ga_decisions.raw_decision_json`` fields directly, NOT rendered
-    report text. Rendered text correctness is verified separately by the
-    renderer unit test on ``_render_plan_state_label``.
+    Per PRD AC18 / R4, AC14 (R6-E P1-3 #5) and design §11.1, this diagnostic
+    is data-driven: it reads ``ga_decisions.raw_decision_json`` fields
+    directly, NOT rendered report text. Rendered text correctness is verified
+    separately by the renderer unit test on ``_render_plan_state_label``.
+
+    A valid unconfirmed deterministic candidate (``candidate_trade_plan``
+    present, ``has_trade_plan=False``, ``plan_execution_state`` in
+    ``unconfirmed`` / ``risk_rejected`` / ``invalidated``) is the fail-closed
+    path and is NOT an error — the renderer already labels it
+    "规则候选计划已生成，LLM 未确认，禁止执行". The pre-fix logic fired
+    ``error`` on ANY non-confirmed/non-no_candidate state, counting a valid
+    fail-closed decision as a defect (AC14 noise). It now fires ONLY on the
+    genuine contradiction: ``has_trade_plan=True`` but
+    ``plan_execution_state != "confirmed"``.
 
     Conditions for the diagnostic to fire (all must hold):
     - ``candidate_trade_plan`` is a non-empty dict (rule SOP produced a
       candidate).
-    - ``has_trade_plan`` is False (no executable plan was confirmed).
-    - ``plan_execution_state`` is not None, not ``confirmed``, not
-      ``no_candidate`` (i.e., the decision is in ``unconfirmed`` /
-      ``risk_rejected`` / ``invalidated`` state).
+    - ``has_trade_plan`` is True (an executable plan was persisted — the row
+      can be rendered as a confirmed trade plan).
+    - ``plan_execution_state`` is not ``confirmed`` (the lifecycle says it was
+      not confirmed — the contradiction).
     """
     issues: list[dict[str, Any]] = []
     cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
@@ -2716,10 +2874,15 @@ def _check_deterministic_candidate_reported_as_trade_plan(
         candidate = raw.get("candidate_trade_plan")
         if not isinstance(candidate, dict) or not candidate:
             continue
-        if raw.get("has_trade_plan"):
-            continue  # has a confirmed plan, not a deterministic-only candidate
+        # AC14 (R6-E P1-3 #5): only flag when an executable plan was persisted
+        # (has_trade_plan=True) yet the lifecycle state is not confirmed — the
+        # genuine contradiction. A valid unconfirmed candidate
+        # (has_trade_plan=False, state=unconfirmed/risk_rejected/invalidated)
+        # is the fail-closed path and MUST NOT be an error.
+        if not raw.get("has_trade_plan"):
+            continue
         state = str(raw.get("plan_execution_state") or "")
-        if state in ("", "confirmed", "no_candidate"):
+        if state == "confirmed":
             continue
         issues.append(_issue(
             DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "error",
@@ -2729,10 +2892,11 @@ def _check_deterministic_candidate_reported_as_trade_plan(
                 "analysis_time": int(r["analysis_time"] or 0),
                 "plan_execution_state": state,
                 "plan_origin": str(raw.get("plan_origin") or ""),
-                "has_trade_plan": False,
+                "has_trade_plan": True,
                 "candidate_trade_plan_present": True,
             },
-            "规则候选计划存在但 plan_execution_state={state}："
+            "规则候选计划已落库为可执行计划（has_trade_plan=True）但 "
+            "plan_execution_state={state}≠confirmed："
             "小时报告必须渲染为 '规则候选计划已生成，LLM 未确认，禁止执行' 而非 '候选计划已生成（LLM 已确认）'。"
             f" (state={state})",
         ))
@@ -3012,6 +3176,102 @@ def _check_hourly_report_used_partial_running_batch(
         "检查 _select_latest_complete_batch 是否生效，禁用 running/partial 渲染路径。"
         "（已降级为 warning：仅当 hourly alert 创建于 running 批次 started_at 之后时触发。）",
     ))
+    return issues
+
+
+def _check_batch_stuck_running_all_terminal(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-10 R6-E (P1-4): flag ``analysis_batches.status='running'`` batches
+    where every enabled symbol has a terminal row (``completed`` or
+    ``failed``) in ``batch_symbol_status``. Such a batch is a terminalization
+    leak: all work is done but ``finish_analysis_batch`` never flipped the
+    batch to a terminal status (``success`` / ``failed``).
+
+    Per plan §4 P1-4 / AC5: "A batch cannot stay running after all enabled
+    symbols are terminal." At finish, completed/failed arrays must be
+    materialized in the same transaction as the terminal status. A batch that
+    slips through that write-link is a current error, not a warning — the
+    report's progress header would freeze at <100% and the partial-running
+    render guard would fire next cycle.
+
+    Detection mirrors ``_check_hourly_report_incomplete_batch``: read the
+    enabled set from ``enabled_symbols_json``, then join
+    ``batch_symbol_status`` for live completed/failed/pending counts. The
+    leak holds iff the enabled set is non-empty AND
+    (completed ∪ failed) ⊇ enabled AND no pending rows exist for the batch.
+
+    Window: only running batches with ``started_at`` within the latest 24h are
+    evaluated, matching the Phase-I LLM diagnostic window. Older stuck-running
+    rows are historical audit (recovered/restarted between cycles) and would
+    be noise; the marker cutoff does not apply (this is a runtime check with
+    no persisted-marker contract of its own, consistent with the other Phase-I
+    runtime diagnostics). Severity: ``error``.
+    """
+    issues: list[dict[str, Any]] = []
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    rows = repo.conn.execute(
+        """
+        SELECT batch_id, primary_interval, analysis_time, status,
+               enabled_symbols_json, started_at
+        FROM analysis_batches
+        WHERE status = 'running'
+          AND analysis_time >= ?
+        ORDER BY started_at DESC LIMIT 20
+        """,
+        (cutoff_ms,),
+    ).fetchall()
+    for row in rows:
+        bid = row["batch_id"] if row["batch_id"] else None
+        if not bid:
+            continue
+        enabled = _json_list(row["enabled_symbols_json"])
+        if not enabled:
+            continue
+        completed_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                (bid,),
+            ).fetchall()
+        ]
+        failed_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+                (bid,),
+            ).fetchall()
+        ]
+        pending_syms = [
+            r["symbol"] for r in repo.conn.execute(
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+                (bid,),
+            ).fetchall()
+        ]
+        terminal = set(completed_syms) | set(failed_syms)
+        # All enabled symbols must be terminal AND no pending work remains.
+        # A symbol enabled but absent from batch_symbol_status entirely is
+        # NOT terminal (it is missing/pending per P1-4 #1) -> not a leak.
+        if pending_syms:
+            continue
+        if not set(enabled).issubset(terminal):
+            continue  # Genuine leak check: every enabled symbol must be terminal.
+        # Genuine leak: every enabled symbol terminal but batch still running.
+        issues.append(_issue(
+            BATCH_STUCK_RUNNING_ALL_TERMINAL, "error",
+            {
+                "batch_id": bid,
+                "primary_interval": row["primary_interval"],
+                "analysis_time": int(row["analysis_time"] or 0),
+                "status": "running",
+                "enabled_count": len(enabled),
+                "completed_count": len(completed_syms),
+                "failed_count": len(failed_syms),
+                "enabled_symbols": enabled,
+                "completed_symbols": completed_syms,
+                "failed_symbols": failed_syms,
+            },
+            "批次全部 enabled 品种已终态（completed+failed==enabled）但 "
+            "status 仍为 running：finish_analysis_batch 未在同一事务终态化，"
+            "属 terminalization leak；必须物化 completed/failed 列并置 status "
+            "为 success/failed，批次不得在全部品种终态后继续 running。",
+        ))
     return issues
 
 
@@ -3534,14 +3794,20 @@ def _check_llm_success_missing_attempt_metadata(repo: CryptoGuardRepository) -> 
     evidence of a call). Severity: ``error``.
     """
     issues: list[dict[str, Any]] = []
+    # R6-E P1-3 #4 (second half): apply a marker/time bound BEFORE LIMIT so
+    # historical rows are not fetched and counted in the summary (the §3.6
+    # ``llm_success_missing_attempt_metadata=32`` cumulative-count noise).
+    bound = _llm_attempt_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         raw = _safe_json(r["raw_decision_json"]) or {}
@@ -3603,14 +3869,19 @@ def _check_llm_continuity_not_included(repo: CryptoGuardRepository) -> list[dict
     Severity: ``error``.
     """
     issues: list[dict[str, Any]] = []
+    # R6-E P1-3 #4 (second half): marker/time bound BEFORE LIMIT (see
+    # _llm_attempt_check_created_at_lower_bound).
+    bound = _llm_attempt_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         raw = _safe_json(r["raw_decision_json"]) or {}
@@ -3662,14 +3933,19 @@ def _check_llm_timeout_config_out_of_range(repo: CryptoGuardRepository) -> list[
     NOT flagged. Severity: ``error``.
     """
     issues: list[dict[str, Any]] = []
+    # R6-E P1-3 #4 (second half): marker/time bound BEFORE LIMIT (see
+    # _llm_attempt_check_created_at_lower_bound).
+    bound = _llm_attempt_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         raw = _safe_json(r["raw_decision_json"]) or {}
@@ -3806,14 +4082,19 @@ def _check_llm_repair_counted_as_provider_call(repo: CryptoGuardRepository) -> l
     ``warning``.
     """
     issues: list[dict[str, Any]] = []
+    # R6-E P1-3 #4 (second half): marker/time bound BEFORE LIMIT (see
+    # _llm_attempt_check_created_at_lower_bound).
+    bound = _llm_attempt_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
+          AND datetime(created_at) >= datetime(?)
         ORDER BY id DESC LIMIT 200
-        """
+        """,
+        (bound,),
     ).fetchall()
     for r in rows:
         raw = _safe_json(r["raw_decision_json"]) or {}
@@ -3980,3 +4261,85 @@ def _reaggregate_batch_llm_outcomes(
         "llm_coverage_degraded": bool(expected and coverage < 1.0),
         "dominant_llm_fallback_reason": dominant_reason,
     }
+
+
+# 07-14 R8 P2-NEW-1 (contract #4): staleness threshold for a "stuck prepared"
+# skill-execution log. Mirrors ``recover_stale_prepared_skill_logs``'s default
+# (cron_scheduler.py): a prepared row surviving past this age is no longer a
+# legitimate in-flight producer tick -- the producer died before reaching the
+# Phase-2 terminalization. The restart hook terminalizes these to ``aborted``;
+# this diagnostic surfaces any that remain (e.g. on a node that has not yet
+# restarted, or a row younger than the hook threshold but older than this).
+SKILL_LOG_PREPARED_STALE_SECONDS = 600
+
+
+def _check_stuck_prepared_skill_logs(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """07-14 R8 P2-NEW-1 (contract #4): surface ``skill_execution_logs`` rows
+    stuck at ``commit_state='prepared'`` past the staleness threshold.
+
+    A producer that crashes (OOM kill, power loss, OS fault) between Phase 1
+    (the prepared skill-log autocommit write) and Phase 2 (the BEGIN IMMEDIATE
+    commit/abort) leaves rows at ``prepared`` indefinitely. The restart
+    recovery hook ``recover_stale_prepared_skill_logs`` (wired in
+    ``service_manager.start_all_services``) terminalizes long-prepared rows to
+    ``aborted`` so they stay excluded from learning (contract #5) yet are no
+    longer silent stuck-state. BUT: (a) a node that has not yet restarted
+    never runs the hook, and (b) a row younger than the hook threshold but
+    older than a real tick (stuck mid-Phase-1) is also a signal.
+
+    This runtime diagnostic queries ANY ``prepared`` row older than
+    ``SKILL_LOG_PREPARED_STALE_SECONDS`` and emits one aggregate ``warning``
+    issue per distinct (symbol, analysis_time) so an operator sees the stuck
+    batch without restarting. Severity is ``warning`` (not ``error``): a stuck
+    prepared row does NOT corrupt learning (the consumer gating at
+    ``latest_skill_result_refs`` excludes it), it just signals the producer
+    failed to terminalize -- which the restart hook will clean up on next
+    start.
+
+    This is a LIVE runtime invariant, NOT marker-cutoff-scoped: every
+    ``prepared`` row is in-flight by definition, so there is no historical
+    pre-marker audit to demote. It is windowed to recent rows
+    (``created_at >= now - 24h``) so the diagnostic does not scan the full
+    audit history on every hourly-report render.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        rows = repo.conn.execute(
+            """
+            SELECT symbol, timeframe, analysis_time, skill_name,
+                   COUNT(*) AS stuck_count,
+                   MIN(created_at) AS oldest_created_at,
+                   MAX(created_at) AS newest_created_at
+            FROM skill_execution_logs
+            WHERE commit_state='prepared'
+              AND created_at < datetime('now', ? )
+              AND created_at >= datetime('now', '-24 hours')
+            GROUP BY symbol, analysis_time
+            ORDER BY oldest_created_at DESC
+            LIMIT 50
+            """,
+            (f"-{int(SKILL_LOG_PREPARED_STALE_SECONDS)} seconds",),
+        ).fetchall()
+    except Exception:
+        # Schema not present (pre-R8 DB) or query failure: skip cleanly. A
+        # missing commit_state column means no layered lifecycle is in effect,
+        # so there can be no stuck-prepared rows by definition.
+        return issues
+    for r in rows:
+        issues.append(_issue(
+            STUCK_PREPARED_SKILL_LOGS, "warning",
+            {
+                "symbol": str(r["symbol"] or ""),
+                "timeframe": str(r["timeframe"] or ""),
+                "analysis_time": int(r["analysis_time"] or 0),
+                "stuck_log_count": int(r["stuck_count"] or 0),
+                "oldest_created_at": str(r["oldest_created_at"] or ""),
+                "newest_created_at": str(r["newest_created_at"] or ""),
+                "stale_threshold_seconds": int(SKILL_LOG_PREPARED_STALE_SECONDS),
+            },
+            "skill_execution_logs 存在长期 prepared 行（生产者 Phase 1 与 Phase 2 之间"
+            "崩溃残留）。已排除出学习上下文（contract #5），但需重启恢复钩子"
+            "（recover_stale_prepared_skill_logs）终态化为 aborted。若持续新增，"
+            "排查 enqueue_market_analysis 是否在 Phase 1 后崩溃。",
+        ))
+    return issues

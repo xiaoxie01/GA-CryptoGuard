@@ -33,6 +33,19 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
             _apply_stop_loss_adjustment_dedup(conn)
             _ensure_profit_protection_cutoff_marker(conn)
             _apply_hourly_report_accuracy_migration(conn)
+            # 07-13 R6-B (P0-1): whole-batch sealing columns. Runs AFTER
+            # _apply_hourly_report_accuracy_migration (which creates
+            # analysis_batches) so the ALTER TABLE succeeds on old DBs.
+            _apply_r6_batch_seal_migration(conn)
+            # 07-13 R6-F (P1-1): service-ownership lease table. Additive
+            # CREATE TABLE IF NOT EXISTS; runs before executescript so the
+            # table exists when start_all_services opens its own connection.
+            apply_r6f_service_ownership_migration(conn)
+            # 07-15 R10-P2: per-batch attempt counter table for atomic
+            # attempt_id allocation. Additive CREATE TABLE IF NOT EXISTS; runs
+            # before executescript so the table exists when the producer (and
+            # start_all_services) opens its own connection.
+            apply_r10_attempt_counter_migration(conn)
             with SCHEMA_PATH.open("r", encoding="utf-8") as f:
                 conn.executescript(f.read())
             # R5-D1: Run dedupe_key migration AFTER executescript. schema.sql no
@@ -56,6 +69,7 @@ def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, An
             _apply_ga_master_migrations(conn)
             _apply_pending_order_lifecycle_migrations(conn)
             _apply_p1_structured_feedback_migrations(conn)
+            _apply_r8_skill_log_lifecycle_migration(conn)
             _apply_account_feedback_gate_migration(conn)
             _apply_daily_review_idempotency_migration(conn)
             _apply_legacy_fuzzy_migration(conn)
@@ -606,6 +620,39 @@ def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
     _add_column(conn, "skill_feedback_memory", "affected_symbols", "TEXT")
     _add_column(conn, "skill_feedback_memory", "affected_sides", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status)")
+
+
+def _apply_r8_skill_log_lifecycle_migration(conn: sqlite3.Connection) -> None:
+    """07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle columns.
+
+    ``skill_execution_logs`` is architecturally DECOUPLED from snapshots (no
+    ``snapshot_id`` FK -- it is an immutable audit row keyed by
+    (symbol, timeframe, analysis_time), retained 30d, designed to accumulate
+    across batches as a learning/audit store). So the fix for the Phase-1
+    autocommit orphan is NOT to defer-and-rollback the audit row like P2-2 did
+    for module results. Instead the row gains a ``commit_state`` so it stays
+    (immutable audit) but is MARKED for consumer gating:
+
+      * ``prepared``      - written in Phase 1 (immediate audit, not yet sealed).
+      * ``committed``     - the Phase-2 seal succeeded; the tick is durable.
+      * ``aborted_unsealed`` - the Phase-2 seal FAILED; the row is retained as
+                            audit but excluded from learning.
+      * ``aborted``       - a recovery hook terminalized a long-lived
+                            ``prepared`` row left by a crash before the seal.
+
+    ``batch_id`` links the audit row to the analysis batch (for diagnostics);
+    ``attempt_id`` records the producer attempt. Legacy rows (NULL commit_state)
+    are read as ``legacy_committed`` by consumers -- NO production backfill.
+    """
+    _add_column(conn, "skill_execution_logs", "commit_state", "TEXT")
+    _add_column(conn, "skill_execution_logs", "batch_id", "TEXT")
+    _add_column(conn, "skill_execution_logs", "attempt_id", "INTEGER")
+    # Diagnostic index: find long-lived prepared rows (crash-recovery target)
+    # and the committed/aborted population per tick.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_logs_commit_state_time "
+        "ON skill_execution_logs(commit_state, analysis_time)"
+    )
 
 
 def _apply_account_feedback_gate_migration(conn: sqlite3.Connection) -> None:
@@ -1501,6 +1548,110 @@ def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
     _ensure_batch_symbol_status_check_constraint(conn)
 
 
+def _apply_r6_batch_seal_migration(conn: sqlite3.Connection) -> None:
+    """07-13 R6-B (P0-1): whole-batch sealing columns on ``analysis_batches``.
+
+    Adds two additive, nullable columns:
+    - ``claim_ready_at``: set by the producer ONLY after every enabled-symbol
+      job + batch_symbol_status row exists and the exact-set validation
+      (jobs == batch_symbol_status symbols == enabled_symbols_json) passes.
+      NULL means the batch is NOT yet claimable (producer still inserting, or
+      validation failed closed).
+    - ``sealed_at``: same write as ``claim_ready_at``; kept as an explicit,
+      human-auditable "the batch was sealed" timestamp distinct from the
+      read-side "claim-ready" gate so diagnostics can distinguish "never
+      sealed" from "sealed but not yet claimed".
+
+    Idempotent: ``_add_column`` checks PRAGMA table_info first. Both columns
+    are nullable so existing pre-R6 batches (NULL sealed_at) are simply
+    non-claimable under the new claim gate -- they were already finished and
+    will not be re-claimed. The producer re-seals on the next tick.
+
+    Release-gated: this migration runs on fresh/test DBs and on the production
+    DB only via the authorized release workflow. It does NOT mutate business
+    rows.
+    """
+    # Guard: analysis_batches must exist before we ALTER it (this runs after
+    # _apply_hourly_report_accuracy_migration which creates it, but be safe).
+    ab_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_batches'"
+    ).fetchone()
+    if ab_table:
+        _add_column(conn, "analysis_batches", "claim_ready_at", "TEXT")
+        _add_column(conn, "analysis_batches", "sealed_at", "TEXT")
+
+
+def apply_r6f_service_ownership_migration(conn: sqlite3.Connection) -> None:
+    """07-13 R6-F (P1-1): service-ownership lease table.
+
+    A single-row table (key=``service_ownership``) records the process that
+    owns the CryptoGuard service set for this DB: ``pid``, ``started_at_ms``,
+    ``db_path``, ``release_commit``, ``owner_identity``, ``lease_until_ms``.
+    ``start_all_services`` acquires this lease atomically; a live external owner
+    (different PID, lease not expired, PID alive) blocks a duplicate start and
+    returns ``already_started_external``. A stale lease (expired OR dead PID)
+    is reclaimable by the new caller (crash/restart recovery).
+
+    Additive and idempotent: ``CREATE TABLE IF NOT EXISTS``. Does not touch
+    business rows. AC15: this migration does not modify ``hub.pyw``.
+
+    07-14 R7-P0-3: add the ``owner_token`` column. The token is a per-process
+    random secret generated at acquire time and persisted alongside ``pid`` so
+    the heartbeat renewal and reclaim paths can use a CAS keyed on
+    ``key + pid + owner_token``. PID alone is not a safe owner identity: an OS
+    may recycle a dead PID onto a new process, which would then look like the
+    same owner. The token disambiguates a recycled PID from the genuine owner.
+    ``_add_column`` is PRAGMA-guarded (idempotent), so this is a no-op on DBs
+    that already have the column (fresh schema.sql DBs include it directly).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS _service_ownership (
+            key TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            started_at_ms INTEGER NOT NULL,
+            db_path TEXT NOT NULL,
+            release_commit TEXT,
+            owner_identity TEXT,
+            lease_until_ms INTEGER NOT NULL
+        )
+        """
+    )
+    _add_column(conn, "_service_ownership", "owner_token", "TEXT")
+
+
+def apply_r10_attempt_counter_migration(conn: sqlite3.Connection) -> None:
+    """07-15 R10-P2: per-batch attempt counter table for ATOMIC ``attempt_id``
+    allocation.
+
+    PRE-R10 ``attempt_id`` was computed as ``COALESCE(MAX(attempt_id),0)+1`` over
+    ``skill_execution_logs`` OUTSIDE any transaction. Two concurrent producers
+    (two connections) could both read the same MAX before either wrote a prepared
+    log -> both stamped the same ``attempt_id`` -> audit-identity collision (the
+    Phase-2 CAS includes the log ``id`` so no direct data overwrite, hence P2,
+    but per-call-unique-monotonic was broken).
+
+    This dedicated counter row, keyed by ``batch_id``, is incremented under an
+    explicit ``BEGIN IMMEDIATE`` (see ``cron_scheduler._allocate_attempt_id``).
+    The RESERVED lock serializes concurrent allocators so each gets a DISTINCT
+    monotonic integer; the counter is per-batch so each batch has its own
+    1,2,3,... sequence (preserving the R9-P2 per-batch monotonic contract).
+
+    Additive and idempotent: ``CREATE TABLE IF NOT EXISTS``. Does not touch
+    business rows. AC15: this migration does not modify ``hub.pyw`` /
+    ``frontends/fsapp.py`` / ``data/binance_rest.py``.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS _analysis_attempt_counter (
+            batch_id TEXT PRIMARY KEY,
+            next_attempt INTEGER NOT NULL
+        )
+        """
+    )
+
+
+
 def _ensure_hourly_report_accuracy_r4_contract_marker(conn: sqlite3.Connection) -> None:
     """FS-5: Write the hourly_report_accuracy_r4_contract_v1 marker.
 
@@ -1868,6 +2019,11 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
     # Required columns for skill_feedback_memory
     required_columns = {
         "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
+        # 07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle. commit_state gates
+        # learning consumers (latest_skill_result_refs) so an aborted/prepared
+        # audit row never points the orchestrator at a dead/failed tick.
+        # batch_id/attempt_id link the audit row to its batch for diagnostics.
+        "skill_execution_logs": ["commit_state", "batch_id", "attempt_id"],
         "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json", "batch_id", "previous_grade", "rendered_summary"],
         "opportunity_watches": ["dedupe_key"],
         "paper_positions": ["updated_at"],
@@ -1884,6 +2040,16 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
         # replace the error_message-parsed defer count so a legitimate long LLM
         # lease cannot be falsely exhausted (R4-P0-1 absolute defer window).
         "agent_jobs": ["claim_token", "lease_until", "defer_count", "deferred_at"],
+        # 07-13 R6-B (P0-1): whole-batch sealing columns. claim_next_batch
+        # selects only batches whose claim_ready_at IS NOT NULL (the producer
+        # sealed them after exact-set validation).
+        "analysis_batches": ["claim_ready_at", "sealed_at"],
+        # 07-14 R7-P0-3: service-ownership lease owner_token. The per-process
+        # random token pairs with ``pid`` so the heartbeat-renewal CAS can reject
+        # a stale/reclaimed lease held by a recycled PID. Missing column on an
+        # old DB means the R7-P0-3 atomic-acquire + heartbeat contract is not
+        # deployed; acquire_service_ownership fail-closes on the health gate.
+        "_service_ownership": ["owner_token"],
     }
 
     # Required indexes
@@ -1897,7 +2063,19 @@ def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite
     ]
 
     # Required tables
-    required_tables = ["analysis_batches", "batch_symbol_status", "backfill_progress"]
+    # 07-15 R10-F (reviewer P2-1): ``_analysis_attempt_counter`` MUST be present
+    # for the producer's atomic ``_allocate_attempt_id`` (R10-P2). A DB
+    # initialized before the R10 migration -- or an interrupted migration --
+    # would be MISSING this table, and the producer would die at tick time with
+    # ``no such table``. ``start_all_services`` runs this health gate and
+    # ``acquire_service_ownership`` fail-closes on it, so the missing table MUST
+    # flip ``ok=False`` (otherwise an unhealthy DB silently passes the gate).
+    required_tables = [
+        "analysis_batches",
+        "batch_symbol_status",
+        "backfill_progress",
+        "_analysis_attempt_counter",
+    ]
 
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []

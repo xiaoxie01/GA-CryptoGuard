@@ -23,7 +23,7 @@ from plugins.crypto_guard.review.daily_reviewer import run_daily_review
 from plugins.crypto_guard.review.trade_reviewer import review_trade
 from plugins.crypto_guard.scheduler.opportunity_watcher import render_watch_alert_text, update_opportunity_watches
 from plugins.crypto_guard.storage.migrations import initialize_database
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, validate_job_identity
 from plugins.crypto_guard.storage.redis_adapter import RedisAdapter, should_use_redis_for_path
 from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.tools.ga_crypto_tools import crypto_handle_text_command
@@ -396,12 +396,24 @@ def process_fair_batch(
     for job in jobs:
         payload = json.loads(job["payload_json"])
         snap = payload.get("snapshot") or {}
-        sym = str(snap.get("symbol") or payload.get("symbol") or "")
-        if not sym:
+        # 07-15 R8-A (P0-2): the worker uses ONLY ``payload.symbol`` as the
+        # authoritative symbol, validated by the SHARED identity contract (the
+        # same helper seal/claim use). Pre-R8 the worker derived
+        # ``sym = str(snap.get("symbol") or payload.get("symbol") or "")`` which
+        # PREFERRED ``snapshot.symbol`` over ``payload.symbol`` -- a swapped
+        # snapshot made the worker analyze the WRONG symbol under the running
+        # job's identity (cross-symbol corruption). Now: a missing/no-symbol/
+        # swapped-snapshot job fails ``validate_job_identity`` (returns None) and
+        # is marked ``failed`` (``invalid_scheduled_payload``) WITHOUT analysis,
+        # exactly like the pre-existing no-symbol poison pill. This unifies the
+        # malformed trigger from "no symbol" to "any identity inconsistency".
+        sym = validate_job_identity(payload)
+        if sym is None:
             job_id = job.get("id")
             LOGGER.error(
                 "process_fair_batch: malformed scheduled_market_analysis job "
-                "id=%s batch=%s has no symbol in payload -> marking failed "
+                "id=%s batch=%s failed identity contract (payload.symbol missing "
+                "or snapshot.symbol missing/swapped) -> marking failed "
                 "(invalid_scheduled_payload). It will NOT be retried.",
                 job_id, batch_id,
             )
@@ -413,7 +425,7 @@ def process_fair_batch(
                         "reason": "invalid_scheduled_payload",
                         "batch_id": batch_id,
                     },
-                    error_message="invalid_scheduled_payload: payload has no symbol",
+                    error_message="invalid_scheduled_payload: payload failed identity contract (symbol missing or snapshot.symbol missing/swapped)",
                 )
             except Exception:
                 LOGGER.exception(
@@ -1479,6 +1491,13 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         expected_analysis_time = payload.get("expected_analysis_time")
         receive_id = payload.get("receive_id")
         receive_id_type = payload.get("receive_id_type")
+        # 07-13 R6-C (P0-4): carry the immutable first-wait/deadline anchor
+        # across retries so the report gates on REAL elapsed time, not retry_count.
+        first_wait_utc = payload.get("first_wait_utc")
+        # R8-B (P0-1): carry the monotonic ``poll_sequence`` so every requeue has
+        # a unique session_id even when ``retry_count`` is clamped at the cap.
+        # Default 0 for legacy/first payloads that carry no ``poll_sequence``.
+        poll_sequence = int(payload.get("poll_sequence") or 0)
         report = build_hourly_report(
             repo,
             retry_count=retry_count,
@@ -1487,6 +1506,8 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
             expected_analysis_time=expected_analysis_time if expected_analysis_time is not None else None,
             receive_id=receive_id,
             receive_id_type=receive_id_type,
+            first_wait_utc=first_wait_utc,
+            poll_sequence=poll_sequence,
         )
         if report.get("error") == "batch_incomplete_requeued":
             LOGGER.info("hourly_feishu_report requeued retry=%s batch=%s", report.get("retry_count"), report.get("batch_id"))
@@ -2373,11 +2394,19 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
             payload = redis_payload.get("payload") or {}
             sqlite_job_id = redis_payload.get("sqlite_job_id")
             if sqlite_job_id:
-                claimed = repo.conn.execute(
-                    "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
-                    (int(sqlite_job_id),),
+                # 07-13 R6-C (P0-2): Redis is an acceleration channel; SQLite is
+                # the sole ownership authority. The consumer MUST recheck
+                # scheduled_at before flipping a row to running -- evidence §3.3
+                # showed a future-scheduled Redis payload (report retry with
+                # scheduled_at in the future) was claimed by id alone, exhausting
+                # a nominal 300s wait in ~20s. claim_job_by_id_cas verifies
+                # id + status='pending' + datetime(scheduled_at)<=datetime('now')
+                # in ONE statement; a future or stale/duplicate payload fails
+                # closed (0 rows) and the row stays pending for the SQLite path.
+                claimed = repo.claim_job_by_id_cas(
+                    job_id=int(sqlite_job_id), expected_status="pending",
                 )
-                if claimed.rowcount != 1:
+                if not claimed:
                     redis_payload = None
             if not redis_payload:
                 job = repo.claim_next_job(max_priority=2) if user_only else repo.claim_next_job(background=background)

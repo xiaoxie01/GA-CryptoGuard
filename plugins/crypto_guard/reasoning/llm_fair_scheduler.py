@@ -1117,6 +1117,13 @@ def _terminal_reason_for(category: str | None, fallback_reason: str) -> str:
         return "retry_budget_exhausted"
     if fallback_reason == "circuit_breaker_open":
         return "breaker_skipped"
+    # 07-13 R6-D (P0-3.5 / §7.9): truncation carries its own structured
+    # terminal reason (distinct from ``llm_json_parse_failed``). It is
+    # retryable, so a truncation that exhausts the deadline/retry budget
+    # surfaces as ``llm_output_truncated`` (the model-output defect), not
+    # the generic transport fallback.
+    if category == "llm_output_truncated":
+        return "llm_output_truncated"
     if category in ("llm_transport_error", "llm_rate_limited",
                     "llm_empty_response", "llm_tool_call_no_text"):
         return category or "llm_transport_error"

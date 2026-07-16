@@ -699,7 +699,13 @@ class NativeClaudeSession(BaseSession):
             claude_tools = openai_tools_to_claude(self.tools)
             tools = [dict(t) for t in claude_tools]; tools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = tools
-        else: print("[ERROR] No tools provided for this session.")
+        elif not getattr(self, "tools_optional", False):
+            # 07-13 R6-F (P1-2): JSON-only callers (e.g. CryptoGuard market
+            # decisions) intentionally run with no tools and set
+            # ``session.tools_optional = True`` to suppress this ERROR. For
+            # sessions that DO expect tools, keep the diagnostic so a missing
+            # tool list is not silently swallowed.
+            print("[ERROR] No tools provided for this session.")
         payload['system'] = [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}]
         if self.system:
             if self.fake_cc_system_prompt: payload["system"].append({"type": "text", "text": self.system})

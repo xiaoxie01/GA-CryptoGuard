@@ -420,13 +420,44 @@ def fault_llm_circuit_breaker_open(conn):
 
 
 def fault_deterministic_candidate_reported_as_trade_plan(conn):
-    """Fault: ga_decisions row with candidate present but
-    ``plan_execution_state=unconfirmed`` and ``has_trade_plan=False``.
+    """Fault (positive, the genuine contradiction): a ``ga_decisions`` row
+    where an executable plan WAS persisted (``has_trade_plan=True``) yet
+    ``plan_execution_state != confirmed`` — the row can be rendered/executed
+    as a trade plan while the lifecycle state says it was never confirmed.
 
-    Per design §11.1, the diagnostic reads ``raw_decision_json`` fields
-    directly — it does NOT parse rendered report text. The seed plants a
-    candidate + unconfirmed state + has_trade_plan=False; the diagnostic
-    must flag it.
+    Per design §11.1 + R6-E P1-3 #5 (AC14), the diagnostic reads
+    ``raw_decision_json`` fields directly — it does NOT parse rendered report
+    text. The seed plants ``has_trade_plan=True`` + ``unconfirmed`` (a valid
+    candidate present alongside a persisted executable plan) — the diagnostic
+    MUST flag this contradiction.
+    """
+    at_ms = _recent_analysis_time_ms()
+    _insert_decision(conn, raw={
+        "llm_status": "failed",
+        "llm_error_category": "llm_empty_response",
+        "llm_fallback_reason": "retry_exhausted",
+        "has_trade_plan": True,
+        "trade_plan": {
+            "side": "long", "entry": 100, "stop": 95,
+            "trigger_price": 100, "trigger_side": "long",
+        },
+        "candidate_trade_plan": {
+            "side": "long", "entry": 100, "stop": 95,
+            "trigger_price": 100, "trigger_side": "long",
+        },
+        "plan_origin": "deterministic_fallback",
+        "plan_execution_state": "unconfirmed",
+        "plan_status": "withheld",
+    }, analysis_time=at_ms, decision="no_edge", grade="C")
+
+
+def fault_deterministic_candidate_reported_as_trade_plan_negative(conn):
+    """Negative: a valid fail-closed deterministic candidate
+    (``candidate_trade_plan`` present, ``has_trade_plan=False``,
+    ``plan_execution_state=unconfirmed``). Per R6-E P1-3 #5 / AC14 this is
+    the legitimate fail-closed path — the renderer already labels it
+    "规则候选计划已生成，LLM 未确认，禁止执行" — and the diagnostic MUST NOT
+    fire (the pre-R6-E logic wrongly counted this as a defect, AC14 noise).
     """
     at_ms = _recent_analysis_time_ms()
     _insert_decision(conn, raw={
@@ -1069,6 +1100,11 @@ def main():
         ("deterministic_candidate_reported_as_trade_plan",
          fault_deterministic_candidate_reported_as_trade_plan,
          DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "caught", None),
+        # R6-E P1-3 #5 / AC14: a valid fail-closed unconfirmed candidate
+        # (has_trade_plan=False) MUST NOT fire the diagnostic.
+        ("deterministic_candidate_reported_as_trade_plan_negative",
+         fault_deterministic_candidate_reported_as_trade_plan_negative,
+         DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "not_caught", None),
         ("raw_grade_exceeds_htf_cap", fault_raw_grade_exceeds_htf_cap,
          RAW_GRADE_EXCEEDS_HTF_CAP, "caught", None),
         ("success_batch_missing_completed_symbols",

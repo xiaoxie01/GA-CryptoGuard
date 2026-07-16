@@ -119,9 +119,17 @@ CREATE TABLE IF NOT EXISTS skill_execution_logs (
     ga_interpretation_json TEXT NOT NULL,
     final_result_json TEXT NOT NULL,
     confidence REAL,
+    -- 07-14 R8 P2-NEW-1: LAYERED lifecycle. 'prepared' in Phase 1,
+    -- 'committed' after a successful Phase-2 seal, 'aborted_unsealed' on seal
+    -- failure, 'aborted' by crash-recovery. NULL (legacy) reads as
+    -- legacy_committed. Consumers gate on commit_state.
+    commit_state TEXT,
+    batch_id TEXT,
+    attempt_id INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_skill_logs_symbol_time ON skill_execution_logs(symbol, timeframe, analysis_time, skill_name);
+CREATE INDEX IF NOT EXISTS idx_skill_logs_commit_state_time ON skill_execution_logs(commit_state, analysis_time);
 
 CREATE TABLE IF NOT EXISTS skill_feedback_memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +196,12 @@ CREATE TABLE IF NOT EXISTS analysis_batches (
     completed_symbols_json TEXT NOT NULL DEFAULT '[]',
     failed_symbols_json TEXT NOT NULL DEFAULT '[]',
     summary_json TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- 07-13 R6-B (P0-1): whole-batch sealing. NULL = producer still inserting
+    -- or exact-set validation failed closed; claim_next_batch skips such
+    -- batches. Set together by the producer after the exact-set check.
+    claim_ready_at TEXT,
+    sealed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time ON analysis_batches(status, analysis_time);
 
@@ -603,6 +616,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique
 CREATE TABLE IF NOT EXISTS _migration_state (
     key TEXT PRIMARY KEY,
     applied_at TEXT
+);
+
+-- 07-13 R6-F (P1-1): service-ownership lease. A single row (key=
+-- 'service_ownership') records the process owning the CryptoGuard service
+-- set for this DB. ``start_all_services`` acquires this lease atomically; a
+-- live external owner blocks duplicate starts (already_started_external),
+-- a stale lease (expired or dead PID) is reclaimable. Mirrored in
+-- migrations.apply_r6f_service_ownership_migration so old DBs get it too.
+-- 07-14 R7-P0-3: ``owner_token`` is a per-process random secret generated at
+-- acquire time so heartbeat renewal/reclaim can CAS on key+pid+owner_token
+-- (PID alone is unsafe: an OS may recycle a dead PID onto a new process).
+CREATE TABLE IF NOT EXISTS _service_ownership (
+    key TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    db_path TEXT NOT NULL,
+    release_commit TEXT,
+    owner_identity TEXT,
+    lease_until_ms INTEGER NOT NULL,
+    owner_token TEXT
 );
 
 CREATE TABLE IF NOT EXISTS alert_failure_log (
