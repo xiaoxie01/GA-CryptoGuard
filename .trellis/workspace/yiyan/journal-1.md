@@ -992,3 +992,36 @@ No production migration needed. Code requires service restart (not performed). E
 ### Next Steps
 
 - None - task complete
+
+
+## Session 30: CryptoGuard 07-10 LLM fair scheduling + context continuity — R10 terminal-repair round (commit)
+
+**Date**: 2026-07-16
+**Task**: CryptoGuard 07-10 LLM fair scheduling + context continuity — R10 terminal-repair round (commit)
+**Branch**: `main`
+
+### Summary
+
+Closed the R10 terminal-review rejection: 3 NEW findings (2 P1 + 1 P2) - lease leak on init/recovery failure, current-symbol partial skill log stuck prepared, attempt_id races under concurrency - plus the 2 reviewer P2 (schema-health coverage for _analysis_attempt_counter, stale docstring) and the ShadowVTLifecycleTest fixture regression P2-1 caused. All RED-first + revert-fail proven; independent crypto-guard-reviewer R10 re-pass returned PASS zero findings. Verified: focused 44 passed, broader 237 passed, two consecutive full-suite 1229 passed each (0 failures/0 skips), git diff --check exit 0, AC15 zero-diff on hub.pyw/frontends/fsapp.py/binance_rest.py (bnapi endpoint preserved), task.py validate passes. Committed the 17 tracked task files (2c07137e) excluding .claude/. Terminal states remain all-false per plan section 10; production migration (initialize_database for the new _analysis_attempt_counter table) + marker write + restart + 3-batch observation gated to a separate crypto-guard-release pass.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2c07137e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
