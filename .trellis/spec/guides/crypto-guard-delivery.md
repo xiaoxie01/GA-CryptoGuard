@@ -72,6 +72,29 @@ Production mutation is a separate, user-confirmed phase:
 
 Use `/trellis:crypto-guard-release`. Do not start `fsapp.py` or `hub.pyw` merely because tests passed.
 
+### Release Agent Routing
+
+- Before any production mutation or service control, the main release session
+  dispatches `crypto-guard-ops-auditor`. That agent is read-only and returns
+  `release_plan_ready: true|false`; it never creates an approval token.
+- PostgreSQL releases require a second independent read-only pass after startup:
+  `crypto-guard-postgres-release-verifier`. It verifies connected identity and
+  least privilege, schema fingerprint, greenfield row counts, diagnostics,
+  ownership, notifications, and three consecutive complete analysis batches.
+- The main release session is the only actor allowed to request user approval,
+  create/revoke a command-guard token, execute mutation/service commands, or
+  update production completion states.
+- Agent output and release transcripts contain password-free identities only.
+  Raw DSNs, passwords and approval tokens are never written to source, task
+  artifacts, journals, logs or Git.
+
+For a PostgreSQL greenfield cutover, archive the retired SQLite database as a
+read-only rollback/audit artifact but do not import its rows when the approved
+task explicitly requires a fresh start. Create dedicated non-dangerous
+`crypto_guard_migrator` and `crypto_guard_app` roles with separate strong
+passwords, run DDL explicitly through the migrator before service startup, and
+validate production through the runtime role.
+
 For an isolated reproduction, use the dedicated `crypto_guard_test_app` /
 `crypto_guard_test` identity and a unique scratch schema. Never point tests at
 the production `crypto_guard` database. This exemption never applies to service

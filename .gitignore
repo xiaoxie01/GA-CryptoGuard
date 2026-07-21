@@ -163,6 +163,7 @@ frontends/conductor_im_plugins/config.local.json
 .claude/agents/*
 !.claude/agents/crypto-guard-reviewer.md
 !.claude/agents/crypto-guard-ops-auditor.md
+!.claude/agents/crypto-guard-postgres-release-verifier.md
 !.claude/commands/
 .claude/commands/*
 !.claude/commands/trellis/
