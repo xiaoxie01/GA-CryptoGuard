@@ -891,7 +891,7 @@ def _verify_deterministic_rule_id(
         # so the global fallback branch is removed. Query is always scoped.
         mod_rows = repo.conn.execute(
             "SELECT result_json, analysis_time, timeframe FROM module_analysis_results "
-            "WHERE symbol=? AND analysis_time >= ? "
+            "WHERE symbol=%s AND analysis_time >= %s "
             "ORDER BY analysis_time DESC LIMIT 50",
             (conf_symbol, conf_close_time - 86400000),  # 24h lookback
         ).fetchall()
@@ -902,7 +902,13 @@ def _verify_deterministic_rule_id(
             if row_analysis_time > analysis_time_upper:
                 continue
             try:
-                result = json.loads(row["result_json"] or "{}")
+                _rr = row["result_json"]
+                if isinstance(_rr, (dict, list)):
+                    result = _rr
+                elif isinstance(_rr, str):
+                    result = json.loads(_rr)
+                else:
+                    result = {}
             except (json.JSONDecodeError, TypeError):
                 continue
             events = result.get("structure_events") if isinstance(result, dict) else None
@@ -972,12 +978,18 @@ def _verify_deterministic_rule_id(
     #    and event close_time must not be after analysis_time_upper (no future leak).
     try:
         fe_row = repo.conn.execute(
-            "SELECT event_id, payload_json FROM feishu_events WHERE event_id=? LIMIT 1",
+            "SELECT event_id, payload_json FROM feishu_events WHERE event_id=%s LIMIT 1",
             (rule_id,),
         ).fetchone()
         if fe_row:
+            _raw_payload = fe_row["payload_json"]
             try:
-                payload = json.loads(fe_row["payload_json"] or "{}")
+                if isinstance(_raw_payload, (dict, list)):
+                    payload = _raw_payload
+                elif isinstance(_raw_payload, str):
+                    payload = json.loads(_raw_payload)
+                else:
+                    payload = {}
             except (json.JSONDecodeError, TypeError):
                 payload = {}
             if not isinstance(payload, dict):
@@ -1236,8 +1248,9 @@ def _long_quality_gate(decision: dict[str, Any], snapshot: dict[str, Any]) -> di
 
 
 def risk_summary_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    raw = signal.get("ga_decision_json") or {}
     try:
-        decision = json.loads(signal.get("ga_decision_json") or "{}")
+        decision = raw if isinstance(raw, dict) else json.loads(raw)
     except Exception:
         decision = {}
     return decision.get("risk_check") or {"ok": False, "reasons": ["signal 缺少风控记录"]}
@@ -1439,10 +1452,10 @@ def apply_regime_gate(
         recent_trades = repo.conn.execute(
             """
             SELECT close_reason FROM paper_trades
-            WHERE side=? AND closed_at IS NOT NULL
-              AND DATE(COALESCE(closed_at, datetime('now')))=?
+            WHERE side=%s AND closed_at IS NOT NULL
+              AND DATE(COALESCE(closed_at, NOW()))=%s
             ORDER BY closed_at DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (side, today, watch_only_after),
         ).fetchall()

@@ -15,9 +15,9 @@ from plugins.crypto_guard.backtest.historical_replay import run_historical_repla
 from plugins.crypto_guard.config.loader import PROJECT_ROOT, load_config
 from plugins.crypto_guard.fetch_historical import ALL_SYMBOLS
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 
 LOGGER = get_logger("crypto_guard.backtest")
 
@@ -39,10 +39,10 @@ def _load_candles_from_parquet(symbol: str, interval: str) -> list[dict[str, Any
 
 
 def _load_candles_from_repo(repo: CryptoGuardRepository, symbol: str, interval: str) -> list[dict[str, Any]]:
-    """Load candles from SQLite repository."""
+    """Load candles from the PostgreSQL repository."""
     candles = repo.get_candles(symbol, interval, limit=50000)
     if candles:
-        LOGGER.info("Loaded %d candles from SQLite for %s %s", len(candles), symbol, interval)
+        LOGGER.info("Loaded %d candles from PostgreSQL for %s %s", len(candles), symbol, interval)
     return candles
 
 
@@ -56,7 +56,7 @@ def run_full_backtest(
 ) -> dict[str, Any]:
     """Run backtest for all symbols on the given interval.
 
-    Data source priority: Parquet (via DuckDB) > SQLite.
+    Data source priority: Parquet (via DuckDB) > PostgreSQL.
     Uses real trade simulation (not pseudo-R) and market regime classification.
     """
     targets = symbols or ALL_SYMBOLS
@@ -76,14 +76,14 @@ def run_full_backtest(
     for symbol in targets:
         LOGGER.info("Running backtest for %s %s...", symbol, interval)
 
-        # Priority: Parquet > SQLite
+        # Priority: Parquet > PostgreSQL
         candles = _load_candles_from_parquet(symbol, interval)
         data_source = "parquet"
         if not candles:
             candles = _load_candles_from_repo(repo, symbol, interval)
-            data_source = "sqlite"
+            data_source = "postgres"
         if not candles:
-            LOGGER.warning("No candles for %s %s (neither Parquet nor SQLite), skipping", symbol, interval)
+            LOGGER.warning("No candles for %s %s (neither Parquet nor PostgreSQL), skipping", symbol, interval)
             continue
 
         result = run_historical_replay(
@@ -242,8 +242,9 @@ def main() -> None:
     """CLI entry point for running backtests."""
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PG cutover: pooled connection (auto-returned; every repo write self-wraps
+    # ``conn.transaction()``).
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
         print("Running full backtest...")
         result = run_full_backtest(repo)
@@ -268,8 +269,6 @@ def main() -> None:
         print(f"\nRecommendations:")
         for r in evo["recommendations"]:
             print(f"  - {r}")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

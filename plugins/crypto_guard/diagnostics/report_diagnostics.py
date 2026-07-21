@@ -101,6 +101,7 @@ LLM_SUCCESS_MISSING_ATTEMPT_METADATA = "llm_success_missing_attempt_metadata"
 LLM_CONTINUITY_NOT_INCLUDED = "llm_continuity_not_included"
 LLM_TIMEOUT_CONFIG_OUT_OF_RANGE = "llm_timeout_config_out_of_range"
 LLM_BATCH_DEGRADED_REPORTED_HEALTHY = "llm_batch_degraded_reported_healthy"
+DIAGNOSTIC_QUERY_FAILED = "diagnostic_query_failed"
 LLM_REPAIR_COUNTED_AS_PROVIDER_CALL = "llm_repair_counted_as_provider_call"
 # 07-14 R8 P2-NEW-1 (contract #4): crash-residue diagnostic. A producer that
 # died between Phase 1 (prepared skill-execution log autocommit write) and
@@ -415,15 +416,12 @@ _CONTINUITY_ISSUE_TYPES: frozenset[str] = frozenset({
 
 def _get_r4_contract_marker_ts(repo: CryptoGuardRepository) -> str | None:
     """Return the R4 contract marker's applied_at timestamp, or None."""
-    try:
-        row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
-            (R4_CONTRACT_MARKER_KEY,),
-        ).fetchone()
-        if row and row["applied_at"]:
-            return str(row["applied_at"])
-    except Exception:
-        return None
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (R4_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
     return None
 
 
@@ -435,15 +433,12 @@ def _get_semantic_accuracy_marker_ts(repo: CryptoGuardRepository) -> str | None:
     with ``error`` severity against a contract that has not yet been
     initialized. The marker-missing check separately surfaces the absence.
     """
-    try:
-        row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
-            (SEMANTIC_ACCURACY_MARKER_KEY,),
-        ).fetchone()
-        if row and row["applied_at"]:
-            return str(row["applied_at"])
-    except Exception:
-        return None
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (SEMANTIC_ACCURACY_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
     return None
 
 
@@ -466,10 +461,9 @@ def _semantic_check_created_at_lower_bound(repo: CryptoGuardRepository) -> str:
     contract that has not been initialized.
 
     Returns an ISO-ish timestamp string. Callers compare with
-    ``datetime(created_at) >= datetime(?)`` so the bound is format-agnostic:
-    SQLite ``datetime()`` normalizes both ``YYYY-MM-DD HH:MM:SS`` (the
-    ``CURRENT_TIMESTAMP`` default) and ``YYYY-MM-DDTHH:MM:SSZ`` (ISO-8601) to
-    ``YYYY-MM-DD HH:MM:SS`` before comparing, so a raw string comparison
+    ``created_at >= %s::timestamptz`` so the bound is format-agnostic:
+    PostgreSQL casts the ISO-8601 param string to ``timestamptz`` before
+    comparing against the ``TIMESTAMPTZ`` column, so a raw string comparison
     cannot be fooled by the separator/zone difference. With the SQL bound in
     place, ``_apply_semantic_marker_cutoff`` becomes a redundant safety net
     (pre-marker rows are no longer fetched) — it is retained as
@@ -492,15 +486,12 @@ def _get_continuity_contract_marker_ts(repo: CryptoGuardRepository) -> str | Non
     (_check_plan_lifecycle_contract_markers_missing) separately surfaces
     the absence as an error.
     """
-    try:
-        row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
-            (CONTINUITY_CONTRACT_MARKER_KEY,),
-        ).fetchone()
-        if row and row["applied_at"]:
-            return str(row["applied_at"])
-    except Exception:
-        return None
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (CONTINUITY_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
     return None
 
 
@@ -515,15 +506,12 @@ def _get_llm_fair_scheduling_contract_marker_ts(repo: CryptoGuardRepository) -> 
     (_check_llm_fair_scheduling_contract_markers_missing) separately surfaces
     the absence as an error.
     """
-    try:
-        row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
-            (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
-        ).fetchone()
-        if row and row["applied_at"]:
-            return str(row["applied_at"])
-    except Exception:
-        return None
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
     return None
 
 
@@ -682,15 +670,12 @@ def _get_decision_created_ts(repo: CryptoGuardRepository, decision_id: int | Non
     """Return the created_at timestamp for a ga_decisions row, or None."""
     if decision_id is None:
         return None
-    try:
-        row = repo.conn.execute(
-            "SELECT created_at FROM ga_decisions WHERE id=?",
-            (int(decision_id),),
-        ).fetchone()
-        if row and row["created_at"]:
-            return str(row["created_at"])
-    except Exception:
-        return None
+    row = repo.conn.execute(
+        "SELECT created_at FROM ga_decisions WHERE id=%s",
+        (int(decision_id),),
+    ).fetchone()
+    if row and row["created_at"]:
+        return str(row["created_at"])
     return None
 
 
@@ -702,7 +687,29 @@ def run_for_report(repo: CryptoGuardRepository, *, batch_id: str | None = None) 
     try:
         return diagnose_report_accuracy(repo, batch_id=batch_id)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "summary": {}, "total_issues": 0, "issues": []}
+        # A PostgreSQL statement error aborts the current transaction until an
+        # explicit rollback. Reporting fail-closed is not enough if we return
+        # an unusable pooled connection to the caller.
+        try:
+            repo.conn.rollback()
+        except Exception:
+            pass
+        issue = _issue(
+            DIAGNOSTIC_QUERY_FAILED,
+            "error",
+            {"error_type": type(exc).__name__},
+            "报告准确性诊断查询失败；已故障关闭。检查 PostgreSQL 连接、事务状态和 SQL。",
+        )
+        return {
+            "ok": False,
+            "error": f"diagnostic query failed ({type(exc).__name__})",
+            "summary": {DIAGNOSTIC_QUERY_FAILED: 1, "error_count": 1},
+            "total_issues": 1,
+            "error_count": 1,
+            "warning_count": 0,
+            "legacy_info_count": 0,
+            "issues": [issue],
+        }
 
 
 # ── issue codes omit "rate,"; for schema simplicity keep both forms documented. ──
@@ -760,19 +767,19 @@ def _check_hourly_report_incomplete_batch(repo: CryptoGuardRepository, batch_id:
         # P0-2/6: use batch_symbol_status for accurate counts
         completed_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='completed'",
                 (bid,),
             ).fetchall()
         ]
         failed_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='failed'",
                 (bid,),
             ).fetchall()
         ]
         pending_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='pending'",
                 (bid,),
             ).fetchall()
         ]
@@ -820,11 +827,11 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository, *, batch_id
     if batch_id:
         try:
             batch_row = repo.conn.execute(
-                "SELECT analysis_time FROM analysis_batches WHERE batch_id=? LIMIT 1",
+                "SELECT analysis_time FROM analysis_batches WHERE batch_id=%s LIMIT 1",
                 (batch_id,),
             ).fetchone()
         except Exception:
-            batch_row = None
+            raise
         if batch_row is not None and batch_row["analysis_time"] is not None:
             try:
                 cutoff = int(batch_row["analysis_time"])
@@ -838,14 +845,14 @@ def _check_hourly_report_stale_decision(repo: CryptoGuardRepository, *, batch_id
     if batch_id:
         rows = repo.conn.execute(
             "SELECT id, symbol, analysis_time, signal_grade, batch_id "
-            "FROM ga_decisions WHERE batch_id=? ORDER BY id DESC LIMIT 120",
+            "FROM ga_decisions WHERE batch_id=%s ORDER BY id DESC LIMIT 120",
             (batch_id,),
         ).fetchall()
     else:
         min_time = cutoff - span
         rows = repo.conn.execute(
             "SELECT id, symbol, analysis_time, signal_grade, batch_id "
-            "FROM ga_decisions WHERE analysis_time >= ? ORDER BY id DESC LIMIT 120",
+            "FROM ga_decisions WHERE analysis_time >= %s ORDER BY id DESC LIMIT 120",
             (min_time,),
         ).fetchall()
     for r in rows:
@@ -1017,7 +1024,7 @@ def _check_excessive_grade_flip(repo: CryptoGuardRepository) -> list[dict[str, A
         """
         SELECT id, symbol, analysis_time, signal_grade, previous_grade
         FROM ga_decisions
-        WHERE analysis_time >= ?
+        WHERE analysis_time >= %s
         ORDER BY symbol, analysis_time ASC
         """,
         (cutoff_ms,),
@@ -1065,7 +1072,7 @@ def _check_direction_flip_without_closed_candle(repo: CryptoGuardRepository) -> 
         SELECT id, symbol, analysis_time, market_bias, counter_evidence_json,
                trade_plan_json, evidence_json, snapshot_id
         FROM ga_decisions
-        WHERE analysis_time >= ?
+        WHERE analysis_time >= %s
         ORDER BY symbol, analysis_time ASC
         """,
         (cutoff_ms,),
@@ -1370,18 +1377,15 @@ def _lookup_snapshot_events(
     """
     if snapshot_id is None:
         return []
-    try:
-        rows = repo.conn.execute(
-            """
-            SELECT module, timeframe, analysis_time, result_json
-            FROM module_analysis_results
-            WHERE snapshot_id=? AND symbol=? AND module IN (?, ?, ?)
-            ORDER BY timeframe
-            """,
-            (int(snapshot_id), symbol, *_SNAPSHOT_EVENT_MODULES),
-        ).fetchall()
-    except Exception:
-        return []
+    rows = repo.conn.execute(
+        """
+        SELECT module, timeframe, analysis_time, result_json
+        FROM module_analysis_results
+        WHERE snapshot_id=%s AND symbol=%s AND module IN (%s, %s, %s)
+        ORDER BY timeframe
+        """,
+        (int(snapshot_id), symbol, *_SNAPSHOT_EVENT_MODULES),
+    ).fetchall()
 
     events: list[dict[str, Any]] = []
     for row in rows:
@@ -1435,7 +1439,7 @@ def _parse_event_time(event: dict[str, Any]) -> int | None:
             if not raw_str:
                 continue
             try:
-                dt = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(str(raw_str).replace("Z", "+00:00"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return int(dt.timestamp() * 1000)
@@ -1503,7 +1507,7 @@ def _check_negative_drawdown_display(repo: CryptoGuardRepository) -> list[dict[s
         ).fetchone()
         initial_balance = float(init_row["initial_balance"]) if init_row and init_row["initial_balance"] else 0.0
     except Exception:
-        initial_balance = 0.0
+        raise
     rows = repo.conn.execute(
         """
         SELECT id, account_equity, unrealized_pnl, realized_pnl, snapshot_json
@@ -1578,11 +1582,11 @@ def _check_semantic_contract_markers_missing(repo: CryptoGuardRepository) -> lis
     for key, label in required_markers:
         try:
             row = repo.conn.execute(
-                "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+                "SELECT applied_at FROM _migration_state WHERE key=%s LIMIT 1",
                 (key,),
             ).fetchone()
         except Exception:
-            row = None
+            raise
         if not row or not row["applied_at"]:
             issues.append(_issue(
                 SEMANTIC_CONTRACT_MARKER_MISSING, "error",
@@ -1618,7 +1622,7 @@ def _check_bias_stage_semantic_conflict(repo: CryptoGuardRepository) -> list[dic
         FROM ga_decisions
         WHERE market_bias IN ('neutral', 'mixed', 'unknown')
           AND trend_stage IN ('early', 'middle', 'late')
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -1667,8 +1671,8 @@ def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[
         SELECT id, symbol, signal_grade, confidence, market_bias,
                raw_decision_json, created_at
         FROM ga_decisions
-        WHERE confidence >= ?
-          AND datetime(created_at) >= datetime(?)
+        WHERE confidence >= %s
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (MIN_CONFIDENCE_FOR_PAPER_ORDER, bound),
@@ -1799,7 +1803,7 @@ def _check_summary_structured_state_mismatch(repo: CryptoGuardRepository) -> lis
                confidence, analysis_time, final_summary, rendered_summary,
                raw_decision_json, created_at
         FROM ga_decisions
-        WHERE datetime(created_at) >= datetime(?)
+        WHERE created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -1930,7 +1934,7 @@ def _check_observation_reason_missing_market_context(repo: CryptoGuardRepository
         WHERE (decision IN ('monitor_only', 'opportunity_watch', 'no_edge',
                            'watch_only', 'add_to_watchlist', 'ignore')
            OR decision NOT IN ('create_paper_order', 'trade_plan_available'))
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -1988,7 +1992,7 @@ def _check_no_edge_reason_coverage_mismatch(repo: CryptoGuardRepository) -> list
         FROM ga_decisions
         WHERE (signal_grade IN ('C', 'D')
            OR decision = 'no_edge')
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 300
         """,
         (bound,),
@@ -2045,6 +2049,16 @@ def _check_no_edge_reason_coverage_mismatch(repo: CryptoGuardRepository) -> list
 def _json_list(raw: Any) -> list[str]:
     if not raw:
         return []
+    # JSONB columns come back from psycopg3 as already-decoded list/dict (NOT
+    # str); ``json.loads(list)`` raises TypeError inside the bare ``except`` ->
+    # returns [] -> the check silently skips every row (false green, the SC-4
+    # bug). Pass list/dict through; only parse str. Mirrors state_consistency.
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if isinstance(raw, dict):
+        # enabled_symbols_json is a list at the JSON root; a dict root is not a
+        # list-shape contract, so treat as empty rather than guessing keys.
+        return []
     try:
         import json
         data = json.loads(raw)
@@ -2056,6 +2070,12 @@ def _json_list(raw: Any) -> list[str]:
 def _safe_json(raw: Any) -> Any:
     if raw is None:
         return None
+    # JSONB pass-through: psycopg3 decodes JSONB columns to dict/list already,
+    # so ``json.loads(dict)`` would raise TypeError and (via the bare except)
+    # return None -> every JSONB-backed check silently skips its rows. Accept
+    # dict/list as-is; only str needs parsing. Mirrors state_consistency.
+    if isinstance(raw, (dict, list)):
+        return raw
     import json
     try:
         return json.loads(raw)
@@ -2088,11 +2108,11 @@ def _check_plan_lifecycle_contract_markers_missing(repo: CryptoGuardRepository) 
     issues: list[dict[str, Any]] = []
     try:
         row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+            "SELECT applied_at FROM _migration_state WHERE key=%s LIMIT 1",
             (CONTINUITY_CONTRACT_MARKER_KEY,),
         ).fetchone()
     except Exception:
-        row = None
+        raise
     if not row or not row["applied_at"]:
         issues.append(_issue(
             PLAN_LIFECYCLE_CONTRACT_MARKER_MISSING, "error",
@@ -2447,7 +2467,7 @@ def _check_batch_time_health_mismatch(repo: CryptoGuardRepository) -> list[dict[
         completed = [
             r["symbol"] for r in repo.conn.execute(
                 "SELECT symbol FROM batch_symbol_status "
-                "WHERE batch_id=? AND status='completed' LIMIT 50",
+                "WHERE batch_id=%s AND status='completed' LIMIT 50",
                 (bid,),
             ).fetchall()
         ]
@@ -2460,7 +2480,7 @@ def _check_batch_time_health_mismatch(repo: CryptoGuardRepository) -> list[dict[
                 SELECT ms.data_quality_json, ms.analysis_time AS snapshot_time
                 FROM market_snapshots ms
                 JOIN ga_decisions gd ON gd.snapshot_id = ms.id
-                WHERE gd.batch_id=? AND gd.symbol=?
+                WHERE gd.batch_id=%s AND gd.symbol=%s
                 LIMIT 1
                 """,
                 (bid, sym),
@@ -2592,7 +2612,7 @@ def _check_failed_jobs_outside_window(repo: CryptoGuardRepository) -> list[dict[
         SELECT batch_id, primary_interval, analysis_time, started_at, status
         FROM analysis_batches
         WHERE status = 'failed'
-          AND datetime(started_at) < datetime('now', ?)
+          AND started_at < NOW() + %s::interval
         ORDER BY started_at DESC LIMIT 50
         """,
         (f"-{FAILED_JOBS_RECENT_WINDOW_DAYS} days",),
@@ -2644,7 +2664,7 @@ def _check_llm_failure_rate_high(repo: CryptoGuardRepository) -> list[dict[str, 
         """
         SELECT batch_id, primary_interval, analysis_time, status, summary_json
         FROM analysis_batches
-        WHERE analysis_time >= ?
+        WHERE analysis_time >= %s
         ORDER BY started_at DESC LIMIT 5
         """,
         (cutoff_ms,),
@@ -2709,7 +2729,7 @@ def _check_llm_config_error_detected(repo: CryptoGuardRepository) -> list[dict[s
         SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time, created_at
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND analysis_time >= ?
+          AND analysis_time >= %s
         ORDER BY id DESC LIMIT 200
         """,
         (cutoff_ms,),
@@ -2751,7 +2771,7 @@ def _check_llm_retry_exhausted(repo: CryptoGuardRepository) -> list[dict[str, An
         SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND analysis_time >= ?
+          AND analysis_time >= %s
         ORDER BY id DESC LIMIT 200
         """,
         (cutoff_ms,),
@@ -2792,7 +2812,7 @@ def _check_llm_circuit_breaker_open(repo: CryptoGuardRepository) -> list[dict[st
         """
         SELECT batch_id, primary_interval, analysis_time, status, summary_json
         FROM analysis_batches
-        WHERE analysis_time >= ?
+        WHERE analysis_time >= %s
         ORDER BY started_at DESC LIMIT 5
         """,
         (cutoff_ms,),
@@ -2862,7 +2882,7 @@ def _check_deterministic_candidate_reported_as_trade_plan(
         SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND analysis_time >= ?
+          AND analysis_time >= %s
         ORDER BY id DESC LIMIT 200
         """,
         (cutoff_ms,),
@@ -2925,7 +2945,7 @@ def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[s
         SELECT id, symbol, signal_grade, decision, raw_decision_json, analysis_time
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND analysis_time >= ?
+          AND analysis_time >= %s
         ORDER BY id DESC LIMIT 200
         """,
         (cutoff_ms,),
@@ -3041,7 +3061,7 @@ def _check_success_batch_missing_completed_symbols(
         SELECT batch_id, primary_interval, analysis_time, status,
                completed_symbols_json, failed_symbols_json, summary_json
         FROM analysis_batches
-        WHERE status = 'success' AND analysis_time >= ?
+        WHERE status = 'success' AND analysis_time >= %s
         ORDER BY started_at DESC LIMIT 20
         """,
         (cutoff_ms,),
@@ -3061,11 +3081,11 @@ def _check_success_batch_missing_completed_symbols(
         if bid:
             try:
                 live_completed = repo.conn.execute(
-                    "SELECT COUNT(*) AS c FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                    "SELECT COUNT(*) AS c FROM batch_symbol_status WHERE batch_id=%s AND status='completed'",
                     (bid,),
                 ).fetchone()["c"]
             except Exception:
-                live_completed = 0
+                raise
         issues.append(_issue(
             SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, "error",
             {
@@ -3127,12 +3147,12 @@ def _check_hourly_report_used_partial_running_batch(
             SELECT id, alert_type, created_at, status
             FROM alert_outbox
             WHERE alert_type = 'hourly_summary'
-              AND datetime(created_at) >= datetime('now', '-1 hour')
+              AND created_at >= NOW() - INTERVAL '1 hour'
             ORDER BY id DESC LIMIT 1
             """
         ).fetchone()
     except Exception:
-        alert_row = None
+        raise
     if not alert_row:
         return issues  # no hourly report in last hour - nothing to flag
     # P2-5 fix: cross-reference alert created_at vs running batch started_at.
@@ -3146,10 +3166,10 @@ def _check_hourly_report_used_partial_running_batch(
     if running_started_at and alert_created_at:
         try:
             from datetime import datetime as _dt
-            # SQLite stores started_at as ISO string; alert_outbox.created_at
-            # is also ISO. Compare via datetime parsing.
-            t_running = _dt.fromisoformat(running_started_at.replace("Z", "+00:00"))
-            t_alert = _dt.fromisoformat(alert_created_at.replace("Z", "+00:00"))
+            # time columns come back as datetime objects under PG; str() normalizes
+            # both datetime and ISO-string values before fromisoformat.
+            t_running = _dt.fromisoformat(str(running_started_at).replace("Z", "+00:00"))
+            t_alert = _dt.fromisoformat(str(alert_created_at).replace("Z", "+00:00"))
             if t_alert < t_running:
                 # Alert fired before the running batch started - renderer
                 # correctly used a previous complete batch. Not a defect.
@@ -3214,7 +3234,7 @@ def _check_batch_stuck_running_all_terminal(repo: CryptoGuardRepository) -> list
                enabled_symbols_json, started_at
         FROM analysis_batches
         WHERE status = 'running'
-          AND analysis_time >= ?
+          AND analysis_time >= %s
         ORDER BY started_at DESC LIMIT 20
         """,
         (cutoff_ms,),
@@ -3228,19 +3248,19 @@ def _check_batch_stuck_running_all_terminal(repo: CryptoGuardRepository) -> list
             continue
         completed_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='completed'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='completed'",
                 (bid,),
             ).fetchall()
         ]
         failed_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='failed'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='failed'",
                 (bid,),
             ).fetchall()
         ]
         pending_syms = [
             r["symbol"] for r in repo.conn.execute(
-                "SELECT symbol FROM batch_symbol_status WHERE batch_id=? AND status='pending'",
+                "SELECT symbol FROM batch_symbol_status WHERE batch_id=%s AND status='pending'",
                 (bid,),
             ).fetchall()
         ]
@@ -3308,11 +3328,11 @@ def _check_llm_fair_scheduling_contract_markers_missing(
     issues: list[dict[str, Any]] = []
     try:
         row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=? LIMIT 1",
+            "SELECT applied_at FROM _migration_state WHERE key=%s LIMIT 1",
             (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
         ).fetchone()
     except Exception:
-        row = None
+        raise
     if not row or not row["applied_at"]:
         issues.append(_issue(
             LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING, "error",
@@ -3396,7 +3416,7 @@ def _check_fair_path_continuity_real_injection(
                 exclude_batch_id=batch_id,
             )
         except Exception:
-            prior = None
+            raise
         if not prior:
             # No qualifying prior row -> a non-ok status (e.g. "missing") is
             # the correct first-analysis outcome. Not a defect.
@@ -3480,17 +3500,17 @@ def _check_per_job_failure_consistency(
                 SELECT id, status, error_message, payload_json, finished_at
                 FROM agent_jobs
                 WHERE job_type='scheduled_market_analysis'
-                  AND json_extract(payload_json, '$.batch_id')=?
+                  AND payload_json ->> 'batch_id' = %s
                   AND (
-                    json_extract(payload_json, '$.symbol')=?
-                    OR json_extract(payload_json, '$.snapshot.symbol')=?
+                    payload_json ->> 'symbol' = %s
+                    OR payload_json #>> '{snapshot,symbol}' = %s
                   )
                 ORDER BY id DESC LIMIT 1
                 """,
                 (batch_id, symbol, symbol),
             ).fetchone()
         except Exception:
-            job_row = None
+            raise
         if not job_row:
             # No matching agent_jobs row — a separate concern (orphaned
             # batch_symbol_status), not the S6 mislabel defect. Skip; the
@@ -3550,7 +3570,7 @@ _LLM_PER_SYMBOL_TIMEOUT_MAX_MS = 1200 * 1000  # per_symbol_timeout_seconds <= 12
 def _recent_success_batches(repo: CryptoGuardRepository, limit: int = 10) -> list[Any]:
     """Latest ``success`` batches (the batches the hourly report renders
     against), most-recent first. Bounded by ``limit``."""
-    try:
+    with repo.conn.transaction():
         return repo.conn.execute(
             """
             SELECT batch_id, primary_interval, analysis_time, status,
@@ -3558,12 +3578,10 @@ def _recent_success_batches(repo: CryptoGuardRepository, limit: int = 10) -> lis
                    failed_symbols_json, summary_json
             FROM analysis_batches
             WHERE status = 'success'
-            ORDER BY started_at DESC LIMIT ?
+            ORDER BY started_at DESC LIMIT %s
             """,
             (limit,),
         ).fetchall()
-    except Exception:
-        return []
 
 
 def _check_llm_first_attempt_coverage_low(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
@@ -3804,7 +3822,7 @@ def _check_llm_success_missing_attempt_metadata(repo: CryptoGuardRepository) -> 
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -3878,7 +3896,7 @@ def _check_llm_continuity_not_included(repo: CryptoGuardRepository) -> list[dict
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -3942,7 +3960,7 @@ def _check_llm_timeout_config_out_of_range(repo: CryptoGuardRepository) -> list[
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -4091,7 +4109,7 @@ def _check_llm_repair_counted_as_provider_call(repo: CryptoGuardRepository) -> l
                raw_decision_json
         FROM ga_decisions
         WHERE raw_decision_json IS NOT NULL
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s::timestamptz
         ORDER BY id DESC LIMIT 200
         """,
         (bound,),
@@ -4152,20 +4170,18 @@ def _reaggregate_batch_llm_outcomes(
     """
     if not batch_id:
         return {}
-    try:
+    with repo.conn.transaction():
         rows = repo.list_ga_decisions_for_batch(batch_id)
-    except Exception:
-        return {}
     if not rows:
         return {}
     # Expected denominator from the batch row (the authoritative enabled set).
-    enabled_symbols: list[str] = []
-    try:
+    with repo.conn.transaction():
         batch_row = repo.get_analysis_batch(batch_id)
-        if batch_row is not None:
-            enabled_symbols = list(batch_row.get("enabled_symbols") or [])
-    except Exception:
-        enabled_symbols = []
+    enabled_symbols = (
+        list(batch_row.get("enabled_symbols") or [])
+        if batch_row is not None
+        else []
+    )
 
     covered: set[str] = set()
     expected = 0
@@ -4304,16 +4320,22 @@ def _check_stuck_prepared_skill_logs(repo: CryptoGuardRepository) -> list[dict[s
     """
     issues: list[dict[str, Any]] = []
     try:
+        # 07-16 PG adaptation: aggregate per (symbol, analysis_time) per the
+        # contract -- do NOT group by ``skill_name`` (two stuck logs with
+        # different skills on the same (symbol, analysis_time) are ONE stuck
+        # batch with stuck_count=2, not two count=1 issues). ``timeframe`` is
+        # aggregated via MIN so the SELECT stays PG-valid (no bare non-grouped
+        # column) without widening the GROUP BY away from the contract.
         rows = repo.conn.execute(
             """
-            SELECT symbol, timeframe, analysis_time, skill_name,
+            SELECT symbol, MIN(timeframe) AS timeframe, analysis_time,
                    COUNT(*) AS stuck_count,
                    MIN(created_at) AS oldest_created_at,
                    MAX(created_at) AS newest_created_at
             FROM skill_execution_logs
             WHERE commit_state='prepared'
-              AND created_at < datetime('now', ? )
-              AND created_at >= datetime('now', '-24 hours')
+              AND created_at < NOW() + %s::interval
+              AND created_at >= NOW() - INTERVAL '24 hours'
             GROUP BY symbol, analysis_time
             ORDER BY oldest_created_at DESC
             LIMIT 50
@@ -4321,10 +4343,9 @@ def _check_stuck_prepared_skill_logs(repo: CryptoGuardRepository) -> list[dict[s
             (f"-{int(SKILL_LOG_PREPARED_STALE_SECONDS)} seconds",),
         ).fetchall()
     except Exception:
-        # Schema not present (pre-R8 DB) or query failure: skip cleanly. A
-        # missing commit_state column means no layered lifecycle is in effect,
-        # so there can be no stuck-prepared rows by definition.
-        return issues
+        # ``run_for_report`` turns this into an explicit
+        # diagnostic_query_failed issue and restores the connection.
+        raise
     for r in rows:
         issues.append(_issue(
             STUCK_PREPARED_SKILL_LOGS, "warning",

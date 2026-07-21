@@ -27,11 +27,11 @@ def _log_retryable_skip_audit(
 
     R4-D4: Uses direct INSERT with UNIQUE constraint on dedupe_key column
     instead of SELECT-then-INSERT race window. When a duplicate INSERT is
-    attempted, sqlite3.IntegrityError is caught and silently ignored —
+    attempted, psycopg.errors.UniqueViolation is caught and silently ignored —
     the row already exists from a concurrent/earlier call.
     Audit log failure must not mask the original skip_reason.
     """
-    import sqlite3
+    from psycopg.errors import UniqueViolation
 
     try:
         dedupe_key = f"retryable_skip:{order['id']}:{candle_close_time}:{skip_reason}"
@@ -55,7 +55,7 @@ def _log_retryable_skip_audit(
             event_time=candle_close_time if candle_close_time > 0 else None,
             dedupe_key=dedupe_key,
         )
-    except sqlite3.IntegrityError:
+    except UniqueViolation:
         # R4-D4: UNIQUE constraint on dedupe_key — row already exists, idempotent.
         return
     except Exception:
@@ -355,17 +355,18 @@ def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, flo
                     if fill_result.get("filled"):
                         filled_order_ids.add(order["id"])
                         # Update cursor to the candle that triggered the fill
-                        repo.conn.execute(
-                            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
-                            (last_candle_time, order["id"]),
-                        )
+                        with repo.conn.transaction():
+                            repo.conn.execute(
+                                "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
+                                (last_candle_time, order["id"]),
+                            )
                         # Order is now open — transition to open-order path
                         # for subsequent candles. Do NOT evaluate SL/TP on
                         # this same candle (conservative rule).
                         order_became_open = True
                         # Refresh order dict to reflect new status
                         order = dict(repo.conn.execute(
-                            "SELECT * FROM paper_orders WHERE id=?", (order["id"],),
+                            "SELECT * FROM paper_orders WHERE id=%s", (order["id"],),
                         ).fetchone())
                     continue
 
@@ -387,33 +388,37 @@ def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, flo
                     if close_result.get("closed"):
                         # Trade closed on this candle — advance cursor and stop
                         last_candle_time = candle_close_time
-                        repo.conn.execute(
-                            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
-                            (last_candle_time, order["id"]),
-                        )
+                        with repo.conn.transaction():
+                            repo.conn.execute(
+                                "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
+                                (last_candle_time, order["id"]),
+                            )
                         prev_candle_close = float(candle["close"])
                         break  # Trade closed, no more processing needed
                     # Not closed: advance cursor to this candle
                     last_candle_time = candle_close_time
-                    repo.conn.execute(
-                        "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
-                        (last_candle_time, order["id"]),
-                    )
+                    with repo.conn.transaction():
+                        repo.conn.execute(
+                            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
+                            (last_candle_time, order["id"]),
+                        )
                 else:
                     # No open trade (shouldn't happen, but handle gracefully)
                     last_candle_time = candle_close_time
-                    repo.conn.execute(
-                        "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
-                        (last_candle_time, order["id"]),
-                    )
+                    with repo.conn.transaction():
+                        repo.conn.execute(
+                            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
+                            (last_candle_time, order["id"]),
+                        )
                 prev_candle_close = float(candle["close"])
 
             # After processing all candles, advance cursor for non-fill, non-close cases
             if last_candle_time is not None and not order_became_open:
-                repo.conn.execute(
-                    "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
-                    (last_candle_time, order["id"]),
-                )
+                with repo.conn.transaction():
+                    repo.conn.execute(
+                        "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
+                        (last_candle_time, order["id"]),
+                    )
 
             # Use the last candle's close as the latest price for equity tracking
             if last_candle_time is not None:
@@ -452,7 +457,6 @@ def update_paper_positions(repo: CryptoGuardRepository, *, prices: dict[str, flo
                 if adjustment:
                     results.append(adjustment)
 
-    repo.conn.commit()
     snapshot = equity_snapshot(
         ts=utc_ms(),
         closed_realized_pnl=repo.sum_closed_realized_pnl(),
@@ -504,14 +508,14 @@ def _ensure_daily_review(repo: CryptoGuardRepository) -> None:
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     # Check if daily_review_reports already exists for yesterday (source of truth)
     existing = repo.conn.execute(
-        "SELECT id FROM daily_review_reports WHERE review_date=? LIMIT 1",
+        "SELECT id FROM daily_review_reports WHERE review_date=%s LIMIT 1",
         (yesterday,),
     ).fetchone()
     if existing:
         return
     # Also check scheduler_runs for success
     existing_run = repo.conn.execute(
-        "SELECT id FROM scheduler_runs WHERE job_name='daily_review' AND status='success' AND started_at >= ? AND started_at < ? LIMIT 1",
+        "SELECT id FROM scheduler_runs WHERE job_name='daily_review' AND status='success' AND started_at >= %s AND started_at < %s LIMIT 1",
         (yesterday, now.strftime("%Y-%m-%d")),
     ).fetchone()
     if existing_run:
@@ -536,7 +540,7 @@ def _check_daily_loss_trigger(repo: CryptoGuardRepository, results: list[dict[st
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     row = repo.conn.execute(
-        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE close_reason='stop_loss' AND DATE(COALESCE(closed_at, datetime('now')))=?",
+        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE close_reason='stop_loss' AND DATE(COALESCE(closed_at, NOW()))=%s",
         (today,),
     ).fetchone()
     daily_losses = int(row["cnt"]) if row else 0
@@ -544,7 +548,7 @@ def _check_daily_loss_trigger(repo: CryptoGuardRepository, results: list[dict[st
     if 3 <= daily_losses <= 5:
         # Check if we already triggered today
         existing = repo.conn.execute(
-            "SELECT id FROM agent_jobs WHERE job_type='intraday_loss_review' AND session_id LIKE ? AND created_at >= ?",
+            "SELECT id FROM agent_jobs WHERE job_type='intraday_loss_review' AND session_id LIKE %s AND created_at >= %s",
             (f"system:paper:intraday_loss:{today}:%", today),
         ).fetchone()
         if not existing:
@@ -918,7 +922,7 @@ def _execute_profit_protection_close(
 
     # Idempotent: check order is still open
     current_order = repo.conn.execute(
-        "SELECT status FROM paper_orders WHERE id=?", (order_id,),
+        "SELECT status FROM paper_orders WHERE id=%s", (order_id,),
     ).fetchone()
     if not current_order or current_order["status"] != "open":
         return {
@@ -933,7 +937,7 @@ def _execute_profit_protection_close(
     # Dedupe: check if already closed for this GA decision
     dedupe_key = f"profit_protection:{trade_id}:{ga_decision_id}"
     existing = repo.conn.execute(
-        "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
+        "SELECT id FROM paper_trade_logs WHERE event_json ->> 'dedupe_key'=%s LIMIT 1",
         (dedupe_key,),
     ).fetchone()
     if existing:
@@ -1030,10 +1034,11 @@ def _execute_profit_protection_close(
     # Update paper_orders
     now = datetime.now(timezone.utc).isoformat()
     repo.update_paper_order_status(order_id, "closed", closed_at=now)
-    repo.conn.execute(
-        "UPDATE paper_orders SET cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
-        (f"profit_protection: GA#{ga_decision_id} strong reverse signal", ga_decision_id, order_id),
-    )
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE paper_orders SET cancel_reason=%s, invalidated_by_ga_decision_id=%s WHERE id=%s",
+            (f"profit_protection: GA#{ga_decision_id} strong reverse signal", ga_decision_id, order_id),
+        )
 
     # Update paper_positions
     account = repo.ensure_paper_account()
@@ -1129,7 +1134,7 @@ def _execute_profit_protection_close(
             "current_r": round(current_r, 4),
             "mfe_r": round(mfe_r, 4),
             "retracement_r": round(retracement_r, 4),
-            "take_profits": _json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "take_profits": order.get("take_profit_json") or [],
             "filled_at": order.get("filled_at"),
             "closed_at": now,
             "event_time": now,
@@ -1139,8 +1144,6 @@ def _execute_profit_protection_close(
             "ga_decision_id": ga_decision_id,
         },
     )
-
-    repo.conn.commit()
 
     LOGGER.info(
         "profit_protection_close: trade_id=%s symbol=%s side=%s exit_price=%s pnl_r=%.2f ga=%s",
@@ -1194,10 +1197,12 @@ def _maybe_enqueue_drawdown_alert(repo: CryptoGuardRepository, snapshot: dict[st
         return None
     previous_alert = False
     if previous:
-        import json
-
+        # JSONB column `snapshot_json` is decoded to a dict by psycopg — no
+        # json.loads needed. Guard against None/str for defense-in-depth.
         try:
-            previous_alert = bool(json.loads(previous.get("snapshot_json") or "{}").get("drawdown_alert"))
+            snap = previous.get("snapshot_json")
+            snap = snap if isinstance(snap, dict) else {}
+            previous_alert = bool(snap.get("drawdown_alert"))
         except Exception:
             previous_alert = False
     if previous_alert:

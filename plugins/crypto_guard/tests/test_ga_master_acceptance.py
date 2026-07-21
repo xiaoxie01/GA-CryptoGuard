@@ -9,23 +9,18 @@ from pathlib import Path
 class GAMasterAcceptanceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.old_db = os.environ.get("CRYPTO_GUARD_DB")
         self.old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         self.old_redis_disabled = os.environ.get("CRYPTO_GUARD_REDIS_DISABLED")
-        os.environ["CRYPTO_GUARD_DB"] = str(Path(self.tmp.name) / "crypto_guard.sqlite3")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
 
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._h = make_repo()
+        self.conn = self._h.conn
+        self.repo = self._h.repo
 
     def tearDown(self) -> None:
-        self.conn.close()
-        _restore_env("CRYPTO_GUARD_DB", self.old_db)
+        self._h.close()
         _restore_env("CRYPTO_GUARD_LLM_ANALYSIS", self.old_llm)
         _restore_env("CRYPTO_GUARD_REDIS_DISABLED", self.old_redis_disabled)
         self.tmp.cleanup()
@@ -76,6 +71,7 @@ class GAMasterAcceptanceTest(unittest.TestCase):
                 "decision": "trade_plan_available",
                 "signal_grade": "A",
                 "confidence": 0.8,
+                "analysis_time_utc": 1_700_000_000_000,
                 "summary": "legacy compatibility",
                 "has_trade_plan": True,
                 "risk_notes": [],
@@ -86,9 +82,9 @@ class GAMasterAcceptanceTest(unittest.TestCase):
         result = create_paper_order_from_signal(self.repo, signal_id)
         self.assertTrue(result["ok"])
         self.assertIsNotNone(result["ga_decision_id"])
-        order = self.conn.execute("SELECT ga_decision_id, source, risk_check_passed FROM paper_orders WHERE id=?", (result["order_id"],)).fetchone()
+        order = self.conn.execute("SELECT ga_decision_id, source, risk_check_passed FROM paper_orders WHERE id=%s", (result["order_id"],)).fetchone()
         self.assertEqual(order["source"], "ga_decision")
-        self.assertEqual(int(order["risk_check_passed"]), 1)
+        self.assertTrue(order["risk_check_passed"])
         self.assertEqual(int(order["ga_decision_id"]), int(result["ga_decision_id"]))
 
     def test_parquet_merge_dedupe_and_duckdb_read(self) -> None:
@@ -113,12 +109,12 @@ class GAMasterAcceptanceTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(float(rows[0]["close"]), 1.2)
 
-    def test_temp_database_uses_sqlite_queue_fallback(self) -> None:
+    def test_postgresql_test_fixture_disables_redis_queue(self) -> None:
         from plugins.crypto_guard.storage.redis_adapter import should_use_redis_for_path
 
-        self.assertFalse(should_use_redis_for_path(os.environ["CRYPTO_GUARD_DB"]))
+        self.assertFalse(should_use_redis_for_path(None))
         job_id = self.repo.enqueue_job("unit_job", 1, "test", "session", {})
-        row = self.conn.execute("SELECT id, status FROM agent_jobs WHERE id=?", (job_id,)).fetchone()
+        row = self.conn.execute("SELECT id, status FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
         self.assertEqual(row["status"], "pending")
 
     def test_same_feishu_message_id_sends_ad_hoc_result_once(self) -> None:
@@ -155,7 +151,26 @@ def _risk_approved_snapshot(symbol: str) -> dict[str, object]:
             "15m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
             "5m": {"market_structure": "bullish", "trend_stage": "early", "momentum": "bullish", "candles_count": 80},
         },
-        "modules": {"market_regime": {"regime": "normal", "extreme": False, "evolution_trigger_allowed": True}},
+        "modules": {
+            "market_regime": {
+                "regime": "normal",
+                "extreme": False,
+                "evolution_trigger_allowed": True,
+            },
+            "price_action": {
+                "structure_events": [
+                    {
+                        "type": "BREAKOUT_RETEST",
+                        "timeframe": "5m",
+                        "direction": "bullish",
+                        "candle_close_time": 1_700_000_000_000,
+                        "price": 100.0,
+                        "closed": True,
+                        "rule_id": "unit_acceptance_breakout_retest",
+                    }
+                ]
+            },
+        },
         "counter_evidence": {
             "bullish_evidence": ["higher timeframe supports long", "momentum aligned"],
             "bearish_evidence": [],
@@ -177,7 +192,18 @@ def _trade_plan() -> dict[str, object]:
         "stop_loss": 95.0,
         "take_profits": [{"price": 110.0, "ratio": 1.0}],
         "risk_percent": 0.5,
-        "invalid_condition": "below 95",
+        "invalid_condition": "below 97",
+        "entry_trigger_confirmation": {
+            "type": "closed_candle_confirmation",
+            "timeframe": "5m",
+            "event_type": "BREAKOUT_RETEST",
+            "direction": "bullish",
+            "candle_close_time": 1_700_000_000_000,
+            "price": 100.0,
+            "source": "deterministic_rule",
+            "symbol": "BTCUSDT",
+            "rule_id": "unit_acceptance_breakout_retest",
+        },
         "reason": "unit acceptance",
     }
 

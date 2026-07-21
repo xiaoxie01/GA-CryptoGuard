@@ -10,9 +10,9 @@ from plugins.crypto_guard.data.market_data_health import assess_health
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.reasoning.market_state_builder import build_market_state_snapshot
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
 
 
@@ -22,8 +22,7 @@ LOGGER = get_logger("crypto_guard.scheduler")
 def fetch_closed_klines_for_active_symbols(interval: str, lookback: int, *, analysis_time_utc: int | None = None) -> dict[str, Any]:
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
         analysis_time = latest_closed_close_time_ms(interval, analysis_time_utc or utc_ms())
         results = []
@@ -39,9 +38,9 @@ def fetch_closed_klines_for_active_symbols(interval: str, lookback: int, *, anal
                 except Exception as exc:
                     result["agent_summary"] = {"ok": False, "error": str(exc)}
             results.append(result)
+        # Read-only tick: discard the implicit transaction's snapshot.
+        conn.rollback()
         return {"ok": all(item.get("ok") for item in results), "interval": interval, "analysis_time_utc": analysis_time, "results": results}
-    finally:
-        conn.close()
 
 
 def summarize_higher_timeframe(repo: CryptoGuardRepository, symbol: str, interval: str, analysis_time_utc: int) -> dict[str, Any]:
@@ -119,7 +118,7 @@ def _commit_skill_log_lifecycle(
             # ROLLBACK -> abort the prepared log).
             cur = conn.execute(
                 "UPDATE skill_execution_logs SET commit_state='committed' "
-                "WHERE id=? AND commit_state='prepared' AND batch_id=? AND attempt_id=?",
+                "WHERE id=%s AND commit_state='prepared' AND batch_id=%s AND attempt_id=%s",
                 (int(log_id), batch_id, int(attempt_id)),
             )
             if int(cur.rowcount or 0) != 1:
@@ -155,11 +154,10 @@ def _abort_unsealed_skill_logs(
             log_ids.append(int(log_id))
     if not log_ids:
         return
-    placeholders = ",".join("?" for _ in log_ids)
     conn.execute(
-        f"UPDATE skill_execution_logs SET commit_state='aborted_unsealed' "
-        f"WHERE id IN ({placeholders}) AND commit_state='prepared'",
-        log_ids,
+        "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' "
+        "WHERE id = ANY(%s) AND commit_state='prepared'",
+        (log_ids,),
     )
 
 
@@ -176,16 +174,20 @@ def recover_stale_prepared_skill_logs(conn: Any, *, stale_after_seconds: int = 6
     as ``commit_state='aborted'`` so diagnostics can report it and it never
     blocks the audit. Returns a summary dict for the diagnostics layer.
     """
-    cur = conn.execute(
-        """
-        UPDATE skill_execution_logs
-        SET commit_state='aborted'
-        WHERE commit_state='prepared'
-          AND created_at < datetime('now', ? )
-        """,
-        (f"-{int(stale_after_seconds)} seconds",),
-    )
-    affected = int(cur.rowcount or 0)
+    # Keep terminalization as an explicit repository-sized transaction. It is
+    # independently durable on an idle connection and becomes a savepoint when
+    # the caller deliberately owns a larger transaction.
+    with conn.transaction():
+        cur = conn.execute(
+            """
+            UPDATE skill_execution_logs
+            SET commit_state='aborted'
+            WHERE commit_state='prepared'
+              AND created_at < NOW() - make_interval(secs => %s)
+            """,
+            (int(stale_after_seconds),),
+        )
+        affected = int(cur.rowcount or 0)
     return {
         "ok": True,
         "terminalized_prepared_to_aborted": affected,
@@ -207,50 +209,53 @@ def _allocate_attempt_id(conn: Any, batch_id: str) -> int:
     per-call-unique-monotonic contract is broken.
 
     FIX: allocate from a DEDICATED per-batch attempt counter row
-    (``_analysis_attempt_counter``) under an explicit ``BEGIN IMMEDIATE``. The
-    RESERVED lock serializes concurrent allocators: the second blocks until the
+    (``_analysis_attempt_counter``) inside a transaction. The atomic upsert +
+    read runs as one unit; the row lock (from the ``ON CONFLICT ... DO UPDATE``
+    which writes the counter row) serializes concurrent allocators on the SAME
+    ``batch_id``: a second connection's UPDATE blocks on the row lock until the
     first commits, then re-reads the incremented counter -> each gets a DISTINCT
     monotonic integer. The counter is keyed by ``batch_id`` so each batch has
     its own 1,2,3,... sequence (preserving the R9-P2 per-batch monotonic
     contract the audit relies on). The transaction is a single upsert + read ->
-    the lock is held only for that instant, well under the ``busy_timeout``.
+    the lock is held only for that instant.
+
+    07-16 PG-native: the SQLite ``BEGIN IMMEDIATE`` (which took a RESERVED lock
+    serializing concurrent allocators) maps to a psycopg transaction. The pooled
+    connection is ``autocommit=False`` (always in an implicit transaction); if the
+    caller already holds an open transaction (Phase-1 prepared-log writes), this
+    ``conn.transaction()`` opens a SAVEPOINT -- which would NOT give an
+    independent commit. To preserve the R10-P2 "the counter increment is durable
+    before Phase 2 (a Phase-2 rollback must NOT revert the attempt_id)" contract,
+    the caller commits Phase 1 before opening Phase 2, so the savepoint here is
+    released (committed) by the Phase-1 commit. Under concurrency the row lock on
+    ``_analysis_attempt_counter`` (held for the duration of this transaction) is
+    what serializes two producers on the same batch_id.
 
     Returns the allocated attempt_id (a positive int; the first call for a
     batch_id returns 1). Idempotent in the sense that every call advances the
     counter and returns a fresh, distinct value.
     """
     # ATOMIC (R10-P2 fix): allocate from the dedicated per-batch counter row
-    # under BEGIN IMMEDIATE. The RESERVED lock serializes concurrent allocators
-    # (two connections racing on the same batch_id): the second blocks until the
-    # first COMMITs, then re-reads the incremented counter -> distinct values.
-    # The counter is keyed by batch_id, so each batch has its own 1,2,3,...
-    # sequence (preserving the R9-P2 per-batch monotonic contract).
+    # inside a transaction. The row lock serializes concurrent allocators on the
+    # same batch_id (two connections racing): the second's UPDATE blocks on the
+    # row lock until the first commits, then re-reads the incremented counter ->
+    # distinct values. The counter is keyed by batch_id, so each batch has its
+    # own 1,2,3,... sequence (preserving the R9-P2 per-batch monotonic contract).
     #
-    # The upsert+read is a single transaction; the lock is held only for that
-    # instant, well under the busy_timeout. We read back via the SAME atomic
-    # increment rather than ``last_insert_rowid()`` so the value is correct
-    # whether the row was INSERTed or UPDATEd (ON CONFLICT path).
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute(
-            "INSERT INTO _analysis_attempt_counter(batch_id, next_attempt) "
-            "VALUES(?, 1) "
-            "ON CONFLICT(batch_id) DO UPDATE SET "
-            "next_attempt = _analysis_attempt_counter.next_attempt + 1",
-            (batch_id,),
-        )
-        row = conn.execute(
-            "SELECT next_attempt FROM _analysis_attempt_counter WHERE batch_id=?",
-            (batch_id,),
-        ).fetchone()
-        attempt_id = int(row["next_attempt"])
-        conn.commit()
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+    # We read back via the SAME atomic increment (RETURNING) so the value is
+    # correct whether the row was INSERTed or UPDATEd (ON CONFLICT path).
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO _analysis_attempt_counter(batch_id, next_attempt) "
+                "VALUES(%s, 1) "
+                "ON CONFLICT(batch_id) DO UPDATE SET "
+                "next_attempt = _analysis_attempt_counter.next_attempt + 1 "
+                "RETURNING next_attempt",
+                (batch_id,),
+            )
+            row = cur.fetchone()
+            attempt_id = int(row["next_attempt"])
     return attempt_id
 
 
@@ -288,7 +293,15 @@ def enqueue_market_analysis(
 
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
+    # 07-16 PG-native: a pooled psycopg connection (``autocommit=False`` -> always
+    # in an implicit transaction). The producer drives its OWN transaction
+    # boundaries explicitly (Phase-1 commit so prepared audit logs survive a
+    # Phase-2 rollback; Phase-2 atomic ``conn.transaction()``). We check out a
+    # raw pooled conn (not the ``pg_db.get_conn()`` context manager) so the
+    # long-lived ``try/except/finally`` below can control commit/rollback across
+    # the two phases without a context manager closing the conn mid-flow.
+    conn_ctx = pg_db.get_conn()
+    conn = conn_ctx.__enter__()
     # 07-15 R9-P1b: ``prepared`` is initialized BEFORE the outer lifecycle
     # ``try`` so the outer ``except`` (which covers Phase-1 mid-loop exceptions)
     # can reference it to abort the skill logs already created this tick. Pre-R9
@@ -318,26 +331,27 @@ def enqueue_market_analysis(
         # ``COALESCE(MAX(attempt_id),0)+1`` SELECT OUTSIDE any transaction; two
         # concurrent producers (two connections) could both read the same MAX and
         # stamp the same attempt_id -> audit-identity collision. Now it allocates
-        # from the dedicated ``_analysis_attempt_counter`` row under
-        # ``BEGIN IMMEDIATE`` (see ``_allocate_attempt_id``), so each call gets a
+        # from the dedicated ``_analysis_attempt_counter`` row under a row-locking
+        # psycopg transaction (see ``_allocate_attempt_id``), so each call gets a
         # DISTINCT per-batch monotonic integer even under concurrent producers.
         attempt_id = _allocate_attempt_id(conn, batch_id)
 
-        # 07-13 R7 (P0-2): the batch-creation contract is ATOMIC. The SQLite
-        # connection runs in autocommit mode (sqlite_db.py ``isolation_level=
-        # None``), so without an explicit transaction the batch row, every job
-        # INSERT, every batch_symbol_status row, and the seal stamp are N
-        # independent transactions. A crash between them leaves a half-built
-        # batch; a duplicate/foreign job inserted AFTER the seal (post-seal
-        # pollution) is then claimed by ``claim_next_batch`` because the claim
-        # only re-checks ``claim_ready_at`` (P0-2 item 2).
+        # 07-13 R7 (P0-2): the batch-creation contract is ATOMIC. Under PG,
+        # pooled psycopg connections run ``autocommit=False`` (always in an
+        # implicit transaction), so without an explicit ``conn.transaction()``
+        # the batch row, every job INSERT, every batch_symbol_status row, and
+        # the seal stamp share ONE implicit transaction whose commit point is
+        # undefined. A crash between them leaves a half-built batch; a
+        # duplicate/foreign job inserted AFTER the seal (post-seal pollution)
+        # is then claimed by ``claim_next_batch`` because the claim only
+        # re-checks ``claim_ready_at`` (P0-2 item 2).
         #
         # Phase 1 (below, no transaction): build per-symbol snapshots. This is
         # read-only DB + in-memory computation (``build_market_state_snapshot``
         # reads candles/analysis_states; ``assess_health`` is read-only; the real
         # network fetch is the separate ``market_data_warmup`` cron job, NOT this
-        # producer). Building snapshots outside the write lock keeps
-        # ``BEGIN IMMEDIATE`` short-lived. The snapshot dicts are collected here
+        # producer). Building snapshots outside the write lock keeps the
+        # Phase-2 transaction short-lived. The snapshot dicts are collected here
         # and ONLY persisted inside Phase 2's transaction (R8-C), so a seal
         # failure rolls the snapshots back with the batch -- no orphan.
         skipped_pending = 0
@@ -348,7 +362,7 @@ def enqueue_market_analysis(
                 SELECT 1
                 FROM agent_jobs
                 WHERE job_type='scheduled_market_analysis'
-                  AND session_id=?
+                  AND session_id=%s
                   AND status IN ('pending', 'running')
                 LIMIT 1
                 """,
@@ -369,7 +383,7 @@ def enqueue_market_analysis(
                 continue
             # 07-14 R8 P2-2: collect this symbol's module_analysis_results
             # writes here (Phase 1) and persist them in Phase 2 inside the
-            # BEGIN IMMEDIATE so a seal failure rolls them back with the batch.
+            # transaction so a seal failure rolls them back with the batch.
             module_sink: list = []
             # 07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle. Collect the
             # (log_id, feedback_payload) tuples here (Phase 1 writes the audit
@@ -408,10 +422,12 @@ def enqueue_market_analysis(
                 module_result_sink=module_sink,
                 skill_log_sink=skill_sink, batch_id=batch_id, attempt_id=attempt_id,
             )
-            # 07-15 R8-C (P1-2): DO NOT persist the snapshot here. The connection
-            # is autocommit (sqlite_db.py ``isolation_level=None``), so a
-            # ``save_market_snapshot`` call NOW would auto-commit the row BEFORE
-            # Phase 2's ``BEGIN IMMEDIATE`` -- and a later seal-failure
+            # 07-15 R8-C (P1-2): DO NOT persist the snapshot here. Under PG the
+            # pooled psycopg connection is ``autocommit=False`` (always in an
+            # implicit transaction); if Phase 1 held an already-committed read,
+            # a ``save_market_snapshot`` self-wrapping its own
+            # ``conn.transaction()`` could commit the snapshot row BEFORE
+            # Phase 2's explicit transaction -- and a later seal-failure
             # ``ROLLBACK`` would revert the batch/jobs/status but LEAVE the
             # snapshot row behind (an orphan). The snapshot dict is built here
             # (read-only market-state construction, kept OUT of the write lock)
@@ -436,7 +452,18 @@ def enqueue_market_analysis(
         # back batch is never sealed). None of the repo methods called here
         # commit/rollback internally (verified: start_analysis_batch /
         # enqueue_job / mark_batch_symbol_completed / seal_analysis_batch only
-        # issue INSERT/UPDATE), so the outer BEGIN/COMMIT owns the transaction.
+        # issue INSERT/UPDATE), so the outer transaction owns the atomicity.
+        #
+        # 07-16 PG-native: psycopg pooled connections are ``autocommit=False``
+        # (always in an implicit transaction). Phase 1 above wrote the prepared
+        # skill-execution audit logs (commit_state='prepared') and allocated the
+        # attempt_id; those MUST be durable BEFORE Phase 2 so a Phase-2
+        # ``ROLLBACK`` reverts the batch/jobs/status/snapshots but NOT the
+        # prepared audit rows (the R8-C/R9/R10 layered-skill-log contract). So
+        # we COMMIT Phase 1 here, then open Phase 2 as a ``conn.transaction()``
+        # block: a clean exit commits (seal + skill-log commits land together);
+        # any exception rolls back ONLY Phase 2 (the prepared logs survive).
+        conn.commit()
         job_ids: list[int] = []
         sealed = False
         # ``seal_failed`` distinguishes a seal exact-set validation failure
@@ -445,125 +472,132 @@ def enqueue_market_analysis(
         # so the caller sees the real exception). Both roll back identically.
         seal_failed = False
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            repo.start_analysis_batch(
-                batch_id=batch_id,
-                primary_interval=primary_interval,
-                analysis_time=analysis_time,
-                enabled_symbols=enabled_symbols,
-            )
-            for item in prepared:
-                symbol = item["symbol"]
-                if item["snapshot"] is None:
-                    # Skipped-pending symbol: register its batch_symbol_status
-                    # row only (the job already exists from a prior tick).
-                    repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol, status="pending")
-                    continue
-                # 07-15 R8-C (P1-2): persist the snapshot INSIDE the
-                # ``BEGIN IMMEDIATE`` so a seal failure ``ROLLBACK`` reverts the
-                # snapshot row WITH the batch (no orphan). Pre-R8-C this
-                # ``save_market_snapshot`` call ran in Phase 1 (before the
-                # transaction) and auto-committed, leaving an orphan snapshot on
-                # every seal failure. ``save_market_snapshot`` issues raw
-                # INSERT/UPDATE/UPDATE (no internal commit/rollback), so it
-                # joins the active transaction cleanly.
-                #
-                # 07-14 R8 P2-2: FIRST persist this symbol's deferred
-                # ``module_analysis_results`` rows (collected in Phase 1 via the
-                # sink) so they are inside the same transaction AND exist before
-                # ``save_market_snapshot`` calls ``link_module_results_to_snapshot``
-                # (which keys the link by symbol + analysis_time). A seal-failure
-                # ``ROLLBACK`` now reverts these rows with the snapshot/batch --
-                # no orphan module_analysis_results. ``save_module_result`` is an
-                # upsert (ON CONFLICT DO UPDATE) and issues raw INSERT, so it
-                # joins the active transaction without committing.
-                for (_sym, _tf, _at, _module, _result, _conf) in (item.get("module_sink") or []):
-                    repo.save_module_result(_sym, _tf, _at, _module, _result, _conf)
-                snapshot_id = repo.save_market_snapshot(item["snapshot"])
-                item["snapshot_id"] = snapshot_id
-                # 07-13 R7 (P0-1): the AUTHORITATIVE symbol field. The seal
-                # (``seal_analysis_batch``) derives each job's symbol from
-                # ``payload.symbol`` -- NOT from the ``<batch_id>:<symbol>``
-                # prefix of ``session_id`` -- because the production session_id
-                # format is ``system:scheduled:{interval}:{symbol}:{time}``
-                # (above), which the legacy prefix-strip parser mangled into
-                # the full ``system:scheduled:...`` string and never matched
-                # the enabled set -> production batches never sealed
-                # (reproduced in-memory: ``production_session_seals=False``).
-                # ``payload.symbol`` is the single source of truth; session_id
-                # + snapshot.symbol are cross-checked for identity consistency
-                # by the seal.
-                payload = {
-                    "snapshot_id": item["snapshot_id"],
-                    "snapshot": item["snapshot"],
-                    "primary_interval": primary_interval,
-                    "batch_id": batch_id,
-                    "symbol": symbol,
-                }
-                job_id = repo.enqueue_job(
-                    "scheduled_market_analysis",
-                    priority,
-                    "scheduler",
-                    item["session_id"],
-                    payload,
+            with conn.transaction():
+                repo.start_analysis_batch(
+                    batch_id=batch_id,
+                    primary_interval=primary_interval,
+                    analysis_time=analysis_time,
+                    enabled_symbols=enabled_symbols,
                 )
-                job_ids.append(job_id)
-                # 07-13 R6-B (P0-1): register a 'pending' batch_symbol_status
-                # row for every enabled symbol that received a job, so the
-                # whole-batch seal can validate the exact set
-                # (jobs == batch_symbol_status == enabled). The controller
-                # flips this to 'completed'/'failed' on terminal.
-                repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol, status="pending")
-            # 07-13 R6-B (P0-1): seal the whole batch AFTER every enabled-symbol
-            # job + batch_symbol_status row exists. seal_analysis_batch validates
-            # the exact-set equality and stamps claim_ready_at/sealed_at only on
-            # success. A malformed/incomplete/duplicate/cross-symbol set fails
-            # closed (the batch stays non-claimable) instead of being partially
-            # claimed. A failed seal is rolled back (no partial batch) and
-            # reported as ok=False below.
-            sealed = repo.seal_analysis_batch(batch_id)
-            if not sealed:
-                # Exact-set validation failed. Flag seal_failed so the except
-                # branch knows this is a controlled rollback (return ok=False),
-                # not a crash (re-raise). The batch stays unsealed + unclaimable.
-                seal_failed = True
-                raise RuntimeError("seal_analysis_batch exact-set validation failed")
-            # 07-14 R8 P2-NEW-1 (contract #2): the Phase-2 seal SUCCEEDED. Now
-            # terminalize the prepared skill logs to 'committed' and write the
-            # DEFERRED feedback rows -- all INSIDE the still-open transaction so
-            # the learning signal lands atomically with the batch. The prepared
-            # audit rows were written in Phase 1 (autocommit); here they are
-            # flipped to 'committed'. The feedback was NOT written in Phase 1
-            # (it was collected into skill_sink), so this is the FIRST and only
-            # write. ``latest_skill_result_refs`` only reads 'committed' rows, so
-            # the orchestrator sees this tick's skill output only after a
-            # successful seal (contract #5).
-            _commit_skill_log_lifecycle(conn, repo, prepared, batch_id=batch_id, attempt_id=attempt_id)
-            conn.execute("COMMIT")
+                for item in prepared:
+                    symbol = item["symbol"]
+                    if item["snapshot"] is None:
+                        # Skipped-pending symbol: register its batch_symbol_status
+                        # row only (the job already exists from a prior tick).
+                        repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=symbol, status="pending")
+                        continue
+                    # 07-15 R8-C (P1-2): persist the snapshot INSIDE the Phase-2
+                    # transaction so a seal failure ``ROLLBACK`` reverts the
+                    # snapshot row WITH the batch (no orphan). Pre-R8-C this
+                    # ``save_market_snapshot`` call ran in Phase 1 (before the
+                    # transaction) and committed, leaving an orphan snapshot on
+                    # every seal failure. ``save_market_snapshot`` issues raw
+                    # INSERT/UPDATE/UPDATE (no internal commit/rollback), so it
+                    # joins the active transaction cleanly.
+                    #
+                    # 07-14 R8 P2-2: FIRST persist this symbol's deferred
+                    # ``module_analysis_results`` rows (collected in Phase 1 via the
+                    # sink) so they are inside the same transaction AND exist before
+                    # ``save_market_snapshot`` calls ``link_module_results_to_snapshot``
+                    # (which keys the link by symbol + analysis_time). A seal-failure
+                    # ``ROLLBACK`` now reverts these rows with the snapshot/batch --
+                    # no orphan module_analysis_results. ``save_module_result`` is an
+                    # upsert (ON CONFLICT DO UPDATE) and issues raw INSERT, so it
+                    # joins the active transaction without committing.
+                    for (_sym, _tf, _at, _module, _result, _conf) in (item.get("module_sink") or []):
+                        repo.save_module_result(_sym, _tf, _at, _module, _result, _conf)
+                    snapshot_id = repo.save_market_snapshot(item["snapshot"])
+                    item["snapshot_id"] = snapshot_id
+                    # 07-13 R7 (P0-1): the AUTHORITATIVE symbol field. The seal
+                    # (``seal_analysis_batch``) derives each job's symbol from
+                    # ``payload.symbol`` -- NOT from the ``<batch_id>:<symbol>``
+                    # prefix of ``session_id`` -- because the production session_id
+                    # format is ``system:scheduled:{interval}:{symbol}:{time}``
+                    # (above), which the legacy prefix-strip parser mangled into
+                    # the full ``system:scheduled:...`` string and never matched
+                    # the enabled set -> production batches never sealed
+                    # (reproduced in-memory: ``production_session_seals=False``).
+                    # ``payload.symbol`` is the single source of truth; session_id
+                    # + snapshot.symbol are cross-checked for identity consistency
+                    # by the seal.
+                    payload = {
+                        "snapshot_id": item["snapshot_id"],
+                        "snapshot": item["snapshot"],
+                        "primary_interval": primary_interval,
+                        "batch_id": batch_id,
+                        "symbol": symbol,
+                    }
+                    # The database-level scheduled-job FK requires membership to
+                    # exist before the job row. Both writes remain in this Phase-2
+                    # transaction, so a later seal failure rolls them back together.
+                    repo.mark_batch_symbol_completed(
+                        batch_id=batch_id, symbol=symbol, status="pending",
+                    )
+                    job_id = repo.enqueue_job(
+                        "scheduled_market_analysis",
+                        priority,
+                        "scheduler",
+                        item["session_id"],
+                        payload,
+                    )
+                    job_ids.append(job_id)
+                    # 07-13 R6-B (P0-1): register a 'pending' batch_symbol_status
+                    # row for every enabled symbol that received a job, so the
+                    # whole-batch seal can validate the exact set
+                    # (jobs == batch_symbol_status == enabled). The controller
+                    # flips this to 'completed'/'failed' on terminal.
+                # 07-13 R6-B (P0-1): seal the whole batch AFTER every enabled-symbol
+                # job + batch_symbol_status row exists. seal_analysis_batch validates
+                # the exact-set equality and stamps claim_ready_at/sealed_at only on
+                # success. A malformed/incomplete/duplicate/cross-symbol set fails
+                # closed (the batch stays non-claimable) instead of being partially
+                # claimed. A failed seal is rolled back (no partial batch) and
+                # reported as ok=False below.
+                sealed = repo.seal_analysis_batch(batch_id)
+                if not sealed:
+                    # Exact-set validation failed. Flag seal_failed so the except
+                    # branch knows this is a controlled rollback (return ok=False),
+                    # not a crash (re-raise). The batch stays unsealed + unclaimable.
+                    seal_failed = True
+                    raise RuntimeError("seal_analysis_batch exact-set validation failed")
+                # 07-14 R8 P2-NEW-1 (contract #2): the Phase-2 seal SUCCEEDED. Now
+                # terminalize the prepared skill logs to 'committed' and write the
+                # DEFERRED feedback rows -- all INSIDE the still-open transaction so
+                # the learning signal lands atomically with the batch. The prepared
+                # audit rows were written + committed in Phase 1; here they are
+                # flipped to 'committed'. The feedback was NOT written in Phase 1
+                # (it was collected into skill_sink), so this is the FIRST and only
+                # write. ``latest_skill_result_refs`` only reads 'committed' rows, so
+                # the orchestrator sees this tick's skill output only after a
+                # successful seal (contract #5).
+                _commit_skill_log_lifecycle(conn, repo, prepared, batch_id=batch_id, attempt_id=attempt_id)
+                # ``conn.transaction()`` commits on clean exit (seal + skill-log
+                # commits + feedback all land atomically).
         except Exception:
-            # Roll back the entire batch creation on ANY failure (crash, seal
-            # validation failure, constraint error). The batch stays unsealed
-            # and unclaimable; the next tick rebuilds it from scratch.
-            # ``ROLLBACK`` is issued unconditionally; if no transaction is open
-            # (e.g. the BEGIN itself raised) sqlite3 raises OperationalError
-            # "no transaction is active" which we swallow.
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            # The ``conn.transaction()`` block already rolled back Phase 2 on the
+            # exception (batch row, jobs, batch_symbol_status, snapshots, the
+            # skill-log commit UPDATEs + feedback INSERTs -- all reverted). The
+            # Phase-1 prepared audit rows SURVIVE (they were committed before
+            # Phase 2 opened), so ROLLBACK cannot remove them.
             sealed = False
             # 07-14 R8 P2-NEW-1 (contract #3): a seal failure / crash MUST leave
             # the prepared skill logs RETAINED as audit but MARKED
             # 'aborted_unsealed', and MUST write ZERO new feedback rows. The
-            # prepared logs were autocommitted in Phase 1 (outside the rolled-
-            # back transaction), so ROLLBACK cannot remove them -- instead they
-            # are terminalized here in a fresh autocommit UPDATE. NO feedback is
-            # written on the failure path (it was collected but never persisted),
-            # so a failed tick never pollutes future learning/decisions. An
-            # exception here is logged but never masks the original failure.
+            # prepared logs were committed in Phase 1 (outside the rolled-back
+            # Phase-2 transaction), so the Phase-2 rollback cannot remove them --
+            # instead they are terminalized here in a FRESH committed transaction.
+            # NO feedback is written on the failure path (it was collected but
+            # never persisted), so a failed tick never pollutes future
+            # learning/decisions. An exception here is logged but never masks the
+            # original failure.
             try:
                 _abort_unsealed_skill_logs(conn, prepared)
+                conn.commit()
             except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 LOGGER.exception(
                     "enqueue_market_analysis: failed to mark prepared skill logs "
                     "aborted_unsealed for batch %s (audit rows may remain "
@@ -613,9 +647,20 @@ def enqueue_market_analysis(
         # This outer except now covers BOTH Phase 1 (the per-symbol build loop
         # above) and Phase 2 (via the inner except's re-raise). On ANY exception
         # that reaches here:
-        #   1. ROLLBACK if a transaction is still open (a Phase-1 exception
-        #      happens BEFORE ``BEGIN IMMEDIATE`` so there is no open txn -- the
-        #      OperationalError is swallowed).
+        #   1. COMMIT any open transaction. Under PG autocommit=False the
+        #      Phase-1 read-only SELECTs (``active_analysis_symbols`` + the
+        #      pending check) strand an implicit transaction on the pooled conn,
+        #      so each symbol's ``save_skill_execution_log(prepared)`` self-
+        #      wrapping ``conn.transaction()`` is a SAVEPOINT -- NOT a durable
+        #      write. A ``rollback()`` here would DISCARD those savepointed
+        #      prepared logs (and the attempt-counter), leaving symbols 1..N-1
+        #      with NO row for the abort handler to terminalize. ``commit()``
+        #      finalizes the stranded Phase-1 transaction so the prepared logs
+        #      survive as 'prepared' (matching ``_allocate_attempt_id``'s
+        #      design: the caller's Phase-1 commit finalizes the counter). On
+        #      the Phase-2 re-raise path the inner except already rolled back
+        #      Phase-2 + committed its abort (conn is IDLE here), so this commit
+        #      is a no-op and step 2 behaves unchanged. Guard defensively.
         #   2. Abort the prepared skill logs already created this tick (the
         #      symbols 1..N-1) so they are immediately terminalized to
         #      'aborted_unsealed' instead of staying stuck 'prepared'.
@@ -623,13 +668,18 @@ def enqueue_market_analysis(
         #      crash. This is distinct from the controlled ``seal_failed``
         #      path (return ok=False) which never reaches here.
         try:
-            conn.execute("ROLLBACK")
+            conn.commit()
         except Exception:
             pass
         if prepared:
             try:
                 _abort_unsealed_skill_logs(conn, prepared)
+                conn.commit()
             except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 LOGGER.exception(
                     "enqueue_market_analysis: outer-except failed to abort "
                     "prepared skill logs (audit rows may remain 'prepared' "
@@ -637,7 +687,9 @@ def enqueue_market_analysis(
                 )
         raise
     finally:
-        conn.close()
+        # Return the pooled connection (psycopg rolls back any aborted
+        # transaction on return; a clean commit already happened above).
+        conn_ctx.__exit__(None, None, None)
 
 
 def enqueue_15m_analysis(*, analysis_time_utc: int | None = None, mode: str = "scheduled") -> dict[str, Any]:
@@ -694,7 +746,8 @@ def _market_data_warmup_impl(*, analysis_time_utc: int | None = None) -> dict[st
     """
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
+    conn_ctx = pg_db.get_conn()
+    conn = conn_ctx.__enter__()
     try:
         repo = CryptoGuardRepository(conn)
         now = utc_ms()
@@ -805,4 +858,4 @@ def _market_data_warmup_impl(*, analysis_time_utc: int | None = None) -> dict[st
             "analysis_time_utc": now,
         }
     finally:
-        conn.close()
+        conn_ctx.__exit__(None, None, None)

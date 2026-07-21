@@ -194,7 +194,7 @@ def _check_account_feedback_recheck(
             SELECT id, confidence, trade_plan_json, decision, trend_stage, market_bias,
                    analysis_time_utc, risk_check_json
             FROM ga_decisions
-            WHERE symbol = ?
+            WHERE symbol = %s
             ORDER BY analysis_time DESC, id DESC
             LIMIT 1
             """,
@@ -206,7 +206,7 @@ def _check_account_feedback_recheck(
     if not ga_row:
         return _result(watch, "waiting", "等待新的 GA 分析决策")
 
-    # Convert sqlite3.Row to dict for easier access
+    # psycopg rows.dict_row -> plain dict for easier access
     ga_dict = dict(ga_row)
 
     # 4. Require GA decision to be newer than watch creation time

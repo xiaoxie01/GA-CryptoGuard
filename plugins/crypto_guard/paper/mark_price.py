@@ -171,25 +171,40 @@ def get_mark_price_with_fallback(
             pos_row = repo.conn.execute(
                 """SELECT current_price, updated_at
                    FROM paper_positions
-                   WHERE symbol=? AND status='open'
+                   WHERE symbol=%s AND status='open'
                    ORDER BY updated_at DESC LIMIT 1""",
                 (symbol,),
             ).fetchone()
 
             if pos_row and pos_row["current_price"] is not None:
-                price_as_of = pos_row["updated_at"]
-                if price_as_of:
+                raw_updated_at = pos_row["updated_at"]
+                if raw_updated_at:
                     try:
-                        dt = datetime.fromisoformat(str(price_as_of).replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
+                        # PG greenfield: ``paper_positions.updated_at`` is a
+                        # TIMESTAMPTZ column, so under the psycopg dict_row factory
+                        # ``raw_updated_at`` is a ``datetime`` object (SQLite returned
+                        # an ISO string). Normalize through ``fromisoformat`` so both
+                        # shapes parse, then emit a single canonical ISO 8601 string
+                        # (``...T...Z``) for ``price_as_of`` - matching the
+                        # binance_usdm_mark path (line 77) and the documented result
+                        # schema. Returning ``str(datetime)`` (``... ...+00:00``)
+                        # produced an inconsistent format that broke downstream
+                        # audit/serialization consumers.
+                        if isinstance(raw_updated_at, datetime):
+                            dt = raw_updated_at
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                        else:
+                            dt = datetime.fromisoformat(str(raw_updated_at).replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
                         age = (datetime.now(timezone.utc) - dt).total_seconds()
                         if age <= max_cache_age_seconds:
                             return {
                                 "ok": True,
                                 "mark_price": float(pos_row["current_price"]),
                                 "price_source": "paper_position_cache",
-                                "price_as_of": str(price_as_of),
+                                "price_as_of": dt.isoformat().replace("+00:00", "Z"),
                                 "price_age_seconds": age,
                             }
                     except (ValueError, TypeError):

@@ -52,18 +52,17 @@ def revalidate_pending_orders(
     ).fetchall()
 
     actions: list[dict[str, Any]] = []
-    for row in orders:
-        order = dict(row)
-        action = _review_order(repo, order, now)
-        if action["action"] != "keep":
-            _apply_action(repo, order, action, now)
-            actions.append({"order_id": order["id"], "symbol": order["symbol"], "side": order["side"], **action})
-            LOGGER.info(
-                "revalidator: order %d %s/%s -> %s (reason: %s)",
-                order["id"], order["symbol"], order["side"], action["action"], action.get("reason"),
-            )
-
-    repo.conn.commit()
+    with repo.conn.transaction():
+        for row in orders:
+            order = dict(row)
+            action = _review_order(repo, order, now)
+            if action["action"] != "keep":
+                _apply_action(repo, order, action, now)
+                actions.append({"order_id": order["id"], "symbol": order["symbol"], "side": order["side"], **action})
+                LOGGER.info(
+                    "revalidator: order %d %s/%s -> %s (reason: %s)",
+                    order["id"], order["symbol"], order["side"], action["action"], action.get("reason"),
+                )
 
     # Send notifications for converted/cancelled orders
     if send_message:
@@ -149,7 +148,7 @@ def _review_order(repo: CryptoGuardRepository, order: dict[str, Any], now: datet
         created_at_str = order.get("created_at")
         if created_at_str:
             try:
-                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=timezone.utc)
                 if now - created_at > timedelta(hours=NEEDS_RECHECK_MAX_HOURS):
@@ -173,19 +172,19 @@ def _apply_action(repo: CryptoGuardRepository, order: dict[str, Any], action: di
     if act == "cancel":
         ga_decision_id = action.get("ga_decision_id")
         repo.conn.execute(
-            "UPDATE paper_orders SET status='revalidator_cancelled', cancelled_at=?, cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
+            "UPDATE paper_orders SET status='revalidator_cancelled', cancelled_at=%s, cancel_reason=%s, invalidated_by_ga_decision_id=%s WHERE id=%s",
             (now_iso, reason, ga_decision_id, order_id),
         )
     elif act == "convert_to_watch":
         repo.conn.execute(
-            "UPDATE paper_orders SET status='watch_cancelled', cancelled_at=?, cancel_reason=? WHERE id=?",
+            "UPDATE paper_orders SET status='watch_cancelled', cancelled_at=%s, cancel_reason=%s WHERE id=%s",
             (now_iso, reason, order_id),
         )
         # Create opportunity_watch entry so the signal isn't lost
         _create_watch_from_order(repo, order, reason)
     elif act == "needs_manual_review":
         repo.conn.execute(
-            "UPDATE paper_orders SET status='needs_manual_review' WHERE id=? AND status IN ('pending', 'needs_recheck')",
+            "UPDATE paper_orders SET status='needs_manual_review' WHERE id=%s AND status IN ('pending', 'needs_recheck')",
             (order_id,),
         )
 
@@ -198,7 +197,7 @@ def _create_watch_from_order(repo: CryptoGuardRepository, order: dict[str, Any],
     if not ga_decision_id:
         signal_id = order.get("signal_id")
         if signal_id:
-            sig = repo.conn.execute("SELECT ga_decision_id FROM signals WHERE id=?", (signal_id,)).fetchone()
+            sig = repo.conn.execute("SELECT ga_decision_id FROM signals WHERE id=%s", (signal_id,)).fetchone()
             if sig:
                 ga_decision_id = sig["ga_decision_id"]
 
@@ -208,7 +207,7 @@ def _create_watch_from_order(repo: CryptoGuardRepository, order: dict[str, Any],
         repo.conn.execute(
             """
             INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at, expires_at)
-            VALUES (?, ?, ?, ?, '{}', 'active', ?, ?)
+            VALUES (%s, %s, %s, %s, '{}'::jsonb, 'active', %s, %s)
             """,
             (symbol, side, ga_decision_id, f"pending转观察：{reason}", now_iso, expires_iso),
         )
@@ -229,12 +228,12 @@ def _latest_ga_decision(repo: CryptoGuardRepository, symbol: str, *, max_analysi
     """
     if max_analysis_time is not None:
         row = repo.conn.execute(
-            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=? AND analysis_time <= ? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=%s AND analysis_time <= %s ORDER BY analysis_time DESC, id DESC LIMIT 1",
             (symbol, int(max_analysis_time)),
         ).fetchone()
     else:
         row = repo.conn.execute(
-            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+            "SELECT id, market_bias, signal_grade, trend_stage, confidence, analysis_time_utc FROM ga_decisions WHERE symbol=%s ORDER BY analysis_time DESC, id DESC LIMIT 1",
             (symbol,),
         ).fetchone()
     return dict(row) if row else None
@@ -274,7 +273,7 @@ def _ga_context(ga_decision: dict[str, Any]) -> str:
 
 def _latest_price(repo: CryptoGuardRepository, symbol: str) -> float | None:
     row = repo.conn.execute(
-        "SELECT close FROM candles WHERE symbol=? ORDER BY close_time DESC LIMIT 1",
+        "SELECT close FROM candles WHERE symbol=%s ORDER BY close_time DESC LIMIT 1",
         (symbol,),
     ).fetchone()
     return float(row["close"]) if row else None

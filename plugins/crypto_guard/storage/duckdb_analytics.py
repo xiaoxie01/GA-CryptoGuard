@@ -6,7 +6,7 @@ import os
 import subprocess
 from typing import Any
 
-from plugins.crypto_guard.config.loader import PROJECT_ROOT, load_config
+from plugins.crypto_guard.config.loader import PROJECT_ROOT
 
 
 # DuckDB executable is installed under Program Files, but the analytics
@@ -17,10 +17,28 @@ DEFAULT_DUCKDB_EXE = Path("D:/Program Files/duckdb/duckdb.exe")
 
 
 class DuckDBAnalytics:
+    """DuckDB-backed analytics.
+
+    Two read paths:
+
+    * ``query_klines`` reads candle data from the Parquet archive (unchanged by
+      the PostgreSQL cutover — Parquet is the candle store of record).
+    * The frame analytics (``hourly_signal_distribution`` /
+      ``paper_account_summary`` / ``daily_review_stats`` /
+      ``strategy_performance``) historically pulled rows from the legacy SQLite
+      OLTP file into a pandas DataFrame, registered it in DuckDB, and ran
+      DuckDB aggregation SQL. The SQLite file no longer exists under the
+      PostgreSQL-only runtime, so these now read source rows from PostgreSQL
+      via the pooled connection (``pg_db.get_conn()``) and register the frame in
+      DuckDB the same way. Aggregation SQL is unchanged.
+    """
+
     def __init__(self, database_path: str | Path = DEFAULT_DUCKDB_PATH, parquet_root: str | Path | None = None, sqlite_path: str | Path | None = None):
         self.database_path = Path(os.environ.get("CRYPTO_GUARD_DUCKDB_PATH") or database_path)
         self.parquet_root = Path(parquet_root) if parquet_root else PROJECT_ROOT / "data" / "parquet" / "klines" / "binance_um"
-        self.sqlite_path = Path(sqlite_path) if sqlite_path else Path(load_config().database_path)
+        # ``sqlite_path`` is retained on the signature for backward-compat with
+        # callers/tests that pass it, but is intentionally unused: the SQLite
+        # OLTP file is gone under the PostgreSQL-only runtime.
 
     def health_check(self) -> dict[str, Any]:
         try:
@@ -53,64 +71,70 @@ class DuckDBAnalytics:
         return self._query(sql, params)
 
     def hourly_signal_distribution(self, start: str, end: str) -> dict[str, int]:
-        rows = self._query_sqlite_frame(
-            "SELECT signal_grade FROM ga_decisions WHERE analysis_time_utc >= ? AND analysis_time_utc < ?",
+        rows = self._pg_query(
+            "SELECT signal_grade, COUNT(*) AS count "
+            "FROM ga_decisions WHERE analysis_time_utc >= %s AND analysis_time_utc < %s "
+            "GROUP BY signal_grade",
             [start, end],
-            "SELECT signal_grade, COUNT(*) AS count FROM rows GROUP BY signal_grade",
         )
         return {str(row["signal_grade"] or "-"): int(row["count"]) for row in rows}
 
     def paper_account_summary(self, date_utc: str) -> dict[str, Any]:
-        rows = self._query_sqlite_frame(
-            """
-            SELECT account_equity, realized_pnl, unrealized_pnl, created_at
-            FROM paper_equity_snapshots
-            WHERE substr(created_at, 1, 10)=?
-            ORDER BY created_at
-            """,
-            [date_utc],
+        # ``arg_max`` (DuckDB) -> PostgreSQL: pick the value at the max
+        # ``created_at`` via a DISTINCT ON / ORDER BY pattern. ``created_at`` is
+        # TIMESTAMPTZ; compare its UTC date against ``date_utc``.
+        rows = self._pg_query(
             """
             SELECT
               COUNT(*) AS samples,
-              arg_max(account_equity, created_at) AS latest_equity,
-              arg_max(realized_pnl, created_at) AS realized_pnl,
-              arg_max(unrealized_pnl, created_at) AS unrealized_pnl,
-              min(account_equity) AS min_equity,
-              max(account_equity) AS max_equity
-            FROM rows
+              (SELECT account_equity FROM paper_equity_snapshots
+                 WHERE to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = %s
+                 ORDER BY created_at DESC LIMIT 1) AS latest_equity,
+              (SELECT realized_pnl FROM paper_equity_snapshots
+                 WHERE to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = %s
+                 ORDER BY created_at DESC LIMIT 1) AS realized_pnl,
+              (SELECT unrealized_pnl FROM paper_equity_snapshots
+                 WHERE to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = %s
+                 ORDER BY created_at DESC LIMIT 1) AS unrealized_pnl,
+              MIN(account_equity) AS min_equity,
+              MAX(account_equity) AS max_equity
+            FROM paper_equity_snapshots
+            WHERE to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = %s
             """,
+            [date_utc, date_utc, date_utc, date_utc],
         )
         summary = rows[0] if rows else {}
-        if summary and summary.get("max_equity"):
+        # Native PostgreSQL ``COUNT(*)`` over zero rows still yields one row
+        # (samples=0, NULL aggregates); the former DuckDB-frame path returned
+        # ``[]`` (an empty frame) for zero rows, so the caller saw ``{}``.
+        # Match that: treat a zero-sample result as empty.
+        if not summary or not summary.get("samples") or summary.get("samples") == 0:
+            return {}
+        if summary.get("max_equity"):
             summary["drawdown"] = float(summary["min_equity"] or 0) - float(summary["max_equity"] or 0)
         return summary
 
     def daily_review_stats(self, date_utc: str) -> dict[str, Any]:
-        rows = self._query_sqlite_frame(
-            "SELECT review_date, summary_json FROM daily_review_reports WHERE review_date=?",
+        rows = self._pg_query(
+            "SELECT COUNT(*) AS reports FROM daily_review_reports WHERE review_date=%s",
             [date_utc],
-            "SELECT COUNT(*) AS reports FROM rows",
         )
         return rows[0] if rows else {"reports": 0}
 
     def strategy_performance(self, strategy_name: str, days: int = 30) -> dict[str, Any]:
-        rows = self._query_sqlite_frame(
-            """
-            SELECT strategy_name, sample_count, win_count, loss_count, avg_rr
-            FROM strategy_memory
-            WHERE strategy_name=?
-            """,
-            [strategy_name],
+        rows = self._pg_query(
             """
             SELECT
               strategy_name,
-              sum(sample_count) AS samples,
-              sum(win_count) AS wins,
-              sum(loss_count) AS losses,
-              avg(avg_rr) AS avg_r
-            FROM rows
+              SUM(sample_count) AS samples,
+              SUM(win_count) AS wins,
+              SUM(loss_count) AS losses,
+              AVG(avg_rr) AS avg_r
+            FROM strategy_memory
+            WHERE strategy_name=%s
             GROUP BY strategy_name
             """,
+            [strategy_name],
         )
         return rows[0] if rows else {}
 
@@ -149,36 +173,31 @@ class DuckDBAnalytics:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def _query_sqlite_frame(self, sqlite_sql: str, sqlite_params: list[Any], duckdb_sql: str) -> list[dict[str, Any]]:
-        import sqlite3
+    def _pg_query(self, pg_sql: str, pg_params: list[Any]) -> list[dict[str, Any]]:
+        """Run an analytics SELECT directly on PostgreSQL via the pooled
+        connection and return dict rows.
 
-        if not self.sqlite_path.exists():
-            return []
+        The four frame analytics (``hourly_signal_distribution`` /
+        ``paper_account_summary`` / ``daily_review_stats`` /
+        ``strategy_performance``) formerly pulled source rows from the legacy
+        SQLite file into a pandas DataFrame and ran DuckDB aggregation SQL over
+        it. PostgreSQL supports every aggregate they used (COUNT/MIN/MAX/SUM/AVG
+        and an ``arg_max``-equivalent via correlated subqueries), so the
+        aggregations now run natively in PostgreSQL - no duckdb/pandas/CLI
+        dependency, no intermediate frame. The connection is read-only; the
+        clean ``get_conn`` boundary closes its read transaction before pool
+        return.
+        """
+        from plugins.crypto_guard.storage import pg_db
 
-        try:
-            import duckdb
-            import pandas as pd
-
-            with sqlite3.connect(str(self.sqlite_path)) as sqlite_conn:
-                frame = pd.read_sql_query(sqlite_sql, sqlite_conn, params=sqlite_params)
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with duckdb.connect(str(self.database_path)) as conn:
-                conn.register("rows", frame)
-                cursor = conn.execute(duckdb_sql)
-                columns = [col[0] for col in cursor.description]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        except ModuleNotFoundError:
-            # pandas or duckdb Python module unavailable: fallback to pure sqlite3
-            return self._sqlite_only_fallback(sqlite_sql, sqlite_params)
-
-    def _sqlite_only_fallback(self, sqlite_sql: str, sqlite_params: list[Any]) -> list[dict[str, Any]]:
-        """Fallback when neither pandas nor duckdb Python module is available."""
-        import sqlite3
-
-        with sqlite3.connect(str(self.sqlite_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sqlite_sql, sqlite_params)
-            return [dict(row) for row in cursor.fetchall()]
+        # ``pg_db.get_conn()`` yields a ``dict_row``-factory connection, so each
+        # fetched row is already a ``dict`` keyed by column name - no manual
+        # ``zip(columns, row)`` is needed (that would zip column names with the
+        # dict's keys and produce {col: col} nonsense).
+        with pg_db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(pg_sql, pg_params)
+                return [dict(row) for row in cur.fetchall()]
 
 
 def _inline_params(sql: str, params: list[Any]) -> str:

@@ -33,3 +33,8 @@ def run_scheduled_job(
         raise
     finally:
         release_lock(repo, lock_name, owner)
+        # Close the scheduler unit before returning or propagating task_fn's
+        # exception. This deliberately preserves the scheduler run outcome and
+        # lock release even on the failed-job path; otherwise the outer
+        # get_conn exception boundary would roll back that audit state.
+        repo.conn.commit()

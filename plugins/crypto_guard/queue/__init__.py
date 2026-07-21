@@ -1,3 +1,3 @@
-from .sqlite_queue import SQLiteJobQueue
+from .postgres_queue import PostgresJobQueue
 
-__all__ = ["SQLiteJobQueue"]
+__all__ = ["PostgresJobQueue"]

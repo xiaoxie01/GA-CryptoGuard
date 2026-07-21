@@ -70,7 +70,7 @@ def evaluate_account_feedback_rules_dry_run(
         FROM skill_feedback_memory
         WHERE source_type = 'evolution_trigger'
           AND pattern_type IS NOT NULL AND pattern_type != ''
-          AND datetime(created_at) >= datetime(?)
+          AND created_at >= %s
         ORDER BY created_at DESC
         """,
         (cutoff,),
@@ -198,7 +198,7 @@ def _infer_affected_context(
     batch_size = 200
     for i in range(0, len(patch_ids), batch_size):
         batch = patch_ids[i:i + batch_size]
-        placeholders = ",".join("?" for _ in batch)
+        placeholders = ",".join("%s" for _ in batch)
         rows = repo.conn.execute(
             f"""
             SELECT DISTINCT et.related_trade_ids
@@ -225,7 +225,7 @@ def _infer_affected_context(
         # Get symbols/sides from paper_trades
         for j in range(0, len(trade_ids), batch_size):
             trade_batch = trade_ids[j:j + batch_size]
-            trade_placeholders = ",".join("?" for _ in trade_batch)
+            trade_placeholders = ",".join("%s" for _ in trade_batch)
             trade_rows = repo.conn.execute(
                 f"""
                 SELECT DISTINCT symbol, side

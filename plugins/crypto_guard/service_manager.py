@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
-import sqlite3
 import sys
 import threading
 import time
@@ -10,13 +10,15 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from plugins.crypto_guard.config.loader import load_config
+import psycopg
+
+from plugins.crypto_guard.config.loader import load_config, resolve_database_url
 from plugins.crypto_guard.logging_utils import get_logger, log_path
 from plugins.crypto_guard.run_ga_workers import run_once
 from plugins.crypto_guard.run_scheduler import run_job
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 
 
 _START_LOCK = threading.Lock()
@@ -60,12 +62,13 @@ _WARMUP_FAILURE_REASON: str = ""
 # the service set. AC15: this logic lives entirely in service_manager.py; it
 # does not modify hub.pyw.
 #
-# 07-14 R7-P0-3: the acquire path now uses an explicit ``BEGIN IMMEDIATE``
-# transaction (not a read-then-INSERT-OR-REPLACE) so two concurrent processes
-# cannot both read a stale owner and both win the write. ``BEGIN IMMEDIATE``
-# takes a RESERVED lock immediately; the second acquire blocks on BEGIN until
-# the first commits, then re-SELECTs and sees the fresh owner -> blocks. The
-# lease also carries a per-process random ``owner_token`` (persisted alongside
+# 07-14 R7-P0-3: the acquire path now uses an explicit ``conn.transaction()``
+# (not a read-then-INSERT-OR-REPLACE) so two concurrent processes cannot both
+# read a stale owner and both win the write. PostgreSQL has no RESERVED lock;
+# a transaction-scoped advisory lock (``pg_advisory_xact_lock``) is acquired
+# UNCONDITIONALLY at transaction start, so the second acquire blocks until the
+# first commits, then re-SELECTs and sees the fresh owner -> blocks. The lease
+# also carries a per-process random ``owner_token`` (persisted alongside
 # ``pid``) so the heartbeat renewal CAS keys on ``key + pid + owner_token``:
 # PID alone is unsafe because an OS may recycle a dead PID onto a NEW process,
 # which would then look like the same owner. A periodic heartbeat
@@ -82,6 +85,30 @@ OWNERSHIP_LEASE_TTL_MS = 5 * 60 * 1000  # 5 minutes; renewed by the heartbeat
 # is refreshed long before expiry. The scheduler loop already wakes every 20s;
 # the heartbeat piggy-backs on each wake.
 OWNERSHIP_HEARTBEAT_SECONDS = 20
+# Stable 64-bit advisory-lock key for ``acquire_service_ownership``. PostgreSQL
+# ``SELECT ... FOR UPDATE`` locks NOTHING when the lease row does not exist yet,
+# so two concurrent FIRST acquires (empty table) would both see ``None``, both
+# UPSERT, and both return ``acquired: True`` -> a dual-owner service set (the
+# exact race R7-P0-3 exists to prevent; SQLite's ``BEGIN IMMEDIATE`` RESERVED
+# lock blocked it at BEGIN, before any SELECT). We therefore serialize the
+# acquire with a transaction-scoped advisory lock (``pg_advisory_xact_lock``),
+# acquired unconditionally at transaction start, which blocks a concurrent
+# acquire on the same key until we COMMIT -- replicating the RESERVED-lock
+# guarantee regardless of whether the lease row exists. The key is derived from
+# a fixed name (NOT the lease row) so it is stable across processes/reboots and
+# independent of the row's presence. (migrations.py uses the same primitive for
+# ``initialize_database`` serialization.)
+_ADVISORY_LOCK_NAME = b"crypto_guard.acquire_service_ownership"
+
+
+def _ownership_advisory_lock_key() -> tuple[int, int]:
+    """Return the two int32 halves of the stable advisory-lock key."""
+    digest = hashlib.sha1(_ADVISORY_LOCK_NAME).digest()
+    hi = int.from_bytes(digest[0:4], "big") & 0x7FFFFFFF
+    lo = int.from_bytes(digest[4:8], "big") & 0x7FFFFFFF
+    return hi, lo
+
+
 # In-process cache of the lease this process holds (so a same-process
 # reentrant start is the idempotent ``already_started`` path, not external).
 # Carries ``owner_token`` so the heartbeat renewal CAS can prove ownership.
@@ -104,6 +131,13 @@ _OWNERSHIP_LOST = threading.Event()
 # process exists). Tests inject a stub via set_pid_liveness_probe to simulate
 # live/dead external owners without signalling real PIDs.
 _PID_LIVENESS_PROBE: Callable[[int], bool] | None = None
+# Test seam for the cross-process advisory lock (see ``acquire_service_ownership``).
+# Production path leaves this ``True`` and the advisory lock is acquired. A test
+# that needs to prove the advisory lock is load-bearing sets this ``False`` in
+# its OWN process space (it never propagates across processes) so the
+# ``pg_advisory_xact_lock`` call is skipped -- re-introducing the
+# empty-table dual-acquire race the lock exists to close. Default ``True``.
+_ADVISORY_LOCK_ENABLED: bool = True
 
 LOGGER = get_logger("crypto_guard.service")
 
@@ -175,7 +209,28 @@ def _owner_identity() -> str:
         return "unknown_owner"
 
 
-def acquire_service_ownership(conn: sqlite3.Connection, db_path: str) -> dict[str, Any]:
+def _redacted_db_id() -> str:
+    """Return a REDACTED database identifier (dbname only) for the lease row's
+    ``db_path`` field.
+
+    The ``db_path`` field is stored in ``_service_ownership`` and surfaced in
+    ``already_started_external`` operator output -- it MUST NOT contain the raw
+    DSN, which carries the application password (``CRYPTO_GUARD_DATABASE_URL``).
+    We derive the dbname from the DSN path and never return the credentials
+    segment. If the DSN cannot be parsed we fall back to a sentinel so the
+    field is never empty in production (operators need *something* to correlate
+    a live lease to a database).
+    """
+    try:
+        dsn = resolve_database_url()
+        tail = dsn.rsplit("/", 1)[-1]
+        dbname = tail.split("?", 1)[0].strip()
+        return dbname or "crypto_guard"
+    except Exception:
+        return "crypto_guard"
+
+
+def acquire_service_ownership(conn: psycopg.Connection, db_path: str) -> dict[str, Any]:
     """Atomically acquire (or reclaim) the service-ownership lease for ``db_path``.
 
     Returns one of:
@@ -189,14 +244,20 @@ def acquire_service_ownership(conn: sqlite3.Connection, db_path: str) -> dict[st
         already holds the lease (in-process reentrant start); idempotent.
 
     07-14 R7-P0-3: the check-and-update runs inside an explicit
-    ``BEGIN IMMEDIATE`` transaction so two concurrent processes cannot both
-    read a stale owner row and both win the write. ``BEGIN IMMEDIATE`` takes a
-    RESERVED lock immediately; a second concurrent acquire blocks on its own
-    ``BEGIN IMMEDIATE`` until the first commits, then re-SELECTs and observes
-    the freshly written owner -> it must block (live external owner) or reclaim
-    (now stale) under the *post-commit* row state. The previous read-then-
-    ``INSERT OR REPLACE`` (no BEGIN) raced: both could read the stale row, both
-    write, and both return ``acquired: True`` -> two service sets.
+    ``conn.transaction()`` so two concurrent processes cannot both read a stale
+    owner row and both win the write. PostgreSQL has no RESERVED lock; instead
+    we acquire a transaction-scoped advisory lock
+    (``pg_advisory_xact_lock``) UNCONDITIONALLY at transaction start, which
+    blocks a concurrent acquire on the same key until we COMMIT, then the second
+    process re-SELECTs (in its own fresh transaction) and observes the freshly
+    written owner -> it must block (live external owner) or reclaim (now stale)
+    under the *post-commit* row state. The advisory lock is required because
+    ``SELECT ... FOR UPDATE`` locks NOTHING when the lease row does not yet
+    exist, so without it two concurrent FIRST acquires (empty table) would both
+    see ``None``, both UPSERT, and both return ``acquired: True`` -> two service
+    sets (the exact race R7-P0-3 exists to prevent; SQLite's ``BEGIN
+    IMMEDIATE`` RESERVED lock blocked it at BEGIN, before any SELECT). The
+    previous read-then-``INSERT OR REPLACE`` (no transaction) had the same race.
 
     The lease also carries a per-process random ``owner_token`` (persisted
     alongside ``pid``). The heartbeat renewal CAS keys on
@@ -221,103 +282,131 @@ def acquire_service_ownership(conn: sqlite3.Connection, db_path: str) -> dict[st
             # mismatch (theoretically impossible here since pid+token are
             # both cached) cannot stomp an external owner.
             cached_token = _OWNERSHIP_LEASE.get("owner_token")
-            conn.execute(
-                "UPDATE _service_ownership SET lease_until_ms=? "
-                "WHERE key=? AND owner_token=?",
-                (lease_until_ms, OWNERSHIP_LEASE_KEY, cached_token),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE _service_ownership SET lease_until_ms=%s "
+                    "WHERE key=%s AND owner_token=%s",
+                    (lease_until_ms, OWNERSHIP_LEASE_KEY, cached_token),
+                )
             conn.commit()
             _OWNERSHIP_LEASE["lease_until_ms"] = lease_until_ms
             return {"acquired": False, "reason": "already_started"}
 
-        # Atomic acquire under BEGIN IMMEDIATE. The RESERVED lock blocks a
-        # concurrent BEGIN IMMEDIATE from a second process until we COMMIT,
-        # so the second process observes our freshly written row on its
-        # re-SELECT. busy_timeout=5000 (sqlite_db.py) bounds the wait.
-        conn.execute("BEGIN IMMEDIATE")
+        # Atomic acquire under an explicit transaction. A transaction-scoped
+        # advisory lock (``pg_advisory_xact_lock``) serializes concurrent
+        # acquires UNCONDITIONALLY at transaction start -- replicating SQLite's
+        # ``BEGIN IMMEDIATE`` RESERVED-lock guarantee. This is required because
+        # ``SELECT ... FOR UPDATE`` locks nothing when the lease row does not
+        # yet exist, so without the advisory lock two concurrent FIRST acquires
+        # would both see ``None``, both UPSERT, and both return ``acquired:
+        # True`` -> a dual-owner service set (the exact R7-P0-3 race). The
+        # advisory lock is released automatically at COMMIT/ROLLBACK. We then
+        # SELECT the lease row (no row lock needed -- the advisory lock already
+        # excludes any concurrent acquire) so the second process, after the
+        # first commits and releases the advisory lock, re-SELECTs in its own
+        # fresh transaction and observes the freshly written owner.
         try:
-            row = conn.execute(
-                "SELECT pid, started_at_ms, db_path, release_commit, "
-                "owner_identity, lease_until_ms, owner_token "
-                "FROM _service_ownership WHERE key=?",
-                (OWNERSHIP_LEASE_KEY,),
-            ).fetchone()
-
-            if row is not None:
-                owner_pid = int(row["pid"])
-                lease_until = int(row["lease_until_ms"])
-                lease_expired = lease_until <= now_ms
-                owner_live = _pid_alive(owner_pid)
-                external = owner_pid != my_pid
-
-                if external and owner_live:
-                    # R7-P0-3: a LIVE external PID blocks a duplicate start
-                    # REGARDLESS of lease expiry. Pre-fix, an expired lease
-                    # (heartbeat missed/stalled) was silently reclaimable, which
-                    # spawned a SECOND service set while the original owner's
-                    # threads were still running -> duplicate analysis / orders.
-                    # Now: lease expiry alone is NOT sufficient to reclaim when
-                    # the PID is alive. The heartbeat keeps the lease fresh in
-                    # normal operation; an expired lease + live PID is an
-                    # operator signal that the owner is sick (heartbeat stalled)
-                    # -- the operator reconciles (kill the hung owner; its PID
-                    # then dies and reclaim succeeds). We hold a RESERVED lock
-                    # here; release it (ROLLBACK) so the owner's heartbeat /
-                    # operations are not blocked. The block is NOT silent: it
-                    # logs a warning + returns structured already_started_external
-                    # (with lease_expired flag) for operator diagnosis.
-                    conn.execute("ROLLBACK")
-                    LOGGER.warning(
-                        "service ownership lease held by external process "
-                        "pid=%s db=%s commit=%s owner=%s lease_until_ms=%s "
-                        "lease_expired=%s -- duplicate start_all_services "
-                        "blocked (already_started_external). If lease_expired "
-                        "is true the owner's heartbeat stalled; operator must "
-                        "reconcile (the live PID is NOT auto-reclaimed to "
-                        "avoid a duplicate service set).",
-                        owner_pid, row["db_path"], row["release_commit"],
-                        row["owner_identity"], lease_until, lease_expired,
+            with conn.transaction():
+                hi, lo = _ownership_advisory_lock_key()
+                with conn.cursor() as cur:
+                    if _ADVISORY_LOCK_ENABLED:
+                        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (hi, lo))
+                        cur.fetchone()
+                    cur.execute(
+                        "SELECT pid, started_at_ms, db_path, release_commit, "
+                        "owner_identity, lease_until_ms, owner_token "
+                        "FROM _service_ownership WHERE key=%s",
+                        (OWNERSHIP_LEASE_KEY,),
                     )
-                    return {
-                        "acquired": False,
-                        "reason": "already_started_external",
-                        "owner_pid": owner_pid,
-                        "owner_db_path": row["db_path"],
-                        "owner_release_commit": row["release_commit"],
-                        "owner_identity": row["owner_identity"],
-                        "lease_expired": lease_expired,
-                    }
-                # Reclaimable: external DEAD owner (crash/restart recovery --
-                # the owner is provably gone, safe to reclaim even if the lease
-                # has not yet expired), OR same-pid-but-cache-miss (the row's
-                # pid equals ours but we hold no cached lease -- by PID
-                # uniqueness among live processes this means the original owner
-                # at this PID is dead and the PID was recycled to us; reclaim
-                # is safe and starts ONE service set, not a duplicate). Reclaim
-                # under the RESERVED lock.
-                LOGGER.info(
-                    "reclaiming service ownership lease old_pid=%s external=%s "
-                    "lease_expired=%s owner_live=%s -> new_pid=%s",
-                    owner_pid, external, lease_expired, owner_live, my_pid,
-                )
+                    row = cur.fetchone()
 
-            # Acquire / reclaim the lease atomically under the RESERVED lock.
-            conn.execute(
-                "INSERT OR REPLACE INTO _service_ownership"
-                "(key, pid, started_at_ms, db_path, release_commit, "
-                "owner_identity, lease_until_ms, owner_token) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (OWNERSHIP_LEASE_KEY, my_pid, now_ms, db_path, commit, identity,
-                 lease_until_ms, owner_token),
-            )
-            conn.execute("COMMIT")
+                if row is not None:
+                    owner_pid = int(row["pid"])
+                    lease_until = int(row["lease_until_ms"])
+                    lease_expired = lease_until <= now_ms
+                    owner_live = _pid_alive(owner_pid)
+                    external = owner_pid != my_pid
+
+                    if external and owner_live:
+                        # R7-P0-3: a LIVE external PID blocks a duplicate start
+                        # REGARDLESS of lease expiry. Pre-fix, an expired lease
+                        # (heartbeat missed/stalled) was silently reclaimable,
+                        # which spawned a SECOND service set while the original
+                        # owner's threads were still running -> duplicate
+                        # analysis / orders. Now: lease expiry alone is NOT
+                        # sufficient to reclaim when the PID is alive. The
+                        # heartbeat keeps the lease fresh in normal operation;
+                        # an expired lease + live PID is an operator signal that
+                        # the owner is sick (heartbeat stalled) -- the operator
+                        # reconciles (kill the hung owner; its PID then dies and
+                        # reclaim succeeds). We hold the advisory lock here; the
+                        # ``with conn.transaction():`` block exits cleanly
+                        # (ROLLBACK -- no writes were made) and releases the
+                        # advisory lock, so the owner's heartbeat / operations
+                        # are not blocked. The block is NOT silent: it logs a
+                        # warning + returns structured already_started_external
+                        # (with lease_expired flag) for operator diagnosis.
+                        LOGGER.warning(
+                            "service ownership lease held by external process "
+                            "pid=%s db=%s commit=%s owner=%s lease_until_ms=%s "
+                            "lease_expired=%s -- duplicate start_all_services "
+                            "blocked (already_started_external). If "
+                            "lease_expired is true the owner's heartbeat "
+                            "stalled; operator must reconcile (the live PID is "
+                            "NOT auto-reclaimed to avoid a duplicate service "
+                            "set).",
+                            owner_pid, row["db_path"], row["release_commit"],
+                            row["owner_identity"], lease_until, lease_expired,
+                        )
+                        return {
+                            "acquired": False,
+                            "reason": "already_started_external",
+                            "owner_pid": owner_pid,
+                            "owner_db_path": row["db_path"],
+                            "owner_release_commit": row["release_commit"],
+                            "owner_identity": row["owner_identity"],
+                            "lease_expired": lease_expired,
+                        }
+                    # Reclaimable: external DEAD owner (crash/restart recovery
+                    # -- the owner is provably gone, safe to reclaim even if
+                    # the lease has not yet expired), OR same-pid-but-cache-miss
+                    # (the row's pid equals ours but we hold no cached lease --
+                    # by PID uniqueness among live processes this means the
+                    # original owner at this PID is dead and the PID was
+                    # recycled to us; reclaim is safe and starts ONE service
+                    # set, not a duplicate). Reclaim under the advisory lock.
+                    LOGGER.info(
+                        "reclaiming service ownership lease old_pid=%s "
+                        "external=%s lease_expired=%s owner_live=%s -> "
+                        "new_pid=%s",
+                        owner_pid, external, lease_expired, owner_live, my_pid,
+                    )
+
+                # Acquire / reclaim the lease atomically under the advisory
+                # lock. ``ON CONFLICT (key) DO UPDATE`` (== SQLite ``INSERT OR
+                # REPLACE``) so a first-ever acquire (no row yet) inserts, and a
+                # reclaim overwrites the stale row, both inside this
+                # transaction.
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO _service_ownership"
+                        "(key, pid, started_at_ms, db_path, release_commit, "
+                        "owner_identity, lease_until_ms, owner_token) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (key) DO UPDATE SET "
+                        "pid=EXCLUDED.pid, started_at_ms=EXCLUDED.started_at_ms, "
+                        "db_path=EXCLUDED.db_path, "
+                        "release_commit=EXCLUDED.release_commit, "
+                        "owner_identity=EXCLUDED.owner_identity, "
+                        "lease_until_ms=EXCLUDED.lease_until_ms, "
+                        "owner_token=EXCLUDED.owner_token",
+                        (OWNERSHIP_LEASE_KEY, my_pid, now_ms, db_path, commit,
+                         identity, lease_until_ms, owner_token),
+                    )
         except Exception:
-            # Any failure inside the transaction: roll back so we never leave
-            # a dangling RESERVED/EXCLUSIVE lock or a half-written row.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
+            # Any failure inside the transaction: ``conn.transaction()`` rolls
+            # back automatically so we never leave a half-written row. Re-raise
+            # so the caller sees the DB error.
             raise
 
         _OWNERSHIP_LEASE = {
@@ -340,7 +429,7 @@ def acquire_service_ownership(conn: sqlite3.Connection, db_path: str) -> dict[st
         return {"acquired": True}
 
 
-def _renew_service_ownership_lease(conn: sqlite3.Connection) -> dict[str, Any]:
+def _renew_service_ownership_lease(conn: psycopg.Connection) -> dict[str, Any]:
     """Heartbeat renewal of the lease this process holds (R7-P0-3).
 
     Called periodically from ``_scheduler_loop`` (every
@@ -380,13 +469,15 @@ def _renew_service_ownership_lease(conn: sqlite3.Connection) -> dict[str, Any]:
         # CAS: only the row whose pid AND owner_token match this process gets
         # its lease_until_ms extended. A recycled-PID process with a different
         # owner_token matches 0 rows and the lease is NOT extended.
-        cur = conn.execute(
-            "UPDATE _service_ownership SET lease_until_ms=? "
-            "WHERE key=? AND pid=? AND owner_token=?",
-            (lease_until_ms, OWNERSHIP_LEASE_KEY, my_pid, token),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE _service_ownership SET lease_until_ms=%s "
+                "WHERE key=%s AND pid=%s AND owner_token=%s",
+                (lease_until_ms, OWNERSHIP_LEASE_KEY, my_pid, token),
+            )
+            affected = cur.rowcount
         conn.commit()
-        if cur.rowcount == 0:
+        if affected == 0:
             # Row gone (reclaimed) or token mismatch (PID recycled). Our cached
             # lease is stale; clear it so the owner stops acting as owner.
             with _OWNERSHIP_LOCK:
@@ -413,14 +504,14 @@ def _renew_service_ownership_lease(conn: sqlite3.Connection) -> dict[str, Any]:
         return {"renewed": True, "lease_until_ms": lease_until_ms}
     except Exception as exc:  # pragma: no cover - transient DB error path
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
+            conn.rollback()
+        except Exception:
             pass
         LOGGER.error("service ownership heartbeat error pid=%s: %s", my_pid, exc)
         return {"renewed": False, "reason": "error", "error": str(exc)}
 
 
-def release_service_ownership(conn: sqlite3.Connection) -> dict[str, Any]:
+def release_service_ownership(conn: psycopg.Connection) -> dict[str, Any]:
     """Release this process's service-ownership lease (07-15 R10-P1).
 
     Used on the EXCEPTION paths of ``start_all_services`` that fall between
@@ -465,13 +556,15 @@ def release_service_ownership(conn: sqlite3.Connection) -> dict[str, Any]:
         # CAS: only the row whose pid AND owner_token match this process is
         # cleared. A recycled-PID process with a different owner_token matches
         # 0 rows and does NOT clear the live owner's row.
-        cur = conn.execute(
-            "DELETE FROM _service_ownership "
-            "WHERE key=? AND pid=? AND owner_token=?",
-            (OWNERSHIP_LEASE_KEY, my_pid, token),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM _service_ownership "
+                "WHERE key=%s AND pid=%s AND owner_token=%s",
+                (OWNERSHIP_LEASE_KEY, my_pid, token),
+            )
+            affected = cur.rowcount
         conn.commit()
-        released = cur.rowcount > 0
+        released = affected > 0
         # Clear the in-process cache regardless: this process is abandoning the
         # lease. If the CAS matched 0 rows (row already reclaimed / PID
         # recycled), the cache is stale anyway and MUST be cleared so the next
@@ -497,8 +590,8 @@ def release_service_ownership(conn: sqlite3.Connection) -> dict[str, Any]:
         return {"released": False, "reason": "cas_mismatch", "owner_token": token}
     except Exception as exc:  # pragma: no cover - transient DB error path
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
+            conn.rollback()
+        except Exception:
             pass
         # Even on a DB error, clear the cache defensively so the process is not
         # left locked onto a lease it could not prove it released.
@@ -611,8 +704,8 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
         # writes and mutated agent_jobs/skill_execution_logs, and ONLY THEN
         # returned ``already_started_external``. That is wrong -- a non-owner
         # must make ZERO DB change. The fix reorders to:
-        #   1. minimal init of ONLY the ownership table (additive CREATE TABLE
-        #      IF NOT EXISTS) so ``acquire_service_ownership`` can read/write it;
+        #   1. verify/use the ownership table provisioned by the explicit
+        #      migrator release step (the runtime role has no DDL privilege);
         #   2. atomically acquire the lease;
         #   3. non-owner (``already_started_external``) -> return IMMEDIATELY
         #      with ZERO further DB change (no full migrations, no job recovery,
@@ -624,20 +717,15 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
         # ``_START_LOCK`` still serializes concurrent calls in THIS process;
         # cross-process races are arbitrated by the DB lease row + PID-liveness
         # check.
-        own_conn = connect_db(cfg.database_path)
+        own_conn_ctx = pg_db.get_conn()
+        own_conn = own_conn_ctx.__enter__()
         try:
-            # Minimal additive init of the ownership lease table ONLY. This is
-            # a CREATE TABLE IF NOT EXISTS (apply_r6f_service_ownership_migration)
-            # that touches no business rows and no markers -- it just guarantees
-            # the lease row exists so the CAS below can read/write it. The full
-            # ``initialize_database()`` (which writes ALL migrations + seeds +
-            # contract markers) runs later and ONLY for the owner.
-            from plugins.crypto_guard.storage.migrations import apply_r6f_service_ownership_migration
-            apply_r6f_service_ownership_migration(own_conn)
-            own_conn.commit()
-            ownership = acquire_service_ownership(own_conn, str(cfg.database_path))
+            ownership = acquire_service_ownership(own_conn, _redacted_db_id())
         finally:
-            own_conn.close()
+            try:
+                own_conn_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
         if not ownership.get("acquired"):
             reason = ownership.get("reason")
             if reason == "already_started":
@@ -682,8 +770,9 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
         # ``initialize_database()`` failure, so this is not theoretical.
         try:
             init_result = initialize_database(cfg)
-            LOGGER.info("CryptoGuard autostart initializing database path=%s log=%s", cfg.database_path, log_path())
-            conn = connect_db(cfg.database_path)
+            LOGGER.info("CryptoGuard autostart initializing database db=%s log=%s", _redacted_db_id(), log_path())
+            conn_ctx = pg_db.get_conn()
+            conn = conn_ctx.__enter__()
             try:
                 recovered = CryptoGuardRepository(conn).recover_stale_running_jobs(older_than_minutes=30)
                 if recovered:
@@ -708,7 +797,10 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
                         terminalized,
                     )
             finally:
-                conn.close()
+                try:
+                    conn_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
         except Exception:
             # R10-P1: release the lease on ANY init/recovery failure so the
             # next start_all_services re-acquires instead of locking onto the
@@ -716,11 +808,15 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
             # CAS (preserves PID-recycle protection) + cache clear. Use a fresh
             # connection so a half-open owner-path conn does not interfere.
             try:
-                rel_conn = connect_db(cfg.database_path)
+                rel_conn_ctx = pg_db.get_conn()
+                rel_conn = rel_conn_ctx.__enter__()
                 try:
                     release_service_ownership(rel_conn)
                 finally:
-                    rel_conn.close()
+                    try:
+                        rel_conn_ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
             except Exception as rel_exc:  # pragma: no cover - defensive
                 LOGGER.error(
                     "R10-P1: failed to release service ownership lease on "
@@ -777,10 +873,11 @@ def start_all_services(*, send_message: Callable[..., Any] | None = None) -> dic
 
         _spawn("crypto_guard_user_worker", _user_worker_loop, send_message)
         _spawn("crypto_guard_background_worker", _background_worker_loop, send_message)
-        # R7-P0-3: pass the DB path to the scheduler loop so it can renew the
-        # service-ownership lease each tick (heartbeat) without re-reading
-        # config on every wake.
-        _spawn("crypto_guard_scheduler", _scheduler_loop, str(cfg.database_path))
+        # R7-P0-3: pass the redacted DB identifier to the scheduler loop so it
+        # can renew the service-ownership lease each tick (heartbeat). The loop
+        # opens its own pooled connection via ``pg_db.get_conn()``; this arg is
+        # the redacted dbname stored in the lease row (NOT a file path / DSN).
+        _spawn("crypto_guard_scheduler", _scheduler_loop, _redacted_db_id())
 
         _STARTED = True
         LOGGER.info("CryptoGuard services started threads=%s", [t.name for t in _THREADS])
@@ -885,11 +982,15 @@ def _scheduler_loop(db_path: Any = None) -> None:
             # connection per wake is fine -- the renewal is a single CAS UPDATE.
             if db_path:
                 try:
-                    hb_conn = connect_db(db_path)
+                    hb_conn_ctx = pg_db.get_conn()
+                    hb_conn = hb_conn_ctx.__enter__()
                     try:
                         hb = _renew_service_ownership_lease(hb_conn)
                     finally:
-                        hb_conn.close()
+                        try:
+                            hb_conn_ctx.__exit__(None, None, None)
+                        except Exception:
+                            pass
                     if not hb.get("renewed") and hb.get("reason") == "lost" \
                             and not heartbeat_warned_lost:
                         LOGGER.error(

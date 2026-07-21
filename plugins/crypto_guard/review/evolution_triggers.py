@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, _decode_json, _json_dumps_payload
 
 
 def evaluate_evolution_triggers(repo: CryptoGuardRepository, *, snapshot: dict[str, Any] | None = None, report_only: bool = False) -> dict[str, Any]:
@@ -76,7 +76,7 @@ def _cleanup_stale_candidates(repo: CryptoGuardRepository) -> dict[str, Any]:
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_days)).isoformat()
     stale = repo.conn.execute(
-        "SELECT id, strategy_name, version FROM strategy_versions WHERE status='shadow_testing' AND created_at < ?",
+        "SELECT id, strategy_name, version FROM strategy_versions WHERE status='shadow_testing' AND created_at < %s::timestamptz",
         (cutoff,),
     ).fetchall()
 
@@ -87,15 +87,14 @@ def _cleanup_stale_candidates(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         # Check backtest status to determine correct threshold
         backtest_row = repo.conn.execute(
-            "SELECT backtest_result_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? AND backtest_result_json IS NOT NULL",
+            "SELECT backtest_result_json FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s AND backtest_result_json IS NOT NULL",
             (strategy_name, version),
         ).fetchone()
 
         effective_min_samples = min_samples_without_backtest  # Default: conservative
         if backtest_row and backtest_row["backtest_result_json"]:
             try:
-                import json
-                backtest = json.loads(backtest_row["backtest_result_json"])
+                backtest = json.loads(backtest_row["backtest_result_json"]) if isinstance(backtest_row["backtest_result_json"], str) else backtest_row["backtest_result_json"]
                 if backtest.get("passed") and not backtest.get("skipped"):
                     effective_min_samples = min_samples_after_backtest
                 elif backtest.get("gate_disabled"):
@@ -105,31 +104,29 @@ def _cleanup_stale_candidates(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         # Check if enough shadow evaluations exist
         count = repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE",
             (strategy_name, version),
         ).fetchone()
         sample_count = int(count["cnt"]) if count else 0
 
         if sample_count < effective_min_samples:
             # Not enough samples after max_days - reject
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-                (f"shadow_testing 超过 {max_days} 天且样本不足 ({sample_count}/{effective_min_samples})，自动拒绝", int(row["id"])),
-            )
-            # Sync strategy_patches status
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate')",
-                (version,),
-            )
-            # Also update the trigger - use trigger_id column from strategy_patches
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL) AND status='shadow_testing'",
-                (version,),
-            )
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE id=%s",
+                    (f"shadow_testing 超过 {max_days} 天且样本不足 ({sample_count}/{effective_min_samples})，自动拒绝", int(row["id"])),
+                )
+                # Sync strategy_patches status
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=%s AND status NOT IN ('rejected', 'duplicate')",
+                    (version,),
+                )
+                # Also update the trigger - use trigger_id column from strategy_patches
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL) AND status='shadow_testing'",
+                    (version,),
+                )
             rejected += 1
-
-    if rejected:
-        repo.conn.commit()
 
     return {"rejected_stale": rejected}
 
@@ -155,14 +152,14 @@ def _daily_loss_threshold(repo: CryptoGuardRepository) -> dict[str, Any] | None:
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     row = repo.conn.execute(
-        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE close_reason='stop_loss' AND DATE(COALESCE(closed_at, datetime('now')))=?",
+        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE close_reason='stop_loss' AND COALESCE(closed_at, NOW())::date=%s::date",
         (today,),
     ).fetchone()
     count = int(row["cnt"]) if row else 0
     if count < 3:
         return None
     rows = repo.conn.execute(
-        "SELECT id FROM paper_trades WHERE close_reason='stop_loss' AND DATE(COALESCE(closed_at, datetime('now')))=?",
+        "SELECT id FROM paper_trades WHERE close_reason='stop_loss' AND COALESCE(closed_at, NOW())::date=%s::date",
         (today,),
     ).fetchall()
     trade_ids = [int(r["id"]) for r in rows]
@@ -178,7 +175,7 @@ def _daily_loss_threshold(repo: CryptoGuardRepository) -> dict[str, Any] | None:
 def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str, Any]) -> dict[str, Any]:
     # P0: 止住重复创建 — 已有同类型未完成 trigger 时复用，不创建新 patch
     existing = repo.conn.execute(
-        "SELECT id FROM evolution_triggers WHERE trigger_type=? AND status IN ('pending','shadow_testing') AND COALESCE(symbol,'')=COALESCE(?, '') ORDER BY id DESC LIMIT 1",
+        "SELECT id FROM evolution_triggers WHERE trigger_type=%s AND status IN ('pending','shadow_testing') AND COALESCE(symbol,'')=COALESCE(%s, '') ORDER BY id DESC LIMIT 1",
         (trigger["trigger_type"], trigger.get("symbol")),
     ).fetchone()
 
@@ -191,31 +188,31 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
 
         # Check if original_related_trade_ids exists; if not, backfill from current related_trade_ids
         existing_row = repo.conn.execute(
-            "SELECT original_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=?",
+            "SELECT original_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=%s",
             (existing_id,),
         ).fetchone()
-        if existing_row and not existing_row["original_related_trade_ids"]:
-            # First reuse: freeze original from the existing related_trade_ids
-            original = existing_row["related_trade_ids"]
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET original_related_trade_ids=?, latest_related_trade_ids=?, related_trade_ids=?, latest_triggered_at=? WHERE id=?",
-                (original, new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
-            )
-        else:
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET latest_related_trade_ids=?, related_trade_ids=?, latest_triggered_at=? WHERE id=?",
-                (new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
-            )
-        # Also sync latest_trigger_value if the new trigger has it
-        if trigger.get("trigger_value") is not None:
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET latest_trigger_value=? WHERE id=?",
-                (float(trigger["trigger_value"]), existing_id),
-            )
-        repo.conn.commit()
+        with repo.conn.transaction():
+            if existing_row and not existing_row["original_related_trade_ids"]:
+                # First reuse: freeze original from the existing related_trade_ids
+                original = existing_row["related_trade_ids"]
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET original_related_trade_ids=%s, latest_related_trade_ids=%s, related_trade_ids=%s, latest_triggered_at=%s WHERE id=%s",
+                    (original, new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
+                )
+            else:
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET latest_related_trade_ids=%s, related_trade_ids=%s, latest_triggered_at=%s WHERE id=%s",
+                    (new_related_trade_ids, new_related_trade_ids, datetime.now(tz.utc).isoformat(), existing_id),
+                )
+            # Also sync latest_trigger_value if the new trigger has it
+            if trigger.get("trigger_value") is not None:
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET latest_trigger_value=%s WHERE id=%s",
+                    (float(trigger["trigger_value"]), existing_id),
+                )
         # Find the associated patch for this trigger
         existing_patch = repo.conn.execute(
-            "SELECT id, candidate_version FROM strategy_patches WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, candidate_version FROM strategy_patches WHERE trigger_id=%s ORDER BY id DESC LIMIT 1",
             (existing_id,),
         ).fetchone()
         return {
@@ -229,10 +226,9 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
     # Detect actual strategy used in related trades
     strategy_name, from_version = _detect_strategy_from_trades(repo, trigger.get("related_trade_ids") or [])
 
-    # Wrap trigger creation + patch creation + version creation + cap enforcement in explicit BEGIN/COMMIT
+    # Wrap trigger creation + patch creation + version creation + cap enforcement in a single transaction
     from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
-    repo.conn.execute("BEGIN")
-    try:
+    with repo.conn.transaction():
         trigger_id = repo.create_evolution_trigger(
             trigger_type=trigger["trigger_type"],
             trigger_value=float(trigger["trigger_value"]),
@@ -266,10 +262,6 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
         )
         # Enforce candidate cap AFTER creation, inside same transaction
         _enforce_candidate_cap(repo, strategy_name, max_candidates=5)
-        repo.conn.commit()
-    except Exception:
-        repo.conn.execute("ROLLBACK")
-        raise
 
     # Run backtest gate immediately after candidate creation
     from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
@@ -294,20 +286,20 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
         and not backtest_result.get("gate_disabled")
     )
     if backtest_failed:
-        repo.conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
-            (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, candidate_version),
-        )
-        repo.conn.execute(
-            "UPDATE evolution_triggers SET status='rejected' WHERE id=?",
-            (trigger_id,),
-        )
-        # Save backtest result and update patch status
-        repo.conn.execute(
-            "UPDATE strategy_patches SET backtest_result_json=?, status='rejected' WHERE id=?",
-            (json.dumps(backtest_result, ensure_ascii=False), patch_id),
-        )
-        repo.conn.commit()
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE strategy_name=%s AND version=%s",
+                (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='rejected' WHERE id=%s",
+                (trigger_id,),
+            )
+            # Save backtest result and update patch status
+            repo.conn.execute(
+                "UPDATE strategy_patches SET backtest_result_json=%s, status='rejected' WHERE id=%s",
+                (_json_dumps_payload(backtest_result), patch_id),
+            )
         return {
             "trigger_id": trigger_id,
             "patch_id": patch_id,
@@ -319,15 +311,15 @@ def _record_trigger_and_candidate(repo: CryptoGuardRepository, trigger: dict[str
         }
 
     # Backtest passed or skipped - transition to shadow_testing and continue
-    repo.conn.execute(
-        "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
-        (strategy_name, candidate_version),
-    )
-    repo.conn.execute(
-        "UPDATE strategy_patches SET backtest_result_json=?, status='shadow_testing' WHERE id=?",
-        (json.dumps(backtest_result, ensure_ascii=False), patch_id),
-    )
-    repo.conn.commit()
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=%s AND version=%s AND status='candidate'",
+            (strategy_name, candidate_version),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_patches SET backtest_result_json=%s, status='shadow_testing' WHERE id=%s",
+            (_json_dumps_payload(backtest_result), patch_id),
+        )
 
     for skill in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
         repo.save_skill_feedback_memory(
@@ -373,7 +365,7 @@ def _detect_strategy_from_trades(repo: CryptoGuardRepository, trade_ids: list[in
         return default_name, active.get("version", default_version) if active else default_version
 
     # Look up strategy info from GA decisions linked to these trades
-    placeholders = ",".join("?" for _ in trade_ids[:10])
+    placeholders = ",".join("%s" for _ in trade_ids[:10])
     rows = repo.conn.execute(
         f"""
         SELECT DISTINCT po.ga_decision_id FROM paper_trades pt
@@ -388,13 +380,12 @@ def _detect_strategy_from_trades(repo: CryptoGuardRepository, trade_ids: list[in
         if not ga_id:
             continue
         ga = repo.conn.execute(
-            "SELECT raw_decision_json FROM ga_decisions WHERE id=?",
+            "SELECT raw_decision_json FROM ga_decisions WHERE id=%s",
             (int(ga_id),),
         ).fetchone()
         if ga:
-            import json
-            raw = json.loads(ga["raw_decision_json"] or "{}")
-            name = raw.get("strategy_name")
+            raw = _decode_json(ga["raw_decision_json"], {})
+            name = raw.get("strategy_name") if isinstance(raw, dict) else None
             if name:
                 version = raw.get("strategy_version", default_version)
                 return str(name), str(version)

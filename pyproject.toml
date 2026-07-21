@@ -40,6 +40,10 @@ all-frontends = [
     "wecom-aibot-sdk>=1.0",
     "dingtalk-stream>=0.20",
 ]
+crypto-guard = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

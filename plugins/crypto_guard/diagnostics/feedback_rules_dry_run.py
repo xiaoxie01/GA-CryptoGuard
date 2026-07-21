@@ -59,7 +59,7 @@ def evaluate_feedback_rules_dry_run(
         """
         SELECT id, skill_name, pattern_type, finding, created_at
         FROM skill_feedback_memory
-        WHERE datetime(created_at) >= datetime(?) AND pattern_type IS NOT NULL AND pattern_type != ''
+        WHERE created_at >= %s AND pattern_type IS NOT NULL AND pattern_type != ''
         ORDER BY created_at DESC
         """,
         (cutoff,),

@@ -122,11 +122,11 @@ def check_account_feedback_gate(
                sp.candidate_version, sp.id AS candidate_patch_id, sp.trigger_id AS patch_trigger_id,
                et.related_trade_ids
         FROM skill_feedback_memory sfm
-        LEFT JOIN strategy_patches sp ON sp.id = json_extract(sfm.suggested_adjustment_json, '$.candidate_patch_id')
+        LEFT JOIN strategy_patches sp ON sp.id = (sfm.suggested_adjustment_json ->> 'candidate_patch_id')::bigint
         LEFT JOIN evolution_triggers et ON et.id = sp.trigger_id
         WHERE sfm.source_type = 'evolution_trigger'
           AND sfm.pattern_type = 'consecutive_stop_losses'
-          AND datetime(sfm.created_at) >= datetime(?)
+          AND sfm.created_at >= %s::timestamptz
         ORDER BY sfm.created_at DESC
         """,
         (cutoff,),
@@ -327,7 +327,7 @@ def _get_affected_symbol_side_pairs(
     # Batch through all trade IDs in chunks of 50
     for i in range(0, len(all_trade_ids), 50):
         batch = all_trade_ids[i:i + 50]
-        placeholders = ",".join("?" for _ in batch)
+        placeholders = ",".join("%s" for _ in batch)
         try:
             rows = repo.conn.execute(
                 f"""

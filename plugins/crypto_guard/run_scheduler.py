@@ -8,9 +8,9 @@ from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.scheduler.cron_scheduler import enqueue_15m_analysis, enqueue_market_analysis, fetch_closed_klines_for_active_symbols, market_data_warmup
 from plugins.crypto_guard.scheduler.job_runner import run_scheduled_job
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
 
 LOGGER = get_logger("crypto_guard.scheduler")
@@ -19,8 +19,9 @@ LOGGER = get_logger("crypto_guard.scheduler")
 def run_job(job_name: str) -> dict:
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PG cutover: pooled connection (auto-returned by the context manager; no
+    # explicit close). Every repo write self-wraps ``conn.transaction()``.
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
         now = utc_ms()
         LOGGER.info("run_job start job=%s now_ms=%s", job_name, now)
@@ -224,8 +225,6 @@ def run_job(job_name: str) -> dict:
             LOGGER.info("run_job done job=%s result=%s", job_name, result)
             return result
         raise ValueError(f"未知 scheduler job: {job_name}")
-    finally:
-        conn.close()
 
 
 def main() -> None:

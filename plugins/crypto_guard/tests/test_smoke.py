@@ -2,11 +2,26 @@ from __future__ import annotations
 
 import os
 import json
-import sqlite3
 import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+
+
+def _load_json(value):
+    """Decode a JSON column value that may arrive as either a raw string
+    (SQLite TEXT) or an already-decoded Python object (PostgreSQL JSONB).
+
+    psycopg 3 returns Python dict/list for JSONB columns, so ``json.loads``
+    must be skipped when the value is already decoded; otherwise it raises
+    ``TypeError``. The SQLite driver returns TEXT, so ``json.loads`` is
+    required there. This helper unifies both so test bodies stay portable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
 
 
 # 07-10 R4-P1-3: module-level picklable subprocess target that BYPASSES the
@@ -20,6 +35,174 @@ def _r4_p1_3_bypass_target(control, child_conn):  # noqa: ANN001, ANN202
     _n = int(control.get("oversized_response") or 0)
     _eff = {"effective_thinking_type": None}
     _laj._safe_send(child_conn, ("ok", "y" * _n, _eff))
+
+
+def _insert_scheduled_analysis_job_valid(
+    conn,
+    *,
+    batch_id: str,
+    symbol: str,
+    analysis_time_ms: int,
+    status: str = "failed",
+    error_message: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    session_id: str | None = None,
+    payload: dict | None = None,
+    claim_token: str | None = None,
+    lease_until: str | None = None,
+) -> int:
+    """Insert a schema-valid ``scheduled_market_analysis`` ``agent_jobs`` row.
+
+    P9 (PG cutover): the greenfield schema enforces the scheduled-job
+    membership invariant with THREE stacked gates -- (1) the CHECK
+    ``ck_scheduled_analysis_job_identity`` requires non-NULL ``batch_id`` +
+    ``symbol`` for ``scheduled_market_analysis``; (2) the composite FK
+    ``fk_agent_job_batch_symbol`` requires a matching ``batch_symbol_status``
+    row; (3) the ``guard_scheduled_analysis_job_membership()`` BEFORE trigger
+    requires a parent ``analysis_batches`` row whose ``claim_ready_at IS NULL``
+    (unsealed). Legacy tests that inserted a bare ``scheduled_market_analysis``
+    row with NULL ``batch_id``/``symbol`` and no parent passed under SQLite
+    (which enforced none of this) but abort the PG transaction on the CHECK
+    (or the trigger) and leave the connection INERROR. This helper inserts the
+    full valid membership chain -- parent ``analysis_batches`` (unsealed) +
+    child ``batch_symbol_status`` + the ``agent_jobs`` row -- so fixture rows
+    used to exercise UNRELATED behaviors (failed-jobs windowing, risk-event
+    rendering, stale-job recovery, per-job consistency diagnostics) satisfy
+    the production invariant WITHOUT weakening any gate or mocking the code
+    under test. The parent is left unsealed (``claim_ready_at IS NULL``) so the
+    trigger admits the job; tests that need a sealed batch set
+    ``claim_ready_at`` themselves after this returns. Returns the new job id.
+    """
+    import json as _json
+    sid = session_id or f"system:scheduled:15m:{symbol}:{analysis_time_ms}"
+    pl = payload if payload is not None else {
+        "batch_id": batch_id,
+        "snapshot": {"symbol": symbol, "analysis_time_utc": analysis_time_ms},
+    }
+    with conn.cursor() as cur:
+        # Parent batch (unsealed: claim_ready_at defaults NULL). Idempotent so a
+        # test can insert multiple jobs for the same batch without collision.
+        cur.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (batch_id) DO NOTHING",
+            (batch_id, "15m", int(analysis_time_ms),
+             _json.dumps([symbol]), "running"),
+        )
+        # Child membership row (the composite FK target). Idempotent on PK.
+        cur.execute(
+            "INSERT INTO batch_symbol_status(batch_id, symbol, status) "
+            "VALUES (%s, %s, %s) ON CONFLICT (batch_id, symbol) DO NOTHING",
+            (batch_id, symbol, "pending"),
+        )
+        cols = [
+            "job_type", "priority", "source", "session_id",
+            "payload_json", "status",
+        ]
+        vals = ["scheduled_market_analysis", 5, "test", sid,
+                _json.dumps(pl, ensure_ascii=False), status]
+        if error_message is not None:
+            cols.append("error_message"); vals.append(error_message)
+        if started_at is not None:
+            cols.append("started_at"); vals.append(started_at)
+        if finished_at is not None:
+            cols.append("finished_at"); vals.append(finished_at)
+        if claim_token is not None:
+            cols.append("claim_token"); vals.append(claim_token)
+        if lease_until is not None:
+            cols.append("lease_until"); vals.append(lease_until)
+        cols += ["batch_id", "symbol"]
+        vals += [batch_id, symbol]
+        placeholders = ", ".join(["%s"] * len(vals))
+        col_list = ", ".join(cols)
+        cur.execute(
+            f"INSERT INTO agent_jobs({col_list}) VALUES ({placeholders}) "
+            "RETURNING id",
+            vals,
+        )
+        row = cur.fetchone()
+    return int(row["id"]) if row is not None else 0
+
+
+def _insert_scheduled_analysis_job_malformed_identity(
+    conn,
+    *,
+    batch_id: str,
+    symbol: str,
+    payload: dict,
+    session_id: str | None = None,
+    priority: int = 5,
+    source: str = "cron",
+    status: str = "pending",
+    claim_token: str | None = None,
+    lease_until: str | None = None,
+    started_at: str | None = None,
+) -> int:
+    """Insert a ``scheduled_market_analysis`` ``agent_jobs`` row whose
+    IDENTITY is malformed (a swapped/missing snapshot symbol) via a BARE
+    INSERT, bypassing ``CryptoGuardRepository.enqueue_job``'s Python-side
+    ``validate_job_identity`` gate.
+
+    P9 / R8-A (PG cutover): the production ``enqueue_job`` raises
+    ``ValueError`` when ``validate_job_identity(payload)`` returns ``None``
+    (missing / non-dict / no-symbol / swapped snapshot). The R8-A seal /
+    claim / worker fail-closed tests must exercise the DOWNSTREAM gates
+    (``seal_analysis_batch``, ``claim_next_batch``, ``process_fair_batch``)
+    on a row that ALREADY exists in the DB with a malformed identity -- i.e.
+    a row that reached the DB through some path that bypassed enqueue's
+    Python validation (a migrated / hand-built / future-bypass batch). Calling
+    ``enqueue_job`` would short-circuit at the ValueError and never reach the
+    seal/claim/worker assertion, making the test a false-green (it "passes"
+    by raising before the asserted behavior). This helper builds the valid
+    MEMBERSHIP chain (parent ``analysis_batches`` unsealed + child
+    ``batch_symbol_status``) so the trigger + composite FK + CHECK admit the
+    row, but writes the MALFORMED payload verbatim into ``payload_json`` and
+    sets the authoritative ``symbol`` COLUMN to ``symbol`` (the authoritative
+    field) so the row is a realistic malformed-identity shape. The caller
+    controls the malformed shape entirely via ``payload``.
+
+    The parent batch is left UNSEALED (``claim_ready_at`` NULL); tests that
+    need a sealed batch hand-stamp ``claim_ready_at`` after this returns (the
+    seal itself rejects malformed identity, so a sealed-malformed batch can
+    only be simulated by hand-stamping).
+    """
+    import json as _json
+    sid = session_id or f"system:scheduled:15m:{symbol}:malformed"
+    cols = [
+        "job_type", "priority", "source", "session_id",
+        "payload_json", "status", "batch_id", "symbol",
+    ]
+    vals = [
+        "scheduled_market_analysis", int(priority), source, sid,
+        _json.dumps(payload, ensure_ascii=False), status, batch_id, symbol,
+    ]
+    if claim_token is not None:
+        cols.append("claim_token"); vals.append(claim_token)
+    if lease_until is not None:
+        cols.append("lease_until"); vals.append(lease_until)
+    if started_at is not None:
+        cols.append("started_at"); vals.append(started_at)
+    placeholders = ", ".join(["%s"] * len(vals))
+    col_list = ", ".join(cols)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (batch_id) DO NOTHING",
+            (batch_id, "15m", 0, _json.dumps([symbol]), "running"),
+        )
+        cur.execute(
+            "INSERT INTO batch_symbol_status(batch_id, symbol, status) "
+            "VALUES (%s, %s, %s) ON CONFLICT (batch_id, symbol) DO NOTHING",
+            (batch_id, symbol, "pending"),
+        )
+        cur.execute(
+            f"INSERT INTO agent_jobs({col_list}) VALUES ({placeholders}) RETURNING id",
+            vals,
+        )
+        row = cur.fetchone()
+    return int(row["id"]) if row is not None else 0
 
 
 class CryptoGuardSmokeTest(unittest.TestCase):
@@ -39,18 +222,20 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             return_value=False,
         )
         self._broker_md_patcher.start()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + connect_db + initialize_database pattern). self.conn is a pooled
+        # psycopg.Connection bound to a fresh schema; self.repo wraps it.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
         self._broker_md_patcher.stop()
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm_analysis is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -254,9 +439,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         decision = run_ga_sop_decision(snapshot)
         snapshot_id = self.repo.save_market_snapshot(snapshot)
         signal_from_snapshot = self.repo.create_signal(decision, snapshot_id)
-        saved_snapshot = self.conn.execute("SELECT data_quality_json FROM market_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+        saved_snapshot = self.conn.execute("SELECT data_quality_json FROM market_snapshots WHERE id=%s", (snapshot_id,)).fetchone()
         self.assertIsNotNone(saved_snapshot["data_quality_json"])
-        eval_count = self.conn.execute("SELECT COUNT(*) FROM strategy_evaluations WHERE snapshot_id=?", (snapshot_id,)).fetchone()[0]
+        eval_count = self.conn.execute("SELECT COUNT(*) FROM strategy_evaluations WHERE snapshot_id=%s", (snapshot_id,)).fetchone()["count"]
         self.assertGreaterEqual(eval_count, 1)
         signal_row = self.repo.get_signal(signal_from_snapshot)
         self.assertEqual(signal_row["market_snapshot_id"], snapshot_id)
@@ -296,13 +481,17 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(fill["filled"])
         order = self.repo.list_open_paper_orders()[0]
         trade = self.repo.get_open_trade_for_order(order["id"])
-        self.assertEqual(trade["signal_id"], signal_id)
+        # Under PG, paper_trades has no signal_id column (normalized away -
+        # see review/trade_reviewer.py _snapshot_context). Resolve via the
+        # production chain: paper_trades.order_id -> paper_orders.signal_id.
+        self.assertEqual(order["signal_id"], signal_id)
+        self.assertEqual(trade["order_id"], order["id"])
         close = close_trade_if_needed(self.repo, order, trade, 111.0)
         self.assertTrue(close["closed"])
         review = review_trade(self.repo, close["trade_id"])
         self.assertTrue(review["ok"])
         if review["patch_id"]:
-            row = self.conn.execute("SELECT status FROM strategy_patches WHERE id=?", (review["patch_id"],)).fetchone()
+            row = self.conn.execute("SELECT status FROM strategy_patches WHERE id=%s", (review["patch_id"],)).fetchone()
             self.assertEqual(row["status"], "shadow_testing")
 
     def test_system_status_result_uses_text_renderer(self) -> None:
@@ -576,7 +765,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(int(row["priority"]), 2)
-        self.assertIn('"limit": 10', row["payload_json"])
+        # payload_json is a JSONB column: psycopg decodes it to a dict on read
+        # (on SQLite it round-tripped as a JSON string). Assert the enqueued
+        # payload carries limit=10 regardless of which shape comes back.
+        payload = row["payload_json"]
+        if isinstance(payload, str):
+            import json as _json
+            payload = _json.loads(payload)
+        self.assertEqual(payload.get("limit"), 10)
 
     def test_paper_event_alert_uses_event_time_and_converts_naive_utc_entry_time(self) -> None:
         from plugins.crypto_guard.run_ga_workers import handle_paper_event_alert
@@ -668,11 +864,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(second.get("existing"), "Second call should return existing report")
         self.assertIn("每日模拟盘复盘", first["text"])
         patches = self.conn.execute(
-            "SELECT status FROM strategy_patches WHERE trigger_id IN (SELECT id FROM evolution_triggers WHERE created_at >= date('now'))"
+            "SELECT status FROM strategy_patches WHERE trigger_id IN (SELECT id FROM evolution_triggers WHERE created_at >= CURRENT_DATE)"
         ).fetchall()
         if patches:
             self.assertTrue(all(row["status"] == "shadow_testing" for row in patches))
-        memory_count = self.conn.execute("SELECT COUNT(*) FROM strategy_memory").fetchone()[0]
+        memory_count = self.conn.execute("SELECT COUNT(*) FROM strategy_memory").fetchone()["count"]
         self.assertGreaterEqual(memory_count, 1)
 
     def test_v2_evolution_trigger_daily_review_and_skill_memory(self) -> None:
@@ -688,7 +884,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
-                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s)
                 """,
                 (closed_at,),
             )
@@ -701,9 +897,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         review = run_daily_review(self.repo, day_utc=day)
         self.assertTrue(review["daily_review_report_id"])
-        report = self.conn.execute("SELECT * FROM daily_review_reports WHERE review_date=?", (day,)).fetchone()
+        report = self.conn.execute("SELECT * FROM daily_review_reports WHERE review_date=%s", (day,)).fetchone()
         self.assertIsNotNone(report)
-        skill_memory = self.conn.execute("SELECT COUNT(*) FROM skill_feedback_memory WHERE source_type='daily_review'").fetchone()[0]
+        skill_memory = self.conn.execute("SELECT COUNT(*) FROM skill_feedback_memory WHERE source_type='daily_review'").fetchone()["count"]
         self.assertGreaterEqual(skill_memory, 1)  # At least 1 entry per failure pattern
 
     def test_decision_supplement_buttons_risk_and_intraday_preprocessing(self) -> None:
@@ -785,7 +981,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "strategy_version": "1.0",
             "analysis_time_utc": 1_700_000_000_000,
         }
-        approved_snapshot = json.loads(self.conn.execute("SELECT snapshot_json FROM market_snapshots WHERE id=?", (self._risk_approved_snapshot_id("BTCUSDT"),)).fetchone()[0])
+        approved_snapshot = self.conn.execute("SELECT snapshot_json FROM market_snapshots WHERE id=%s", (self._risk_approved_snapshot_id("BTCUSDT"),)).fetchone()["snapshot_json"]
         approved = apply_risk_to_decision(decision, approved_snapshot)
         self.assertTrue(approved["risk_check"]["ok"])
         self.assertIn("create_paper_order", approved["suggested_actions"])
@@ -846,12 +1042,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(pending_duplicate["silenced"])
         self.assertEqual(pending_duplicate_calls, [])
         for _ in range(2):
-            self.conn.execute("UPDATE alert_outbox SET next_retry_at=CURRENT_TIMESTAMP WHERE id=?", (alert_id,))
+            self.conn.execute("UPDATE alert_outbox SET next_retry_at=CURRENT_TIMESTAMP WHERE id=%s", (alert_id,))
             process_alert_outbox(self.repo, failing_send)
-        final = self.conn.execute("SELECT status, retry_count FROM alert_outbox WHERE id=?", (alert_id,)).fetchone()
+        final = self.conn.execute("SELECT status, retry_count FROM alert_outbox WHERE id=%s", (alert_id,)).fetchone()
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final["retry_count"], 3)
-        failure_count = self.conn.execute("SELECT COUNT(*) FROM alert_failure_log WHERE alert_outbox_id=?", (alert_id,)).fetchone()[0]
+        failure_count = self.conn.execute("SELECT COUNT(*) FROM alert_failure_log WHERE alert_outbox_id=%s", (alert_id,)).fetchone()["count"]
         self.assertEqual(failure_count, 1)
 
         sent_messages: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -884,12 +1080,26 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         request = crypto_handle_text_command("把置信度阈值改成 0.73", user_id="u1")
         self.assertTrue(request["confirmation_required"])
         change_id = int(request["change_id"])
-        pending = self.conn.execute("SELECT status FROM config_hot_reload WHERE id=?", (change_id,)).fetchone()
+        # P9 (PG cutover): crypto_handle_text_command writes the config_hot_reload
+        # row on its OWN pooled connection (conn2) and commits there. self.conn
+        # (conn1) has an open transaction whose MVCC snapshot was taken at the
+        # first raw SELECT above, predating conn2's commit, so it cannot see the
+        # new row. Commit conn1 to release the stale snapshot; the next SELECT
+        # opens a fresh transaction that sees conn2's committed row. (SQLite
+        # shared one connection, so this cross-connection visibility issue never
+        # arose.)
+        self.conn.commit()
+        pending = self.conn.execute("SELECT status FROM config_hot_reload WHERE id=%s", (change_id,)).fetchone()
         self.assertEqual(pending["status"], "pending")
         confirm = crypto_confirm_config_update(change_id)
         self.assertTrue(confirm["ok"])
+        # Refresh conn1's snapshot again to see conn3's committed runtime_config
+        # update written by crypto_confirm_config_update (same cross-connection
+        # MVCC reason as above).
+        self.conn.commit()
         runtime = self.conn.execute("SELECT value_json FROM runtime_config WHERE config_key='risk.min_confidence_for_paper_order'").fetchone()
-        self.assertEqual(json.loads(runtime["value_json"]), 0.73)
+        _vj_raw = runtime["value_json"]
+        self.assertEqual(json.loads(_vj_raw) if isinstance(_vj_raw, str) else _vj_raw, 0.73)
 
     def test_ad_hoc_analysis_silence_does_not_send_fallback_duplicate(self) -> None:
         from plugins.crypto_guard.run_ga_workers import _maybe_send_feishu_result
@@ -1040,11 +1250,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         state = self.conn.execute("SELECT * FROM analysis_states WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertIsNotNone(state)
-        state_json = json.loads(state["state_json"])
+        _sj_raw = state["state_json"]
+        state_json = json.loads(_sj_raw) if isinstance(_sj_raw, str) else _sj_raw
         self.assertEqual(state_json["previous_state_id"], previous_id)
         self.assertIn("market_structure", state_json)
         self.assertIn("next_triggers", state_json)
-        skill_count = self.conn.execute("SELECT COUNT(*) FROM skill_execution_logs").fetchone()[0]
+        skill_count = self.conn.execute("SELECT COUNT(*) FROM skill_execution_logs").fetchone()["count"]
         self.assertGreaterEqual(skill_count, 5 * len(DEFAULT_TIMEFRAMES))
         root = Path("plugins/crypto_guard/skills")
         for name in ("chanlun_skill", "price_action_skill", "smc_orderflow_skill", "momentum_skill", "trend_stage_skill"):
@@ -1271,7 +1482,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.assertTrue(fill["filled"])
 
-        order = self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        order = self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         update = update_paper_positions(
             self.repo,
             prices={
@@ -1286,7 +1497,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             },
         )
         self.assertTrue(any(result.get("closed") for result in update["results"]))
-        trade = self.conn.execute("SELECT * FROM paper_trades WHERE order_id=?", (order["id"],)).fetchone()
+        trade = self.conn.execute("SELECT * FROM paper_trades WHERE order_id=%s", (order["id"],)).fetchone()
         self.assertEqual(trade["close_reason"], "take_profit")
         self.assertEqual(trade["exit_price"], 110.0)
         # MFE/MAE are in PnL (USDT) units, not price units
@@ -1297,7 +1508,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertIsNotNone(trade["entry_efficiency"])
         self.assertIsNotNone(trade["exit_efficiency"])
         self.assertIsNotNone(trade["signal_decay_score"])
-        path = json.loads(trade["stop_take_path_json"])
+        _stp_raw = trade["stop_take_path_json"]
+        path = json.loads(_stp_raw) if isinstance(_stp_raw, str) else _stp_raw
         self.assertTrue(any(item.get("event") == "exit_hit" for item in path))
         equity = update["equity_snapshot"]
         # PnL = (110 - 100) * 10 (quantity) = 100
@@ -1579,12 +1791,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Ensure an active strategy_version exists so backtest gate can run without no_active_version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT(strategy_name, version) DO UPDATE SET "
+            "status=excluded.status, config_json=excluded.config_json, change_reason=excluded.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)"
+            "INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING"
         )
 
         snapshot = self._decision_snapshot(trend_stage="late", neutral_risks=["趋势阶段偏末端，追价风险高"])
@@ -1601,18 +1815,39 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             },
             snapshot_id,
         )
-        self.conn.execute(
-            """
-            INSERT INTO paper_trades(
-                signal_id, market_snapshot_id, symbol, side, entry_price, exit_price, stop_loss, quantity,
-                pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion,
-                entry_efficiency, exit_efficiency, signal_decay_score, close_reason, closed_at
-            )
-            VALUES (?, ?, 'BTCUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 0.1, 0, 0.8, 'stop_loss', CURRENT_TIMESTAMP)
-            """,
-            (signal_id, snapshot_id),
-        )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        # 07-16 cutover: PG ``paper_trades`` has no ``signal_id``/``market_snapshot_id``
+        # (normalized away -- the snapshot is reached via the order -> signal chain,
+        # see ``trade_reviewer._snapshot_context``). Create a ``paper_orders`` row bound
+        # to ``signal_id`` (which carries ``market_snapshot_id`` on ``signals``), then
+        # link the trade via ``order_id`` so ``review_trade`` can resolve the snapshot.
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_orders(
+                        signal_id, symbol, side, order_type, entry_price, stop_loss, quantity,
+                        status, source, risk_check_passed
+                    )
+                    VALUES (%s, 'BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'filled', 'signal_compat', TRUE)
+                    RETURNING id
+                    """,
+                    (signal_id,),
+                )
+                order_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    """
+                    INSERT INTO paper_trades(
+                        order_id, symbol, side, entry_price, exit_price, stop_loss, quantity,
+                        pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion,
+                        entry_efficiency, exit_efficiency, signal_decay_score, close_reason, closed_at
+                    )
+                    VALUES (%s, 'BTCUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 0.1, 0, 0.8, 'stop_loss', CURRENT_TIMESTAMP)
+                    RETURNING id
+                    """,
+                    (order_id,),
+                )
+                trade_id = int(cur.fetchone()["id"])
+        self.conn.commit()
 
         # Mock backtest to skip (no candle data in test DB)
         with patch(
@@ -1627,9 +1862,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertTrue(review["source_snapshot"]["available"])
         self.assertTrue(review["evidence_checklist"])
         self.assertTrue(result["patch_id"])
-        patch = self.conn.execute("SELECT * FROM strategy_patches WHERE id=?", (result["patch_id"],)).fetchone()
+        patch = self.conn.execute("SELECT * FROM strategy_patches WHERE id=%s", (result["patch_id"],)).fetchone()
         self.assertEqual(patch["status"], "shadow_testing")
-        evidence = json.loads(patch["evidence_json"])
+        evidence = patch["evidence_json"]
         self.assertEqual(evidence["review_id"], result["review_id"])
 
     def test_phase12_strategy_versions_candidate_and_rollback(self) -> None:
@@ -1775,7 +2010,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertGreater(result["stats"]["signal_count"], 0)
         self.assertTrue(result["strategy_comparison"])
         self.assertTrue(os.path.exists(export_path))
-        saved = self.conn.execute("SELECT * FROM historical_replay_results WHERE id=?", (result["replay_result_id"],)).fetchone()
+        saved = self.conn.execute("SELECT * FROM historical_replay_results WHERE id=%s", (result["replay_result_id"],)).fetchone()
         self.assertIsNotNone(saved)
 
     def test_phase15_self_evolution_audit_overfit_gate_and_shadow(self) -> None:
@@ -1784,14 +2019,18 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
             for idx in range(2):
-                self.conn.execute(
-                    """
-                    INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
-                    VALUES (?, 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 'stop_loss', CURRENT_TIMESTAMP)
-                    """,
-                    (symbol,),
-                )
-                trade_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                with self.conn.transaction():
+                    with self.conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
+                            VALUES (%s, 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 'stop_loss', CURRENT_TIMESTAMP)
+                            RETURNING id
+                            """,
+                            (symbol,),
+                        )
+                        trade_id = int(cur.fetchone()["id"])
+                self.conn.commit()
                 self.repo.save_trade_review(
                     trade_id,
                     {
@@ -1856,7 +2095,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.assertIn("explanation", promoted)
         self.assertTrue(promoted["audit_steps"])
-        saved_run = self.conn.execute("SELECT * FROM self_evolution_runs WHERE id=?", (promoted["run_id"],)).fetchone()
+        saved_run = self.conn.execute("SELECT * FROM self_evolution_runs WHERE id=%s", (promoted["run_id"],)).fetchone()
         self.assertIsNotNone(saved_run)
 
     def test_backtest_gate_disabled_uses_5_samples(self) -> None:
@@ -1877,7 +2116,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         # Save gate_disabled result
         self.conn.execute(
-            "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
+            "UPDATE strategy_patches SET backtest_result_json=%s WHERE id=%s",
             (json.dumps({"ok": True, "passed": True, "gate_disabled": True, "reason": "backtest_gate_disabled"}), patch_id),
         )
         self.repo.save_strategy_version(
@@ -1909,7 +2148,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         # Save skipped result (no scoring changes)
         self.conn.execute(
-            "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
+            "UPDATE strategy_patches SET backtest_result_json=%s WHERE id=%s",
             (json.dumps({"ok": True, "passed": False, "skipped": True, "reason": "skipped_or_needs_online_shadow"}), patch_id),
         )
 
@@ -1951,7 +2190,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
-                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s)
                 """,
                 (closed_at,),
             )
@@ -2022,14 +2261,18 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Create paper trade linked to this decision
         signal_id = saved.get("signal_id")
-        self.conn.execute(
-            """
-            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
-            VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', ?)
-            """,
-            (signal_id,),
-        )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
+                    VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', %s)
+                    RETURNING id
+                    """,
+                    (signal_id,),
+                )
+                order_id = int(cur.fetchone()["id"])
+        self.conn.commit()
 
         # Insert 3 losing trades
         now = datetime.now(timezone.utc)
@@ -2038,10 +2281,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, order_id)
-                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, ?)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s, %s)
                 """,
                 (closed_at, order_id),
             )
+        self.conn.commit()
 
         # Clear cache to ensure fresh data is read
         gate._cache.clear()
@@ -2114,15 +2358,16 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 trade,
             )
+        self.conn.commit()
 
         # Verify trades were inserted
         count = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trades WHERE symbol='ETHUSDT' AND side='SHORT' AND closed_at IS NOT NULL"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(count, 5)
 
         # Check confidence should be degraded (avg_r = (-1+0.1+0.1-1-1)/5 = -0.56)
@@ -2199,14 +2444,18 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         hist_signal_id = saved.get("signal_id")
 
         # Create paper order and trades
-        self.conn.execute(
-            """
-            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
-            VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', ?)
-            """,
-            (hist_signal_id,),
-        )
-        hist_order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, signal_id)
+                    VALUES ('BTCUSDT', 'LONG', 'limit', 100, 95, 1, 'closed', %s)
+                    RETURNING id
+                    """,
+                    (hist_signal_id,),
+                )
+                hist_order_id = int(cur.fetchone()["id"])
+        self.conn.commit()
 
         # Insert 3 losing trades to trigger context_performance gate
         for i in range(3):
@@ -2214,10 +2463,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, order_id)
-                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, ?)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s, %s)
                 """,
                 (closed_at, hist_order_id),
             )
+        self.conn.commit()
 
         # Disable cooldown to isolate context_performance test
         controller.performance_gate._config["cooldown"]["loss_count_threshold"] = 100
@@ -2291,15 +2541,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Insert trade reviews to pass gates
         for i in range(6):
-            self.conn.execute(
+            trade_id = int(self.conn.execute(
                 """INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, max_favorable_excursion, max_adverse_excursion, close_reason, closed_at)
-                VALUES (?, 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)""",
+                VALUES (%s, 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP) RETURNING id""",
                 (f"SYM{i}USDT",),
-            )
-            trade_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            ).fetchone()["id"])
             self.conn.execute(
                 """INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context, improvement_suggestion, ga_review_json)
-                VALUES (?, 'loss', 'test_loss', '[]', '{}', 'test', '{}')""",
+                VALUES (%s, 'loss', 'test_loss', '[]', '{}', 'test', '{}')""",
                 (trade_id,),
             )
         self.conn.commit()
@@ -2333,12 +2582,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         # First trigger
         first = evaluate_evolution_triggers(self.repo)
         self.assertTrue(first["triggered"])
-        first_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()[0]
+        first_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()["count"]
 
         # Second trigger with same trades - should reuse
         second = evaluate_evolution_triggers(self.repo)
         # Should NOT create new trigger
-        second_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()[0]
+        second_trigger_count = self.conn.execute("SELECT COUNT(*) FROM evolution_triggers").fetchone()["count"]
         self.assertEqual(first_trigger_count, second_trigger_count)
 
     def test_controller_writes_shadow_evaluation(self) -> None:
@@ -2390,7 +2639,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Check shadow evaluation was written
         evals = self.conn.execute(
-            "SELECT * FROM strategy_evaluations WHERE strategy_version='shadow-test-v1' AND is_shadow=1"
+            "SELECT * FROM strategy_evaluations WHERE strategy_version='shadow-test-v1' AND is_shadow=TRUE"
         ).fetchall()
         self.assertGreaterEqual(len(evals), 1)
         self.assertEqual(evals[0]["symbol"], "BTCUSDT")
@@ -2421,7 +2670,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         for i in range(30):
             self.conn.execute(
                 """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, paper_trade_id)
-                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', '1.0', 0.5, 'trade_plan_available', 0, -0.5, 'real_pnl', ?, ?)""",
+                VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long', '1.0', 0.5, 'trade_plan_available', FALSE, -0.5, 'real_pnl', %s, %s)""",
                 (1700000000 + i, 10000 + i, 10000 + i),
             )
 
@@ -2430,7 +2679,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         for i in range(30):
             self.conn.execute(
                 """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, shadow_virtual_trade_id)
-                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'verdict-test-v1', 0.7, 'trade_plan_available', 1, 0.3, 'real_pnl', ?, ?)""",
+                VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long', 'verdict-test-v1', 0.7, 'trade_plan_available', TRUE, 0.3, 'real_pnl', %s, %s)""",
                 (1700000000 + i, 10000 + i, 20000 + i),
             )
         self.conn.commit()
@@ -2486,7 +2735,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             change_reason="test",
         )
         self.conn.execute(
-            "UPDATE strategy_versions SET created_at=? WHERE version='stale-no-backtest'",
+            "UPDATE strategy_versions SET created_at=%s WHERE version='stale-no-backtest'",
             (stale_time,),
         )
         trigger_id = self.repo.create_evolution_trigger(
@@ -2495,7 +2744,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         )
         self.conn.execute(
             """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status)
-            VALUES ('smc_pullback_long', '1.0', 'stale-no-backtest', '{}', 'test', ?, 'shadow_testing')""",
+            VALUES ('smc_pullback_long', '1.0', 'stale-no-backtest', '{}', 'test', %s, 'shadow_testing')""",
             (trigger_id,),
         )
         self.conn.commit()
@@ -2513,20 +2762,20 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             change_reason="test",
         )
         self.conn.execute(
-            "UPDATE strategy_versions SET created_at=? WHERE version='stale-with-backtest'",
+            "UPDATE strategy_versions SET created_at=%s WHERE version='stale-with-backtest'",
             (stale_time,),
         )
         # Create patch with backtest passed
         self.conn.execute(
             """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status, backtest_result_json)
-            VALUES ('smc_pullback_long', '1.0', 'stale-with-backtest', '{}', 'test', ?, 'shadow_testing', ?)""",
+            VALUES ('smc_pullback_long', '1.0', 'stale-with-backtest', '{}', 'test', %s, 'shadow_testing', %s)""",
             (trigger_id, json.dumps({"ok": True, "passed": True, "skipped": False})),
         )
         # Add 3 shadow evaluations (less than 5 but more than 0)
         for i in range(3):
             self.conn.execute(
                 """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow)
-                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'stale-with-backtest', 0.5, 'trade_plan_available', 1)""",
+                VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long', 'stale-with-backtest', 0.5, 'trade_plan_available', TRUE)""",
                 (1700000000 + i,),
             )
         self.conn.commit()
@@ -2544,19 +2793,19 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             change_reason="test",
         )
         self.conn.execute(
-            "UPDATE strategy_versions SET created_at=? WHERE version='stale-enough-samples'",
+            "UPDATE strategy_versions SET created_at=%s WHERE version='stale-enough-samples'",
             (stale_time,),
         )
         self.conn.execute(
             """INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, reason, trigger_id, status, backtest_result_json)
-            VALUES ('smc_pullback_long', '1.0', 'stale-enough-samples', '{}', 'test', ?, 'shadow_testing', ?)""",
+            VALUES ('smc_pullback_long', '1.0', 'stale-enough-samples', '{}', 'test', %s, 'shadow_testing', %s)""",
             (trigger_id, json.dumps({"ok": True, "passed": True, "skipped": False})),
         )
         # Add 5 shadow evaluations (exactly min_samples_after_backtest)
         for i in range(5):
             self.conn.execute(
                 """INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow)
-                VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long', 'stale-enough-samples', 0.5, 'trade_plan_available', 1)""",
+                VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long', 'stale-enough-samples', 0.5, 'trade_plan_available', TRUE)""",
                 (1700000000 + i,),
             )
         self.conn.commit()
@@ -2611,7 +2860,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertIn("test-candidate-v1", row["dedupe_key"])
 
         # Verify payload contains the correct receive_id
-        outbox_payload = json.loads(row["payload_json"])
+        _op_raw = row["payload_json"]
+        outbox_payload = json.loads(_op_raw) if isinstance(_op_raw, str) else _op_raw
         self.assertEqual(outbox_payload["receive_id"], "chat_test_123")
         self.assertEqual(outbox_payload["msg_type"], "interactive")
 
@@ -2648,7 +2898,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertIsNotNone(row)
 
         # Parse card content
-        outbox_payload = json.loads(row["payload_json"])
+        _op_raw = row["payload_json"]
+        outbox_payload = json.loads(_op_raw) if isinstance(_op_raw, str) else _op_raw
         card = json.loads(outbox_payload["content"])
 
         # Verify card structure
@@ -2776,24 +3027,22 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         exit_price = entry + (pnl / 1.0)  # crude approximation
         stop_loss = 95.0 if side == "LONG" else 105.0
         self.conn.execute(
-            "INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES (?, 1)",
+            "INSERT INTO symbols(symbol, enabled) VALUES (%s, TRUE) ON CONFLICT (symbol) DO NOTHING",
             (symbol,),
         )
-        self.conn.execute(
+        order_id = int(self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, quantity, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s::timestamptz) RETURNING id",
             (symbol, side, "market", entry, 0.01, "filled", "2026-06-20T10:00:00Z"),
-        )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
+        ).fetchone()["id"])
+        trade_id = int(self.conn.execute(
             "INSERT INTO paper_trades(symbol, side, order_id, entry_price, stop_loss, "
             "exit_price, pnl, pnl_r, close_reason, quantity, created_at, closed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.01, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0.01, %s::timestamptz, %s::timestamptz) RETURNING id",
             (symbol, side, order_id, entry, stop_loss,
              exit_price, pnl, pnl_r, close_reason,
              "2026-06-20T09:00:00Z", "2026-06-20T14:00:00Z"),
-        )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ).fetchone()["id"])
         self.conn.commit()
         return trade_id
 
@@ -2882,7 +3131,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify related_trade_ids updated to latest
         row = self.repo.conn.execute(
-            "SELECT related_trade_ids, latest_triggered_at FROM evolution_triggers WHERE id=?",
+            "SELECT related_trade_ids, latest_triggered_at FROM evolution_triggers WHERE id=%s",
             (trigger_id,),
         ).fetchone()
         import json
@@ -2905,12 +3154,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         if result.get("patch_id"):
             # Check that backtest_result_json was written
             row = self.repo.conn.execute(
-                "SELECT backtest_result_json FROM strategy_patches WHERE id=?",
+                "SELECT backtest_result_json FROM strategy_patches WHERE id=%s",
                 (result["patch_id"],),
             ).fetchone()
             self.assertIsNotNone(row, "strategy_patches should have backtest_result_json")
             import json
-            bt = json.loads(row["backtest_result_json"])
+            _bt_raw = row["backtest_result_json"]
+            bt = json.loads(_bt_raw) if isinstance(_bt_raw, str) else _bt_raw
             self.assertIn("passed", bt)
 
     # ── Fix 5: Shadow state pseudo-R vs real PnL ──
@@ -2973,12 +3223,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         from plugins.crypto_guard.review.trade_reviewer import review_trade
 
         # Create trade with order linked to a ga_decision that has top-level strategy_name
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute(
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        order_id = int(self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, quantity, status, created_at) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 100, 0.01, 'filled', '2026-06-20T10:00:00Z')"
-        )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            "VALUES ('BTCUSDT', 'LONG', 'market', 100, 0.01, 'filled', '2026-06-20T10:00:00Z'::timestamptz) RETURNING id"
+        ).fetchone()["id"])
 
         # Create ga_decision with top-level strategy_name (no raw_legacy_decision)
         ga_id = self.repo.create_ga_decision({
@@ -2994,17 +3243,16 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "strategy_version": "2.0",
         })
         # Link paper_order to ga_decision
-        self.conn.execute("UPDATE paper_orders SET ga_decision_id=? WHERE id=?", (ga_id, order_id))
+        self.conn.execute("UPDATE paper_orders SET ga_decision_id=%s WHERE id=%s", (ga_id, order_id))
 
         # Create the trade
-        self.conn.execute(
+        trade_id = int(self.conn.execute(
             "INSERT INTO paper_trades(symbol, side, order_id, entry_price, stop_loss, "
             "exit_price, pnl, pnl_r, close_reason, quantity, created_at, closed_at) "
-            "VALUES ('BTCUSDT', 'LONG', ?, 100, 95, 150, 50, 1.0, 'take_profit', 0.01, "
-            "'2026-06-20T09:00:00Z', '2026-06-20T14:00:00Z')",
+            "VALUES ('BTCUSDT', 'LONG', %s, 100, 95, 150, 50, 1.0, 'take_profit', 0.01, "
+            "'2026-06-20T09:00:00Z'::timestamptz, '2026-06-20T14:00:00Z'::timestamptz) RETURNING id",
             (order_id,),
-        )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ).fetchone()["id"])
         self.conn.commit()
 
         result = review_trade(self.repo, trade_id)
@@ -3106,21 +3354,22 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         # Also need an active version (no_active_version won't trigger rejection — it sets skipped=False default but ok=False only)
         # Actually for exception test we mock run_backtest_gate to raise, so active version doesn't matter
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-exception", "shadow_testing", "{}", "test"),
         )
-        self.conn.execute(
+        patch_id = int(self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("smc_pullback_long", "1.0", "v2-test-exception", '{"patch":{"score_adjustments":{"entry":0.05}}}', "candidate"),
-        )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ).fetchone()["id"])
         self.conn.commit()
 
         with patch(
@@ -3131,12 +3380,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify backtest_result_json was written
         row = self.conn.execute(
-            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=?",
+            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=%s",
             (patch_id,),
         ).fetchone()
         self.assertIsNotNone(row["backtest_result_json"])
         import json
-        bt = json.loads(row["backtest_result_json"])
+        _bt_raw = row["backtest_result_json"]
+        bt = json.loads(_bt_raw) if isinstance(_bt_raw, str) else _bt_raw
         self.assertFalse(bt["ok"])
         self.assertFalse(bt["passed"])
         self.assertEqual(bt["reason"], "backtest_exception")
@@ -3145,7 +3395,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify strategy_version also rejected
         sv = self.conn.execute(
-            "SELECT status FROM strategy_versions WHERE version=?",
+            "SELECT status FROM strategy_versions WHERE version=%s",
             ("v2-test-exception",),
         ).fetchone()
         self.assertEqual(sv["status"], "rejected")
@@ -3156,21 +3406,22 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         from unittest.mock import patch
 
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-okfalse", "shadow_testing", "{}", "test"),
         )
-        self.conn.execute(
+        patch_id = int(self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("smc_pullback_long", "1.0", "v2-test-okfalse", '{"patch":{"score_adjustments":{"entry":0.05}}}', "candidate"),
-        )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ).fetchone()["id"])
         self.conn.commit()
 
         with patch(
@@ -3180,7 +3431,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             _run_backtest_for_candidate(self.repo, "smc_pullback_long", "v2-test-okfalse", patch_id)
 
         row = self.conn.execute(
-            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=?",
+            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=%s",
             (patch_id,),
         ).fetchone()
         self.assertEqual(row["status"], "rejected")
@@ -3194,8 +3445,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Setup active version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.commit()
@@ -3221,12 +3473,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify backtest_result_json exists with ok=False, reason="backtest_exception"
         patch_row = self.conn.execute(
-            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=?",
+            "SELECT backtest_result_json, status FROM strategy_patches WHERE id=%s",
             (result["patch_id"],),
         ).fetchone()
         self.assertIsNotNone(patch_row["backtest_result_json"])
         import json
-        bt = json.loads(patch_row["backtest_result_json"])
+        _bt_raw = patch_row["backtest_result_json"]
+        bt = json.loads(_bt_raw) if isinstance(_bt_raw, str) else _bt_raw
         self.assertFalse(bt["ok"])
         self.assertEqual(bt["reason"], "backtest_exception")
         self.assertEqual(bt["error"], "simulated backtest crash in evolution")
@@ -3234,7 +3487,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify strategy_versions.status='rejected'
         sv = self.conn.execute(
-            "SELECT status FROM strategy_versions WHERE version=?",
+            "SELECT status FROM strategy_versions WHERE version=%s",
             (result.get("candidate_version"),),
         ).fetchone()
         self.assertIsNotNone(sv)
@@ -3242,7 +3495,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify evolution_triggers.status='rejected'
         et = self.conn.execute(
-            "SELECT status FROM evolution_triggers WHERE id=?",
+            "SELECT status FROM evolution_triggers WHERE id=%s",
             (result["trigger_id"],),
         ).fetchone()
         self.assertIsNotNone(et)
@@ -3259,12 +3512,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         if result.get("patch_id"):
             row = self.repo.conn.execute(
-                "SELECT backtest_result_json FROM strategy_patches WHERE id=?",
+                "SELECT backtest_result_json FROM strategy_patches WHERE id=%s",
                 (result["patch_id"],),
             ).fetchone()
             self.assertIsNotNone(row, "strategy_patches should have backtest_result_json")
             import json
-            bt = json.loads(row["backtest_result_json"])
+            _bt_raw = row["backtest_result_json"]
+            bt = json.loads(_bt_raw) if isinstance(_bt_raw, str) else _bt_raw
             self.assertIn("passed", bt)
         # If no patch_id, the test still passes — not all trades generate patches
 
@@ -3276,14 +3530,16 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Setup active version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         # Setup candidate version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-realpnl", "shadow_testing", "{}", "test"),
         )
         # Insert 30 shadow evals: only 1 has real pnl_r with complete audit fields
@@ -3292,7 +3548,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 self.conn.execute(
                     "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                     "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r, outcome_source, ga_decision_id, shadow_virtual_trade_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'real_pnl', 9001, 9001)",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, 'real_pnl', 9001, 9001)",
                     ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-realpnl",
                      0.7, "LONG", "{}", "{}", 1.5),
                 )
@@ -3300,7 +3556,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 self.conn.execute(
                     "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                     "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)",
                     ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-realpnl",
                      0.7, "LONG", "{}", "{}", None),
                 )
@@ -3309,7 +3565,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r, outcome_source, ga_decision_id, paper_trade_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'real_pnl', ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, 'real_pnl', %s, %s)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "1.0",
                  0.7, "LONG", "{}", "{}", 1.0 + i * 0.1, 5000 + i, 5000 + i),
             )
@@ -3331,8 +3587,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Setup candidate version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-nonewr", "shadow_testing", "{}", "test"),
         )
         # Insert pseudo-only shadow evals (no pnl_r)
@@ -3340,7 +3597,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-nonewr",
                  0.7, "LONG", "{}", "{}"),
             )
@@ -3374,26 +3631,27 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Setup active version (needed for patch lookup)
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         # Setup candidate version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-trigger", "shadow_testing", "{}", "test"),
         )
         # Create an evolution trigger first
-        self.conn.execute(
+        trigger_id = int(self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, status, related_trade_ids, strategy_name, trigger_value, threshold_value, created_at) "
-            "VALUES ('consecutive_stop_losses', 'shadow_testing', '[]', 'smc_pullback_long', 3, 3, datetime('now'))"
-        )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            "VALUES ('consecutive_stop_losses', 'shadow_testing', '[]', 'smc_pullback_long', 3, 3, NOW()) RETURNING id"
+        ).fetchone()["id"])
         # Create strategy_patch with trigger_id
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             ("smc_pullback_long", "1.0", "v2-test-trigger", '{}', 'candidate', trigger_id),
         )
         self.conn.commit()
@@ -3403,7 +3661,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-trigger",
                  0.7, "LONG", "{}", "{}"),
             )
@@ -3448,7 +3706,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify initial state: original == latest == related_trade_ids
         row = self.repo.conn.execute(
-            "SELECT original_related_trade_ids, latest_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=?",
+            "SELECT original_related_trade_ids, latest_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=%s",
             (trigger_id,),
         ).fetchone()
         import json
@@ -3469,7 +3727,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify original preserved, latest updated
         row = self.repo.conn.execute(
-            "SELECT original_related_trade_ids, latest_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=?",
+            "SELECT original_related_trade_ids, latest_related_trade_ids, related_trade_ids FROM evolution_triggers WHERE id=%s",
             (trigger_id,),
         ).fetchone()
         self.assertEqual(json.loads(row["original_related_trade_ids"]), [5, 2, 3])
@@ -3484,20 +3742,22 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Setup active version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-llm-insuf", "shadow_testing", "{}", "test"),
         )
         # Only 1 shadow eval
         self.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
             "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)",
             ("BTCUSDT", "1h", 1000000, "smc_pullback_long", "v2-test-llm-insuf",
              0.7, "LONG", "{}", "{}", 1.5),
         )
@@ -3521,13 +3781,15 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         from plugins.crypto_guard.strategy.shadow_testing import run_shadow_test
 
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-llm-partial", "shadow_testing", "{}", "test"),
         )
         # 30 shadow evals with real pnl_r
@@ -3535,7 +3797,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-llm-partial",
                  0.7, "LONG", "{}", "{}", 1.5 + i * 0.1),
             )
@@ -3544,7 +3806,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "1.0",
                  0.6, "LONG", "{}", "{}", 1.0 + i * 0.05),
             )
@@ -3600,13 +3862,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', '1.0', 0.80, "
-            "  'trade_plan_available', 0, 2001, NULL, 'pending_outcome')"
+            "  'trade_plan_available', FALSE, 2001, NULL, 'pending_outcome')"
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', '1.0', 0.80, "
-            "  'trade_plan_available', 0, 2001, NULL, 'pending_outcome')"
+            "  'trade_plan_available', FALSE, 2001, NULL, 'pending_outcome')"
         )
         self.repo.conn.commit()
 
@@ -3615,7 +3877,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(updated, 1, "Only ONE active evaluation should be backfilled (LIMIT 1)")
 
         filled = self.repo.conn.execute(
-            "SELECT COUNT(*) as cnt FROM strategy_evaluations WHERE ga_decision_id=2001 AND is_shadow=0 AND pnl_r IS NOT NULL"
+            "SELECT COUNT(*) as cnt FROM strategy_evaluations WHERE ga_decision_id=2001 AND is_shadow=FALSE AND pnl_r IS NOT NULL"
         ).fetchone()["cnt"]
         self.assertEqual(filled, 1, "Exactly one active evaluation should have pnl_r set")
 
@@ -3652,14 +3914,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'active', "
-            "  0.75, 'trade_plan_available', 0, 2002, NULL, 'pending_outcome')"
+            "  0.75, 'trade_plan_available', FALSE, 2002, NULL, 'pending_outcome')"
         )
         # Shadow eval (is_shadow=1) — must NOT get updated
         self.repo.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'self-evo-1-candidate', "
-            "  0.72, 'monitor_only', 1, 2002, NULL, NULL)"
+            "  0.72, 'monitor_only', TRUE, 2002, NULL, NULL)"
         )
         self.repo.conn.commit()
 
@@ -3669,12 +3931,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify: active eval got pnl_r, shadow eval did NOT
         active_pnl_r = self.repo.conn.execute(
-            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2002 AND is_shadow=0"
+            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2002 AND is_shadow=FALSE"
         ).fetchone()["pnl_r"]
         self.assertIsNotNone(active_pnl_r, "Active eval must be backfilled")
 
         shadow_pnl_r = self.repo.conn.execute(
-            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2002 AND is_shadow=1"
+            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2002 AND is_shadow=TRUE"
         ).fetchone()["pnl_r"]
         self.assertIsNone(shadow_pnl_r, "Shadow eval must NOT be backfilled (no broadcast)")
 
@@ -3700,7 +3962,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         eval_id = result["evaluation_id"]
 
         row = self.repo.conn.execute(
-            "SELECT decision, outcome_source, is_shadow FROM strategy_evaluations WHERE id=?",
+            "SELECT decision, outcome_source, is_shadow FROM strategy_evaluations WHERE id=%s",
             (eval_id,),
         ).fetchone()
         self.assertEqual(row["decision"], "monitor_only")
@@ -3708,7 +3970,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(row["is_shadow"], 1)
         self.assertIsNone(
             self.repo.conn.execute(
-                "SELECT pnl_r FROM strategy_evaluations WHERE id=?", (eval_id,)
+                "SELECT pnl_r FROM strategy_evaluations WHERE id=%s", (eval_id,)
             ).fetchone()["pnl_r"]
         )
 
@@ -3721,13 +3983,13 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('smc_pullback_long_test4', '1.0', 'active', '{}', 'initial', ?)",
+            "VALUES ('smc_pullback_long_test4', '1.0', 'active', '{}', 'initial', %s)",
             (now.isoformat(),),
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
             "VALUES ('smc_pullback_long_test4', 'self-evo-1-candidate', 'shadow_testing', "
-            "  '{\"candidate_patch\": {}}', 'test', ?)",
+            "  '{\"candidate_patch\": {}}', 'test', %s)",
             (now.isoformat(),),
         )
         # Add backtest with gate_disabled so effective_min_samples=5
@@ -3735,7 +3997,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, "
             "  backtest_result_json, created_at) "
             "VALUES ('smc_pullback_long_test4', '1.0', 'self-evo-1-candidate', '{}', 'candidate', "
-            "  '{\"ok\": true, \"passed\": true, \"reason\": \"backtest_gate_disabled\", \"gate_disabled\": true}', ?)",
+            "  '{\"ok\": true, \"passed\": true, \"reason\": \"backtest_gate_disabled\", \"gate_disabled\": true}', %s)",
             (now.isoformat(),),
         )
         # Active: 10 rows but only 1 with real PnL (other 9 are pseudo-r)
@@ -3747,8 +4009,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, paper_trade_id) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_test4', '1.0', "
-                "  0.80, 'trade_plan_available', 0, ?, ?, ?, ?)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_test4', '1.0', "
+                "  0.80, 'trade_plan_available', FALSE, %s, %s, %s, %s)",
                 (1700000000000 + i, pnl, outcome, gid, ptid),
             )
         # Candidate: 10 real PnL with shadow_virtual_trade_id (required for shadow real_pnl classification)
@@ -3756,8 +4018,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, shadow_virtual_trade_id) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_test4', 'self-evo-1-candidate', "
-                "  0.75, 'monitor_only', 1, ?, 'real_pnl', ?, ?)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_test4', 'self-evo-1-candidate', "
+                "  0.75, 'monitor_only', TRUE, %s, 'real_pnl', %s, %s)",
                 (1700000000000 + i, float(i % 3 - 1) * 0.5, 3000 + i, 4000 + i),
             )
         self.repo.conn.commit()
@@ -3785,7 +4047,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             version = f"self-evo-{i+1}-candidate"
             self.repo.conn.execute(
                 "INSERT INTO strategy_versions(id, strategy_name, version, status, config_json, change_reason, created_at) "
-                "VALUES (?, 'smc_pullback_long_test5', ?, 'shadow_testing', '{}', 'test', ?)",
+                "VALUES (%s, 'smc_pullback_long_test5', %s, 'shadow_testing', '{}', 'test', %s)",
                 (3000 + i, version, (now - timedelta(days=i)).isoformat()),
             )
             real_count = max(0, 6 - i)
@@ -3793,8 +4055,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 self.repo.conn.execute(
                     "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                     "  strategy_version, score, decision, is_shadow, pnl_r, outcome_source) "
-                    "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_test5', ?, "
-                    "  0.75, 'monitor_only', 1, -1.0, 'real_pnl')",
+                    "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_test5', %s, "
+                    "  0.75, 'monitor_only', TRUE, -1.0, 'real_pnl')",
                     (1700000000000 + j, version),
                 )
         self.repo.conn.commit()
@@ -3836,7 +4098,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         }
         eval_id = self.repo.save_strategy_evaluation(decision, is_shadow=False)
         row = self.repo.conn.execute(
-            "SELECT ga_decision_id FROM strategy_evaluations WHERE id=?",
+            "SELECT ga_decision_id FROM strategy_evaluations WHERE id=%s",
             (eval_id,),
         ).fetchone()
         self.assertEqual(row["ga_decision_id"], 9999,
@@ -3873,7 +4135,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'self-evo-1-candidate', "
-            "  0.65, 'monitor_only', 1, 2901, NULL, 'avoided_trade')"
+            "  0.65, 'monitor_only', TRUE, 2901, NULL, 'avoided_trade')"
         )
         self.repo.conn.commit()
 
@@ -3885,7 +4147,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
 
         # Verify avoided_trade eval pnl_r still NULL
         pnl_r = self.repo.conn.execute(
-            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2901 AND is_shadow=1"
+            "SELECT pnl_r FROM strategy_evaluations WHERE ga_decision_id=2901 AND is_shadow=TRUE"
         ).fetchone()["pnl_r"]
         self.assertIsNone(pnl_r, "avoided_trade evaluation pnl_r must remain NULL")
 
@@ -4138,12 +4400,11 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
         # Insert a real open long order with stop_loss=98 so the atomic
         # update_paper_order_stop_loss can win and report stop_loss_adjusted=True.
-        self.conn.execute(
+        order_id = self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
             "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open')"
-        )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open') RETURNING id"
+        ).fetchone()["id"]
         self.conn.commit()
         trade = {
             "id": 100, "symbol": "BTCUSDT", "side": "LONG",
@@ -4152,7 +4413,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 1.5,
             "initial_risk_usdt": 2.0,
         }
-        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone())
 
         with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback') as mock_mp:
             # mark price fetch fails → fail-closed (no market.close fallback)
@@ -4186,24 +4447,24 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                     "price_as_of": now.isoformat(),
                     "price_age_seconds": 0.0}
 
+        account_id = int(self.repo.ensure_paper_account()["id"])
+
         # qty=2, MFE=3, risk=(100-98)*2=4, MFE/R=0.75 → passes
         # Insert a real open long order with stop_loss=98 to back the atomic update.
-        self.conn.execute(
+        oid_q2 = self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
             "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 2.0, 100.0, 98.0, 98.0, 'open')"
-        )
-        oid_q2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
+            "VALUES ('BTCUSDT', 'LONG', 'market', 2.0, 100.0, 98.0, 98.0, 'open') RETURNING id"
+        ).fetchone()["id"]
+        tid_q2 = self.conn.execute(
             "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 98.0, 4.0)",
+            "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 98.0, 4.0) RETURNING id",
             (oid_q2,),
-        )
-        tid_q2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 'open')",
-            (tid_q2,),
+            "VALUES (%s, %s, 'BTCUSDT', 'LONG', 100.0, 2.0, 98.0, 'open')",
+            (tid_q2, account_id),
         )
         self.conn.commit()
         trade_q2 = {
@@ -4213,29 +4474,27 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 3.0,
             "initial_risk_usdt": 4.0,
         }
-        order_q2 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q2,)).fetchone())
+        order_q2 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (oid_q2,)).fetchone())
         with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
             result = _maybe_adjust_stop_to_breakeven(self.repo, order_q2, trade_q2, market)
         self.assertIsNotNone(result, "qty=2, MFE=3, risk=4, MFE/R=0.75 → should pass gate")
         self.assertTrue(result.get("stop_loss_adjusted"))
 
         # qty=0.5, MFE=3, risk=1, MFE/R=3.0 → passes
-        self.conn.execute(
+        oid_q05 = self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
             "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 0.5, 100.0, 98.0, 98.0, 'open')"
-        )
-        oid_q05 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
+            "VALUES ('BTCUSDT', 'LONG', 'market', 0.5, 100.0, 98.0, 98.0, 'open') RETURNING id"
+        ).fetchone()["id"]
+        tid_q05 = self.conn.execute(
             "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 98.0, 1.0)",
+            "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 98.0, 1.0) RETURNING id",
             (oid_q05,),
-        )
-        tid_q05 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 'open')",
-            (tid_q05,),
+            "VALUES (%s, %s, 'BTCUSDT', 'LONG', 100.0, 0.5, 98.0, 'open')",
+            (tid_q05, account_id),
         )
         self.conn.commit()
         trade_q05 = {
@@ -4245,7 +4504,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "max_favorable_excursion": 3.0,
             "initial_risk_usdt": 1.0,
         }
-        order_q05 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (oid_q05,)).fetchone())
+        order_q05 = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (oid_q05,)).fetchone())
         with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
             result2 = _maybe_adjust_stop_to_breakeven(self.repo, order_q05, trade_q05, market)
         self.assertIsNotNone(result2, "qty=0.5, MFE=3, risk=1, MFE/R=3.0 → should pass")
@@ -4297,7 +4556,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, "
             "  confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, "
             "  counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES ('BTCUSDT', 1700000000001, ?, 'scheduled', 'A', 0.80, 'bearish', 'middle', "
+            "VALUES ('BTCUSDT', 1700000000001, %s, 'scheduled', 'A', 0.80, 'bearish', 'middle', "
             "  'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{\"side\": \"SHORT\", \"entry_type\": \"limit\"}')",
             ((now - timedelta(minutes=5)).isoformat(),),
         )
@@ -4306,7 +4565,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, "
             "  confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, "
             "  counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES ('BTCUSDT', 1700000000002, ?, 'scheduled', 'B', 0.75, 'bearish', 'middle', "
+            "VALUES ('BTCUSDT', 1700000000002, %s, 'scheduled', 'B', 0.75, 'bearish', 'middle', "
             "  'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{}')",
             ((now - timedelta(minutes=3)).isoformat(),),
         )
@@ -4352,20 +4611,20 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('smc_pullback_long_test14', '1.0', 'active', '{}', 'initial', ?)",
+            "VALUES ('smc_pullback_long_test14', '1.0', 'active', '{}', 'initial', %s)",
             (now.isoformat(),),
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
             "VALUES ('smc_pullback_long_test14', 'self-evo-1-candidate', 'shadow_testing', "
-            "  '{\"candidate_patch\": {}}', 'test', ?)",
+            "  '{\"candidate_patch\": {}}', 'test', %s)",
             (now.isoformat(),),
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, "
             "  backtest_result_json, created_at) "
             "VALUES ('smc_pullback_long_test14', '1.0', 'self-evo-1-candidate', '{}', 'candidate', "
-            "  '{\"ok\": true, \"passed\": true, \"reason\": \"backtest_gate_disabled\", \"gate_disabled\": true}', ?)",
+            "  '{\"ok\": true, \"passed\": true, \"reason\": \"backtest_gate_disabled\", \"gate_disabled\": true}', %s)",
             (now.isoformat(),),
         )
         # Active: 5 total (3 real + 2 pseudo) — must be >= effective_min_samples=5
@@ -4376,9 +4635,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, pnl_r, "
                 "  outcome_source, ga_decision_id, paper_trade_id) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_test14', '1.0', "
-                "  0.80, 'trade_plan_available', 0, ?, "
-                "  ?, ?, ?)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_test14', '1.0', "
+                "  0.80, 'trade_plan_available', FALSE, %s, "
+                "  %s, %s, %s)",
                 (1700000000000 + i, pnl,
                  'real_pnl' if is_real else None,
                  100 + i if is_real else None,
@@ -4392,9 +4651,9 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, pnl_r, "
                 "  outcome_source, ga_decision_id, shadow_virtual_trade_id) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_test14', 'self-evo-1-candidate', "
-                "  0.75, 'monitor_only', 1, ?, "
-                "  ?, ?, ?)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_test14', 'self-evo-1-candidate', "
+                "  0.75, 'monitor_only', TRUE, %s, "
+                "  %s, %s, %s)",
                 (1700000000000 + i, pnl,
                  'real_pnl' if is_real else None,
                  300 + i if is_real else None,
@@ -4482,18 +4741,20 @@ class PendingOrderManagerTest(unittest.TestCase):
             return_value=False,
         )
         self._broker_md_patcher.start()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real PG test
+        # DB (replaces CRYPTO_GUARD_DB=<tmp>.sqlite3 + connect_db +
+        # initialize_database). self.tmp is retained only so legacy inert
+        # ``os.environ["CRYPTO_GUARD_DB"]`` lines do not AttributeError.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
         self._broker_md_patcher.stop()
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm_analysis is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -4514,15 +4775,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         created_at = (datetime.now(timezone.utc) - timedelta(hours=created_hours_ago)).isoformat()
         if expires_at is None and created_hours_ago == 0:
             expires_at = compute_expires_at(order_type)
-        self.conn.execute(
-            """
-            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at)
-            VALUES (?, ?, ?, 100, 95, 1, 'pending', ?, ?)
-            """,
-            (symbol, side, order_type, created_at, expires_at),
-        )
-        self.conn.commit()
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at)
+                    VALUES (%s, %s, %s, 100, 95, 1, 'pending', %s, %s)
+                    RETURNING id
+                    """,
+                    (symbol, side, order_type, created_at, expires_at),
+                )
+                return int(cur.fetchone()["id"])
 
     def _insert_ga_decision(
         self,
@@ -4530,26 +4793,45 @@ class PendingOrderManagerTest(unittest.TestCase):
         market_bias: str = "bullish",
         signal_grade: str = "A",
     ) -> int:
-        self.conn.execute(
-            """
-            INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade,
-                confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json,
-                counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json)
-            VALUES (?, 1700000000000, '2023-11-14T22:13:20', 'scheduled_analysis', ?, 0.8, ?, 'middle',
-                'wait', '{}', '{}', '{}', '{}', '{}', 'test', '{}')
-            """,
-            (symbol, signal_grade, market_bias),
-        )
-        self.conn.commit()
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade,
+                        confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json,
+                        counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json)
+                    VALUES (%s, 1700000000000, '2023-11-14T22:13:20', 'scheduled_analysis', %s, 0.8, %s, 'middle',
+                        'wait', '{}', '{}', '{}', '{}', '{}', 'test', '{}')
+                    RETURNING id
+                    """,
+                    (symbol, signal_grade, market_bias),
+                )
+                return int(cur.fetchone()["id"])
 
     def _seed_paper_data(self) -> None:
         """Seed paper_accounts and other required data for position conflict tests."""
-        self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
-        )
-        self.conn.commit()
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+                    "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+                    "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+                    "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+                    "equity=EXCLUDED.equity"
+                )
+                # The explicit id=1 insert above does NOT advance the IDENTITY
+                # sequence (GENERATED BY DEFAULT AS IDENTITY only advances on
+                # auto-generated inserts). Without this setval, a later
+                # ensure_paper_account(<new_name>) auto-generates id=1 and
+                # collides on the paper_accounts pkey (UniqueViolation (id)=(1)
+                # at repository.ensure_paper_account). Advance the sequence past
+                # the manual id so subsequent auto-generated inserts get
+                # id > MAX(id). (Production never inserts explicit ids, so the
+                # sequence is always correct there; this is a test-only fix.)
+                cur.execute(
+                    "SELECT setval(pg_get_serial_sequence('paper_accounts', 'id'), "
+                    "GREATEST((SELECT MAX(id) FROM paper_accounts), 1))"
+                )
 
     def test_expire_pending_orders_ttl_expired(self) -> None:
         """P0: Orders older than TTL should be expired."""
@@ -4567,12 +4849,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["expired_orders"][0]["id"], old_id)
 
         # Verify old order status
-        old_row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=?", (old_id,)).fetchone()
+        old_row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=%s", (old_id,)).fetchone()
         self.assertEqual(old_row["status"], "expired")
         self.assertIn("挂单已超过", old_row["cancel_reason"])
 
         # Verify fresh order is still pending
-        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (fresh_id,)).fetchone()
+        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (fresh_id,)).fetchone()
         self.assertEqual(fresh_row["status"], "pending")
 
     def test_expire_pending_orders_trigger_short_ttl(self) -> None:
@@ -4614,7 +4896,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["cancelled_orders"][0]["id"], order_id)
 
         row = self.conn.execute(
-            "SELECT status, cancel_reason, invalidated_by_ga_decision_id FROM paper_orders WHERE id=?",
+            "SELECT status, cancel_reason, invalidated_by_ga_decision_id FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(row["status"], "conflict_cancelled")
@@ -4655,7 +4937,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["cancelled_count"], 0)
 
         # Verify order is marked needs_recheck, not cancelled
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "needs_recheck")
 
     def test_cancel_conflict_pending_low_grade_no_cancel(self) -> None:
@@ -4680,10 +4962,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         self.assertEqual(result["cleaned"], 1)
 
-        old_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (old_id,)).fetchone()
+        old_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (old_id,)).fetchone()
         self.assertEqual(old_row["status"], "expired")
 
-        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (fresh_id,)).fetchone()
+        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (fresh_id,)).fetchone()
         self.assertEqual(fresh_row["status"], "pending")
 
     def test_cleanup_stale_pending_no_stale(self) -> None:
@@ -4714,7 +4996,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["expire"]["expired_count"], 1)
         self.assertEqual(result["conflict"]["cancelled_count"], 1)
 
-        safe_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (safe_id,)).fetchone()
+        safe_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (safe_id,)).fetchone()
         self.assertEqual(safe_row["status"], "pending")
 
     def test_compute_expires_at_limit(self) -> None:
@@ -4736,27 +5018,27 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create order with expires_at in the past
         past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at) VALUES (?, ?, ?, 100, 95, 1, 'pending', ?, ?)",
+            "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at) VALUES (%s, %s, %s, 100, 95, 1, 'pending', %s, %s)",
             ("BTCUSDT", "LONG", "limit", datetime.now(timezone.utc).isoformat(), past),
         )
         self.conn.commit()
-        expired_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        expired_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
 
         # Create order with expires_at in the future
         future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
         self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at) VALUES (?, ?, ?, 100, 95, 1, 'pending', ?, ?)",
+            "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at, expires_at) VALUES (%s, %s, %s, 100, 95, 1, 'pending', %s, %s)",
             ("BTCUSDT", "LONG", "limit", datetime.now(timezone.utc).isoformat(), future),
         )
         self.conn.commit()
-        fresh_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        fresh_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
 
         result = expire_pending_orders(self.repo)
 
         self.assertEqual(result["expired_count"], 1)
         self.assertEqual(result["expired_orders"][0]["id"], expired_id)
 
-        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (fresh_id,)).fetchone()
+        fresh_row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (fresh_id,)).fetchone()
         self.assertEqual(fresh_row["status"], "pending")
 
     def test_create_paper_order_writes_expires_at(self) -> None:
@@ -4776,10 +5058,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         order_id, created = self.repo.create_paper_order(None, signal, trade_plan)
         self.assertTrue(created)
 
-        row = self.conn.execute("SELECT expires_at FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT expires_at FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertIsNotNone(row["expires_at"])
         # expires_at should be ~8h from now for limit orders
-        expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        expires = row["expires_at"]
+        if isinstance(expires, str):
+            expires = datetime.fromisoformat(expires.replace("Z", "+00:00"))
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
@@ -4789,7 +5073,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_migration_columns_exist(self) -> None:
         """P0: expires_at, cancelled_at, cancel_reason, invalidated_by_ga_decision_id columns exist after migration."""
-        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
+        cols = {row["name"] for row in self.conn.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'paper_orders' ORDER BY ordinal_position").fetchall()}
         self.assertIn("expires_at", cols)
         self.assertIn("cancelled_at", cols)
         self.assertIn("cancel_reason", cols)
@@ -4816,7 +5100,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(row)
 
-            payload = json.loads(row["payload_json"])
+            payload = _load_json(row["payload_json"])
             self.assertEqual(payload.get("receive_id"), "test_chat_id")
             self.assertEqual(payload.get("msg_type"), "interactive")
             self.assertIn("body", payload.get("content", ""))
@@ -4833,8 +5117,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO paper_accounts(account_name, initial_balance, current_balance, equity)
-            VALUES ('default', ?, ?, ?)
-            ON CONFLICT(account_name) DO UPDATE SET current_balance=excluded.current_balance, equity=excluded.equity
+            VALUES ('default', %s, %s, %s)
+            ON CONFLICT(account_name) DO UPDATE SET current_balance=EXCLUDED.current_balance, equity=EXCLUDED.equity
             """,
             (initial, equity, equity),
         )
@@ -4845,19 +5129,20 @@ class PendingOrderManagerTest(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
         closed_at = closed_at_override or (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
         # Create a dummy order first to satisfy FK constraint
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, status) VALUES (?, ?, 'limit', 'filled')",
-            (symbol, side),
-        )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
-            """
-            INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, stop_loss, pnl_r, closed_at)
-            VALUES (?, ?, ?, 100, 105, 95, ?, ?)
-            """,
-            (order_id, symbol, side, pnl_r, closed_at),
-        )
-        self.conn.commit()
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_orders(symbol, side, order_type, status) VALUES (%s, %s, 'limit', 'filled') RETURNING id",
+                    (symbol, side),
+                )
+                order_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    """
+                    INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, stop_loss, pnl_r, closed_at)
+                    VALUES (%s, %s, %s, 100, 105, 95, %s, %s)
+                    """,
+                    (order_id, symbol, side, pnl_r, closed_at),
+                )
 
     def _risk_approved_snapshot_id(self, symbol: str = "BTCUSDT") -> int:
         snapshot = {
@@ -5074,14 +5359,16 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Setup active version (pseudo-only — no pnl_r)
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "1.0", "active", "{}", "seed"),
         )
         # Setup candidate version
         self.conn.execute(
-            "INSERT OR REPLACE INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status=EXCLUDED.status, config_json=EXCLUDED.config_json, change_reason=EXCLUDED.change_reason",
             ("smc_pullback_long", "v2-test-active-pseudo", "shadow_testing", "{}", "test"),
         )
         # Insert 30 active evals with NO pnl_r (pseudo-only baseline)
@@ -5089,7 +5376,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "1.0",
                  0.7, "LONG", "{}", "{}"),
             )
@@ -5098,7 +5385,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, "
                 "score, decision, evidence_json, counter_evidence_json, is_shadow, pnl_r, outcome_source, ga_decision_id, shadow_virtual_trade_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'real_pnl', ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, 'real_pnl', %s, %s)",
                 ("BTCUSDT", "1h", 1000000 + i * 60000, "smc_pullback_long", "v2-test-active-pseudo",
                  0.7, "LONG", "{}", "{}", 1.5, 9000 + i, 9000 + i),
             )
@@ -5133,15 +5420,17 @@ class PendingOrderManagerTest(unittest.TestCase):
     def _insert_needs_recheck_order(self, symbol: str = "BTCUSDT", side: str = "LONG", created_hours_ago: float = 0) -> int:
         from datetime import datetime, timedelta, timezone
         created_at = (datetime.now(timezone.utc) - timedelta(hours=created_hours_ago)).isoformat()
-        self.conn.execute(
-            """
-            INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at)
-            VALUES (?, ?, 'limit', 100, 95, 1, 'needs_recheck', ?)
-            """,
-            (symbol, side, created_at),
-        )
-        self.conn.commit()
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, status, created_at)
+                    VALUES (%s, %s, 'limit', 100, 95, 1, 'needs_recheck', %s)
+                    RETURNING id
+                    """,
+                    (symbol, side, created_at),
+                )
+                return int(cur.fetchone()["id"])
 
     def test_revalidator_needs_recheck_timeout(self) -> None:
         """P0: needs_recheck orders older than 4h should be converted to watch."""
@@ -5156,7 +5445,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIn("超时", result["actions"][0]["reason"])
 
         # Verify order status changed
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "watch_cancelled")
 
     def test_revalidator_keeps_fresh_needs_recheck(self) -> None:
@@ -5168,7 +5457,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Should have 0 actions (kept)
         self.assertEqual(result["actions_count"], 0)
 
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "needs_recheck")
 
     def test_revalidator_late_trend_stage(self) -> None:
@@ -5265,7 +5554,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["actions"][0]["action"], "cancel")
         self.assertIn("方向冲突", result["actions"][0]["reason"])
 
-        row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status, cancel_reason FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "revalidator_cancelled")
         self.assertIn("方向冲突", row["cancel_reason"])
 
@@ -5399,7 +5688,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         if not signal_row:
             # Create a dummy signal
             self.conn.execute(
-                "INSERT INTO signals (symbol, decision, confidence, trade_plan_json) VALUES (?, ?, ?, ?)",
+                "INSERT INTO signals (symbol, decision, confidence, trade_plan_json) VALUES (%s, %s, %s, %s)",
                 ("BTCUSDT", "trade_plan_available", 0.85, json.dumps({
                     "side": "LONG", "entry_type": "limit", "stop_loss": 95.0,
                     "take_profits": [110.0], "risk_percent": 0.5,
@@ -5445,11 +5734,11 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Create pending orders
         self.conn.execute(
-            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at) VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "LONG", "limit", "pending", "2026-06-04T10:00:00"),
         )
         self.conn.execute(
-            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at) VALUES (%s, %s, %s, %s, %s)",
             ("ETHUSDT", "SHORT", "trigger", "needs_recheck", "2026-06-04T10:00:00"),
         )
         self.conn.commit()
@@ -5469,7 +5758,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._setup_paper_account(equity=9650.0, initial=10000.0)
 
         self.conn.execute(
-            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at, ga_decision_id) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_orders (symbol, side, order_type, status, created_at, ga_decision_id) VALUES (%s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", "LONG", "limit", "pending", "2026-06-04T10:00:00", 1),
         )
         self.conn.commit()
@@ -5891,7 +6180,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at, signal_decay_score)
-                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?, 0.8)
+                VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s, 0.8)
                 """,
                 (closed_at,),
             )
@@ -5923,7 +6212,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.conn.execute(
                 """
                 INSERT INTO paper_trades(symbol, side, entry_price, exit_price, stop_loss, quantity, pnl, pnl_percent, pnl_r, close_reason, closed_at)
-                VALUES (?, ?, 100, 95, 95, 1, -5, -5, -1, 'stop_loss', ?)
+                VALUES (%s, %s, 100, 95, 95, 1, -5, -5, -1, 'stop_loss', %s)
                 """,
                 (symbol, side, closed_at),
             )
@@ -6100,38 +6389,39 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, trigger_id, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_orphan', NULL, 'draft', datetime('now'), '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_orphan', NULL, 'draft', NOW(), '{}')
             """
         )
         self.conn.commit()
 
     def _insert_status_mismatch(self) -> None:
         """Insert trigger/pitch with mismatched statuses."""
-        # Insert a trigger with pending status
-        self.conn.execute(
-            """
-            INSERT INTO evolution_triggers(strategy_name, trigger_type, status, created_at)
-            VALUES ('test_strategy', 'pattern_loss', 'pending', datetime('now'))
-            """
-        )
-        trigger_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                # Insert a trigger with pending status
+                cur.execute(
+                    """
+                    INSERT INTO evolution_triggers(strategy_name, trigger_type, status, created_at)
+                    VALUES ('test_strategy', 'pattern_loss', 'pending', NOW()) RETURNING id
+                    """
+                )
+                trigger_id = int(cur.fetchone()["id"])
 
-        # Insert a patch with rejected status linked to this trigger
-        self.conn.execute(
-            """
-            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, trigger_id, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_mismatch', ?, 'rejected', datetime('now'), '{}')
-            """,
-            (trigger_id,),
-        )
-        self.conn.commit()
+                # Insert a patch with rejected status linked to this trigger
+                cur.execute(
+                    """
+                    INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, trigger_id, status, created_at, patch_json)
+                    VALUES ('test_strategy', 'v0.9', 'v1.0_mismatch', %s, 'rejected', NOW(), '{}')
+                    """,
+                    (trigger_id,),
+                )
 
     def _insert_stale_shadow(self) -> None:
         """Insert a shadow_testing candidate with stale update (>7 days)."""
         self.conn.execute(
             """
             INSERT INTO strategy_versions(strategy_name, version, status, created_at, config_json)
-            VALUES ('test_strategy', 'v1.0_stale', 'shadow_testing', datetime('now', '-10 days'), '{}')
+            VALUES ('test_strategy', 'v1.0_stale', 'shadow_testing', NOW() - INTERVAL '10 days', '{}')
             """
         )
         self.conn.commit()
@@ -6141,7 +6431,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_limbo', 'draft', datetime('now', '-4 days'), '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_limbo', 'draft', NOW() - INTERVAL '4 days', '{}')
             """
         )
         self.conn.commit()
@@ -6308,7 +6598,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
-            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Old loss', 'false_breakout_loss', 'candidate', datetime('now', '-60 days'))
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Old loss', 'false_breakout_loss', 'candidate', NOW() - INTERVAL '60 days')
             """
         )
         self.conn.commit()
@@ -6341,7 +6631,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
-            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Test feedback', 'false_breakout_loss', ?, datetime('now', ?))
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Test feedback', 'false_breakout_loss', %s, NOW() + %s::interval)
             """,
             (status, f"-{days_old} days"),
         )
@@ -6382,24 +6672,26 @@ class PendingOrderManagerTest(unittest.TestCase):
         from plugins.crypto_guard.diagnostics.feedback_ttl import apply_feedback_ttl
 
         # Insert old feedback
-        self.conn.execute(
-            """
-            INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
-            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected feedback', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
-            """
-        )
-        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
+                    VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected feedback', 'false_breakout_loss', 'decayed', NOW() - INTERVAL '100 days')
+                    RETURNING id
+                    """
+                )
+                feedback_id = int(cur.fetchone()["id"])
 
-        # Insert active patch referencing this feedback
-        import json
-        self.conn.execute(
-            """
-            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0', 'active', '{}', ?)
-            """,
-            (json.dumps({"feedback_ids": [feedback_id]}),),
-        )
-        self.conn.commit()
+                # Insert active patch referencing this feedback
+                import json
+                cur.execute(
+                    """
+                    INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
+                    VALUES ('test_strategy', 'v0.9', 'v1.0', 'active', '{}', %s)
+                    """,
+                    (json.dumps({"feedback_ids": [feedback_id]}),),
+                )
 
         result = apply_feedback_ttl(self.repo)
         self.assertTrue(result["ok"])
@@ -6457,14 +6749,14 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO strategy_versions(strategy_name, version, status, created_at, config_json)
-            VALUES ('test_strategy', 'v1.0_active_dep', 'deprecated', datetime('now'), '{}')
+            VALUES ('test_strategy', 'v1.0_active_dep', 'deprecated', NOW(), '{}')
             """
         )
         # Insert patch as active referencing the deprecated version
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_active_dep', 'active', datetime('now'), '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_active_dep', 'active', NOW(), '{}')
             """
         )
         self.conn.commit()
@@ -6491,13 +6783,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'draft', datetime('now'), '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'draft', NOW(), '{}')
             """
         )
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, created_at, patch_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'candidate', datetime('now'), '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_dup', 'candidate', NOW(), '{}')
             """
         )
         self.conn.commit()
@@ -6521,17 +6813,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
-            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via patch', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via patch', 'false_breakout_loss', 'decayed', NOW() - INTERVAL '100 days')
             """
         )
-        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        feedback_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
 
         # Insert active patch referencing this feedback via patch_json
         import json
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_patch_ref', 'active', ?, '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_patch_ref', 'active', %s, '{}')
             """,
             (json.dumps({"feedback_id": feedback_id}),),
         )
@@ -6549,17 +6841,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO skill_feedback_memory(skill_name, skill_version, feedback_type, source_type, finding, pattern_type, status, created_at)
-            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via source', 'false_breakout_loss', 'decayed', datetime('now', '-100 days'))
+            VALUES ('price_action', '1.0', 'daily_review', 'daily_review', 'Protected via source', 'false_breakout_loss', 'decayed', NOW() - INTERVAL '100 days')
             """
         )
-        feedback_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        feedback_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
 
         # Insert active patch referencing this feedback via source_feedback_ids in patch_json
         import json
         self.conn.execute(
             """
             INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, status, patch_json, evidence_json)
-            VALUES ('test_strategy', 'v0.9', 'v1.0_source_ref', 'active', ?, '{}')
+            VALUES ('test_strategy', 'v0.9', 'v1.0_source_ref', 'active', %s, '{}')
             """,
             (json.dumps({"source_feedback_ids": [feedback_id]}),),
         )
@@ -6581,13 +6873,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             """
             INSERT INTO strategy_evaluations(strategy_name, strategy_version, symbol, timeframe, analysis_time, is_shadow, pnl_r, outcome_source, created_at)
-            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, 1, 0.0, 'real_pnl', datetime('now'))
+            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, TRUE, 0.0, 'real_pnl', NOW())
             """
         )
         self.conn.execute(
             """
             INSERT INTO strategy_evaluations(strategy_name, strategy_version, symbol, timeframe, analysis_time, is_shadow, pnl_r, outcome_source, created_at)
-            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, 1, NULL, NULL, datetime('now'))
+            VALUES ('test_strategy', 'v1.0', 'BTCUSDT', '1h', 1700000000, TRUE, NULL, NULL, NOW())
             """
         )
         self.conn.commit()
@@ -6654,7 +6946,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "3 consecutive stop losses",
              _json.dumps({"candidate_patch_id": 99001}),
@@ -6664,7 +6956,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("momentum", "1.0", "evolution_trigger", "evolution_trigger",
              "daily_loss_threshold", "4 stop losses hit threshold",
              _json.dumps({"candidate_patch_id": 99002}),
@@ -6701,7 +6993,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "old event",
              _json.dumps({"candidate_patch_id": 99003}),
@@ -6713,7 +7005,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("momentum", "1.0", "evolution_trigger", "evolution_trigger",
              "daily_loss_threshold", "recent event",
              _json.dumps({"candidate_patch_id": 99004}),
@@ -6750,7 +7042,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "3 consecutive stop losses",
              _json.dumps({"candidate_patch_id": 99101}),
@@ -6778,7 +7070,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "old event",
              _json.dumps({"candidate_patch_id": 99102}),
@@ -6804,7 +7096,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "3 consecutive stop losses",
              _json.dumps({"candidate_patch_id": 99103}),
@@ -6856,40 +7148,42 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
 
         # Create a paper trade so the gate can detect affected symbols
-        self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
-        )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+                )
+                trade_id = int(cur.fetchone()["id"])
 
-        # Create evolution_trigger linked to this trade
-        self.conn.execute(
-            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
-        )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+                # Create evolution_trigger linked to this trade
+                cur.execute(
+                    "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+                )
+                trigger_id = int(cur.fetchone()["id"])
 
-        # Create strategy_patch linked to this trigger
-        self.conn.execute(
-            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
-        )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+                # Create strategy_patch linked to this trigger
+                cur.execute(
+                    "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+                )
+                patch_id = int(cur.fetchone()["id"])
 
-        # Insert recent consecutive_stop_losses event linked to the patch
-        self.conn.execute(
-            "INSERT INTO skill_feedback_memory "
-            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
-            "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
-             "consecutive_stop_losses", "3 consecutive stop losses",
-             _json.dumps({"candidate_patch_id": patch_id}),
-             "candidate", now),
-        )
+                # Insert recent consecutive_stop_losses event linked to the patch
+                cur.execute(
+                    "INSERT INTO skill_feedback_memory "
+                    "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+                    "suggested_adjustment_json, status, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+                     "consecutive_stop_losses", "3 consecutive stop losses",
+                     _json.dumps({"candidate_patch_id": patch_id}),
+                     "candidate", now),
+                )
         self.conn.commit()
 
         # Run gate
@@ -6898,18 +7192,18 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Save to GA decision (mimic paper_broker behavior)
         if gate_result.get("active"):
             self.conn.execute(
-                "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+                "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
                 (_json.dumps(gate_result, ensure_ascii=False), ga_id),
             )
             self.conn.commit()
 
         # Verify saved
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertIsNotNone(row["account_feedback_gate_json"])
-        saved = _json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["ok"])
         self.assertTrue(saved["active"])
 
@@ -6924,35 +7218,36 @@ class PendingOrderManagerTest(unittest.TestCase):
         from datetime import datetime, timezone
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
-        )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
-            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
-        )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
-            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
-        )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
-            "INSERT INTO skill_feedback_memory "
-            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
-            "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
-             "consecutive_stop_losses", "3 consecutive stop losses",
-             _json.dumps({"candidate_patch_id": patch_id}),
-             "candidate", now),
-        )
-        self.conn.commit()
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+                )
+                trade_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
+                )
+                trigger_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+                )
+                patch_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    "INSERT INTO skill_feedback_memory "
+                    "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+                    "suggested_adjustment_json, status, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+                     "consecutive_stop_losses", "3 consecutive stop losses",
+                     _json.dumps({"candidate_patch_id": patch_id}),
+                     "candidate", now),
+                )
 
     def _controlled_config(self, on_fail: str) -> object:
         """Build a mock config with account_feedback_rules in controlled mode."""
@@ -7016,15 +7311,16 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": now_ms, "analysis_time_utc": now_iso,
         })
-        self.conn.execute(
-            "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("BTCUSDT", 0.75, ga_id,
-             json.dumps(trade_plan, ensure_ascii=False),
-             json.dumps({"confidence": 0.75, "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
-        )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.commit()
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    ("BTCUSDT", 0.75, ga_id,
+                     json.dumps(trade_plan, ensure_ascii=False),
+                     json.dumps({"confidence": 0.75, "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
+                )
+                signal_id = int(cur.fetchone()["id"])
         return signal_id, ga_id
 
     def test_broker_blocks_order_on_gate_downgrade(self) -> None:
@@ -7045,9 +7341,9 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Gate result persisted to GA decision
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["active"])
         self.assertIn("downgrade_to_watch", saved["would_decide"])
 
@@ -7068,9 +7364,9 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["gate_decision"], "block_order")
 
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["active"])
         self.assertEqual(saved["would_decide"], "block_order")
 
@@ -7091,10 +7387,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Gate result persisted
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(row["account_feedback_gate_json"])
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["active"])
         self.assertFalse(saved["passed"])  # Low confidence/quality doesn't pass
         self.assertTrue(saved["decision"].startswith("shadow_"))
@@ -7131,9 +7427,9 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["gate_decision"], "block_order")
 
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["active"])
         self.assertEqual(saved["would_decide"], "block_order")
 
@@ -7158,10 +7454,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Gate result should still be persisted
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(row["account_feedback_gate_json"])
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["active"])
         # would_decide reflects controlled mode (would block)
         self.assertEqual(saved["would_decide"], "block_order")
@@ -7186,10 +7482,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # But gate result MUST be persisted (P1-3 fix: persistence before risk validation)
         row = self.conn.execute(
-            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(row["account_feedback_gate_json"], "Gate result must be persisted even when risk validation fails")
-        saved = json.loads(row["account_feedback_gate_json"])
+        saved = row["account_feedback_gate_json"]
         self.assertTrue(saved["ok"])
         self.assertIn("mode", saved)
 
@@ -7212,7 +7508,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Opportunity watch MUST be created (P1-2 fix)
         watch_rows = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE symbol = ? AND direction = ?",
+            "SELECT * FROM opportunity_watches WHERE symbol = %s AND direction = %s",
             ("BTCUSDT", "LONG"),
         ).fetchall()
         self.assertGreaterEqual(len(watch_rows), 1, "downgrade_to_watch must create an opportunity_watches record")
@@ -7230,45 +7526,47 @@ class PendingOrderManagerTest(unittest.TestCase):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         # Create two trades: BTCUSDT/LONG and ETHUSDT/SHORT
-        self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("BTCUSDT", "LONG", 50000.0, 0.01, now),
-        )
-        trade_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("ETHUSDT", "SHORT", 3000.0, 0.1, now),
-        )
-        trade_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    ("BTCUSDT", "LONG", 50000.0, 0.01, now),
+                )
+                trade_id_1 = int(cur.fetchone()["id"])
+                cur.execute(
+                    "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    ("ETHUSDT", "SHORT", 3000.0, 0.1, now),
+                )
+                trade_id_2 = int(cur.fetchone()["id"])
 
-        # Create evolution trigger referencing both trades
-        self.conn.execute(
-            "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) VALUES (?, ?, ?, ?)",
-            ("consecutive_stop_losses", "active", _json.dumps([trade_id_1, trade_id_2]), now),
-        )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute(
-            "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
-        )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+                # Create evolution trigger referencing both trades
+                cur.execute(
+                    "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                    ("consecutive_stop_losses", "active", _json.dumps([trade_id_1, trade_id_2]), now),
+                )
+                trigger_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
+                )
+                patch_id = int(cur.fetchone()["id"])
 
-        # Create events referencing the patch
-        events_raw = self.conn.execute(
-            "INSERT INTO skill_feedback_memory "
-            "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
-            "suggested_adjustment_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
-             "consecutive_stop_losses", "2 consecutive stop losses",
-             _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
-        )
+                # Create events referencing the patch
+                cur.execute(
+                    "INSERT INTO skill_feedback_memory "
+                    "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
+                    "suggested_adjustment_json, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
+                     "consecutive_stop_losses", "2 consecutive stop losses",
+                     _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
+                )
         self.conn.commit()
 
         # Fetch the events as the gate would
         events = self.conn.execute(
             "SELECT sfm.id, sfm.pattern_type, sfm.created_at, sp.candidate_version, et.related_trade_ids "
             "FROM skill_feedback_memory sfm "
-            "LEFT JOIN strategy_patches sp ON sp.id = json_extract(sfm.suggested_adjustment_json, '$.candidate_patch_id') "
+            "LEFT JOIN strategy_patches sp ON sp.id = (sfm.suggested_adjustment_json::jsonb ->> 'candidate_patch_id')::bigint "
             "LEFT JOIN evolution_triggers et ON et.id = sp.trigger_id "
             "WHERE sfm.pattern_type = 'consecutive_stop_losses' ORDER BY sfm.created_at DESC"
         ).fetchall()
@@ -7353,14 +7651,14 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Verify the GA decision was created with honest risk status
         ga_id = result["ga_decision_id"]
         ga_row = self.conn.execute(
-            "SELECT account_feedback_gate_json, risk_check_json FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT account_feedback_gate_json, risk_check_json FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(ga_row["account_feedback_gate_json"])
-        saved_gate = json.loads(ga_row["account_feedback_gate_json"])
+        saved_gate = _load_json(ga_row["account_feedback_gate_json"])
         self.assertEqual(saved_gate["would_decide"], "block_order")
 
         # Risk check should be the pending marker (not fake approval)
-        risk_check = json.loads(ga_row["risk_check_json"])
+        risk_check = _load_json(ga_row["risk_check_json"])
         self.assertFalse(risk_check["ok"], "Risk check must be honest (pending/false), not synthetic True")
         self.assertTrue(risk_check.get("pending"), "Risk check should have pending marker")
 
@@ -7396,7 +7694,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "WHERE decision_type = 'legacy_signal_compat' ORDER BY id DESC LIMIT 1"
         ).fetchall()
         self.assertGreaterEqual(len(ga_rows), 1, "GA decision must be created for legacy signal")
-        risk_check = json.loads(ga_rows[0]["risk_check_json"])
+        risk_check = _load_json(ga_rows[0]["risk_check_json"])
         self.assertFalse(risk_check["ok"], "Risk check must show actual failure, not synthetic True")
         self.assertIn("止损距离不足", risk_check["reasons"])
 
@@ -7425,7 +7723,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Exactly 1 watch record, not 2
         watch_rows = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s AND status = 'active'",
             (ga_id,),
         ).fetchall()
         self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
@@ -7440,27 +7738,27 @@ class PendingOrderManagerTest(unittest.TestCase):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         self.conn.execute(
             "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "LONG", 50000.0, 0.01, now),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
-            "VALUES (?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s)",
             ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
         )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        patch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "2 consecutive stop losses",
              _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
@@ -7507,13 +7805,13 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Read back the created watch
         watch_rows = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s AND status = 'active'",
             (ga_id,),
         ).fetchall()
         self.assertEqual(len(watch_rows), 1, "Must be exactly 1 watch")
 
         watch = watch_rows[0]
-        watch_condition = json.loads(watch["watch_condition_json"])
+        watch_condition = _load_json(watch["watch_condition_json"])
 
         # Assert: watch_condition_json has structured account_feedback_recheck format
         self.assertIsInstance(watch_condition, dict, "watch_condition must be a dict")
@@ -7587,7 +7885,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # account_feedback_gate_json is not in the standard create_ga_decision INSERT,
         # so we set it via direct UPDATE
         self.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (gate_json, ga_id),
         )
         self.conn.commit()
@@ -7619,13 +7917,13 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Exactly 1 watch record
         watch_rows = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ? AND status = 'active'",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s AND status = 'active'",
             (ga_id,),
         ).fetchall()
         self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
 
         # Verify the stored watch condition is the new structured format
-        watch_condition = json.loads(watch_rows[0]["watch_condition_json"])
+        watch_condition = _load_json(watch_rows[0]["watch_condition_json"])
         self.assertEqual(watch_condition.get("type"), "account_feedback_recheck")
         self.assertEqual(watch_condition.get("source"), "account_feedback_gate")
         self.assertNotIn("ok", watch_condition,
@@ -7656,7 +7954,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify the GA decision was created
         ga_row = self.conn.execute(
-            "SELECT id FROM ga_decisions WHERE id = ?", (ga_id,)
+            "SELECT id FROM ga_decisions WHERE id = %s", (ga_id,)
         ).fetchone()
         self.assertIsNotNone(ga_row, "GA decision must exist after gate block")
 
@@ -7675,7 +7973,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Exactly 1 watch
         watch_rows = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s",
             (ga_id,),
         ).fetchall()
         self.assertEqual(len(watch_rows), 1, f"Must be exactly 1 watch, got {len(watch_rows)}")
@@ -7694,7 +7992,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Get the first watch
         watch1 = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s",
             (ga_id,),
         ).fetchone()
         first_expires = watch1["expires_at"]
@@ -7703,7 +8001,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Modify the expires_at to an old value to force refresh
         old_expires = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         self.conn.execute(
-            "UPDATE opportunity_watches SET expires_at = ? WHERE id = ?",
+            "UPDATE opportunity_watches SET expires_at = %s WHERE id = %s",
             (old_expires, first_id),
         )
         self.conn.commit()
@@ -7712,13 +8010,13 @@ class PendingOrderManagerTest(unittest.TestCase):
             create_paper_order_from_signal(self.repo, signal_id)
 
         watch2 = self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE ga_decision_id = ?",
+            "SELECT * FROM opportunity_watches WHERE ga_decision_id = %s",
             (ga_id,),
         ).fetchone()
 
         # Only 1 row (UPSERT, not INSERT)
         watch_rows = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM opportunity_watches WHERE ga_decision_id = ?",
+            "SELECT COUNT(*) as cnt FROM opportunity_watches WHERE ga_decision_id = %s",
             (ga_id,),
         ).fetchone()
         self.assertEqual(watch_rows["cnt"], 1)
@@ -7754,14 +8052,14 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # No GA decision exists yet -- should return "waiting"
@@ -7811,7 +8109,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status) "
-            "VALUES (?, ?, ?, ?, 'active')",
+            "VALUES (%s, %s, %s, %s, 'active')",
             ("BTCUSDT", "LONG", "test", json.dumps({"type": "price_above", "level": 999999.0}),),
         )
         self.conn.commit()
@@ -7860,9 +8158,9 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ga_id_1 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (gate_annotate, ga_id_1),
         )
 
@@ -7874,9 +8172,9 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ga_id_2 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (gate_block, ga_id_2),
         )
         self.conn.commit()
@@ -7925,8 +8223,8 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+        ga_id_1 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
+        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
                           (gate_downgrade, ga_id_1))
 
         self.repo.create_ga_decision({
@@ -7937,8 +8235,8 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+        ga_id_2 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
+        self.conn.execute("UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
                           (gate_block, ga_id_2))
         self.conn.commit()
 
@@ -7982,33 +8280,33 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create one trade
         self.conn.execute(
             "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "LONG", 50000.0, 0.01, now),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create one evolution trigger
         self.conn.execute(
             "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
-            "VALUES (?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s)",
             ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create one strategy_patch
         self.conn.execute(
             "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
         )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        patch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create TWO feedback rows for the same patch (duplicate by candidate_patch_id)
         self.conn.execute(
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "loss 1",
              _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
@@ -8017,7 +8315,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "loss 2",
              _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
@@ -8119,14 +8417,17 @@ class PendingOrderManagerTest(unittest.TestCase):
             "required": {"min_confidence": 0.80, "min_entry_quality": 0.70},
         }
 
-        # Start a manual transaction, insert something, call helper, then rollback
-        self.conn.execute("BEGIN")
+        # Start a manual transaction, insert something, call helper, then
+        # rollback. PG (psycopg autocommit=False): the connection is always in
+        # an implicit transaction, so no explicit BEGIN is needed (it would
+        # raise ActiveSqlTransaction); the INSERT auto-starts the txn and
+        # lastval() returns its sequence value.
         self.conn.execute(
             "INSERT INTO opportunity_watches (symbol, direction, watch_reason, watch_condition_json, status) "
-            "VALUES (?, ?, ?, ?, 'active')",
+            "VALUES (%s, %s, %s, %s, 'active')",
             ("ETHUSDT", "SHORT", "test_outer", json.dumps({"type": "test"})),
         )
-        outer_watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        outer_watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Call the helper (which should NOT commit)
         watch_id = _create_opportunity_watch_from_gate(
@@ -8134,12 +8435,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.assertIsNotNone(watch_id, "Helper should return a watch ID")
 
-        # Now rollback the outer transaction
-        self.conn.execute("ROLLBACK")
+        # Now rollback the outer transaction (psycopg native rollback).
+        self.conn.rollback()
 
         # Verify: the outer watch was rolled back (not persisted)
         outer_row = self.conn.execute(
-            "SELECT id FROM opportunity_watches WHERE id = ?", (outer_watch_id,)
+            "SELECT id FROM opportunity_watches WHERE id = %s", (outer_watch_id,)
         ).fetchone()
         self.assertIsNone(outer_row, "Outer watch should be rolled back")
 
@@ -8163,13 +8464,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Create a GA decision with decision="monitor_only"
@@ -8211,13 +8512,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -8258,13 +8559,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Mock AccountRiskGuard to return blocked=True
@@ -8304,13 +8605,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Create a GA decision with analysis_time_utc in the PAST relative to watch
@@ -8353,13 +8654,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Create a GA decision with NO entry_quality in trade_plan.metrics
@@ -8412,33 +8713,33 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create one trade
         self.conn.execute(
             "INSERT INTO paper_trades (symbol, side, entry_price, quantity, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "LONG", 50000.0, 0.01, now),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create ONE evolution trigger
         self.conn.execute(
             "INSERT INTO evolution_triggers (trigger_type, status, related_trade_ids, created_at) "
-            "VALUES (?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s)",
             ("consecutive_stop_losses", "active", _json.dumps([trade_id]), now),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create ONE strategy_patch linked to the trigger
         self.conn.execute(
             "INSERT INTO strategy_patches (strategy_name, from_version, candidate_version, patch_json, trigger_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "active-v1", "test-v1", "{}", trigger_id, "shadow_testing", now),
         )
-        patch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        patch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create TWO feedback rows with same candidate_patch_id (same trigger)
         self.conn.execute(
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "loss 1",
              _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
@@ -8447,7 +8748,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO skill_feedback_memory "
             "(skill_name, skill_version, feedback_type, source_type, pattern_type, finding, "
             "suggested_adjustment_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("price_action", "1.0", "evolution_trigger", "evolution_trigger",
              "consecutive_stop_losses", "loss 2",
              _json.dumps({"candidate_patch_id": patch_id}), "candidate", now),
@@ -8500,9 +8801,9 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_1 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ga_id_1 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (gate_shadow, ga_id_1),
         )
 
@@ -8514,9 +8815,9 @@ class PendingOrderManagerTest(unittest.TestCase):
             "risk_check": {"ok": True}, "evidence": [], "counter_evidence": [],
             "analysis_time": 1700000000000, "analysis_time_utc": now,
         })
-        ga_id_2 = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ga_id_2 = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (gate_controlled, ga_id_2),
         )
         self.conn.commit()
@@ -8562,13 +8863,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Create a GA decision with trade_plan_available but trade_plan has NO side field
@@ -8610,13 +8911,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO opportunity_watches "
             "(symbol, direction, watch_reason, watch_condition_json, status, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'active', %s, %s)",
             ("BTCUSDT", "LONG", "test", watch_condition_json, expires_at, watch_created_at),
         )
-        watch_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        watch_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
         watch = dict(self.conn.execute(
-            "SELECT * FROM opportunity_watches WHERE id = ?", (watch_id,)
+            "SELECT * FROM opportunity_watches WHERE id = %s", (watch_id,)
         ).fetchone())
 
         # Create a valid GA decision with all the right fields
@@ -8744,7 +9045,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         jid2 = self.repo.enqueue_job_once("daily_review", 7, "test", "test:session:fail", {"day_utc": "2026-06-15"})
         self.assertEqual(jid1, jid2)
 
-        row = self.conn.execute("SELECT status FROM agent_jobs WHERE id=?", (jid1,)).fetchone()
+        row = self.conn.execute("SELECT status FROM agent_jobs WHERE id=%s", (jid1,)).fetchone()
         self.assertEqual(row["status"], "pending", "Failed job should be reset to pending")
 
     def test_enqueue_job_once_resets_failed_clears_defer_state(self) -> None:
@@ -8761,7 +9062,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Simulate a job that accumulated defer history then terminated failed.
         self.conn.execute(
             "UPDATE agent_jobs SET defer_count=5, deferred_at='2026-06-10 00:00:00', "
-            "error_message='single_flight_deferred:5' WHERE id=?",
+            "error_message='single_flight_deferred:5' WHERE id=%s",
             (jid1,),
         )
         self.conn.commit()
@@ -8774,7 +9075,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(jid1, jid2)
 
         row = self.conn.execute(
-            "SELECT status, defer_count, deferred_at, error_message FROM agent_jobs WHERE id=?",
+            "SELECT status, defer_count, deferred_at, error_message FROM agent_jobs WHERE id=%s",
             (jid1,),
         ).fetchone()
         self.assertEqual(str(row["status"]), "pending")
@@ -8842,37 +9143,10 @@ class PendingOrderManagerTest(unittest.TestCase):
         )["alert_id"]
 
         row = self.conn.execute(
-            "SELECT dedupe_key FROM alert_outbox WHERE id=?", (alert_id,)
+            "SELECT dedupe_key FROM alert_outbox WHERE id=%s", (alert_id,)
         ).fetchone()
         self.assertEqual(row["dedupe_key"], "daily_review:2026-06-15",
                          "dedupe_key should include review_date for per-day dedup")
-
-    def test_cleanup_migration_is_idempotent(self) -> None:
-        """_cleanup_agent_job_duplicates is idempotent — safe to run multiple times."""
-        from plugins.crypto_guard.storage.migrations import _cleanup_agent_job_duplicates
-
-        # Create duplicates with different session_ids first (no DB-level UNIQUE index)
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('daily_review', 7, 'test', 'cleanup:dup:1', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('daily_review', 7, 'test', 'cleanup:dup:2', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        # Rename to same session_id to create the duplicate scenario
-        self.conn.execute(
-            "UPDATE agent_jobs SET session_id='cleanup:dup' WHERE session_id IN ('cleanup:dup:1', 'cleanup:dup:2')"
-        )
-        self.conn.commit()
-
-        # First run should clean
-        result1 = _cleanup_agent_job_duplicates(self.conn)
-        self.assertGreater(result1["agent_jobs_duplicate"], 0)
-
-        # Second run should be idempotent (no new duplicates)
-        result2 = _cleanup_agent_job_duplicates(self.conn)
-        self.assertEqual(result2["agent_jobs_duplicate"], 0, "Second cleanup should find no new duplicates")
 
     def test_scheduler_daily_review_session_has_date(self) -> None:
         """Scheduler daily_review job uses date-specific session_id."""
@@ -8883,88 +9157,10 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIsNotNone(jid)
 
         # Verify the session_id is date-specific (contains today's date)
-        row = self.conn.execute("SELECT session_id FROM agent_jobs WHERE id=?", (jid,)).fetchone()
+        row = self.conn.execute("SELECT session_id FROM agent_jobs WHERE id=%s", (jid,)).fetchone()
         self.assertIn(today, row["session_id"])
 
     # ── Regression Tests for P1 Fixes ──
-
-    def test_cleanup_does_not_dedupe_event_queue_jobs(self) -> None:
-        """Cleanup must NOT touch event-queue jobs like feishu_user_message."""
-        from plugins.crypto_guard.storage.migrations import _cleanup_agent_job_duplicates
-
-        # Two legitimate feishu_user_message jobs with same session_id but different payloads
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('feishu_user_message', 1, 'feishu', 'feishu:user:open_test', '{\"text\":\"msg1\"}', CURRENT_TIMESTAMP, 'pending')"
-        )
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('feishu_user_message', 1, 'feishu', 'feishu:user:open_test', '{\"text\":\"msg2\"}', CURRENT_TIMESTAMP, 'pending')"
-        )
-        self.conn.commit()
-
-        result = _cleanup_agent_job_duplicates(self.conn)
-        self.assertEqual(result["agent_jobs_duplicate"], 0,
-                         "Event-queue jobs must NOT be deduped")
-
-        # Both should still be pending
-        rows = self.conn.execute(
-            "SELECT id, status, session_id FROM agent_jobs WHERE session_id='feishu:user:open_test' ORDER BY id"
-        ).fetchall()
-        self.assertEqual(len(rows), 2)
-        for r in rows:
-            self.assertEqual(r["status"], "pending",
-                             f"Event-queue job {r['id']} should stay pending")
-            self.assertEqual(r["session_id"], "feishu:user:open_test",
-                             f"Event-queue job {r['id']} session_id must not be rewritten")
-
-    def test_migration_on_dirty_db_with_existing_duplicates(self) -> None:
-        """Migration cleanup covers ALL job types, not just daily_review."""
-        # No DB-level UNIQUE index, so duplicates can be created directly
-
-        # Create duplicates for multiple job types — daily_review AND alert_outbox_retry
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('daily_review', 7, 'test', 'dirty:dup:same', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('daily_review', 7, 'test', 'dirty:dup:same', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        # alert_outbox_retry with fixed session_id (simulating real-world dup pattern)
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('alert_outbox_retry', 2, 'scheduler', 'system:scheduled:alert_outbox_retry', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, payload_json, scheduled_at, status) "
-            "VALUES ('alert_outbox_retry', 2, 'scheduler', 'system:scheduled:alert_outbox_retry', '{}', CURRENT_TIMESTAMP, 'success')"
-        )
-        self.conn.commit()
-
-        # Verify duplicates exist BEFORE migration
-        daily_dup = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='dirty:dup:same'"
-        ).fetchone()["cnt"]
-        self.assertEqual(daily_dup, 2)
-        alert_dup = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='system:scheduled:alert_outbox_retry'"
-        ).fetchone()["cnt"]
-        self.assertEqual(alert_dup, 2)
-
-        # Run migration — should cleanup ALL job types without error (no DB UNIQUE index)
-        from plugins.crypto_guard.storage.migrations import _apply_daily_review_idempotency_migration
-        _apply_daily_review_idempotency_migration(self.conn)
-
-        # After migration: each (job_type, session_id) should have at most 1 non-duplicate
-        remaining_daily = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='dirty:dup:same' AND status NOT IN ('duplicate', 'superseded')"
-        ).fetchone()["cnt"]
-        self.assertLessEqual(remaining_daily, 1)
-        remaining_alert = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id='system:scheduled:alert_outbox_retry' AND status NOT IN ('duplicate', 'superseded')"
-        ).fetchone()["cnt"]
-        self.assertLessEqual(remaining_alert, 1, "alert_outbox_retry duplicates should also be cleaned")
 
     def test_hourly_report_second_enqueue_no_integrity_error(self) -> None:
         """Second enqueue of hourly_feishu_report with same session_id is idempotent (no IntegrityError)."""
@@ -8975,7 +9171,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify only one job exists
         count = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id=?", (sid,)
+            "SELECT COUNT(*) as cnt FROM agent_jobs WHERE session_id=%s", (sid,)
         ).fetchone()["cnt"]
         self.assertEqual(count, 1, "Only one job should exist for the same session_id")
 
@@ -8984,7 +9180,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Simulate: report exists but was NOT pushed (pushed_to_feishu=0)
         self.conn.execute(
             "INSERT INTO daily_review_reports(review_date, summary_json, ga_report, pushed_to_feishu) "
-            "VALUES ('2026-06-15', '{}', 'test report', 0)"
+            "VALUES ('2026-06-15', '{}', 'test report', FALSE)"
         )
         self.conn.commit()
 
@@ -9029,9 +9225,9 @@ class PendingOrderManagerTest(unittest.TestCase):
         jid = self.repo.enqueue_job_once("daily_review", 7, "scheduler", sid, {"day_utc": yesterday_utc})
 
         row = self.conn.execute(
-            "SELECT payload_json FROM agent_jobs WHERE id=?", (jid,)
+            "SELECT payload_json FROM agent_jobs WHERE id=%s", (jid,)
         ).fetchone()
-        payload = json.loads(row["payload_json"])
+        payload = _load_json(row["payload_json"])
         self.assertEqual(payload["day_utc"], yesterday_utc,
                          "Scheduler must pass yesterday_utc, not today_utc")
 
@@ -9083,64 +9279,65 @@ class PendingOrderManagerTest(unittest.TestCase):
             low_p = round(min(open_p, close_p) - body * 0.3, 4)
             vol = 1000.0 + abs(body) * 100
             self.conn.execute(
-                "INSERT OR IGNORE INTO candles(symbol, interval, open_time, close_time, "
+                "INSERT INTO candles(symbol, interval, open_time, close_time, "
                 "open, high, low, close, volume, is_closed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE) "
+                "ON CONFLICT (symbol, interval, open_time) DO NOTHING",
                 (symbol, interval, ot, ct, open_p, high_p, low_p, close_p, vol),
             )
 
     def _seed_btc_candles(self) -> None:
         """Seed BTCUSDT: 4h bullish, 1h bullish (risk_on)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.004, volatility_pct=0.4)
         self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=67000, accel_factor=1.002, volatility_pct=0.2)
         self.conn.commit()
 
     def _seed_eth_candles(self) -> None:
         """Seed ETHUSDT: 4h bullish, 1h bullish."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('ETHUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('ETHUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("ETHUSDT", "4h", count=30, start_price=3400, accel_factor=1.003, volatility_pct=0.4)
         self._seed_candles_accel("ETHUSDT", "1h", count=30, start_price=3500, accel_factor=1.0015, volatility_pct=0.2)
         self.conn.commit()
 
     def _seed_eth_bearish_candles(self) -> None:
         """Seed ETHUSDT: 4h bearish, 1h bearish (for selloff/risk_off tests)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('ETHUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('ETHUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("ETHUSDT", "4h", count=30, start_price=3400, accel_factor=0.997, volatility_pct=0.4)
         self._seed_candles_accel("ETHUSDT", "1h", count=30, start_price=3300, accel_factor=0.9985, volatility_pct=0.2)
         self.conn.commit()
 
     def _seed_btc_rebound_candles(self) -> None:
         """Seed BTCUSDT: 4h bearish, 1h bullish (rebound pattern)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=0.997, volatility_pct=0.4)
         self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=60000, accel_factor=1.004, volatility_pct=0.3)
         self.conn.commit()
 
     def _seed_btc_selloff_candles(self) -> None:
         """Seed BTCUSDT: 4h bullish, 1h bearish (selloff pattern)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.003, volatility_pct=0.4)
         self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=68000, accel_factor=0.996, volatility_pct=0.3)
         self.conn.commit()
 
     def _seed_btc_risk_on_candles(self) -> None:
         """Seed BTCUSDT: 4h bullish, 1h bullish (risk_on pattern)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("BTCUSDT", "4h", count=30, start_price=65000, accel_factor=1.005, volatility_pct=0.4)
         self._seed_candles_accel("BTCUSDT", "1h", count=30, start_price=68000, accel_factor=1.003, volatility_pct=0.2)
         self.conn.commit()
 
     def _seed_symbol_candles(self, symbol: str) -> None:
         """Seed generic symbol candles: mild uptrend, following BTC."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES (?, 1)", (symbol,))
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES (%s, TRUE) ON CONFLICT (symbol) DO NOTHING", (symbol,))
         self._seed_candles_accel(symbol, "4h", count=30, start_price=20, accel_factor=1.002, volatility_pct=0.3)
         self._seed_candles_accel(symbol, "1h", count=30, start_price=21, accel_factor=1.001, volatility_pct=0.2)
         self.conn.commit()
 
     def _seed_symbol_strong_candles(self, symbol: str) -> None:
         """Seed symbol candles showing strong outperformance (independent_trend)."""
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES (?, 1)", (symbol,))
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES (%s, TRUE) ON CONFLICT (symbol) DO NOTHING", (symbol,))
         self._seed_candles_accel(symbol, "4h", count=30, start_price=20, accel_factor=1.006, volatility_pct=0.4)
         self._seed_candles_accel(symbol, "1h", count=30, start_price=22, accel_factor=1.004, volatility_pct=0.25)
         self.conn.commit()
@@ -9270,11 +9467,11 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "INSERT INTO paper_orders(symbol, side, order_type, status) "
                 "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
             )
-            order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            order_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
             self.conn.execute(
                 "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
                 "close_reason, pnl_r, closed_at) "
-                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, ?)",
+                "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, %s)",
                 (order_id, f"{today}T10:00:00Z"),
             )
 
@@ -9365,10 +9562,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify stored
         row = self.conn.execute(
-            "SELECT * FROM skill_feedback_memory WHERE id=?", (memory_id,)
+            "SELECT * FROM skill_feedback_memory WHERE id=%s", (memory_id,)
         ).fetchone()
         self.assertIsNotNone(row)
-        finding = json.loads(row["suggested_adjustment_json"] or "{}")
+        finding = _load_json(row["suggested_adjustment_json"] or "{}")
         self.assertEqual(finding.get("market_phase"), "rebound")
         self.assertEqual(finding.get("regime_alignment"), "counter_regime")
 
@@ -9393,7 +9590,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.risk.risk_engine.load_config", return_value=mock_cfg), \
@@ -9431,11 +9628,11 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Read back and verify
         row = self.conn.execute(
-            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=%s", (ga_id,),
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertIsNotNone(row["market_regime_gate_json"])
-        saved = json.loads(row["market_regime_gate_json"])
+        saved = _load_json(row["market_regime_gate_json"])
         self.assertEqual(saved["adjustments"]["risk_multiplier"], 0.5)
         self.assertEqual(saved["market_regime"]["market_phase"], "rebound")
 
@@ -9450,17 +9647,20 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create 2 consecutive SHORT stop losses to trigger watch_only
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for _ in range(2):
-            self.conn.execute(
-                "INSERT INTO paper_orders(symbol, side, order_type, status) "
-                "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
-            )
-            order_id = self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            self.conn.execute(
-                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
-                "close_reason, pnl_r, closed_at) "
-                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, ?)",
-                (order_id, f"{today}T10:00:00Z"),
-            )
+            with self.conn.transaction():
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO paper_orders(symbol, side, order_type, status) "
+                        "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled') RETURNING id",
+                    )
+                    order_id = int(cur.fetchone()["id"])
+                    cur.execute(
+                        "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
+                        "close_reason, pnl_r, closed_at) "
+                        "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, %s)",
+                        (order_id, f"{today}T10:00:00Z"),
+                    )
+            self.conn.commit()
 
         result = apply_regime_gate(
             self.repo,
@@ -9513,11 +9713,11 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "INSERT INTO paper_orders(symbol, side, order_type, status) "
                 "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
             )
-            order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
             self.conn.execute(
                 "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
                 "close_reason, pnl_r, closed_at) "
-                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -0.3, ?)",
+                "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -0.3, %s)",
                 (order_id, f"{today}T10:00:00Z"),
             )
 
@@ -9535,7 +9735,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         # Patch load_config at every module that imports it, plus validate_trade_plan
@@ -9551,7 +9751,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify regime gate result was saved
         row = self.conn.execute(
-            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=%s", (ga_id,),
         ).fetchone()
         self.assertIsNotNone(row["market_regime_gate_json"])
 
@@ -9609,7 +9809,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "adjustments": {"watch_only": False},
         }
         self.conn.execute(
-            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            "UPDATE ga_decisions SET market_regime_gate_json=%s WHERE id=%s",
             (json.dumps(regime_gate), ga_id),
         )
         self.conn.commit()
@@ -9617,19 +9817,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create an order linked to the GA decision
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
-            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', %s)",
             (ga_id,),
         )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create a trade linked to the order
         self.conn.execute(
             "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
             "close_reason, pnl_r) "
-            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
+            "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
             (order_id,),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Get the trade and enrich it
         trade = self.repo.get_trade(trade_id)
@@ -9661,11 +9861,11 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "INSERT INTO paper_orders(symbol, side, order_type, status) "
                 "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled')",
             )
-            order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
             self.conn.execute(
                 "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
                 "close_reason, pnl_r, closed_at) "
-                "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, ?, ?, ?)",
+                "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, %s, %s, %s)",
                 (order_id, close_reason, pnl_r_val, f"{today}T10:00:00Z"),
             )
 
@@ -9882,7 +10082,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "adjustments": {"watch_only": False},
         }
         self.conn.execute(
-            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            "UPDATE ga_decisions SET market_regime_gate_json=%s WHERE id=%s",
             (json.dumps(regime_gate), ga_id),
         )
         self.conn.commit()
@@ -9890,17 +10090,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create order + trade linked to this GA decision
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
-            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', %s)",
             (ga_id,),
         )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
             "close_reason, pnl_r, closed_at) "
-            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, datetime('now'))",
+            "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0, NOW())",
             (order_id,),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # The reviewed list simulates review_trade output with the correct pattern
         reviewed = [{
@@ -9963,7 +10163,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "adjustments": {"watch_only": False},
         }
         self.conn.execute(
-            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            "UPDATE ga_decisions SET market_regime_gate_json=%s WHERE id=%s",
             (json.dumps(regime_gate), ga_id),
         )
         self.conn.commit()
@@ -9971,17 +10171,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create order + trade
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
-            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', ?)",
+            "VALUES ('AVAXUSDT', 'SHORT', 'market', 'filled', %s)",
             (ga_id,),
         )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO paper_trades(order_id, symbol, side, entry_price, exit_price, "
             "close_reason, pnl_r) "
-            "VALUES (?, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
+            "VALUES (%s, 'AVAXUSDT', 'SHORT', 100, 105, 'stop_loss', -1.0)",
             (order_id,),
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Run review_trade (which will enrich and save)
         from plugins.crypto_guard.review.trade_reviewer import review_trade
@@ -9990,7 +10190,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Check that the saved trade_reviews row has regime data
         row = self.conn.execute(
-            "SELECT market_regime_at_loss FROM trade_reviews WHERE trade_id=?",
+            "SELECT market_regime_at_loss FROM trade_reviews WHERE trade_id=%s",
             (trade_id,),
         ).fetchone()
         self.assertIsNotNone(row)
@@ -10039,7 +10239,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -10094,7 +10294,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -10105,10 +10305,10 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify that the regime gate was saved with time_source=original_analysis_time
         row = self.conn.execute(
-            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?", (ga_id,),
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=%s", (ga_id,),
         ).fetchone()
         self.assertIsNotNone(row["market_regime_gate_json"])
-        gate_data = json.loads(row["market_regime_gate_json"])
+        gate_data = _load_json(row["market_regime_gate_json"])
         self.assertEqual(gate_data.get("time_source"), "original_analysis_time")
 
     # ── End P1 Round 2 Regime Fixes ──
@@ -10121,11 +10321,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, "
             "quantity, risk_percent, reason, source, risk_check_passed, status) "
-            "VALUES (?, ?, 'market', ?, ?, 1.0, 0.5, 'test', 'test', 1, 'open')",
+            "VALUES (%s, %s, 'market', %s, %s, 1.0, 0.5, 'test', 'test', TRUE, 'open')",
             (symbol, side, entry_price, entry_price - 5.0),
         )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone())
         trade_id = self.repo.create_paper_trade(order, entry_price, fill_method="market", allow_wall_clock=True)
         return trade_id
 
@@ -10143,32 +10343,34 @@ class PendingOrderManagerTest(unittest.TestCase):
             "invalid_condition": {"type": "price", "value": 90.0},
             "reason": "test",
         }
-        self.conn.execute(
-            "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, "
-            "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
-            "counter_evidence_json, risk_check_json, trade_plan_json, feishu_actions_json, "
-            "final_summary, raw_decision_json, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                symbol,
-                1700000000000,
-                "2024-01-15T00:00:00Z",
-                "scheduled",
-                "A",
-                0.80,
-                "trade_plan_available",
-                json.dumps([]),
-                json.dumps([]),
-                json.dumps([]),
-                json.dumps({"ok": True, "reasons": []}),
-                json.dumps(trade_plan),
-                json.dumps(["create_paper_order"]),
-                "test decision",
-                json.dumps({}),
-                snapshot_id,
-            ),
-        )
-        ga_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, "
+                    "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
+                    "counter_evidence_json, risk_check_json, trade_plan_json, feishu_actions_json, "
+                    "final_summary, raw_decision_json, snapshot_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        symbol,
+                        1700000000000,
+                        "2024-01-15T00:00:00Z",
+                        "scheduled",
+                        "A",
+                        0.80,
+                        "trade_plan_available",
+                        json.dumps([]),
+                        json.dumps([]),
+                        json.dumps([]),
+                        json.dumps({"ok": True, "reasons": []}),
+                        json.dumps(trade_plan),
+                        json.dumps(["create_paper_order"]),
+                        "test decision",
+                        json.dumps({}),
+                        snapshot_id,
+                    ),
+                )
+                ga_id = int(cur.fetchone()["id"])
         self.conn.commit()
         return ga_id
 
@@ -10181,7 +10383,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Seed BTC: 4h bullish, 1h bullish (would be risk_on without ETH)
         self._seed_btc_risk_on_candles()
         # Seed ETH: 4h bullish, 1h bearish (conflicts with BTC risk_on)
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('ETHUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('ETHUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("ETHUSDT", "4h", count=30, start_price=3400, accel_factor=1.003, volatility_pct=0.4)
         self._seed_candles_accel("ETHUSDT", "1h", count=30, start_price=3500, accel_factor=0.997, volatility_pct=0.3)
         self.conn.commit()
@@ -10322,7 +10524,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "signal_grade, confidence, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, "
             "final_summary, raw_decision_json, market_regime_gate_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 "AVAXUSDT", 1700000000000, "2024-01-15T00:00:00Z", "scheduled",
                 "A", 0.80, "trade_plan_available",
@@ -10465,8 +10667,8 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # No BTC/ETH candles → market_phase=unknown → alignment=unclear
         # → require_stronger_confirmation=True
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -10488,12 +10690,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("AVAXUSDT", 0.85, ga_id,
              json.dumps(trade_plan, ensure_ascii=False),
              json.dumps({"confidence": 0.85, "signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
         )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        signal_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         # Controlled market_regime mode
@@ -10507,7 +10709,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -10528,8 +10730,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         import plugins.crypto_guard.config.loader as loader
 
         # No BTC/ETH candles → market_phase=unknown → alignment=unclear
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -10551,12 +10753,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("AVAXUSDT", 0.85, ga_id,
              json.dumps(trade_plan, ensure_ascii=False),
              json.dumps({"confidence": 0.85, "signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
         )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        signal_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         original_cfg = loader.load_config()
@@ -10569,7 +10771,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -10591,8 +10793,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         import plugins.crypto_guard.config.loader as loader
 
         # No BTC/ETH candles → market_phase=unknown → alignment=unclear
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -10624,7 +10826,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -10670,7 +10872,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # BTC risk_on but no ETH data → unclear
         self._seed_btc_risk_on_candles()
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -10692,12 +10894,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("AVAXUSDT", 0.85, ga_id,
              json.dumps(trade_plan, ensure_ascii=False),
              json.dumps({"confidence": 0.85, "signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
         )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        signal_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         original_cfg = loader.load_config()
@@ -10710,7 +10912,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -11112,7 +11314,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_btc_risk_on_candles()
         self._seed_eth_candles()
         # Seed symbol with mild outperformance (~2% above BTC)
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_candles_accel("AVAXUSDT", "4h", count=30, start_price=20, accel_factor=1.004, volatility_pct=0.3)
         self._seed_candles_accel("AVAXUSDT", "1h", count=30, start_price=21, accel_factor=1.002, volatility_pct=0.2)
         self.conn.commit()
@@ -11137,7 +11339,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.analysis.market_regime_engine.load_config", return_value=mock_cfg):
@@ -11162,8 +11364,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         import plugins.crypto_guard.config.loader as loader
 
         # No BTC/ETH → unclear → require_stronger_confirmation
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -11185,12 +11387,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("AVAXUSDT", 0.85, ga_id,
              json.dumps(trade_plan, ensure_ascii=False),
              json.dumps({"confidence": 0.85, "signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
         )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        signal_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         # Config: market_regime.require_stronger_confirmation.min_entry_quality=0.80
@@ -11216,7 +11418,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -11239,8 +11441,8 @@ class PendingOrderManagerTest(unittest.TestCase):
         import plugins.crypto_guard.config.loader as loader
 
         # No BTC/ETH → unclear → require_stronger_confirmation
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('AVAXUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self._seed_symbol_candles("AVAXUSDT")
 
         now_ms = int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -11263,12 +11465,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Legacy signal: ga_decision_json has NO confidence field
         self.conn.execute(
             "INSERT INTO signals (symbol, confidence, ga_decision_id, trade_plan_json, ga_decision_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("AVAXUSDT", 0.85, ga_id,
              json.dumps(trade_plan, ensure_ascii=False),
              json.dumps({"signal_grade": "A", "trade_plan": trade_plan, "has_trade_plan": True}, ensure_ascii=False)),
         )
-        signal_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        signal_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         original_cfg = loader.load_config()
@@ -11281,7 +11483,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         with _patch("plugins.crypto_guard.paper.paper_broker.validate_trade_plan",
@@ -11305,19 +11507,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9001, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9001, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9001, 9001, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9001, 9001, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         # Paper position with current price showing loss
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9001, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9001, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # S-grade, bullish, high confidence GA decision
@@ -11325,7 +11527,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9001, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9001, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
@@ -11354,19 +11556,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Open SHORT trade with NO signal decay and floating profit (current < entry)
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9011, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9011, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9011, 9011, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.1, 0, 0, ?)",
+            "VALUES (9011, 9011, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.1, 0, 0, %s)",
             (now_iso,),
         )
         # Current price below entry (floating profit)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9011, 1, 'LINKUSDT', 'SHORT', 14.50, 14.40, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9011, 1, 'LINKUSDT', 'SHORT', 14.50, 14.40, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # S-grade bullish with high confidence
@@ -11374,7 +11576,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9011, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9011, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
@@ -11397,26 +11599,26 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Open SHORT trade in profit (current < entry), stop_loss still far
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9021, 'ETHUSDT', 'SHORT', 'market', 'open', 3200.0, 3300.0, 1, ?)",
+            "VALUES (9021, 'ETHUSDT', 'SHORT', 'market', 'open', 3200.0, 3300.0, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9021, 9021, 'ETHUSDT', 'SHORT', 3200.0, 3300.0, 1, 100.0, 3300.0, 0.2, 100, 0, ?)",
+            "VALUES (9021, 9021, 'ETHUSDT', 'SHORT', 3200.0, 3300.0, 1, 100.0, 3300.0, 0.2, 100, 0, %s)",
             (now_iso,),
         )
         # Current price below entry (floating profit)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9021, 1, 'ETHUSDT', 'SHORT', 3200.0, 3100.0, 1, 3300.0, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9021, 1, 'ETHUSDT', 'SHORT', 3200.0, 3100.0, 1, 3300.0, 'open', %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9021, 'ETHUSDT', 1000000, ?, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
+            "VALUES (9021, 'ETHUSDT', 1000000, %s, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish A', '{}')",
             (now_iso,),
         )
@@ -11439,19 +11641,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         # entry=100, stop=95, risk=5, current=91.5 → R = (91.5-100)/5 = -1.7
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9031, 'BTCUSDT', 'LONG', 'market', 'open', 100000.0, 95000.0, 0.01, ?)",
+            "VALUES (9031, 'BTCUSDT', 'LONG', 'market', 'open', 100000.0, 95000.0, 0.01, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9031, 9031, 'BTCUSDT', 'LONG', 100000.0, 95000.0, 0.01, 50.0, 95000.0, 0.3, 0, 5000, ?)",
+            "VALUES (9031, 9031, 'BTCUSDT', 'LONG', 100000.0, 95000.0, 0.01, 50.0, 95000.0, 0.3, 0, 5000, %s)",
             (now_iso,),
         )
         # Current price at 91000 → R = (91000-100000)/5000 = -1.8
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9031, 1, 'BTCUSDT', 'LONG', 100000.0, 91000.0, 0.01, 95000.0, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9031, 1, 'BTCUSDT', 'LONG', 100000.0, 91000.0, 0.01, 95000.0, 'open', %s)",
             (now_iso,),
         )
         # S-grade bearish with high confidence — conflict with LONG
@@ -11459,7 +11661,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9031, 'BTCUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
+            "VALUES (9031, 'BTCUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
             "'[]', '[]', '[]', '[]', '[]', 'bearish S', '{}')",
             (now_iso,),
         )
@@ -11483,17 +11685,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9041, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9041, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9041, 9041, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, ?)",
+            "VALUES (9041, 9041, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9041, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9041, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # Neutral GA decision
@@ -11501,7 +11703,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9041, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'B', 0.80, 'neutral', 'no_trade', "
+            "VALUES (9041, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'B', 0.80, 'neutral', 'no_trade', "
             "'[]', '[]', '[]', '[]', '[]', 'neutral', '{}')",
             (now_iso,),
         )
@@ -11523,7 +11725,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Pending SHORT order
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9051, 'LINKUSDT', 'SHORT', 'limit', 'pending', 14.50, 15.00, 1, ?)",
+            "VALUES (9051, 'LINKUSDT', 'SHORT', 'limit', 'pending', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         # Bullish S GA decision
@@ -11531,7 +11733,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9051, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9051, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S', '{}')",
             (now_iso,),
         )
@@ -11555,25 +11757,25 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9061, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9061, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9061, 9061, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.75, 0, 0.5, ?)",
+            "VALUES (9061, 9061, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.75, 0, 0.5, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9061, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9061, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9061, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9061, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
@@ -11598,17 +11800,17 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9071, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9071, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9071, 9071, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, ?)",
+            "VALUES (9071, 9071, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9071, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9071, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # S-grade but confidence only 0.82 (below 0.85 threshold)
@@ -11616,7 +11818,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9071, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.82, 'bullish', 'enter_long', "
+            "VALUES (9071, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.82, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S low conf', '{}')",
             (now_iso,),
         )
@@ -11643,19 +11845,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         # SHORT trade where stop_loss == entry_price (already at breakeven), held 20 min
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 14.50, 1, ?)",
+            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 14.50, 1, %s)",
             (past_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 0.0, 14.5, 0.1, 0, 0, ?)",
+            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 0.0, 14.5, 0.1, 0, 0, %s)",
             (past_iso,),
         )
         # Current price below entry (floating profit)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 14.30, 1, 14.50, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 14.30, 1, 14.50, 'open', %s)",
             (now_iso,),
         )
         # S-grade bullish with high confidence — conflict with SHORT
@@ -11663,7 +11865,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES (9081, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9081, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}', '{\"entry\":15.00,\"stop\":15.50}')",
             (now_iso,),
         )
@@ -11686,25 +11888,25 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9081, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9081, 9081, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9081, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9081, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9081, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
@@ -11735,13 +11937,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9091, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9091, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9091, 9091, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9091, 9091, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         # NO paper_positions row — so current_price will be None
@@ -11749,7 +11951,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES (9091, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9091, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}', '{\"entry\":14.00,\"stop\":13.50}')",
             (now_iso,),
         )
@@ -11777,7 +11979,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log)
-        event_json = json.loads(log["event_json"])
+        event_json = _load_json(log["event_json"])
         self.assertIn("missing_current_price", event_json.get("reason", ""))
 
     def test_position_conflict_uses_passed_ga_decision_id_not_latest(self):
@@ -11789,18 +11991,18 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9101, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9101, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9101, 9101, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9101, 9101, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9101, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9101, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # Older GA decision: bullish S (conflicts with SHORT)
@@ -11808,7 +12010,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9101, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9101, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S older', '{}')",
             (now_iso,),
         )
@@ -11817,7 +12019,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9102, 'LINKUSDT', 2000000, ?, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
+            "VALUES (9102, 'LINKUSDT', 2000000, %s, 'scheduled_analysis', 'S', 0.89, 'bearish', 'enter_short', "
             "'[]', '[]', '[]', '[]', '[]', 'bearish S newer', '{}')",
             (now_iso,),
         )
@@ -11844,19 +12046,19 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9111, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9111, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (trade_created,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9111, 9111, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.1, 0, 0, ?)",
+            "VALUES (9111, 9111, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.1, 0, 0, %s)",
             (trade_created,),
         )
         # Current price at entry (no loss, no decay trigger)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9111, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9111, 1, 'LINKUSDT', 'SHORT', 14.50, 14.50, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # GA decision BEFORE trade open: bullish S at 09:55
@@ -11923,20 +12125,20 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (9131, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (9131, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9131, 9131, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9131, 9131, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         # Paper position with stale current_price (updated_at is 30 min ago)
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
             "quantity, stop_loss, status, updated_at) "
-            "VALUES (9131, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "VALUES (9131, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (stale_iso,),
         )
         # S-grade bullish with high confidence + decay
@@ -11944,7 +12146,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9131, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9131, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
@@ -11980,37 +12182,37 @@ class PendingOrderManagerTest(unittest.TestCase):
         self._seed_paper_data()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, ga_decision_id, filled_at, created_at) "
-            "VALUES (9121, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, 9121, ?, ?)",
+            "VALUES (9121, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, 9121, %s, %s)",
             (filled_iso, now_iso),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (9121, 9121, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (9121, 9121, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (9121, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (9121, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json) "
-            "VALUES (9121, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (9121, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}')",
             (now_iso,),
         )
         # Update raw_decision_json to include strategy_name for shadow PnL backfill
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json=? WHERE id=9121",
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE id=9121",
             ('{"raw_legacy_decision": {"strategy_name": "test_strategy"}}',),
         )
         # Insert a shadow strategy_evaluation to verify PnL backfill
         self.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, strategy_name, strategy_version, is_shadow, analysis_time, pnl_r, ga_decision_id) "
-            "VALUES ('LINKUSDT', 'test_strategy', 'v1', 1, 1000000, NULL, 9121)"
+            "VALUES ('LINKUSDT', 'test_strategy', 'v1', TRUE, 1000000, NULL, 9121)"
         )
         self.conn.commit()
 
@@ -12058,8 +12260,10 @@ class PendingOrderManagerTest(unittest.TestCase):
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(alert_job)
-        alert_payload = json.loads(alert_job["payload_json"])
-        self.assertEqual(alert_payload["filled_at"], filled_iso)
+        alert_payload = _load_json(alert_job["payload_json"])
+        # filled_at round-trips through a TIMESTAMPTZ column: PG normalizes the
+        # "Z" suffix to "+00:00" (same UTC instant), so compare on canonical form.
+        self.assertEqual(str(alert_payload["filled_at"]).replace("+00:00", "Z"), filled_iso)
         self.assertIn("event_time", alert_payload)
         self.assertIn("closed_at", alert_payload)
         self.assertEqual(alert_payload["close_reason"], "conflict_exit")
@@ -12068,7 +12272,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Shadow evaluations get PnL exclusively from their independent
         # shadow_virtual_trades lifecycle, not from active trade close.
         eval_row = self.conn.execute(
-            "SELECT pnl_r FROM strategy_evaluations WHERE symbol='LINKUSDT' AND strategy_name='test_strategy' AND is_shadow=1"
+            "SELECT pnl_r FROM strategy_evaluations WHERE symbol='LINKUSDT' AND strategy_name='test_strategy' AND is_shadow=TRUE"
         ).fetchone()
         self.assertIsNotNone(eval_row)
         self.assertIsNone(eval_row["pnl_r"],
@@ -12092,13 +12296,13 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         # Pre-create a trade_review
         self.conn.execute(
             """
             INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
                 improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
-            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            VALUES (%s, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', TRUE)
             """,
             (trade_id,),
         )
@@ -12108,11 +12312,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         # loss_analysis should be populated (from existing review) - read from DB
         report = self.conn.execute(
-            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=%s",
             (day,),
         ).fetchone()
         self.assertIsNotNone(report, "daily_review_report should exist")
-        summary = json.loads(report["summary_json"])
+        summary = _load_json(report["summary_json"])
         loss_analysis = summary.get("loss_analysis", [])
         self.assertTrue(len(loss_analysis) > 0, f"loss_analysis should be populated, got: {loss_analysis}")
         self.assertEqual(loss_analysis[0]["trade_id"], trade_id)
@@ -12138,12 +12342,12 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             """
             INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
                 improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
-            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            VALUES (%s, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', TRUE)
             """,
             (trade_id,),
         )
@@ -12200,25 +12404,25 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create triggers related to the window trade
         self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
-            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'pending')",
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, %s, 'pending')",
             (json.dumps([trade_id]),),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create patches with different statuses linked to the trigger
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', ?)",
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', %s)",
             (trigger_id,),
         )
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('test_strategy2', '1.0', 'v2-review', '{}', 'review_required', ?)",
+            "VALUES ('test_strategy2', '1.0', 'v2-review', '{}', 'review_required', %s)",
             (trigger_id,),
         )
         self.conn.commit()
@@ -12252,16 +12456,16 @@ class PendingOrderManagerTest(unittest.TestCase):
             "final_summary, raw_decision_json) "
             "VALUES ('BTCUSDT', 1700000000000, '2024-01-15T00:00:00Z', 'scheduled', "
             "'A', 0.80, 'trade_plan_available', '[]', '[]', '[]', '{\"ok\":true}', '{}', '[]', "
-            "'test', ?)",
+            "'test', %s)",
             (json.dumps(raw_decision),),
         )
-        ga_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        ga_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, status, ga_decision_id) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 'filled', ?)",
+            "VALUES ('BTCUSDT', 'LONG', 'market', 'filled', %s)",
             (ga_id,),
         )
-        order_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        order_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         trade = {"id": 1, "order_id": order_id, "symbol": "BTCUSDT", "side": "LONG"}
@@ -12302,11 +12506,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         result = run_daily_review(self.repo, day_utc=day)
         # The trade should appear in paper_summary (from all_closed)
         report = self.conn.execute(
-            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=%s",
             (day,),
         ).fetchone()
         self.assertIsNotNone(report, "daily_review_report should exist")
-        summary = json.loads(report["summary_json"])
+        summary = _load_json(report["summary_json"])
         paper_summary = summary.get("paper_summary", {})
         self.assertGreaterEqual(paper_summary.get("total", 0), 1, "paper_summary should include all closed trades")
         self.assertLess(paper_summary.get("net_pnl", 0), 0, "net PnL should be negative")
@@ -12329,14 +12533,14 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 110, 95, 1, 10, 10, 2.0, 12, -3, 'take_profit', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         # Pre-create a trade_review with pnl_r only in ga_review_json.metrics
         ga_review_json = json.dumps({"metrics": {"pnl_r": 2.0}})
         self.conn.execute(
             """
             INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
                 improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
-            VALUES (?, 'win', 'correct_direction', '[]', 'test', '{}', ?, 'normal', 1)
+            VALUES (%s, 'win', 'correct_direction', '[]', 'test', '{}', %s, 'normal', TRUE)
             """,
             (trade_id, ga_review_json),
         )
@@ -12344,11 +12548,11 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         result = run_daily_review(self.repo, day_utc=day)
         report = self.conn.execute(
-            "SELECT summary_json FROM daily_review_reports WHERE review_date=?",
+            "SELECT summary_json FROM daily_review_reports WHERE review_date=%s",
             (day,),
         ).fetchone()
         self.assertIsNotNone(report, "daily_review_report should exist")
-        summary = json.loads(report["summary_json"])
+        summary = _load_json(report["summary_json"])
         win_analysis = summary.get("win_analysis", [])
         self.assertTrue(len(win_analysis) > 0, f"win_analysis should be populated, got: {win_analysis}")
 
@@ -12368,7 +12572,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('ETHUSDT', 'SHORT', 100, 106, 105, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         # Pre-create a trade_review with market_regime_at_loss as JSON string
         regime_json = json.dumps({
             "market_phase": "bearish",
@@ -12381,7 +12585,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             """
             INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
                 improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
-            VALUES (?, 'loss', 'counter_regime_entry_loss', '[]', 'test', '{}', '{}', ?, 1)
+            VALUES (%s, 'loss', 'counter_regime_entry_loss', '[]', 'test', '{}', '{}', %s, TRUE)
             """,
             (trade_id, regime_json),
         )
@@ -12394,7 +12598,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         ).fetchall()
         self.assertTrue(len(mem) > 0, "Should have skill_feedback_memory entries")
         for row in mem:
-            adj = json.loads(row["suggested_adjustment_json"] or "{}")
+            adj = _load_json(row["suggested_adjustment_json"] or "{}")
             if adj.get("market_phase"):
                 self.assertEqual(adj["market_phase"], "bearish")
                 self.assertEqual(adj["regime_alignment"], "counter_trend")
@@ -12451,12 +12655,12 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             """
             INSERT INTO trade_reviews(trade_id, result, primary_reason, secondary_reasons_json, market_context,
                 improvement_suggestion, ga_review_json, market_regime_at_loss, evolution_trigger_allowed)
-            VALUES (?, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', 1)
+            VALUES (%s, 'loss', 'wrong_direction', '[]', 'test', '{}', '{}', 'normal', TRUE)
             """,
             (trade_id,),
         )
@@ -12469,7 +12673,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         result = run_daily_review(self.repo, day_utc=day)
         report = self.conn.execute(
-            "SELECT ga_report, summary_json FROM daily_review_reports WHERE review_date=?",
+            "SELECT ga_report, summary_json FROM daily_review_reports WHERE review_date=%s",
             (day,),
         ).fetchone()
         self.assertIsNotNone(report, "daily_review_report should exist")
@@ -12485,7 +12689,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             # OK - shadow_testing is correctly labeled
             pass
         # Should NOT say "进入 review" for shadow_testing patches
-        summary = json.loads(report["summary_json"])
+        summary = _load_json(report["summary_json"])
         evo_status = summary.get("evo_status", {})
         for p in evo_status.get("shadow_testing", []):
             self.assertEqual(p["status"], "shadow_testing")
@@ -12501,10 +12705,10 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
             "VALUES ('consecutive_stop_losses', 3.0, 3.0, '[99999]', 'pending')"
         )
-        old_trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        old_trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('old_strategy', '1.0', 'v2-old', '{}', 'shadow_testing', ?)",
+            "VALUES ('old_strategy', '1.0', 'v2-old', '{}', 'shadow_testing', %s)",
             (old_trigger_id,),
         )
 
@@ -12518,18 +12722,18 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create a trigger related to the window trade
         self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
-            "VALUES ('daily_loss_threshold', 5.0, 5.0, ?, 'pending')",
+            "VALUES ('daily_loss_threshold', 5.0, 5.0, %s, 'pending')",
             (json.dumps([trade_id]),),
         )
-        window_trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        window_trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('window_strategy', '1.0', 'v2-window', '{}', 'review_required', ?)",
+            "VALUES ('window_strategy', '1.0', 'v2-window', '{}', 'review_required', %s)",
             (window_trigger_id,),
         )
         self.conn.commit()
@@ -12572,7 +12776,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('ETHUSDT', 'LONG', 100, 94, 95, 1, -6, -6, -1.2, 1, -6, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.commit()
 
         # Build all_review_items without a review for this trade
@@ -12621,7 +12825,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for i in range(3):
             self.conn.execute(
                 "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status) "
-                "VALUES (?, '1.0', ?, '{}', 'shadow_testing')",
+                "VALUES (%s, '1.0', %s, '{}', 'shadow_testing')",
                 (f"strategy_{i}", f"v2-shadow-{i}"),
             )
         self.conn.commit()
@@ -12668,15 +12872,15 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create a trigger related to the window trade
         self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
-            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, %s, 'shadow_testing')",
             (json.dumps([trade_id]),),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create a patch with backtest_result_json containing raw fields
         raw_backtest = json.dumps({
@@ -12691,7 +12895,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id, backtest_result_json) "
-            "VALUES ('test_strategy', '1.0', 'v2-test', '{}', 'shadow_testing', ?, ?)",
+            "VALUES ('test_strategy', '1.0', 'v2-test', '{}', 'shadow_testing', %s, %s)",
             (trigger_id, raw_backtest),
         )
         self.conn.commit()
@@ -12734,18 +12938,18 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create trigger + patch
         self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
-            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, %s, 'shadow_testing')",
             (json.dumps([trade_id]),),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', ?)",
+            "VALUES ('test_strategy', '1.0', 'v2-shadow', '{}', 'shadow_testing', %s)",
             (trigger_id,),
         )
         self.conn.commit()
@@ -12754,7 +12958,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for i in range(17):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, is_shadow, pnl_r, score, decision, evidence_json) "
-                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-shadow', 1, NULL, 0.5, 'hold', '{}')"
+                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-shadow', TRUE, NULL, 0.5, 'hold', '{}')"
             )
         self.conn.commit()
 
@@ -12798,18 +13002,18 @@ class PendingOrderManagerTest(unittest.TestCase):
             VALUES ('BTCUSDT', 'LONG', 100, 95, 95, 1, -5, -5, -1.0, 0, -5, 'stop_loss', CURRENT_TIMESTAMP)
             """
         )
-        trade_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trade_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create trigger + patch
         self.conn.execute(
             "INSERT INTO evolution_triggers(trigger_type, trigger_value, threshold_value, related_trade_ids, status) "
-            "VALUES ('consecutive_stop_losses', 3.0, 3.0, ?, 'shadow_testing')",
+            "VALUES ('consecutive_stop_losses', 3.0, 3.0, %s, 'shadow_testing')",
             (json.dumps([trade_id]),),
         )
-        trigger_id = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.conn.execute("SELECT lastval() AS id").fetchone()["id"])
         self.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id) "
-            "VALUES ('test_strategy', '1.0', 'v2-no-pnl', '{}', 'shadow_testing', ?)",
+            "VALUES ('test_strategy', '1.0', 'v2-no-pnl', '{}', 'shadow_testing', %s)",
             (trigger_id,),
         )
         self.conn.commit()
@@ -12818,7 +13022,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for i in range(5):
             self.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, is_shadow, pnl_r, score, decision, evidence_json) "
-                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-no-pnl', 1, NULL, 0.3, 'hold', '{}')"
+                "VALUES ('BTCUSDT', '1h', 1000000, 'test_strategy', 'v2-no-pnl', TRUE, NULL, 0.3, 'hold', '{}')"
             )
         self.conn.commit()
 
@@ -12841,7 +13045,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         stale_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
         self.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('smc_pullback_long', 'v2-report-only-test', 'shadow_testing', '{}', 'test', ?)",
+            "VALUES ('smc_pullback_long', 'v2-report-only-test', 'shadow_testing', '{}', 'test', %s)",
             (stale_time,),
         )
         self.conn.execute(
@@ -12956,17 +13160,17 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO evolution_triggers(trigger_type, strategy_name, trigger_value, threshold_value, status, latest_triggered_at) "
             "VALUES ('consecutive_stop_losses', 'smc_pullback_long', 3, 3, 'shadow_testing', CURRENT_TIMESTAMP)"
         )
-        trigger_id = self.repo.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        trigger_id = self.repo.conn.execute("SELECT lastval()").fetchone()["lastval"]
         self.repo.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, trigger_id, status) "
-            "VALUES ('smc_pullback_long', '1.0', 'v2-test-1', '{}', ?, 'shadow_testing')",
+            "VALUES ('smc_pullback_long', '1.0', 'v2-test-1', '{}', %s, 'shadow_testing')",
             (trigger_id,),
         )
         # Add shadow evaluations with real PnL
         for pnl_r in [0.5, -0.3, 0.2, 0.8, -0.1]:
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r) "
-                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-test-1', 0.6, 'monitor_only', 1, ?)",
+                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-test-1', 0.6, 'monitor_only', TRUE, %s)",
                 (pnl_r,),
             )
         # Add unrelated paper_trades (should NOT affect report)
@@ -12992,17 +13196,17 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO evolution_triggers(trigger_type, strategy_name, trigger_value, threshold_value, status, latest_triggered_at) "
             "VALUES ('daily_loss_threshold', 'smc_pullback_long', 4, 3, 'shadow_testing', CURRENT_TIMESTAMP)"
         )
-        trigger_id = self.repo.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        trigger_id = self.repo.conn.execute("SELECT lastval()").fetchone()["lastval"]
         self.repo.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, trigger_id, status) "
-            "VALUES ('smc_pullback_long', '1.0', 'v2-pseudo-only', '{}', ?, 'shadow_testing')",
+            "VALUES ('smc_pullback_long', '1.0', 'v2-pseudo-only', '{}', %s, 'shadow_testing')",
             (trigger_id,),
         )
         # Add shadow evaluations with ONLY pseudo-R (pnl_r IS NULL)
         for score in [0.6, 0.7, 0.55, 0.8, 0.65]:
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow) "
-                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-pseudo-only', ?, 'monitor_only', 1)",
+                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-pseudo-only', %s, 'monitor_only', TRUE)",
                 (score,),
             )
         self.repo.conn.commit()
@@ -13019,7 +13223,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for pnl_r in [0.3, -0.2, 0.4, 0.1, -0.1]:
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r) "
-                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', '1.0', 0.6, 'monitor_only', 0, ?)",
+                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', '1.0', 0.6, 'monitor_only', FALSE, %s)",
                 (pnl_r,),
             )
         # Candidate evaluations with real PnL
@@ -13030,7 +13234,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for pnl_r in [0.5, 0.3, 0.6, 0.2, 0.4]:
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r) "
-                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-real-pnl', 0.6, 'monitor_only', 1, ?)",
+                "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', 'v2-real-pnl', 0.6, 'monitor_only', TRUE, %s)",
                 (pnl_r,),
             )
         self.repo.conn.commit()
@@ -13052,7 +13256,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for v in ["v2-cand-1", "v2-cand-2", "v2-cand-3"]:
             self.repo.conn.execute(
                 "INSERT INTO strategy_versions(strategy_name, version, status, config_json) "
-                "VALUES ('smc_pullback_long', ?, 'shadow_testing', '{}')",
+                "VALUES ('smc_pullback_long', %s, 'shadow_testing', '{}')",
                 (v,),
             )
         self.repo.conn.commit()
@@ -13116,7 +13320,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for _ in range(2):
             self.repo.conn.execute(
                 "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-                "VALUES ('BTCUSDT', 1700000000000, ?, 'scheduled', 'A', 0.80, 'bearish', 'middle', 'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{\"side\": \"SHORT\", \"entry_type\": \"limit\"}')",
+                "VALUES ('BTCUSDT', 1700000000000, %s, 'scheduled', 'A', 0.80, 'bearish', 'middle', 'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{\"side\": \"SHORT\", \"entry_type\": \"limit\"}')",
                 (now.isoformat(),),
             )
         self.repo.conn.commit()
@@ -13148,7 +13352,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         for _ in range(2):
             self.repo.conn.execute(
                 "INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-                "VALUES ('BTCUSDT', 1700000000000, ?, 'scheduled', 'A', 0.80, 'bearish', 'middle', 'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{\"side\": \"SHORT\", \"entry_type\": \"limit\"}')",
+                "VALUES ('BTCUSDT', 1700000000000, %s, 'scheduled', 'A', 0.80, 'bearish', 'middle', 'opportunity_watch', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{\"side\": \"SHORT\", \"entry_type\": \"limit\"}')",
                 (now.isoformat(),),
             )
         self.repo.conn.commit()
@@ -13204,30 +13408,6 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertIn("#4", text)
 
     # ── Item 13: Comprehensive tests ──
-
-    def test_legacy_fuzzy_migration(self) -> None:
-        """After migration, all ga_decision_id IS NULL rows have outcome_source='legacy_fuzzy'."""
-        # Insert legacy rows without ga_decision_id
-        self.repo.conn.execute(
-            "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow) "
-            "VALUES ('BTCUSDT', '15m', 1700000000000, 'test', '1.0', 0.5, 'monitor_only', 0)"
-        )
-        self.repo.conn.execute(
-            "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, paper_trade_id) "
-            "VALUES ('BTCUSDT', '15m', 1700000000001, 'test', '1.0', 0.5, 'monitor_only', 0, NULL)"
-        )
-        self.repo.conn.commit()
-
-        # Run migration
-        from plugins.crypto_guard.storage.migrations import _apply_legacy_fuzzy_migration
-        _apply_legacy_fuzzy_migration(self.repo.conn)
-
-        # Verify all ga_decision_id IS NULL rows are marked legacy_fuzzy
-        rows = self.repo.conn.execute(
-            "SELECT outcome_source FROM strategy_evaluations WHERE ga_decision_id IS NULL"
-        ).fetchall()
-        for r in rows:
-            self.assertEqual(r["outcome_source"], "legacy_fuzzy")
 
     def test_real_pnl_requires_complete_ids(self) -> None:
         """Rows with pnl_r but outcome_source='legacy_fuzzy' are NOT counted as real_pnl."""
@@ -13298,11 +13478,11 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create active and shadow evaluations with some NULL pnl_r
         self.repo.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, paper_trade_id) "
-            "VALUES ('BTCUSDT', '15m', 1000, 'test', '1.0', 0.5, 'monitor_only', 0, 1.5, 'real_pnl', 1, 1)"
+            "VALUES ('BTCUSDT', '15m', 1000, 'test', '1.0', 0.5, 'monitor_only', FALSE, 1.5, 'real_pnl', 1, 1)"
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, strategy_version, score, decision, is_shadow, pnl_r, outcome_source, ga_decision_id, paper_trade_id) "
-            "VALUES ('BTCUSDT', '15m', 1000, 'test', 'v1', 0.5, 'monitor_only', 1, NULL, 'real_pnl', 1, 2)"
+            "VALUES ('BTCUSDT', '15m', 1000, 'test', 'v1', 0.5, 'monitor_only', TRUE, NULL, 'real_pnl', 1, 2)"
         )
         self.repo.conn.commit()
 
@@ -13348,13 +13528,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         for i in range(3):
             self.repo.conn.execute(
                 "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-                "VALUES (?, ?, 'candidate', '{}', 'test')",
+                "VALUES (%s, %s, 'candidate', '{}', 'test')",
                 ("cap_test", f"c{i}"),
             )
         for i in range(3):
             self.repo.conn.execute(
                 "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-                "VALUES (?, ?, 'shadow_testing', '{}', 'test')",
+                "VALUES (%s, %s, 'shadow_testing', '{}', 'test')",
                 ("cap_test", f"s{i}"),
             )
         self.repo.conn.commit()
@@ -13410,13 +13590,23 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(remaining["cnt"], 0, "Re-queried list should exclude rejected candidates")
 
     def test_stalled_candidate_cleanup(self) -> None:
-        """Stalled candidate is rejected with audit trail."""
-        from plugins.crypto_guard.storage.migrations import _apply_legacy_fuzzy_migration
+        """Greenfield: a stalled candidate (>48h in 'candidate' status) is reported
+        by the read-only state-consistency diagnostic, NOT auto-rejected.
 
-        # Create a stalled candidate older than 48 hours
+        The legacy one-time migration that auto-rejected stalled candidates
+        (`_apply_legacy_fuzzy_migration`) was removed in the greenfield cutover
+        (P3); the replacement is the read-only `_check_stalled_candidate`
+        diagnostic wired into `diagnose_state_consistency` (state_consistency.py).
+        This exercises that greenfield contract: the candidate is surfaced as a
+        `stalled_candidate` warning issue, and its row is left untouched
+        (diagnostics never mutate state).
+        """
+        from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
+
+        # Create a stalled candidate (version + patch) older than the 48h threshold.
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('momentum_continuation_long', 'stalled-v1', 'candidate', '{}', 'test', datetime('now', '-72 hours'))"
+            "VALUES ('momentum_continuation_long', 'stalled-v1', 'candidate', '{}', 'test', NOW() - INTERVAL '72 hours')"
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, reason) "
@@ -13424,13 +13614,29 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
         self.repo.conn.commit()
 
-        _apply_legacy_fuzzy_migration(self.repo.conn)
+        result = diagnose_state_consistency(self.repo)
 
+        # The diagnostic must surface this candidate as a stalled_candidate issue.
+        stalled = [
+            i for i in result["issues"]
+            if i["type"] == "stalled_candidate"
+            and i["details"]["strategy_name"] == "momentum_continuation_long"
+            and i["details"]["version"] == "stalled-v1"
+        ]
+        self.assertTrue(
+            stalled,
+            "diagnose_state_consistency must report the >48h candidate as a stalled_candidate issue",
+        )
+        self.assertEqual(stalled[0]["severity"], "warning")
+        # ~72h stale (allow slack for test timing) — confirms the age math ran.
+        self.assertGreaterEqual(stalled[0]["details"]["hours_stalled"], 48)
+
+        # Greenfield contract: diagnostics are READ-ONLY. The candidate must NOT
+        # have been auto-rejected (the legacy migration is gone).
         status = self.repo.conn.execute(
             "SELECT status, change_reason FROM strategy_versions WHERE version='stalled-v1'"
         ).fetchone()
-        self.assertEqual(status["status"], "rejected")
-        self.assertIn("stalled_candidate_cleanup", status["change_reason"])
+        self.assertEqual(status["status"], "candidate")
 
     def test_backtest_data_unavailable_skips(self) -> None:
         """no_valid_backtest_results -> skipped:data_unavailable, not rejection."""
@@ -13475,7 +13681,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
             "  strategy_version, score, decision, is_shadow, ga_decision_id, pnl_r, outcome_source) "
             "VALUES ('BTCUSDT', '1h', 1700000000000, 'smc_pullback_long', '1.0', "
-            "  0.80, 'trade_plan_available', 0, 9001, NULL, 'pending_outcome')"
+            "  0.80, 'trade_plan_available', FALSE, 9001, NULL, 'pending_outcome')"
         )
         # Create paper_order and paper_trade linked to ga_decision
         self.repo.conn.execute(
@@ -13499,7 +13705,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify
         filled = self.repo.conn.execute(
-            "SELECT outcome_source, pnl_r, paper_trade_id FROM strategy_evaluations WHERE ga_decision_id=9001 AND is_shadow=0"
+            "SELECT outcome_source, pnl_r, paper_trade_id FROM strategy_evaluations WHERE ga_decision_id=9001 AND is_shadow=FALSE"
         ).fetchone()
         self.assertEqual(filled["outcome_source"], "real_pnl")
         self.assertIsNotNone(filled["pnl_r"])
@@ -13526,7 +13732,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify: shadow evaluation exists with correct outcome_source
         row = self.repo.conn.execute(
-            "SELECT decision, outcome_source, is_shadow FROM strategy_evaluations WHERE id=?",
+            "SELECT decision, outcome_source, is_shadow FROM strategy_evaluations WHERE id=%s",
             (result["evaluation_id"],),
         ).fetchone()
         self.assertEqual(row["decision"], "opportunity_watch")
@@ -13547,7 +13753,7 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, confidence, "
                 "  market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, counter_evidence_json, "
                 "  risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-                "VALUES (?, 'BTCUSDT', 1700000000000, '2026-06-24T00:00:00+00:00', 'scheduled', 'A', 0.80, 'bullish', 'middle', "
+                "VALUES (%s, 'BTCUSDT', 1700000000000, '2026-06-24T00:00:00+00:00', 'scheduled', 'A', 0.80, 'bullish', 'middle', "
                 "  'trade_plan_available', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{}')",
                 (gd_id,),
             )
@@ -13605,21 +13811,21 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify candidate 1's evaluation is backfilled
         eval1 = self.repo.conn.execute(
-            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=9003 AND is_shadow=1"
+            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=9003 AND is_shadow=TRUE"
         ).fetchone()
         self.assertEqual(eval1["outcome_source"], "real_pnl")
         self.assertIsNotNone(eval1["pnl_r"])
 
         # Verify candidate 2's evaluation is untouched
         eval2 = self.repo.conn.execute(
-            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=9004 AND is_shadow=1"
+            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=9004 AND is_shadow=TRUE"
         ).fetchone()
         self.assertEqual(eval2["outcome_source"], "pending_outcome")
         self.assertIsNone(eval2["pnl_r"])
 
         # Verify candidate 2's virtual trade is still pending_entry (not yet activated)
         vt2_row = self.repo.conn.execute(
-            "SELECT status FROM shadow_virtual_trades WHERE id=?", (vt2,)
+            "SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt2,)
         ).fetchone()
         self.assertEqual(vt2_row["status"], "pending_entry")
 
@@ -13652,7 +13858,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Record the closed_at time
         closed_at_before = self.repo.conn.execute(
-            "SELECT closed_at FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT closed_at FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()["closed_at"]
 
         # Try to "re-create" the same virtual trade (simulating restart)
@@ -13674,7 +13880,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify the trade is still closed (not overwritten)
         vt_row = self.repo.conn.execute(
-            "SELECT status, closed_at FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, closed_at FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(vt_row["status"], "closed")
         self.assertEqual(vt_row["closed_at"], closed_at_before,
@@ -13687,12 +13893,12 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Create active and candidate versions
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('smc_pullback_long_t5', '1.0', 'active', '{}', 'initial', ?)",
+            "VALUES ('smc_pullback_long_t5', '1.0', 'active', '{}', 'initial', %s)",
             (now.isoformat(),),
         )
         self.repo.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-            "VALUES ('smc_pullback_long_t5', 'bad-cand-v1', 'shadow_testing', '{}', 'test', ?)",
+            "VALUES ('smc_pullback_long_t5', 'bad-cand-v1', 'shadow_testing', '{}', 'test', %s)",
             (now.isoformat(),),
         )
         self.repo.conn.commit()
@@ -13712,7 +13918,7 @@ class PendingOrderManagerTest(unittest.TestCase):
                 "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, signal_grade, confidence, "
                 "  market_bias, trend_stage, decision, skill_result_refs_json, evidence_json, counter_evidence_json, "
                 "  risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-                "VALUES (?, 'BTCUSDT', ?, '2026-06-24T00:00:00+00:00', 'scheduled', 'A', 0.80, 'bullish', 'middle', "
+                "VALUES (%s, 'BTCUSDT', %s, '2026-06-24T00:00:00+00:00', 'scheduled', 'A', 0.80, 'bullish', 'middle', "
                 "  'trade_plan_available', '[]', '{}', '{}', '{\"ok\": true}', '[]', 'test', '{}', '{}')",
                 (gd_id, 1700000000000 + i * 3600000),
             )
@@ -13720,16 +13926,16 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, ga_decision_id, outcome_source, pnl_r) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_t5', '1.0', "
-                "  0.80, 'trade_plan_available', 0, ?, 'real_pnl', 1.0)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_t5', '1.0', "
+                "  0.80, 'trade_plan_available', FALSE, %s, 'real_pnl', 1.0)",
                 (1700000000000 + i * 3600000, gd_id),
             )
             # Candidate evaluation: worse pnl_r
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
                 "  strategy_version, score, decision, is_shadow, ga_decision_id, outcome_source, pnl_r) "
-                "VALUES ('BTCUSDT', '1h', ?, 'smc_pullback_long_t5', 'bad-cand-v1', "
-                "  0.70, 'trade_plan_available', 1, ?, 'real_pnl', -0.5)",
+                "VALUES ('BTCUSDT', '1h', %s, 'smc_pullback_long_t5', 'bad-cand-v1', "
+                "  0.70, 'trade_plan_available', TRUE, %s, 'real_pnl', -0.5)",
                 (1700000000000 + i * 3600000, gd_id),
             )
         self.repo.conn.commit()
@@ -13758,31 +13964,42 @@ class PendingOrderManagerTest(unittest.TestCase):
         )
 
     def test_cap_after_creation_not_exceed_5(self) -> None:
-        """创建后 candidate+shadow_testing 不超过 5。"""
+        """创建后 candidate+shadow_testing 不超过 5。
+
+        Greenfield: the LIVE cap mutator is `_enforce_candidate_cap`
+        (strategy/shadow_testing.py), which rejects excess candidate+shadow_testing
+        rows in a transaction. The legacy one-time `_apply_candidate_cap_cleanup`
+        migration was removed in the greenfield cutover (P3). This mirrors the
+        ShadowVTLifecycleTest version but creates 6 shadow_testing candidates for
+        `smc_pullback_long_t6` and asserts the cap keeps <=5 with >=1 rejected.
+        """
+        from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
         now = datetime.now(timezone.utc)
 
-        # Create 6 candidates for the same strategy_name
+        # Create 6 shadow_testing candidates for the same strategy_name.
         for i in range(6):
             version = f"cap-test-v{i}"
             self.repo.conn.execute(
                 "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason, created_at) "
-                "VALUES ('smc_pullback_long_t6', ?, 'shadow_testing', '{}', 'test', ?)",
+                "VALUES ('smc_pullback_long_t6', %s, 'shadow_testing', '{}', 'test', %s)",
                 (version, (now - timedelta(hours=i)).isoformat()),
             )
         self.repo.conn.commit()
 
-        from plugins.crypto_guard.storage.migrations import _apply_candidate_cap_cleanup
+        cap_rejected = _enforce_candidate_cap(self.repo, "smc_pullback_long_t6", max_candidates=5)
+        self.repo.conn.commit()
 
-        _apply_candidate_cap_cleanup(self.repo.conn)
+        # Exactly one excess candidate (6 - 5) is rejected.
+        self.assertEqual(cap_rejected, 1)
 
-        # Count remaining candidates
+        # Count remaining candidate+shadow_testing (cap keeps 5).
         remaining = self.repo.conn.execute(
             "SELECT COUNT(*) as cnt FROM strategy_versions "
             "WHERE strategy_name='smc_pullback_long_t6' AND status IN ('candidate', 'shadow_testing')"
         ).fetchone()["cnt"]
         self.assertLessEqual(remaining, 5)
 
-        # Count rejected
+        # Count rejected (the one excess).
         rejected = self.repo.conn.execute(
             "SELECT COUNT(*) as cnt FROM strategy_versions "
             "WHERE strategy_name='smc_pullback_long_t6' AND status='rejected'"
@@ -13796,7 +14013,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             "INSERT INTO evolution_triggers(strategy_name, trigger_type, trigger_value, status, created_at) "
             "VALUES ('smc_pullback_long_t7', 'manual', 0, 'draft', CURRENT_TIMESTAMP)"
         )
-        trigger_id = int(self.repo.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        trigger_id = int(self.repo.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
         # Create draft patch via save_strategy_patch_candidate
         patch = {
@@ -13811,7 +14028,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify patch.status='draft'
         patch_row = self.repo.conn.execute(
-            "SELECT status FROM strategy_patches WHERE id=?", (patch_id,)
+            "SELECT status FROM strategy_patches WHERE id=%s", (patch_id,)
         ).fetchone()
         self.assertEqual(patch_row["status"], "draft")
 
@@ -13830,7 +14047,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify trigger.status='draft'
         trigger_row = self.repo.conn.execute(
-            "SELECT status FROM evolution_triggers WHERE id=?", (trigger_id,)
+            "SELECT status FROM evolution_triggers WHERE id=%s", (trigger_id,)
         ).fetchone()
         self.assertEqual(trigger_row["status"], "draft")
 
@@ -13839,7 +14056,7 @@ class PendingOrderManagerTest(unittest.TestCase):
     def _vt_start_ms(self, vt_id: int) -> int:
         """Return the replay start time (ms) for a shadow VT — guaranteed >= created_at."""
         from plugins.crypto_guard.paper.shadow_virtual_trade_updater import _iso_to_unix_ms
-        row = self.repo.conn.execute("SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)).fetchone()
+        row = self.repo.conn.execute("SELECT * FROM shadow_virtual_trades WHERE id=%s", (vt_id,)).fetchone()
         trade = dict(row)
         start = _iso_to_unix_ms(trade.get("opened_at") or trade.get("created_at"))
         return start if start is not None else int(__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() * 1000)
@@ -13875,7 +14092,7 @@ class PendingOrderManagerTest(unittest.TestCase):
                 strategy_name, candidate_version, ga_decision_id, symbol, side,
                 entry_type, entry_price, stop_loss, initial_stop_loss, take_profit_json,
                 quantity, initial_risk_usdt, status, opened_at, close_reason, pnl_r
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 defaults["strategy_name"], defaults["candidate_version"], defaults["ga_decision_id"],
@@ -13886,7 +14103,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             ),
         )
         self.repo.conn.commit()
-        return int(self.repo.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        return int(self.repo.conn.execute("SELECT lastval() AS id").fetchone()["id"])
 
     def test_updater_pending_stays_pending_no_activation(self):
         """Pending trade with no price touch stays pending."""
@@ -13907,7 +14124,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify still pending
         row = self.repo.conn.execute(
-            "SELECT status FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "pending_entry")
 
@@ -13929,7 +14146,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify now open
         row = self.repo.conn.execute(
-            "SELECT status, opened_at FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, opened_at FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "open")
         self.assertIsNotNone(row["opened_at"])
@@ -13952,7 +14169,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify closed at stop_loss price (95.0), not mark (96.5)
         row = self.repo.conn.execute(
-            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "stop_loss")
@@ -13977,7 +14194,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["closed_count"], 1)
 
         row = self.repo.conn.execute(
-            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "take_profit")
@@ -14002,7 +14219,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["closed_count"], 1)
 
         row = self.repo.conn.execute(
-            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "ambiguous_path")
@@ -14017,7 +14234,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         vt_id = self._make_shadow_vt(status="pending_entry", entry_type="limit", opened_at=None)
         # Override created_at to be old
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (old_time, vt_id)
+            "UPDATE shadow_virtual_trades SET created_at=%s WHERE id=%s", (old_time, vt_id)
         )
         self.repo.conn.commit()
 
@@ -14033,7 +14250,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["expired_count"], 1)
 
         row = self.repo.conn.execute(
-            "SELECT status FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "expired")
 
@@ -14045,7 +14262,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         vt_id = self._make_shadow_vt(status="open", opened_at=old_time)
         # Override created_at to be old
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (old_time, vt_id)
+            "UPDATE shadow_virtual_trades SET created_at=%s WHERE id=%s", (old_time, vt_id)
         )
         self.repo.conn.commit()
 
@@ -14061,7 +14278,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["closed_count"], 1)
 
         row = self.repo.conn.execute(
-            "SELECT status, close_reason FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "max_hold_expired")
@@ -14072,7 +14289,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         now_ms = self._vt_start_ms(vt_id)
         # Set closed_at
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET closed_at=CURRENT_TIMESTAMP WHERE id=?", (vt_id,)
+            "UPDATE shadow_virtual_trades SET closed_at=CURRENT_TIMESTAMP WHERE id=%s", (vt_id,)
         )
         self.repo.conn.commit()
 
@@ -14091,7 +14308,7 @@ class PendingOrderManagerTest(unittest.TestCase):
 
         # Verify still closed with original values
         row = self.repo.conn.execute(
-            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason, pnl_r FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "stop_loss")
@@ -14140,13 +14357,13 @@ class PendingOrderManagerTest(unittest.TestCase):
         old_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         vt1 = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0, opened_at=old_time, ga_decision_id=1001)
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (old_time, vt1)
+            "UPDATE shadow_virtual_trades SET created_at=%s WHERE id=%s", (old_time, vt1)
         )
         # Trade 2: created just now, same symbol
         recent_time = datetime.now(timezone.utc).isoformat()
         vt2 = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0, opened_at=recent_time, ga_decision_id=1002)
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (recent_time, vt2)
+            "UPDATE shadow_virtual_trades SET created_at=%s WHERE id=%s", (recent_time, vt2)
         )
         self.repo.conn.commit()
         now_ms = self._vt_start_ms(vt2)
@@ -14192,7 +14409,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         self.assertEqual(result["closed_count"], 1)
 
         row = self.repo.conn.execute(
-            "SELECT status, close_reason FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status, close_reason FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "closed")
         self.assertEqual(row["close_reason"], "activation_ambiguous_path")
@@ -14221,7 +14438,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         vt_id = self._make_shadow_vt(status="open", entry_price=100.0, stop_loss=95.0,
                                      opened_at=recent_opened)
         self.repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET created_at=? WHERE id=?", (old_created, vt_id)
+            "UPDATE shadow_virtual_trades SET created_at=%s WHERE id=%s", (old_created, vt_id)
         )
         self.repo.conn.commit()
         now_ms = self._vt_start_ms(vt_id)
@@ -14238,7 +14455,7 @@ class PendingOrderManagerTest(unittest.TestCase):
         # Should NOT be closed for max_hold — opened_at is only 1 hour ago
         self.assertEqual(result["closed_count"], 0)
         row = self.repo.conn.execute(
-            "SELECT status FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone()
         self.assertEqual(row["status"], "open")
 
@@ -14254,17 +14471,25 @@ class PendingOrderManagerTest(unittest.TestCase):
             "patch": {"score_adjustments": {"test_adj": 0.01}},
             "change_reason": "transaction rollback test",
         }
-        # Verify no orphan: insert patch, then simulate failure
-        self.repo.conn.execute("BEGIN")
-        try:
-            pid = self.repo.save_strategy_patch_candidate(patch, status="candidate")
-            self.assertGreater(pid, 0)
-            # Now simulate a failure by raising
-            raise RuntimeError("simulated version save failure")
-        except RuntimeError:
-            self.repo.conn.execute("ROLLBACK")
+        # PG (psycopg autocommit=False): ``save_strategy_patch_candidate``
+        # self-wraps ``with self.conn.transaction():`` and has NO preceding
+        # read, so with no outer txn the conn is IDLE and that inner
+        # ``transaction()`` is a TOP-LEVEL BEGIN...COMMIT (durable) -- a later
+        # ``rollback()`` would undo nothing and leave an orphan. The production
+        # caller opens an outer transaction first; model that here with an
+        # explicit outer ``conn.transaction()`` so the candidate's write is a
+        # SAVEPOINT under it. The simulated version-save failure propagates out
+        # of the outer ``transaction()``, which rolls back (undoing the
+        # savepointed patch); ``assertRaises`` swallows the re-raised error so
+        # the orphan check below can run.
+        with self.assertRaises(RuntimeError):
+            with self.repo.conn.transaction():
+                pid = self.repo.save_strategy_patch_candidate(patch, status="candidate")
+                self.assertGreater(pid, 0)
+                # Now simulate a failure by raising
+                raise RuntimeError("simulated version save failure")
 
-        # After rollback, patch should NOT exist
+        # After the outer transaction rolled back, patch should NOT exist
         row = self.repo.conn.execute(
             "SELECT id FROM strategy_patches WHERE candidate_version='tx-test-v1'"
         ).fetchone()
@@ -14272,8 +14497,9 @@ class PendingOrderManagerTest(unittest.TestCase):
 
     def test_updater_evolution_trigger_transaction_rollback(self):
         """When trigger+patch+version+cap transaction fails, trigger is rolled back."""
-        # Verify create_evolution_trigger doesn't auto-commit
-        self.repo.conn.execute("BEGIN")
+        # Verify create_evolution_trigger doesn't auto-commit. PG (psycopg
+        # autocommit=False): no explicit BEGIN; create_evolution_trigger
+        # self-wraps a conn.transaction() savepoint, rollback() undoes it.
         try:
             tid = self.repo.create_evolution_trigger(
                 trigger_type="test_tx_rollback",
@@ -14285,7 +14511,7 @@ class PendingOrderManagerTest(unittest.TestCase):
             self.assertGreater(tid, 0)
             raise RuntimeError("simulated patch save failure")
         except RuntimeError:
-            self.repo.conn.execute("ROLLBACK")
+            self.repo.conn.rollback()
 
         # After rollback, trigger should NOT exist
         row = self.repo.conn.execute(
@@ -14299,83 +14525,43 @@ class ShadowVTLifecycleTest(unittest.TestCase):
     backtest gate, and state diagnostics pipeline."""
 
     def setUp(self) -> None:
-        import sqlite3
-        self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy sqlite3 :memory: +
+        # executescript(schema.sql) + manual migration calls pattern).
+        # initialize_database() (run inside make_repo) already creates every
+        # table + writes the BTC#9 and LLM-fair-scheduling contract markers,
+        # so the manual migration/marker calls below are no longer needed.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        # Execute schema.sql
-        import plugins.crypto_guard.config.loader as _loader
-        schema_path = _loader.PLUGIN_ROOT / "storage" / "schema.sql"
-        with open(schema_path, "r", encoding="utf-8") as f:
-            self.conn.executescript(f.read())
-
-        # Run migrations
-        from plugins.crypto_guard.storage.migrations import (
-            _apply_phase_01_02_migrations,
-            _apply_phase_13_migrations,
-            _apply_phase_14_15_migrations,
-            _apply_decision_supplement_migrations,
-            _apply_v2_migrations,
-            _apply_ga_master_migrations,
-            _apply_pending_order_lifecycle_migrations,
-            _apply_p1_structured_feedback_migrations,
-            _apply_account_feedback_gate_migration,
-            _apply_daily_review_idempotency_migration,
-            _apply_legacy_fuzzy_migration,
-            _apply_phase_shadow_vt_v2_migration,
-            _apply_candidate_cap_cleanup,
-            _apply_stop_loss_adjustment_dedup,
-            _apply_paper_trade_logs_dedupe_key_migration,
-            _apply_hourly_report_accuracy_migration,
-            apply_r10_attempt_counter_migration,
-        )
-        _apply_phase_01_02_migrations(self.conn)
-        _apply_phase_13_migrations(self.conn)
-        _apply_phase_14_15_migrations(self.conn)
-        _apply_decision_supplement_migrations(self.conn)
-        _apply_v2_migrations(self.conn)
-        _apply_ga_master_migrations(self.conn)
-        _apply_pending_order_lifecycle_migrations(self.conn)
-        _apply_p1_structured_feedback_migrations(self.conn)
-        _apply_account_feedback_gate_migration(self.conn)
-        _apply_daily_review_idempotency_migration(self.conn)
-        _apply_legacy_fuzzy_migration(self.conn)
-        _apply_phase_shadow_vt_v2_migration(self.conn)
-        _apply_candidate_cap_cleanup(self.conn)
-        _apply_stop_loss_adjustment_dedup(self.conn)
-        _apply_hourly_report_accuracy_migration(self.conn)
-        _apply_paper_trade_logs_dedupe_key_migration(self.conn)
-        # 07-15 R10-F: _analysis_attempt_counter is now in check_schema_health's
-        # required_tables (reviewer P2-1). diagnose_state_consistency ->
-        # _check_schema_health_as_issues -> check_schema_health runs against
-        # this in-memory DB, so the table MUST exist (mirror what
-        # initialize_database creates), mirroring the contract-marker lines
-        # below.
-        apply_r10_attempt_counter_migration(self.conn)
-        # Write BTC#9 contract marker so cutoff-gated diagnostics can run
-        from plugins.crypto_guard.storage.migrations import _ensure_btc9_trade_gate_contract_marker
-        _ensure_btc9_trade_gate_contract_marker(self.conn)
-        # Write the 07-10 S7 (P1 #7) fair-scheduling + context-continuity
-        # contract marker so its marker-missing diagnostic does NOT fire on
-        # this correctly-migrated test DB (mirrors the BTC#9 line above; both
-        # are written by initialize_database() in production).
-        from plugins.crypto_guard.storage.migrations import _ensure_llm_fair_scheduling_context_contract_marker
-        _ensure_llm_fair_scheduling_context_contract_marker(self.conn)
-        self.conn.commit()
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository
         self.repo = CryptoGuardRepository(self.conn)
+        # PostgreSQL enforces paper_positions.account_id as a real FK. This
+        # class contains several direct position fixtures that historically
+        # relied on SQLite accepting account_id=1 without a parent row.
+        # Seed the production-shaped default account once per isolated schema.
+        self.repo.ensure_paper_account()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        self._repo_handle.close()
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _insert_strategy_version(self, strategy_name="smc_pullback_long", version="1.0", status="active"):
+        # initialize_database() (run by make_repo) pre-seeds strategy_versions
+        # from config via ON CONFLICT DO NOTHING, so the default (smc_pullback_long
+        # v1.0) already exists. Use ON CONFLICT DO UPDATE so bare default calls
+        # are idempotent against the seed (behavior-preserving: the row ends up
+        # with the test's desired status/config_json).
         self.conn.execute(
             "INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason) "
-            "VALUES (?, ?, ?, '{}', 'test')",
+            "VALUES (%s, %s, %s, '{}', 'test') "
+            "ON CONFLICT (strategy_name, version) DO UPDATE SET "
+            "status = EXCLUDED.status, config_json = EXCLUDED.config_json, "
+            "change_reason = EXCLUDED.change_reason",
             (strategy_name, version, status),
         )
 
@@ -14385,10 +14571,11 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, "
             "final_summary, raw_decision_json) "
-            "VALUES (?, ?, ?, '2023-11-14T22:13:20', 'scheduled_analysis', 'A', 0.8, 'bullish', "
+            "VALUES (%s, %s, %s, '2023-11-14T22:13:20', 'scheduled_analysis', 'A', 0.8, 'bullish', "
             "'middle', 'trade', '{}', '{}', '{}', '{}', '{}', 'test', '{}')",
             (decision_id, symbol, analysis_time),
         )
+        self.conn.commit()
 
     def _insert_virtual_trade(self, **kwargs):
         defaults = {
@@ -14408,23 +14595,27 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "created_at": "2023-11-14T22:13:20",
         }
         defaults.update(kwargs)
-        self.conn.execute(
-            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id, "
-            "symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss, "
-            "take_profit_json, quantity, initial_risk_usdt, status, opened_at, expires_at, "
-            "last_processed_candle_time, closed_at, pnl_r, close_reason, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                defaults["strategy_name"], defaults["candidate_version"], defaults["ga_decision_id"],
-                defaults["symbol"], defaults["side"], defaults["entry_type"],
-                defaults["entry_price"], defaults["stop_loss"], defaults["initial_stop_loss"],
-                defaults["take_profit_json"], defaults["quantity"], defaults["initial_risk_usdt"],
-                defaults["status"], defaults.get("opened_at"), defaults.get("expires_at"),
-                defaults.get("last_processed_candle_time"), defaults.get("closed_at"),
-                defaults.get("pnl_r"), defaults.get("close_reason"), defaults["created_at"],
-            ),
-        )
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id, "
+                    "symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss, "
+                    "take_profit_json, quantity, initial_risk_usdt, status, opened_at, expires_at, "
+                    "last_processed_candle_time, closed_at, pnl_r, close_reason, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        defaults["strategy_name"], defaults["candidate_version"], defaults["ga_decision_id"],
+                        defaults["symbol"], defaults["side"], defaults["entry_type"],
+                        defaults["entry_price"], defaults["stop_loss"], defaults["initial_stop_loss"],
+                        defaults["take_profit_json"], defaults["quantity"], defaults["initial_risk_usdt"],
+                        defaults["status"], defaults.get("opened_at"), defaults.get("expires_at"),
+                        defaults.get("last_processed_candle_time"), defaults.get("closed_at"),
+                        defaults.get("pnl_r"), defaults.get("close_reason"), defaults["created_at"],
+                    ),
+                )
+                _last_id = int(cur.fetchone()["id"])
+        self.conn.commit()
+        return _last_id
 
     def _insert_strategy_evaluation(self, **kwargs):
         defaults = {
@@ -14437,7 +14628,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "decision": "trade",
             "evidence_json": "[]",
             "counter_evidence_json": "[]",
-            "is_shadow": 1,
+            "is_shadow": True,
             "pnl_r": None,
             "ga_decision_id": 1,
             "paper_trade_id": None,
@@ -14445,21 +14636,25 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "outcome_source": None,
         }
         defaults.update(kwargs)
-        self.conn.execute(
-            "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
-            "strategy_version, score, decision, evidence_json, counter_evidence_json, is_shadow, "
-            "pnl_r, ga_decision_id, paper_trade_id, shadow_virtual_trade_id, outcome_source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                defaults["symbol"], defaults["timeframe"], defaults["analysis_time"],
-                defaults["strategy_name"], defaults["strategy_version"], defaults["score"],
-                defaults["decision"], defaults["evidence_json"], defaults["counter_evidence_json"],
-                defaults["is_shadow"], defaults["pnl_r"], defaults["ga_decision_id"],
-                defaults["paper_trade_id"], defaults["shadow_virtual_trade_id"],
-                defaults["outcome_source"],
-            ),
-        )
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO strategy_evaluations(symbol, timeframe, analysis_time, strategy_name, "
+                    "strategy_version, score, decision, evidence_json, counter_evidence_json, is_shadow, "
+                    "pnl_r, ga_decision_id, paper_trade_id, shadow_virtual_trade_id, outcome_source) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        defaults["symbol"], defaults["timeframe"], defaults["analysis_time"],
+                        defaults["strategy_name"], defaults["strategy_version"], defaults["score"],
+                        defaults["decision"], defaults["evidence_json"], defaults["counter_evidence_json"],
+                        defaults["is_shadow"], defaults["pnl_r"], defaults["ga_decision_id"],
+                        defaults["paper_trade_id"], defaults["shadow_virtual_trade_id"],
+                        defaults["outcome_source"],
+                    ),
+                )
+                _last_id = int(cur.fetchone()["id"])
+        self.conn.commit()
+        return _last_id
 
     def _insert_evolution_trigger(self, **kwargs):
         defaults = {
@@ -14470,13 +14665,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "status": "pending",
         }
         defaults.update(kwargs)
-        self.conn.execute(
-            "INSERT INTO evolution_triggers(trigger_type, strategy_name, trigger_value, "
-            "threshold_value, status) VALUES (?, ?, ?, ?, ?)",
-            (defaults["trigger_type"], defaults["strategy_name"],
-             defaults["trigger_value"], defaults["threshold_value"], defaults["status"]),
-        )
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO evolution_triggers(trigger_type, strategy_name, trigger_value, "
+                    "threshold_value, status) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (defaults["trigger_type"], defaults["strategy_name"],
+                     defaults["trigger_value"], defaults["threshold_value"], defaults["status"]),
+                )
+                _last_id = int(cur.fetchone()["id"])
+        self.conn.commit()
+        return _last_id
 
     def _insert_strategy_patch(self, **kwargs):
         defaults = {
@@ -14488,13 +14687,17 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "trigger_id": None,
         }
         defaults.update(kwargs)
-        self.conn.execute(
-            "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, "
-            "patch_json, status, trigger_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (defaults["strategy_name"], defaults["from_version"], defaults["candidate_version"],
-             defaults["patch_json"], defaults["status"], defaults["trigger_id"]),
-        )
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, "
+                    "patch_json, status, trigger_id) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    (defaults["strategy_name"], defaults["from_version"], defaults["candidate_version"],
+                     defaults["patch_json"], defaults["status"], defaults["trigger_id"]),
+                )
+                _last_id = int(cur.fetchone()["id"])
+        self.conn.commit()
+        return _last_id
 
     # ── 20 tests ─────────────────────────────────────────────────────────────
 
@@ -14508,7 +14711,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "strategy_version, score, decision, evidence_json, counter_evidence_json, is_shadow, "
             "pnl_r, ga_decision_id, outcome_source) "
             "VALUES ('BTCUSDT', '15m', 1700000000000, 'smc_pullback_long', '1.1', 0.8, 'trade', "
-            "'[]', '[]', 0, NULL, 1, 'pending_outcome')"
+            "'[]', '[]', FALSE, NULL, 1, 'pending_outcome')"
         )
         # Create VT: pending_entry
         vt_id = self._insert_virtual_trade(
@@ -14517,25 +14720,25 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
         # Transition VT to open
         self.conn.execute(
-            "UPDATE shadow_virtual_trades SET status='open', opened_at='2023-11-14T22:14:00' WHERE id=?",
+            "UPDATE shadow_virtual_trades SET status='open', opened_at='2023-11-14T22:14:00' WHERE id=%s",
             (vt_id,),
         )
         # Close VT with real_pnl
         self.conn.execute(
             "UPDATE shadow_virtual_trades SET status='closed', closed_at='2023-11-14T23:00:00', "
-            "pnl_r=1.5, close_reason='take_profit' WHERE id=?",
+            "pnl_r=1.5, close_reason='take_profit' WHERE id=%s",
             (vt_id,),
         )
         # Backfill evaluation with real_pnl
         self.conn.execute(
             "UPDATE strategy_evaluations SET outcome_source='real_pnl', pnl_r=1.5, "
-            "shadow_virtual_trade_id=? WHERE ga_decision_id=? AND is_shadow=0",
+            "shadow_virtual_trade_id=%s WHERE ga_decision_id=%s AND is_shadow=FALSE",
             (vt_id, 1),
         )
         self.conn.commit()
 
         eval_row = self.conn.execute(
-            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=? AND is_shadow=0",
+            "SELECT outcome_source, pnl_r FROM strategy_evaluations WHERE ga_decision_id=%s AND is_shadow=FALSE",
             (1,),
         ).fetchone()
         self.assertIsNotNone(eval_row)
@@ -14549,7 +14752,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Simulate: the controller decides opportunity_watch, so no VT is created.
         # We verify that no VT exists for this decision.
         rows = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM shadow_virtual_trades WHERE ga_decision_id=?",
+            "SELECT COUNT(*) as cnt FROM shadow_virtual_trades WHERE ga_decision_id=%s",
             (1,),
         ).fetchone()
         self.assertEqual(rows["cnt"], 0, "No VT should exist for opportunity_watch decision")
@@ -14574,13 +14777,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Close vt1
         self.conn.execute(
             "UPDATE shadow_virtual_trades SET status='closed', closed_at='2023-11-14T23:00:00', "
-            "pnl_r=2.0, close_reason='take_profit' WHERE id=?",
+            "pnl_r=2.0, close_reason='take_profit' WHERE id=%s",
             (vt1,),
         )
         self.conn.commit()
 
-        vt1_row = self.conn.execute("SELECT status FROM shadow_virtual_trades WHERE id=?", (vt1,)).fetchone()
-        vt2_row = self.conn.execute("SELECT status FROM shadow_virtual_trades WHERE id=?", (vt2,)).fetchone()
+        vt1_row = self.conn.execute("SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt1,)).fetchone()
+        vt2_row = self.conn.execute("SELECT status FROM shadow_virtual_trades WHERE id=%s", (vt2,)).fetchone()
         self.assertEqual(vt1_row["status"], "closed")
         self.assertEqual(vt2_row["status"], "open")
 
@@ -14605,11 +14808,11 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             )
             self.conn.commit()
         except Exception:
-            self.conn.execute("ROLLBACK")
+            self.conn.rollback()
 
         # Original closed VT should still be closed
         row = self.conn.execute(
-            "SELECT status, pnl_r FROM shadow_virtual_trades WHERE id=?",
+            "SELECT status, pnl_r FROM shadow_virtual_trades WHERE id=%s",
             (vt_id,),
         ).fetchone()
         self.assertEqual(row["status"], "closed")
@@ -14630,7 +14833,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
         self._insert_strategy_evaluation(
             strategy_name="smc_pullback_long", strategy_version="1.1", ga_decision_id=1,
-            is_shadow=1, outcome_source="real_pnl", pnl_r=2.0,
+            is_shadow=True, outcome_source="real_pnl", pnl_r=2.0,
             shadow_virtual_trade_id=vt_good,
         )
 
@@ -14642,7 +14845,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
         self._insert_strategy_evaluation(
             strategy_name="smc_pullback_long", strategy_version="1.2", ga_decision_id=2,
-            is_shadow=1, outcome_source="real_pnl", pnl_r=-3.0,
+            is_shadow=True, outcome_source="real_pnl", pnl_r=-3.0,
             shadow_virtual_trade_id=vt_bad,
         )
         self.conn.commit()
@@ -14698,7 +14901,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.conn.commit()
 
         trigger = self.conn.execute(
-            "SELECT status FROM evolution_triggers WHERE id=?", (trigger_id,)
+            "SELECT status FROM evolution_triggers WHERE id=%s", (trigger_id,)
         ).fetchone()
         patch = self.conn.execute(
             "SELECT status FROM strategy_patches WHERE candidate_version='1.1'"
@@ -14724,13 +14927,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
         self._insert_strategy_evaluation(
             strategy_name="smc_pullback_long", strategy_version="1.1", ga_decision_id=1,
-            is_shadow=1, outcome_source="ambiguous_path", pnl_r=0.0,
+            is_shadow=True, outcome_source="ambiguous_path", pnl_r=0.0,
             shadow_virtual_trade_id=vt_id,
         )
         self.conn.commit()
 
         eval_row = self.conn.execute(
-            "SELECT outcome_source FROM strategy_evaluations WHERE shadow_virtual_trade_id=?",
+            "SELECT outcome_source FROM strategy_evaluations WHERE shadow_virtual_trade_id=%s",
             (vt_id,),
         ).fetchone()
         self.assertEqual(eval_row["outcome_source"], "ambiguous_path")
@@ -14748,13 +14951,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
         self._insert_strategy_evaluation(
             strategy_name="smc_pullback_long", strategy_version="1.1", ga_decision_id=1,
-            is_shadow=1, outcome_source="ambiguous_path", pnl_r=0.0,
+            is_shadow=True, outcome_source="ambiguous_path", pnl_r=0.0,
             shadow_virtual_trade_id=vt_id,
         )
         self.conn.commit()
 
         eval_row = self.conn.execute(
-            "SELECT outcome_source FROM strategy_evaluations WHERE shadow_virtual_trade_id=?",
+            "SELECT outcome_source FROM strategy_evaluations WHERE shadow_virtual_trade_id=%s",
             (vt_id,),
         ).fetchone()
         self.assertEqual(eval_row["outcome_source"], "ambiguous_path")
@@ -14774,7 +14977,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Close the VT and clear the cursor
         self.conn.execute(
             "UPDATE shadow_virtual_trades SET status='closed', closed_at='2023-11-14T23:00:00', "
-            "pnl_r=1.0, close_reason='take_profit', last_processed_candle_time=NULL WHERE id=?",
+            "pnl_r=1.0, close_reason='take_profit', last_processed_candle_time=NULL WHERE id=%s",
             (vt_id,),
         )
         self.conn.commit()
@@ -14926,23 +15129,33 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                            "Closed VT missing evaluation should be detected")
 
     def test_atomic_rollback_on_eval_link_failure(self):
-        """Verify that when the evaluation-VT link UPDATE fails after VT insert,
-        the VT is rolled back (no orphan VT remains)."""
+        """Verify that when the evaluation-VT link step fails after VT insert,
+        the whole transaction rolls back (no orphan VT and no orphan eval).
+
+        PG-native: the production path ``create_shadow_evaluation_with_vt`` wraps
+        the eval INSERT + VT INSERT + link UPDATE in a single
+        ``conn.transaction()``. We force the link step (the work that happens
+        AFTER ``_insert_shadow_virtual_trade`` returns) to raise by patching
+        ``_insert_shadow_virtual_trade`` to succeed on the INSERT then raise on
+        return, exercising the exact failure the original SQLite test aimed at
+        (a post-VT-insert failure) without relying on SQLite-only DDL
+        (``AUTOINCREMENT``, in-transaction ``DROP TABLE`` that doesn't roll back).
+        On PG the raised exception propagates out of ``conn.transaction()``, which
+        rolls back BOTH the eval INSERT and the VT INSERT atomically.
+        """
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="1.1", status="candidate")
         self._insert_ga_decision(decision_id=1)
 
-        # Patch _insert_shadow_virtual_trade to succeed but make the link UPDATE fail
         original_insert = self.repo._insert_shadow_virtual_trade
 
-        def _insert_then_corrupt(*args, **kwargs):
+        def _insert_then_fail_link(*args, **kwargs):
             vt_id = original_insert(*args, **kwargs)
-            # Corrupt the evaluation table so the UPDATE will fail
-            self.conn.execute("DROP TABLE IF EXISTS strategy_evaluations")
-            return vt_id
+            # Simulate the link UPDATE (the step after this returns) failing.
+            raise RuntimeError("simulated link-update failure")
 
-        self.repo._insert_shadow_virtual_trade = _insert_then_corrupt
+        self.repo._insert_shadow_virtual_trade = _insert_then_fail_link
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError):
             self.repo.create_shadow_evaluation_with_vt(
                 strategy_name="smc_pullback_long",
                 strategy_version="1.1",
@@ -14962,44 +15175,21 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 },
             )
 
-        # Restore the table (the DROP was rolled back, but the in-memory table is gone)
-        # Actually, since we dropped the table inside the transaction and then
-        # the rollback should have restored it. But SQLite in-memory with DROP TABLE
-        # inside a transaction may not roll back the DROP. Let's verify differently.
-        # The key assertion: no orphan VT should exist.
-        # Since the transaction was rolled back, the VT insert should also be rolled back.
         self.repo._insert_shadow_virtual_trade = original_insert
 
-        # Re-create the table if needed (DROP TABLE may not roll back in SQLite)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS strategy_evaluations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timeframe TEXT,
-                analysis_time INTEGER NOT NULL,
-                strategy_name TEXT NOT NULL,
-                strategy_version TEXT NOT NULL,
-                score REAL,
-                decision TEXT,
-                evidence_json TEXT,
-                counter_evidence_json TEXT,
-                is_shadow INTEGER DEFAULT 0,
-                snapshot_id INTEGER,
-                pnl_r REAL,
-                ga_decision_id INTEGER,
-                paper_trade_id INTEGER,
-                shadow_virtual_trade_id INTEGER,
-                outcome_source TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Verify no orphan VT exists
+        # On PG ``conn.transaction()`` rolled back both writes. Verify no orphan
+        # VT and no orphan eval survive the rolled-back transaction.
         vts = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM shadow_virtual_trades WHERE ga_decision_id=?",
+            "SELECT COUNT(*) as cnt FROM shadow_virtual_trades WHERE ga_decision_id=%s",
             (1,),
         ).fetchone()
         self.assertEqual(vts["cnt"], 0, "Orphan VT should not exist after rollback")
+
+        evals = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM strategy_evaluations WHERE ga_decision_id=%s",
+            (1,),
+        ).fetchone()
+        self.assertEqual(evals["cnt"], 0, "Orphan eval should not exist after rollback")
 
     def test_market_activation_uses_candle_open_with_slippage(self):
         """Market VT activation must update entry_price from candle.open + slippage,
@@ -15020,7 +15210,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         )
 
         trade = dict(self.conn.execute(
-            "SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT * FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone())
 
         # Simulate activation candle with open=102.0
@@ -15040,7 +15230,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Re-read the VT
         vt_after = dict(self.conn.execute(
-            "SELECT * FROM shadow_virtual_trades WHERE id=?", (vt_id,)
+            "SELECT * FROM shadow_virtual_trades WHERE id=%s", (vt_id,)
         ).fetchone())
 
         # Verify status is 'open'
@@ -15118,69 +15308,82 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                             "Position size should differ when using slipped vs raw entry")
 
     def test_dirty_db_with_duplicate_evals_migration_soft_marks(self):
-        """Dirty DB with duplicate shadow evaluations: migration soft-marks extras as 'duplicate'."""
+        """Greenfield contract for duplicate shadow evaluations: the partial
+        unique index ``idx_strategy_evals_shadow_unique`` (shipped in
+        ``schema_postgres.sql`` and applied by ``initialize_database()`` in
+        setUp/make_repo) PREVENTS a second non-duplicate shadow eval per
+        (strategy_name, strategy_version, ga_decision_id) at WRITE TIME - there
+        is no dirty DB to repair and no SQLite-era soft-mark migration. This
+        test verifies that write-time contract: one non-duplicate eval per group
+        is allowed, a second non-duplicate is blocked, and multiple
+        outcome_source='duplicate' rows coexist (the partial index excludes
+        them)."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="dirty-v1", status="candidate")
         self._insert_ga_decision(decision_id=7001)
-        self._insert_ga_decision(decision_id=7002)
 
-        # Simulate dirty DB: drop the unique index so duplicates can be inserted
-        self.repo.conn.execute("DROP INDEX IF EXISTS idx_strategy_evals_shadow_unique")
+        # First non-duplicate shadow eval (NULL outcome_source is in the index
+        # scope: COALESCE(NULL,'')='' <> 'duplicate') - insert succeeds.
+        self.repo.conn.execute(
+            "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+            "  ga_decision_id, is_shadow, outcome_source, created_at)"
+            " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, TRUE, NULL,"
+            "  '2024-01-01T00:00:01Z')"
+        )
         self.repo.conn.commit()
 
-        # Insert 3 duplicate evaluations for ga_decision_id=7001 (same strategy+version)
-        for i in range(3):
-            self.repo.conn.execute(
-                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
-                "  ga_decision_id, is_shadow, outcome_source, created_at)"
-                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, 1, NULL,"
-                "  '2024-01-01T00:00:0{}Z')".format(i)
-            )
-        self.repo.conn.commit()
-
-        # Run the shadow_vt_v2 migration (which includes dedup)
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
-
-        # Verify: only 1 non-duplicate eval remains for ga_decision_id=7001
-        remaining = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
-            " WHERE ga_decision_id=7001 AND is_shadow=1 AND COALESCE(outcome_source,'') != 'duplicate'"
-        ).fetchone()["cnt"]
-        self.assertEqual(remaining, 1, "Only 1 non-duplicate eval should remain")
-
-        # Verify: the other 2 are marked 'duplicate'
-        dup_count = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
-            " WHERE ga_decision_id=7001 AND is_shadow=1 AND outcome_source='duplicate'"
-        ).fetchone()["cnt"]
-        self.assertEqual(dup_count, 2, "2 duplicates should be soft-marked")
-
-        # Verify: unique index now prevents inserting another non-duplicate shadow eval
+        # Second non-duplicate shadow eval for the SAME group - must be BLOCKED
+        # by the partial unique index at write time.
         with self.assertRaises(Exception):
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
                 "  ga_decision_id, is_shadow, outcome_source, created_at)"
-                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, 1, NULL,"
-                "  '2024-01-01T00:00:04Z')"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, TRUE, NULL,"
+                "  '2024-01-01T00:00:02Z')"
             )
         self.repo.conn.rollback()
+
+        # Multiple outcome_source='duplicate' rows for the same group ARE
+        # allowed (the partial index excludes them from its scope), preserving
+        # the historical "extras recorded as 'duplicate'" shape via explicit
+        # writes rather than a post-hoc soft-mark pass.
+        for i in range(2):
+            self.repo.conn.execute(
+                "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
+                "  ga_decision_id, is_shadow, outcome_source, created_at)"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'dirty-v1', 7001, TRUE, 'duplicate',"
+                "  '2024-01-01T00:00:0{}Z')".format(i + 3)
+            )
+        self.repo.conn.commit()
+
+        # Exactly one non-duplicate eval remains; the two 'duplicate' rows
+        # coexist without violating the partial unique index.
+        remaining = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
+            " WHERE ga_decision_id=7001 AND is_shadow=TRUE AND COALESCE(outcome_source,'') != 'duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(remaining, 1, "Only 1 non-duplicate eval should be insertable per group")
+
+        dup_count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
+            " WHERE ga_decision_id=7001 AND is_shadow=TRUE AND outcome_source='duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(dup_count, 2, "2 outcome_source='duplicate' rows should coexist")
 
     def test_null_outcome_source_duplicates_blocked_by_unique_index(self):
         """Two shadow evaluations with NULL outcome_source: dedup catches them, index blocks re-insert."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="null-v1", status="candidate")
         self._insert_ga_decision(decision_id=8001)
 
-        # Run migration first to ensure the index exists
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
+        # The partial unique index ``idx_strategy_evals_shadow_unique`` is
+        # created by ``initialize_database()`` -> ``schema_postgres.sql`` in
+        # setUp/make_repo, so the SQLite-era one-time migration that created it
+        # is obsolete and has been deleted. No migration call is needed here.
 
         # Insert first NULL-outcome eval — should succeed
         self.repo.conn.execute(
             "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
             "  ga_decision_id, is_shadow, outcome_source, created_at)"
-            " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, 1, NULL,"
+            " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, TRUE, NULL,"
             "  '2024-01-01T00:00:01Z')"
         )
         self.repo.conn.commit()
@@ -15190,7 +15393,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             self.repo.conn.execute(
                 "INSERT INTO strategy_evaluations(symbol, analysis_time, strategy_name, strategy_version,"
                 "  ga_decision_id, is_shadow, outcome_source, created_at)"
-                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, 1, NULL,"
+                " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'null-v1', 8001, TRUE, NULL,"
                 "  '2024-01-01T00:00:02Z')"
             )
         self.repo.conn.rollback()
@@ -15198,60 +15401,36 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Verify only 1 eval exists
         count = self.repo.conn.execute(
             "SELECT COUNT(*) AS cnt FROM strategy_evaluations"
-            " WHERE ga_decision_id=8001 AND is_shadow=1"
+            " WHERE ga_decision_id=8001 AND is_shadow=TRUE"
         ).fetchone()["cnt"]
         self.assertEqual(count, 1, "Only 1 shadow eval should exist — duplicate blocked by index")
 
     def test_dirty_db_with_duplicate_vts_migration_soft_marks(self):
-        """Dirty DB with duplicate shadow_virtual_trades: migration soft-marks extras as 'duplicate'."""
+        """Greenfield contract for duplicate shadow_virtual_trades: the partial
+        unique index ``idx_shadow_vt_unique`` (shipped in ``schema_postgres.sql``
+        and applied by ``initialize_database()`` in setUp/make_repo) PREVENTS a
+        second non-duplicate VT per (strategy_name, candidate_version,
+        ga_decision_id) at WRITE TIME - there is no dirty DB to repair and no
+        SQLite-era soft-mark migration. This test verifies that write-time
+        contract: one non-duplicate VT per group is allowed, a second
+        non-duplicate is blocked, and multiple status='duplicate' rows coexist
+        (the partial index excludes them)."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="vt-dirty-v1", status="candidate")
         self._insert_ga_decision(decision_id=9001)
 
-        # Simulate dirty DB: drop the unique index so duplicates can be inserted
-        self.repo.conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
+        # First non-duplicate VT for the group - insert succeeds.
+        self.repo.conn.execute(
+            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+            " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+        )
         self.repo.conn.commit()
 
-        # Insert 3 duplicate VTs for same (strategy_name, candidate_version, ga_decision_id)
-        for i in range(3):
-            self.repo.conn.execute(
-                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
-                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
-                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
-                " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
-                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:0{}Z')".format(i)
-            )
-        self.repo.conn.commit()
-
-        # Verify 3 duplicates exist before migration
-        before = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
-            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
-        ).fetchone()["cnt"]
-        self.assertEqual(before, 3, "3 duplicate VTs should exist before migration")
-
-        # Run the shadow_vt_v2 migration (which includes VT dedup)
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
-
-        # Verify: only 1 non-duplicate VT remains
-        remaining = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
-            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
-            " AND COALESCE(status,'') != 'duplicate'"
-        ).fetchone()["cnt"]
-        self.assertEqual(remaining, 1, "Only 1 non-duplicate VT should remain")
-
-        # Verify: the other 2 are marked 'duplicate'
-        dup_count = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
-            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
-            " AND status='duplicate'"
-        ).fetchone()["cnt"]
-        self.assertEqual(dup_count, 2, "2 duplicates should be soft-marked as 'duplicate'")
-
-        # Verify: unique index now prevents inserting another duplicate VT
+        # Second non-duplicate VT for the SAME group - must be BLOCKED by the
+        # partial unique index at write time.
         with self.assertRaises(Exception):
             self.repo.conn.execute(
                 "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
@@ -15259,111 +15438,169 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
                 " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
                 "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:04Z')"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:02Z')"
             )
         self.repo.conn.rollback()
 
+        # Multiple status='duplicate' VTs for the same group ARE allowed (the
+        # partial index excludes them), preserving the historical "extras
+        # recorded as 'duplicate'" shape via explicit writes.
+        # Multiple status='duplicate' VTs for the same group ARE allowed (the
+        # partial index excludes them), preserving the historical "extras
+        # recorded as 'duplicate'" shape via explicit writes. Commit them
+        # BEFORE the blocked-re-insert probe below so the probe's forced
+        # rollback cannot wipe these committed rows (connection-poisoning
+        # guard: a failed insert aborts the whole transaction).
+        for i in range(2):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'duplicate', '2024-01-01T00:00:0{}Z')".format(i + 3)
+            )
+        self.repo.conn.commit()
+
+        # Re-insert of a non-duplicate VT for the group is still blocked.
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-dirty-v1', 9001,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
+                "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:05Z')"
+            )
+        self.repo.conn.rollback()
+
+        remaining = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
+            " AND COALESCE(status,'') != 'duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(remaining, 1, "Only 1 non-duplicate VT should be insertable per group")
+
+        dup_count = self.repo.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
+            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-dirty-v1' AND ga_decision_id=9001"
+            " AND status='duplicate'"
+        ).fetchone()["cnt"]
+        self.assertEqual(dup_count, 2, "2 status='duplicate' rows should coexist")
+
     def test_vt_dedup_keeps_closed_with_pnl_r_over_open(self):
-        """VT dedup priority: closed with pnl_r > open > pending_entry."""
+        """Greenfield removed the SQLite-era "priority survivor" soft-mark
+        migration (closed-with-pnl > open > pending) in favor of WRITE-TIME
+        prevention: the partial unique index ``idx_shadow_vt_unique`` blocks a
+        second non-duplicate VT per (strategy_name, candidate_version,
+        ga_decision_id) from being inserted at all, so there is never a group
+        of competing non-duplicate VTs to pick a survivor from. This test
+        verifies that contract: a closed VT with pnl_r for a group is the only
+        non-duplicate VT that can exist, and any attempt to insert a pending or
+        open VT for the same group is blocked at write time."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="vt-prio-v1", status="candidate")
         self._insert_ga_decision(decision_id=9002)
 
-        # Drop index to allow duplicates
-        self.repo.conn.execute("DROP INDEX IF EXISTS idx_shadow_vt_unique")
-        self.repo.conn.commit()
-
-        # Insert: pending_entry (should lose), open (should lose), closed with pnl_r (should win)
-        self.repo.conn.execute(
-            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
-            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
-            "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
-            " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
-            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
-        )
-        self.repo.conn.execute(
-            "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
-            "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
-            "  take_profit_json, quantity, initial_risk_usdt, status, opened_at, created_at)"
-            " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
-            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-            "  '[]', 1.0, 5.0, 'open', '2024-01-01T00:00:02Z', '2024-01-01T00:00:02Z')"
-        )
+        # The closed VT with pnl_r - the only non-duplicate VT the group can
+        # hold - inserts successfully.
         self.repo.conn.execute(
             "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
             "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
             "  take_profit_json, quantity, initial_risk_usdt, status, opened_at, closed_at, pnl_r, close_reason, created_at)"
             " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
-            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-            "  '[]', 1.0, 5.0, 'closed', '2024-01-01T00:00:03Z', '2024-01-01T00:00:04Z', 1.5, 'take_profit', '2024-01-01T00:00:03Z')"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0, '[]', 1.0, 5.0,"
+            "  'closed', '2024-01-01T00:00:03Z', '2024-01-01T00:00:04Z', 1.5, 'take_profit', '2024-01-01T00:00:03Z')"
         )
         self.repo.conn.commit()
 
-        # Run migration
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
+        # Attempting to insert a pending_entry VT for the SAME group is BLOCKED
+        # at write time - no second non-duplicate can coexist.
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0, '[]', 1.0, 5.0,"
+                "  'pending_entry', '2024-01-01T00:00:01Z')"
+            )
+        self.repo.conn.rollback()
 
-        # The closed VT with pnl_r should be the survivor
+        # Attempting to insert an open VT for the SAME group is likewise BLOCKED.
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, opened_at, created_at)"
+                " VALUES ('smc_pullback_long', 'vt-prio-v1', 9002,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0, '[]', 1.0, 5.0,"
+                "  'open', '2024-01-01T00:00:02Z', '2024-01-01T00:00:02Z')"
+            )
+        self.repo.conn.rollback()
+
+        # The closed-with-pnl VT is the sole survivor (the only non-duplicate).
         survivor = self.repo.conn.execute(
             "SELECT status, pnl_r FROM shadow_virtual_trades"
             " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-prio-v1' AND ga_decision_id=9002"
             " AND COALESCE(status,'') != 'duplicate'"
         ).fetchone()
-        self.assertIsNotNone(survivor, "One VT should survive dedup")
-        self.assertEqual(survivor["status"], "closed", "Closed VT with pnl_r should win priority")
-        self.assertEqual(survivor["pnl_r"], 1.5, "pnl_r should be preserved")
-
-        # Verify 2 duplicates
-        dup_count = self.repo.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM shadow_virtual_trades"
-            " WHERE strategy_name='smc_pullback_long' AND candidate_version='vt-prio-v1' AND ga_decision_id=9002"
-            " AND status='duplicate'"
-        ).fetchone()["cnt"]
-        self.assertEqual(dup_count, 2, "2 VTs should be soft-marked as duplicate")
+        self.assertIsNotNone(survivor, "One VT should survive (the closed one)")
+        self.assertEqual(survivor["status"], "closed", "Closed VT with pnl_r is the sole survivor")
+        self.assertAlmostEqual(survivor["pnl_r"], 1.5, "pnl_r should be preserved")
 
     def test_old_plain_index_replaced_by_partial_index(self):
-        """Migration replaces old plain unique index with partial unique index."""
+        """Greenfield ships the partial unique index ``idx_shadow_vt_unique``
+        directly in ``schema_postgres.sql`` (applied by ``initialize_database()``
+        in setUp/make_repo); the SQLite-era "drop the old plain index and create
+        a partial one" migration is obsolete and deleted. This test verifies
+        the shipped index IS the partial one: its definition (pg_get_indexdef)
+        carries the WHERE clause that excludes status='duplicate' rows, and the
+        partial index is enforced at write time."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="idx-repl-v1", status="candidate")
         self._insert_ga_decision(decision_id=9003)
 
-        # Simulate: create old-style plain unique index (no WHERE clause)
-        self.repo.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_vt_unique ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)")
-        self.repo.conn.commit()
+        # The partial unique index is already present (shipped in schema). Verify
+        # its definition carries the partial WHERE clause.
+        idx_sql = self.repo.conn.execute(
+            "SELECT pg_get_indexdef(c.oid) AS sql FROM pg_index i "
+            "JOIN pg_class c ON i.indexrelid = c.oid "
+            "WHERE i.indrelid = 'shadow_virtual_trades'::regclass AND c.relname = 'idx_shadow_vt_unique'"
+        ).fetchone()
+        self.assertIsNotNone(idx_sql, "idx_shadow_vt_unique must exist in pg_index")
+        self.assertIn("WHERE", idx_sql["sql"] or "", "Index SQL must contain partial WHERE clause")
+        self.assertIn("duplicate", idx_sql["sql"] or "", "Index WHERE must reference 'duplicate' status")
 
-        # Insert one valid VT
+        # The shipped partial index is enforced: one non-duplicate VT inserts,
+        # a second non-duplicate for the same group is blocked at write time.
         self.repo.conn.execute(
             "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
             "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
             "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
             " VALUES ('smc_pullback_long', 'idx-repl-v1', 9003,"
-            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0,"
-            "  '[]', 1.0, 5.0, 'pending_entry', '2024-01-01T00:00:01Z')"
+            "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0, '[]', 1.0, 5.0,"
+            "  'pending_entry', '2024-01-01T00:00:01Z')"
         )
         self.repo.conn.commit()
-
-        # Run migration — should drop old index and create partial one
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
-
-        # Verify: the index SQL in sqlite_master has the WHERE clause
-        idx_sql = self.repo.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_shadow_vt_unique'"
-        ).fetchone()
-        self.assertIsNotNone(idx_sql, "idx_shadow_vt_unique must exist in sqlite_master")
-        self.assertIn("WHERE", idx_sql["sql"] or "", "Index SQL must contain partial WHERE clause")
-        self.assertIn("duplicate", idx_sql["sql"] or "", "Index WHERE must reference 'duplicate' status")
+        with self.assertRaises(Exception):
+            self.repo.conn.execute(
+                "INSERT INTO shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id,"
+                "  symbol, side, entry_type, entry_price, stop_loss, initial_stop_loss,"
+                "  take_profit_json, quantity, initial_risk_usdt, status, created_at)"
+                " VALUES ('smc_pullback_long', 'idx-repl-v1', 9003,"
+                "  'BTCUSDT', 'LONG', 'market', 100.0, 95.0, 95.0, '[]', 1.0, 5.0,"
+                "  'pending_entry', '2024-01-01T00:00:02Z')"
+            )
+        self.repo.conn.rollback()
 
     def test_migration_allows_duplicate_status_vt_after_dedup(self):
         """After migration, 1 valid VT + multiple status='duplicate' VTs in same group allowed."""
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="allowed-dup-v1", status="candidate")
         self._insert_ga_decision(decision_id=9004)
 
-        # Run migration first (creates partial index)
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
+        # The partial unique index ``idx_shadow_vt_unique`` is created by
+        # ``initialize_database()`` -> ``schema_postgres.sql`` in setUp/make_repo
+        # (greenfield ships it in the schema; the SQLite-era one-time migration
+        # that created it is obsolete and deleted). No migration call is needed.
 
         # Insert 1 valid VT
         self.repo.conn.execute(
@@ -15412,10 +15649,12 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._insert_strategy_version(strategy_name="smc_pullback_long", version="diag-skip-v1", status="candidate")
         self._insert_ga_decision(decision_id=9005)
 
-        # Run migration (creates partial index)
-        from plugins.crypto_guard.storage.migrations import _apply_phase_shadow_vt_v2_migration
-        _apply_phase_shadow_vt_v2_migration(self.repo.conn)
-        self.repo.conn.commit()
+        # The partial unique index ``idx_shadow_vt_unique`` (created by
+        # ``initialize_database()`` -> ``schema_postgres.sql`` in setUp/make_repo)
+        # blocks duplicate *non*-duplicate-status rows per
+        # (strategy, candidate, decision) but allows multiple status='duplicate'
+        # rows. Greenfield made the old one-time migration helper obsolete; the
+        # contract it created now ships in the schema directly.
 
         # 1 valid VT + 2 duplicate VTs
         self.repo.conn.execute(
@@ -15489,7 +15728,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
             "  is_shadow, ga_decision_id, outcome_source)"
             " VALUES ('BTCUSDT', 1700000000000, 'deterministic_sop', '1.0', 0.8, 'trade',"
-            "  '{}', '{}', 0, NULL, NULL)"
+            "  '{}', '{}', FALSE, NULL, NULL)"
         )
         # Insert legacy_fuzzy active eval with NULL ga_decision_id
         self.repo.conn.execute(
@@ -15497,7 +15736,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
             "  is_shadow, ga_decision_id, outcome_source)"
             " VALUES ('BTCUSDT', 1700000000000, 'deterministic_sop', '1.0', 0.8, 'trade',"
-            "  '{}', '{}', 0, NULL, 'legacy_fuzzy')"
+            "  '{}', '{}', FALSE, NULL, 'legacy_fuzzy')"
         )
         self.repo.conn.commit()
 
@@ -15609,7 +15848,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Set strategy_version created_at to >24h ago
         old_date = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
         self.repo.conn.execute(
-            "UPDATE strategy_versions SET created_at=? WHERE strategy_name=? AND version=?",
+            "UPDATE strategy_versions SET created_at=%s WHERE strategy_name=%s AND version=%s",
             (old_date, "smc_pullback_long", "legacy-cand-v1"),
         )
         self.repo.conn.commit()
@@ -15625,7 +15864,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
                 "  is_shadow, ga_decision_id, outcome_source)"
                 " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'legacy-cand-v1',"
-                "  0.8, 'trade', '{}', '{}', 1, 9106, 'legacy_fuzzy')"
+                "  0.8, 'trade', '{}', '{}', TRUE, 9106, 'legacy_fuzzy')"
             )
         self.repo.conn.commit()
 
@@ -15652,7 +15891,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "  strategy_version, score, decision, evidence_json, counter_evidence_json,"
                 "  is_shadow, ga_decision_id, outcome_source)"
                 " VALUES ('BTCUSDT', 1700000000000, 'smc_pullback_long', 'fresh-cand-v1',"
-                "  0.8, 'trade', '{}', '{}', 1, 9125, 'legacy_fuzzy')"
+                "  0.8, 'trade', '{}', '{}', TRUE, 9125, 'legacy_fuzzy')"
             )
         self.repo.conn.commit()
 
@@ -15744,40 +15983,42 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._insert_virtual_trade(status="open", entry_price=100.0, stop_loss=95.0, initial_stop_loss=95.0)
 
         # Create paper_order
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status, ga_decision_id) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status, ga_decision_id) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1) RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
-            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
-            (order_id,),
+        tid = int(
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0) RETURNING id",
+                (order_id,),
+            ).fetchone()["id"]
         )
-        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+            "VALUES (%s, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
             (tid,),
         )
         self.conn.commit()
 
         # Count trade_logs before
-        before = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+        before = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()["count"]
 
         # First call: updates stop_loss from 95 → 100 (breakeven)
         self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="test breakeven")
-        after_first = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+        after_first = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()["count"]
         self.assertEqual(after_first, before + 1, "First breakeven should create 1 log")
 
         # Second call: same stop_loss (100 → 100), should be empty-update skipped
         self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="test duplicate")
-        after_second = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()[0]
+        after_second = self.conn.execute("SELECT COUNT(*) FROM paper_trade_logs").fetchone()["count"]
         self.assertEqual(after_second, after_first, "Duplicate stop_loss should NOT create log")
 
         # Verify stop_loss unchanged
-        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
 
     def test_enqueue_job_once_stop_adjust_idempotent(self):
@@ -15803,8 +16044,8 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Verify only one job exists
         count = self.conn.execute(
-            "SELECT COUNT(*) FROM agent_jobs WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) FROM agent_jobs WHERE session_id=%s", (session_id,)
+        ).fetchone()["count"]
         self.assertEqual(count, 1, "Only one agent_job should exist for this session_id")
 
     def test_alert_outbox_dedupe_key_prevents_duplicates(self):
@@ -15831,8 +16072,8 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Verify only one row
         count = self.conn.execute(
-            "SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key=?", (dedupe_key,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key=%s", (dedupe_key,)
+        ).fetchone()["count"]
         self.assertEqual(count, 1, "Only one alert_outbox row for this dedupe_key")
 
     def test_stop_loss_reads_current_not_initial(self):
@@ -15844,25 +16085,27 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._insert_ga_decision()
         self._insert_virtual_trade(status="open", entry_price=100.0, stop_loss=100.0, initial_stop_loss=95.0)
 
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status, ga_decision_id) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 100.0, 95.0, 'open', 1)"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status, ga_decision_id) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 100.0, 95.0, 'open', 1) RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        self.conn.execute(
-            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, "
-            "initial_risk_usdt, created_at) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 5.0, '2023-11-14T22:13:20')",
-            (order_id,),
+        trade_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, "
+                "initial_risk_usdt, created_at) "
+                "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 1.0, 5.0, '2023-11-14T22:13:20') RETURNING id",
+                (order_id,),
+            ).fetchone()["id"]
         )
-        trade_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         from plugins.crypto_guard.paper.paper_position_updater import _maybe_adjust_stop_to_breakeven
 
-        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
-        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone())
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone())
+        trade = dict(self.conn.execute("SELECT * FROM paper_trades WHERE id=%s", (trade_id,)).fetchone())
         market = {"symbol": "BTCUSDT", "close": 105.0, "open": 100.0, "high": 106.0, "low": 99.0}
 
         # stop_loss=100.0 == entry=100.0 for LONG → already_safe → returns None
@@ -15872,48 +16115,87 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Verify no duplicate stop_loss_adjustment events in agent_jobs
         count = self.conn.execute(
             "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' AND session_id LIKE 'system:paper:stop_adjust:%'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(count, 0, "No event_alert should be created for already_safe position")
 
     def test_dedup_migration_soft_marks_duplicates(self):
-        """Fix 6: _apply_stop_loss_adjustment_dedup soft-marks duplicate paper_trade_logs."""
-        # Insert 3 identical stop_loss_adjustment logs for the same (order_id, old_stop, new_stop)
+        """PG greenfield contract: the SQLite-era ``_apply_stop_loss_adjustment_dedup``
+        migration SOFT-MARKED duplicate ``paper_trade_logs`` rows post-hoc (set
+        ``event_json.is_duplicate=True`` on the later rows of an (order_id,
+        old_stop, new_stop) group). Greenfield replaces that with WRITE-TIME
+        prevention — the CAS in ``update_stop_loss_across_tables`` only lets the
+        concurrent winner log a ``stop_loss_adjustment`` event — so there is NO
+        post-hoc rescan. This test preserves two greenfield guarantees:
+
+        (1) Structural — the deleted soft-mark helper is NOT importable, so no
+            production path can mass-set ``is_duplicate`` on paper_trade_logs.
+        (2) Behavioral — pre-existing duplicate logs (the "dirty DB" the deleted
+            migration was built to clean) are left UNTOUCHED by idempotent
+            ``initialize_database`` re-inits; ``is_duplicate`` is never set on
+            them because no rescanner exists to set it.
+        """
+        # (1) Structural guard: the SQLite-era soft-mark helper was removed in
+        # the greenfield cutover. If it ever returns, this import would succeed
+        # and silently restore the post-hoc mass-mark path — fail-closed here.
+        import importlib
+        mig = importlib.import_module("plugins.crypto_guard.storage.migrations")
+        self.assertFalse(
+            hasattr(mig, "_apply_stop_loss_adjustment_dedup"),
+            "greenfield must NOT carry the SQLite-era soft-mark migration; "
+            "write-time CAS is the only dedup mechanism",
+        )
+
+        # (2) Behavioral guard: seed the "dirty DB" the deleted migration was
+        # built to clean — 3 IDENTICAL duplicate stop_loss_adjustment logs for
+        # the same (order_id, old_stop, new_stop) group. Commit BEFORE any
+        # re-init / probe so a forced rollback cannot poison the connection and
+        # wipe these rows (connection-poisoning guard: a later failed statement
+        # aborts the whole psycopg transaction and would roll back uncommitted
+        # writes).
         for _ in range(3):
             self.conn.execute(
                 "INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, "
                 "event_json) VALUES (1, 'stop_loss_adjustment', 'BTCUSDT', 'LONG', "
-                "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}')"
+                "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}'::jsonb)"
             )
         self.conn.commit()
 
-        # Run dedup migration. setUp already ran it once on a fresh DB and
-        # recorded the _migration_state marker, so we must clear the marker
-        # to force the soft-mark scan to actually run on the historical rows
-        # we just inserted.
-        self.conn.execute("DELETE FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'")
-        self.conn.commit()
-        from plugins.crypto_guard.storage.migrations import _apply_stop_loss_adjustment_dedup
-        _apply_stop_loss_adjustment_dedup(self.conn)
-        self.conn.commit()
+        # The marker is written directly by initialize_database (ON CONFLICT DO
+        # NOTHING) — no scan ran and no scan will run. It must already be present
+        # after setUp's init.
+        with self.conn.cursor() as cur:
+            marker = cur.execute(
+                "SELECT key FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
+            ).fetchone()
+        self.assertIsNotNone(marker, "dedup marker must be set by initialize_database")
 
-        # Should have 3 rows total
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
-        self.assertEqual(total, 3)
+        # Re-init is idempotent (marker ON CONFLICT DO NOTHING — stays exactly 1
+        # row) and MUST NOT touch the seeded duplicate logs. initialize_database
+        # applies schema with CREATE ... IF NOT EXISTS, so it never drops/wipes
+        # the seeded rows.
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        self.assertTrue(initialize_database()["ok"], "re-init must succeed")
+        marker_rows = self.conn.execute(
+            "SELECT COUNT(*) FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
+        ).fetchone()["count"]
+        self.assertEqual(marker_rows, 1, "marker must stay exactly one row across re-inits")
 
-        # First (earliest) should NOT be marked duplicate
+        # Greenfield never soft-marks: the seeded duplicate logs keep is_duplicate
+        # unset (no rescanner exists to set it). This inverts the deleted
+        # migration's contract — duplicates are left as written, not coerced to
+        # 'duplicate' status — and proves write-time CAS is the sole dedup path.
         rows = self.conn.execute(
-            "SELECT id, event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' ORDER BY id"
+            "SELECT event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' "
+            "ORDER BY id"
         ).fetchall()
-        import json
-        first = json.loads(rows[0]["event_json"])
-        self.assertFalse(first.get("is_duplicate"), "Earliest log should not be marked duplicate")
-
-        # Later 2 should be marked duplicate
-        for r in rows[1:]:
-            data = json.loads(r["event_json"])
-            self.assertTrue(data.get("is_duplicate"), f"Log id={r['id']} should be marked duplicate")
+        self.assertEqual(len(rows), 3, "all 3 seeded logs must survive untouched")
+        for r in rows:
+            ev = _load_json(r["event_json"])
+            self.assertFalse(
+                ev.get("is_duplicate"),
+                "greenfield must NOT soft-mark pre-existing duplicate logs; "
+                "write-time CAS is the only dedup mechanism",
+            )
 
     # ── P1 position-conflict fix tests (Round 9) ──────────────────────────
 
@@ -15934,7 +16216,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Mark it sent. Sent rows are NOT deduped by the partial unique index
         # (schema.sql: status='pending' only) and should not block reuse.
         self.repo.conn.execute(
-            "UPDATE alert_outbox SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE alert_outbox SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=%s",
             (int(aid1),),
         )
         self.repo.conn.commit()
@@ -15951,7 +16233,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertNotEqual(aid2, aid1, "Sent history must not block a new pending enqueue")
 
         rows = self.repo.conn.execute(
-            "SELECT id, status FROM alert_outbox WHERE dedupe_key=? ORDER BY id",
+            "SELECT id, status FROM alert_outbox WHERE dedupe_key=%s ORDER BY id",
             (dedupe_key,),
         ).fetchall()
         statuses = {r["status"] for r in rows}
@@ -15960,67 +16242,60 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertEqual(len(rows), 2, "Exactly two rows: one sent, one pending")
 
     def test_initialize_database_idempotent_on_dirty_db(self):
-        """initialize_database must be idempotent on a DB that already has
-        duplicate pending alert_outbox rows (dedup runs before executescript
-        so the partial unique index does not fail)."""
-        # This test class shares an in-memory handle that initialize_database()
-        # cannot reach, so spin up an isolated on-disk DB to exercise the real
-        # initialize_database() code path (schema.sql + dedup ordering).
-        import tempfile as _tempfile
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        """initialize_database must be idempotent: re-running on a schema that
+        already exists (with seeded data + markers) succeeds again and leaves
+        exactly one copy of each seeded row (ON CONFLICT DO NOTHING).
 
-        tmp_dir = _tempfile.TemporaryDirectory()
-        try:
-            db_path = os.path.join(tmp_dir.name, "dirty.sqlite3")
-            # First init to create the schema + dedup index.
-            old_db = os.environ.get("CRYPTO_GUARD_DB")
-            os.environ["CRYPTO_GUARD_DB"] = db_path
-            try:
-                self.assertTrue(initialize_database()["ok"], "bootstrap initialize_database must succeed")
+        The SQLite-era "drop the partial index + inject duplicate pending rows
+        then re-init" scenario tested a pre-executescript dedup ordering that
+        does not exist in the PostgreSQL greenfield path (the schema is applied
+        once via CREATE ... IF NOT EXISTS + ON CONFLICT; there is no
+        executescript re-ordering). The PG contract this test must preserve is:
+        two consecutive initialize_database() calls on an already-initialized
+        schema both return ok=True, the schema stays healthy, and seeded
+        strategies/symbols are not duplicated.
+        """
+        from plugins.crypto_guard.storage.migrations import (
+            check_schema_health,
+            initialize_database,
+        )
 
-                # Simulate a dirty DB: drop the partial unique index and inject
-                # duplicate pending rows + one sent row sharing the same dedupe_key.
-                seed = connect_db(db_path)
-                seed.execute("DROP INDEX IF EXISTS idx_alert_outbox_dedupe_unique")
-                dup_key = "dedupe_idempotent:1:1700000000"
-                seed.execute(
-                    "INSERT INTO alert_outbox(alert_type, symbol, priority, payload_json,"
-                    "  next_retry_at, dedupe_key, status) VALUES"
-                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'pending'),"
-                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'pending'),"
-                    "  ('stop_loss_adjustment', 'BTCUSDT', 3, '{}', CURRENT_TIMESTAMP, ?, 'sent')",
-                    (dup_key, dup_key, dup_key),
-                )
-                seed.commit()
-                seed.close()
+        # First init on the per-test scratch schema.
+        first = initialize_database()
+        self.assertTrue(first["ok"], "bootstrap initialize_database must succeed")
+        self.assertTrue(check_schema_health()["ok"], "schema healthy after first init")
 
-                # Two consecutive initialize_database() calls on the dirty DB must
-                # both succeed (dedup runs before executescript → index recreate safe).
-                self.assertTrue(initialize_database()["ok"], "First initialize_database on dirty DB must succeed")
-                self.assertTrue(initialize_database()["ok"], "Second initialize_database on dirty DB must succeed")
+        # Seed duplicate-bait: a second strategy the seeder also inserts. A
+        # naive non-idempotent init would either error (UNIQUE violation) or
+        # double-insert. ON CONFLICT DO NOTHING must keep exactly one row.
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO strategy_versions(strategy_name, version, status, "
+                "config_json, change_reason) VALUES ('smc_pullback_long', '1.0', "
+                "'candidate', '{}'::jsonb, 'pre-existing') ON CONFLICT DO NOTHING"
+            )
+            pre_count = int(cur.execute(
+                "SELECT COUNT(*) AS c FROM strategy_versions "
+                "WHERE strategy_name='smc_pullback_long' AND version='1.0'"
+            ).fetchone()["c"])
+        self.conn.commit()
+        self.assertEqual(pre_count, 1, "seeded strategy present exactly once before re-init")
 
-                check = connect_db(db_path)
-                rows = check.execute(
-                    "SELECT id, status FROM alert_outbox WHERE dedupe_key=? ORDER BY id",
-                    (dup_key,),
-                ).fetchall()
-                pending = [r for r in rows if r["status"] == "pending"]
-                sent = [r for r in rows if r["status"] == "sent"]
-                duplicate = [r for r in rows if r["status"] == "duplicate"]
-                check.close()
+        # Two consecutive re-inits on the already-initialized schema must both
+        # succeed (idempotent) and must NOT duplicate seeded rows.
+        second = initialize_database()
+        self.assertTrue(second["ok"], "second initialize_database must succeed")
+        third = initialize_database()
+        self.assertTrue(third["ok"], "third initialize_database must succeed")
 
-                self.assertEqual(len(pending), 1, "Exactly one pending row must survive dedup")
-                self.assertEqual(len(sent), 1, "Sent history must be preserved")
-                self.assertEqual(len(duplicate), 1, "Excess pending duplicates become 'duplicate'")
-            finally:
-                if old_db is None:
-                    os.environ.pop("CRYPTO_GUARD_DB", None)
-                else:
-                    os.environ["CRYPTO_GUARD_DB"] = old_db
-        finally:
-            tmp_dir.cleanup()
+        with self.conn.cursor() as cur:
+            post_count = int(cur.execute(
+                "SELECT COUNT(*) AS c FROM strategy_versions "
+                "WHERE strategy_name='smc_pullback_long' AND version='1.0'"
+            ).fetchone()["c"])
+        self.assertEqual(post_count, 1, "re-init must not duplicate seeded strategy")
+        self.assertTrue(check_schema_health()["ok"], "schema healthy after re-init")
+
 
     def test_paper_loop_does_not_call_update_paper_positions(self):
         """_paper_loop has been removed. The scheduler owns all paper write paths.
@@ -16038,81 +16313,65 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
     def test_update_paper_order_stop_loss_atomic_concurrent(self):
         """Two concurrent connections calling update_paper_order_stop_loss on
-        the same order with the same stop: exactly one succeeds and emits a log."""
-        # The ShadowVTLifecycleTest class runs on a private isolated connection.
-        # For a REAL concurrency test we need two independent connections sharing
-        # a single on-disk database, so spin up an isolated tmp DB and re-seed it
-        # via initialize_database (full schema + dedup).
-        import tempfile as _tempfile
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        the same order with the same stop: exactly one succeeds and emits a log.
+
+        P9 (PG cutover): the scratch schema is shared across pooled connections
+        (search_path override), so two ``pg_db.get_conn()`` checkouts hit the
+        same isolated schema - a real two-writer concurrency test, no tmp DB.
+        """
+        from plugins.crypto_guard.storage import pg_db
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.migrations import initialize_database
 
-        tmp_dir = _tempfile.TemporaryDirectory()
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        try:
-            db_path = os.path.join(tmp_dir.name, "atomic.sqlite3")
-            os.environ["CRYPTO_GUARD_DB"] = db_path
-            self.assertTrue(initialize_database()["ok"], "bootstrap initialize_database must succeed")
-
-            conn_a = connect_db(db_path)
-            conn_b = connect_db(db_path)
+        with pg_db.get_conn() as conn_a, pg_db.get_conn() as conn_b:
             repo_a = CryptoGuardRepository(conn_a)
             repo_b = CryptoGuardRepository(conn_b)
             # Insert one order with stop_loss=95 on repo_a.
-            conn_a.execute(
-                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-                "initial_stop_loss, status, ga_decision_id) "
-                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', NULL)"
+            order_id = int(
+                conn_a.execute(
+                    "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                    "initial_stop_loss, status, ga_decision_id) "
+                    "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', NULL) RETURNING id"
+                ).fetchone()["id"]
             )
             conn_a.commit()
-            order_id = int(conn_a.execute("SELECT last_insert_rowid()").fetchone()[0])
             # Insert matching trade and position
-            conn_a.execute(
-                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-                "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
-                (order_id,),
+            tid = int(
+                conn_a.execute(
+                    "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                    "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0) RETURNING id",
+                    (order_id,),
+                ).fetchone()["id"]
             )
-            tid = int(conn_a.execute("SELECT last_insert_rowid()").fetchone()[0])
             conn_a.execute(
                 "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-                "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+                "VALUES (%s, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
                 (tid,),
             )
             conn_a.commit()
 
             logs_before = conn_a.execute(
                 "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-            ).fetchone()[0]
+            ).fetchone()["count"]
 
-            # First writer moves 95 → 100 atomically; should succeed.
+            # First writer moves 95 -> 100 atomically; should succeed.
             ok_a = repo_a.update_paper_order_stop_loss(order_id, 100.0, reason="writer-a")
             self.assertTrue(ok_a, "First writer should win the conditional UPDATE")
             conn_a.commit()
 
-            # Second writer also tries 95 → 100 against the (now stale) snapshot
-            # it read; the conditional UPDATE sees stop_loss=100 != 95 → rowcount 0.
+            # Second writer also tries 95 -> 100 against the (now stale) snapshot
+            # it read; the conditional UPDATE sees stop_loss=100 != 95 -> rowcount 0.
             ok_b = repo_b.update_paper_order_stop_loss(order_id, 100.0, reason="writer-b")
             self.assertFalse(ok_b, "Second writer must lose (concurrent update wins)")
             conn_b.commit()
 
             logs_after = conn_a.execute(
                 "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-            ).fetchone()[0]
+            ).fetchone()["count"]
             self.assertEqual(logs_after, logs_before + 1,
                 "Exactly one stop_loss_adjustment log should be produced, even with two writers")
 
-            row = conn_a.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+            row = conn_a.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
             self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
-            conn_a.close()
-            conn_b.close()
-        finally:
-            if old_db is None:
-                os.environ.pop("CRYPTO_GUARD_DB", None)
-            else:
-                os.environ["CRYPTO_GUARD_DB"] = old_db
-            tmp_dir.cleanup()
-
     def test_update_paper_order_stop_loss_null_safe(self):
         """stop_loss=NULL (e.g. a never-adjusted order) must not crash the
         atomic conditional UPDATE — the NULL-safe branch handles it."""
@@ -16120,38 +16379,40 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._insert_ga_decision()
 
         # Insert an order with stop_loss=NULL.
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status, ga_decision_id) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, NULL, 95.0, 'open', 1)"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status, ga_decision_id) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, NULL, 95.0, 'open', 1) RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
-            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 95.0, 5.0)",
-            (order_id,),
+        tid = int(
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 95.0, 5.0) RETURNING id",
+                (order_id,),
+            ).fetchone()["id"]
         )
-        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 'open')",
+            "VALUES (%s, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, NULL, 'open')",
             (tid,),
         )
         self.conn.commit()
 
         logs_before = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         ok = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="null-safe test")
         self.assertTrue(ok, "Updating NULL stop must succeed")
 
         logs_after = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(logs_after, logs_before + 1, "NULL-safe update should emit exactly one log")
 
-        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertAlmostEqual(float(row["stop_loss"]), 100.0)
 
         # Replaying the same stop now compares 100 vs 100 → no-op → False.
@@ -16159,7 +16420,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertFalse(ok2, "Replaying same stop against a non-NULL value must be a no-op")
         logs_final = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(logs_final, logs_after, "No new log for identical stop")
 
     def test_breakeven_dedupe_key_different_stops_allowed(self):
@@ -16171,21 +16432,23 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._insert_ga_decision()
 
         # Real order in DB so the atomic update can win.
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status, ga_decision_id) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1)"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status, ga_decision_id) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open', 1) RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
-            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0)",
-            (order_id,),
+        tid = int(
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                "VALUES (%s, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 95.0, 5.0) RETURNING id",
+                (order_id,),
+            ).fetchone()["id"]
         )
-        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
+            "VALUES (%s, 1, 'BTCUSDT', 'LONG', 100.0, 1.0, 95.0, 'open')",
             (tid,),
         )
         self.conn.commit()
@@ -16216,7 +16479,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "initial_risk_usdt": 1.0,
             }
             order = dict(self.conn.execute(
-                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+                "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
             ).fetchone())
             market = {"close": entry + 5.0, "high": entry + 6.0, "low": entry - 1.0}
             with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback', side_effect=_mp_ok):
@@ -16228,7 +16491,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertTrue(r1["stop_loss_adjusted"])
         jid1 = self.conn.execute(
             "SELECT id FROM agent_jobs WHERE job_type='paper_event_alert' "
-            "  AND session_id=?",
+            "  AND session_id=%s",
             (f"system:paper:stop_adjust:breakeven:{order_id}:{round(100.0, 8)}",),
         ).fetchone()
         self.assertIsNotNone(jid1, "First breakeven price should enqueue a job")
@@ -16239,7 +16502,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # update stop directly to a new value so the next breakeven (different
         # entry) can run a fresh atomic update.
         self.conn.execute(
-            "UPDATE paper_orders SET stop_loss=95.0 WHERE id=?",
+            "UPDATE paper_orders SET stop_loss=95.0 WHERE id=%s",
             (order_id,),
         )
         self.conn.commit()
@@ -16248,7 +16511,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertIsNotNone(r2)
         jid2 = self.conn.execute(
             "SELECT id FROM agent_jobs WHERE job_type='paper_event_alert' "
-            "  AND session_id=?",
+            "  AND session_id=%s",
             (f"system:paper:stop_adjust:breakeven:{order_id}:{round(110.0, 8)}",),
         ).fetchone()
         self.assertIsNotNone(jid2, "Different breakeven price should enqueue its OWN job")
@@ -16258,9 +16521,9 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Verify two distinct jobs exist for this order's breakeven alerts.
         count = self.conn.execute(
             "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' "
-            "  AND session_id LIKE ?",
+            "  AND session_id LIKE %s",
             (f"system:paper:stop_adjust:breakeven:{order_id}:%",),
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(count, 2, "Two distinct breakeven prices → two jobs")
 
     # ── Round 10: 4-item final-audit fixes ────────────────────────────────
@@ -16269,83 +16532,87 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         """A status='closed' order must NOT have its stop_loss mutated, even if
         the supplied old_stop matches the row. The atomic UPDATE carries
         AND status='open' so closed/pending orders are immutable."""
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed')"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed') RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.commit()
         logs_before = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         ok = self.repo.update_paper_order_stop_loss(order_id, 100.0, reason="closed-order")
         self.assertFalse(ok, "Closed order must reject stop_loss update")
         logs_after = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(logs_after, logs_before, "No log must be emitted for a closed order")
-        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertAlmostEqual(float(row["stop_loss"]), 95.0)
 
     def test_update_paper_order_stop_loss_rejects_wrong_direction_long(self):
         """A LONG order must not be able to LOWER its stop_loss (that would
         widen risk). The new_stop >= stop_loss branch in SQL rejects it."""
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open')"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'open') RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.commit()
         logs_before = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         # Lowering from 95 → 90 must be rejected.
         ok = self.repo.update_paper_order_stop_loss(order_id, 90.0, reason="lower")
         self.assertFalse(ok, "LONG must reject lowering stop_loss")
         logs_after = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(logs_after, logs_before)
-        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertAlmostEqual(float(row["stop_loss"]), 95.0)
 
     def test_update_paper_order_stop_loss_rejects_wrong_direction_short(self):
         """A SHORT order must not be able to RAISE its stop_loss (that would
         widen risk). The new_stop <= stop_loss branch in SQL rejects it."""
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'SHORT', 'market', 1.0, 100.0, 105.0, 105.0, 'open')"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status) "
+                "VALUES ('BTCUSDT', 'SHORT', 'market', 1.0, 100.0, 105.0, 105.0, 'open') RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self.conn.execute(
-            "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
-            "VALUES (?, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 105.0, 5.0)",
-            (order_id,),
+        tid = int(
+            self.conn.execute(
+                "INSERT INTO paper_trades(order_id, symbol, side, entry_price, quantity, stop_loss, initial_stop_loss, initial_risk_usdt) "
+                "VALUES (%s, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 105.0, 5.0) RETURNING id",
+                (order_id,),
+            ).fetchone()["id"]
         )
-        tid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, quantity, stop_loss, status) "
-            "VALUES (?, 1, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 'open')",
+            "VALUES (%s, 1, 'BTCUSDT', 'SHORT', 100.0, 1.0, 105.0, 'open')",
             (tid,),
         )
         self.conn.commit()
         logs_before = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         # Raising from 105 → 110 must be rejected.
         ok = self.repo.update_paper_order_stop_loss(order_id, 110.0, reason="raise")
         self.assertFalse(ok, "SHORT must reject raising stop_loss")
         logs_after = self.conn.execute(
             "SELECT COUNT(*) FROM paper_trade_logs WHERE event_type='stop_loss_adjustment'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(logs_after, logs_before)
-        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT stop_loss FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertAlmostEqual(float(row["stop_loss"]), 105.0)
 
         # Sanity: lowering SHORT stop 105 → 100 should still be allowed.
@@ -16361,14 +16628,15 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         now = datetime.now(timezone.utc)
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
         # Closed order — atomic update will be rejected.
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed')"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 95.0, 95.0, 'closed') RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.commit()
-        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone())
         trade = {
             "id": 999, "symbol": "BTCUSDT", "side": "LONG",
             "entry_price": 100.0, "quantity": 1.0,
@@ -16397,97 +16665,57 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         jobs = self.conn.execute(
             "SELECT COUNT(*) FROM agent_jobs WHERE job_type='paper_event_alert' "
             "  AND session_id LIKE 'system:paper:stop_adjust:breakeven:%'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(jobs, 0, "No alert job when the atomic update failed")
 
     def test_migration_state_table_prevents_repeat_scan(self):
-        """_apply_stop_loss_adjustment_dedup uses a _migration_state marker so
-        the second initialize_database() call does NOT re-scan history. We
-        verify by inserting dirty duplicate logs AFTER the first run has
-        marked the migration applied, and confirming they remain unmarked."""
-        import tempfile as _tempfile
-        import gc
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        """PG greenfield contract: ``initialize_database()`` writes the
+        ``stop_loss_adjustment_dedup_v1`` marker directly (ON CONFLICT DO
+        NOTHING) on the first init - there is no historical dirty data to scan
+        and no SQLite-era executescript-reorder ``_apply_stop_loss_adjustment_dedup``
+        pass. The contract this test preserves is: (1) the marker is set after
+        ``initialize_database()``; (2) re-running ``initialize_database()`` is
+        idempotent and does NOT touch paper_trade_logs inserted after the marker
+        (they keep their original ``is_duplicate`` state, i.e. never set)."""
         from plugins.crypto_guard.storage.migrations import (
+            check_schema_health,
             initialize_database,
-            _apply_stop_loss_adjustment_dedup,
         )
 
-        tmp_dir = _tempfile.TemporaryDirectory()
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        conn = None
-        try:
-            db_path = os.path.join(tmp_dir.name, "migr.sqlite3")
-            os.environ["CRYPTO_GUARD_DB"] = db_path
-            # First initialize on a fresh DB: _apply_stop_loss_adjustment_dedup
-            # sees no required tables yet (schema.sql runs AFTER the dedup) so
-            # it guards out and the marker is intentionally NOT set yet.
-            self.assertTrue(initialize_database()["ok"], "first initialize_database must succeed")
-
-            conn = connect_db(db_path)
-            marker_first = conn.execute(
+        # The scratch schema is already initialized by setUp's make_repo(); the
+        # marker must already be present (written by initialize_database).
+        with self.conn.cursor() as cur:
+            marker = cur.execute(
                 "SELECT key FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
             ).fetchone()
-            self.assertIsNone(marker_first,
-                "On a fresh DB the dedup migration guards out (no tables yet) "
-                "and must NOT set the marker until schema.sql has applied tables.")
+        self.assertIsNotNone(marker, "dedup marker must be set by initialize_database")
+        self.assertTrue(check_schema_health()["ok"], "schema healthy after init")
 
-            # A second initialize_database now sees the tables existed (from the
-            # first run's executescript) and runs the dedup scan over an empty
-            # dataset — this is the run that records the marker. Must close the
-            # open connection first so the WAL can flush to disk cleanly.
-            conn.close()
-            conn = None
-            gc.collect()
-            self.assertTrue(initialize_database()["ok"], "second initialize_database must succeed")
+        # Insert paper_trade_logs that the SQLite-era migration would have
+        # soft-marked is_duplicate. Under PG greenfield there is no rescan pass,
+        # so these must stay untouched regardless of how many re-inits run.
+        for _ in range(3):
+            self.conn.execute(
+                "INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, "
+                "event_json) VALUES (1, 'stop_loss_adjustment', 'BTCUSDT', 'LONG', "
+                "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}'::jsonb)"
+            )
+        self.conn.commit()
 
-            conn = connect_db(db_path)
-            marker = conn.execute(
-                "SELECT key FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'"
-            ).fetchone()
-            self.assertIsNotNone(marker, "marker must be set after schema tables exist + dedup scan ran")
+        # Re-init must be idempotent (marker ON CONFLICT DO NOTHING) and must NOT
+        # re-scan/touch the inserted logs.
+        self.assertTrue(initialize_database()["ok"], "re-init must succeed")
+        self.assertTrue(initialize_database()["ok"], "second re-init must succeed")
 
-            # Insert dirty duplicate paper_trade_logs that the migration would
-            # normally soft-mark. The next run must skip cleanup because the
-            # marker is already set.
-            for _ in range(3):
-                conn.execute(
-                    "INSERT INTO paper_trade_logs(position_id, event_type, symbol, side, "
-                    "event_json) VALUES (1, 'stop_loss_adjustment', 'BTCUSDT', 'LONG', "
-                    "'{\"order_id\": 1, \"old_stop_loss\": 1.0578, \"new_stop_loss\": 1.0494}')"
-                )
-            conn.commit()
-
-            # Third run — should bail out early via the marker.
-            _apply_stop_loss_adjustment_dedup(conn)
-            conn.commit()
-
-            rows = conn.execute(
-                "SELECT event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' "
-                "ORDER BY id"
-            ).fetchall()
-            import json as _json
-            for r in rows:
-                ev = _json.loads(r["event_json"])
-                self.assertFalse(ev.get("is_duplicate"),
-                    "Duplicate logs inserted AFTER migration marker set should NOT be re-cleaned")
-        finally:
-            if conn is not None:
-                conn.close()
-            conn = None
-            gc.collect()
-            if old_db is None:
-                os.environ.pop("CRYPTO_GUARD_DB", None)
-            else:
-                os.environ["CRYPTO_GUARD_DB"] = old_db
-            # On Windows, sqlite WAL/shm file handles may briefly outlive
-            # conn.close(); swallow cleanup errors so the test result is not
-            # polluted by temp-dir teardown failures unrelated to the assertion.
-            try:
-                tmp_dir.cleanup()
-            except OSError:
-                pass
-
+        rows = self.conn.execute(
+            "SELECT event_json FROM paper_trade_logs WHERE event_type='stop_loss_adjustment' "
+            "ORDER BY id"
+        ).fetchall()
+        for r in rows:
+            ev = _load_json(r["event_json"])
+            self.assertFalse(ev.get("is_duplicate"),
+                "Logs inserted after the marker must NOT be re-cleaned by re-init")
+        self.assertTrue(check_schema_health()["ok"], "schema healthy after re-init")
     def test_non_periodic_alert_no_default_dedupe_key(self):
         """Non-periodic alert types (e.g. paper_order_filled) must default to
         NO dedupe_key so two simultaneously-pending alerts of the same type
@@ -16534,53 +16762,60 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.assertNotIn("paper_order_filled", PERIODIC_ALERT_TYPES)
 
     def test_agent_jobs_dedup_considers_new_stop(self):
-        """Two legitimate stop_loss_adjustment agent_jobs on the same order
-        with DIFFERENT new_stop values must NOT be marked as duplicates of
-        each other. The PARTITION keys on (order_id, event_type, new_stop)."""
-        # Clear the migration marker so the cleanup actually runs.
-        self.conn.execute("DELETE FROM _migration_state WHERE key='stop_loss_adjustment_dedup_v1'")
-        self.conn.commit()
+        """Two legitimate stop_loss_adjustment agent_jobs on the same order with
+        DIFFERENT new_stop values must NOT be collapsed into one job, while a
+        re-issue with the SAME new_stop must collapse (no redundant row).
 
-        # Two agent_jobs for the same order but DIFFERENT new_stop_loss.
+        PG greenfield contract: the SQLite-era ``_apply_stop_loss_adjustment_dedup``
+        migration post-hoc soft-marked duplicate agent_jobs by a (order_id,
+        event_type, new_stop) partition key. Greenfield replaces that with
+        WRITE-TIME idempotency in ``enqueue_job_once`` (repository.py:1489): the
+        idempotency key is the ``session_id``, which the producer
+        (paper_position_updater.py:679) builds as
+        ``system:paper:stop_adjust:breakeven:{order_id}:{round(new_stop, 8)}``.
+        So a DIFFERENT new_stop -> a different session_id -> a DISTINCT pending
+        job; the SAME new_stop -> the same session_id -> ``enqueue_job_once``
+        returns the existing job id and inserts NO new row. Verified here via the
+        real ``enqueue_job_once`` rather than the deleted post-hoc migration.
+        """
+        # No marker deletion, no deleted helper: greenfield dedups at enqueue
+        # time. The producer's exact session_id format (round(new_stop, 8)).
+        alpha_sid = f"system:paper:stop_adjust:breakeven:7777:{round(100.0, 8)}"
+        beta_sid = f"system:paper:stop_adjust:breakeven:7777:{round(110.0, 8)}"
         payload_alpha = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 100.0}
         payload_beta = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 110.0}
-        for p in (payload_alpha, payload_beta):
-            self.conn.execute(
-                "INSERT INTO agent_jobs(job_type, source, session_id, payload_json, status) "
-                "VALUES ('paper_event_alert', 'test', ?, ?, 'pending')",
-                (f"system:paper:stop_adjust:breakeven:7777:{p['new_stop_loss']}", json.dumps(p)),
-            )
-        self.conn.commit()
 
-        # Duplicates with the SAME new_stop should be marked duplicate.
-        payload_dup = {"order_id": 7777, "event_type": "stop_loss_adjustment", "new_stop_loss": 100.0}
-        self.conn.execute(
-            "INSERT INTO agent_jobs(job_type, source, session_id, payload_json, status) "
-            "VALUES ('paper_event_alert', 'test', 'system:paper:stop_adjust:breakeven:7777:100.0dup', "
-            "?, 'pending')",
-            (json.dumps(payload_dup),),
-        )
-        self.conn.commit()
+        # Enqueue two jobs for the same order with DIFFERENT new_stop values.
+        # Distinct session_ids -> enqueue_job_once inserts two distinct rows.
+        id_alpha = self.repo.enqueue_job_once("paper_event_alert", 3, "paper_worker", alpha_sid, payload_alpha)
+        id_beta = self.repo.enqueue_job_once("paper_event_alert", 3, "paper_worker", beta_sid, payload_beta)
+        self.assertNotEqual(id_alpha, id_beta,
+            "Different new_stop_loss -> different session_id -> distinct jobs (must NOT collapse)")
 
-        from plugins.crypto_guard.storage.migrations import _apply_stop_loss_adjustment_dedup
-        _apply_stop_loss_adjustment_dedup(self.conn)
-        self.conn.commit()
+        # Re-issue the alpha adjustment with the SAME new_stop -> SAME session_id
+        # -> enqueue_job_once returns the existing id and inserts NO new row.
+        id_dup = self.repo.enqueue_job_once("paper_event_alert", 3, "paper_worker", alpha_sid, payload_alpha)
+        self.assertEqual(id_dup, id_alpha,
+            "Same new_stop_loss -> same session_id -> collapse to existing job id (no new row)")
 
-        surviving = self.conn.execute(
+        # Exactly two rows exist: alpha and beta. The duplicate re-issue added no
+        # row (it collapsed). This is the inversion of the deleted migration's
+        # soft-mark: greenfield prevents the redundant job from ever existing.
+        rows = self.conn.execute(
             "SELECT session_id, status FROM agent_jobs "
-            "WHERE job_type='paper_event_alert' ORDER BY id"
+            "WHERE job_type='paper_event_alert' AND session_id LIKE 'system:paper:stop_adjust:breakeven:7777:%' "
+            "ORDER BY id"
         ).fetchall()
-        statuses = {r["session_id"]: r["status"] for r in surviving}
-        alpha_sid = "system:paper:stop_adjust:breakeven:7777:100.0"
-        beta_sid = "system:paper:stop_adjust:breakeven:7777:110.0"
-        dup_sid = "system:paper:stop_adjust:breakeven:7777:100.0dup"
+        self.assertEqual(len(rows), 2, "only the two distinct-new_stop jobs exist; the dup collapsed")
+        statuses = {r["session_id"]: r["status"] for r in rows}
 
-        # Beta (different new_stop) must remain pending — NOT marked duplicate.
+        # Both surviving jobs stay 'pending' — greenfield collapses (drops the
+        # redundant enqueue) rather than soft-marking a 'duplicate' row, so no
+        # 'duplicate' status is ever written here.
+        self.assertEqual(statuses[alpha_sid], "pending",
+            "Different new_stop jobs must stay pending, never soft-marked 'duplicate'")
         self.assertEqual(statuses[beta_sid], "pending",
-            "Different new_stop_loss jobs must not be marked duplicate")
-        # One of (alpha, dup) — same new_stop — must be marked duplicate.
-        dup_count = sum(1 for s in (alpha_sid, dup_sid) if statuses.get(s) == "duplicate")
-        self.assertEqual(dup_count, 1, "Exactly one of the same-new_stop pair must be marked duplicate")
+            "Different new_stop jobs must stay pending, never soft-marked 'duplicate'")
 
     # ── P0: Mark Price Tests ──────────────────────────────────
 
@@ -16917,11 +17152,12 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Insert migration marker so _profit_protection_cutoff returns a value
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z') "
+            "ON CONFLICT (key) DO UPDATE SET applied_at=EXCLUDED.applied_at"
         )
         event_json_no_price = json.dumps({"position_id": 9999, "event_time": "2026-06-27T10:00:00Z"})
         self.conn.execute(
-            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json) VALUES (%s, %s, %s, %s)",
             (9999, "BTCUSDT", "profit_protection", event_json_no_price),
         )
         self.conn.commit()
@@ -16936,7 +17172,8 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Insert migration marker so _profit_protection_cutoff returns a value
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z') "
+            "ON CONFLICT (key) DO UPDATE SET applied_at=EXCLUDED.applied_at"
         )
         stale_price_time = "2026-06-27T08:00:00Z"
         action_time = "2026-06-27T08:05:00Z"  # 300s later
@@ -16945,7 +17182,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "price_as_of": stale_price_time, "event_time": action_time,
         })
         self.conn.execute(
-            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO paper_trade_logs(position_id, symbol, event_type, event_json, created_at) VALUES (%s, %s, %s, %s, %s)",
             (9999, "BTCUSDT", "stop_loss_adjustment", event_json_stale, action_time),
         )
         self.conn.commit()
@@ -16960,11 +17197,12 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Insert migration marker so _profit_protection_cutoff returns a value
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('profit_protection_mark_price_contract_v1', '2026-01-01T00:00:00Z') "
+            "ON CONFLICT (key) DO UPDATE SET applied_at=EXCLUDED.applied_at"
         )
         payload_no_time = json.dumps({"symbol": "BTCUSDT", "order_id": 9999})
         self.conn.execute(
-            "INSERT INTO alert_outbox(alert_type, payload_json, status) VALUES (?, ?, ?)",
+            "INSERT INTO alert_outbox(alert_type, payload_json, status) VALUES (%s, %s, %s)",
             ("paper_order_filled", payload_no_time, "sent"),
         )
         self.conn.commit()
@@ -16991,7 +17229,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Insert a paper_position with current_price and updated_at
         self.conn.execute(
-            "INSERT INTO paper_positions(account_id, symbol, side, entry_price, quantity, status, current_price, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_positions(account_id, symbol, side, entry_price, quantity, status, current_price, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (1, "BTCUSDT", "LONG", 64000.0, 1.0, "open", 65000.0, updated_at_iso),
         )
         self.conn.commit()
@@ -17060,11 +17298,11 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         # Set up minimal DB records
         self.conn.execute(
-            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (9999, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
         )
         self.conn.execute(
-            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt, max_favorable_excursion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt, max_favorable_excursion) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (9999, 9999, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0, 1500.0),
         )
         self.conn.commit()
@@ -17093,12 +17331,12 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         """Issue 5: closed_at IS NULL prevents double close."""
         # Insert a paper_order first (FK constraint)
         self.conn.execute(
-            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (9999, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
         )
         # Insert a trade
         self.conn.execute(
-            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, initial_risk_usdt) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (9999, 9999, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0),
         )
         self.conn.commit()
@@ -17174,10 +17412,22 @@ class ShadowVTLifecycleTest(unittest.TestCase):
     def _seed_paper_account(self) -> None:
         """Insert a paper_accounts row (the only precondition the new tests
         need that CryptoGuardSmokeTest._seed_paper_data normally provides).
+
+        Uses ``account_name='default'`` (the production ``ensure_paper_account``
+        default) so a later ``ensure_paper_account()`` call hits its
+        ``ON CONFLICT(account_name) DO NOTHING`` branch instead of trying to
+        INSERT a second row whose GENERATED identity (starting at 1) collides
+        with this seed row's explicit ``id=1`` - PG ``ON CONFLICT(account_name)``
+        does NOT catch a pkey conflict, so the collision would raise
+        ``UniqueViolation: paper_accounts_pkey``. Matching the account_name is
+        the production-shaped fix.
         """
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'default', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
         self.conn.commit()
 
@@ -17198,7 +17448,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, "
             "quantity, stop_loss, filled_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (7001, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0, 49500.0,
              "2026-06-27T10:00:00Z"),
         )
@@ -17415,12 +17665,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._seed_paper_account()
         now = datetime.now(timezone.utc)
         thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
-        self.conn.execute(
-            "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
-            "initial_stop_loss, status) "
-            "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open')"
+        order_id = int(
+            self.conn.execute(
+                "INSERT INTO paper_orders(symbol, side, order_type, quantity, entry_price, stop_loss, "
+                "initial_stop_loss, status) "
+                "VALUES ('BTCUSDT', 'LONG', 'market', 1.0, 100.0, 98.0, 98.0, 'open') RETURNING id"
+            ).fetchone()["id"]
         )
-        order_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         self.conn.commit()
         trade = {
             "id": 8001, "symbol": "BTCUSDT", "side": "LONG",
@@ -17429,7 +17680,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "max_favorable_excursion": 1.5,
             "initial_risk_usdt": 2.0,
         }
-        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+        order = dict(self.conn.execute("SELECT * FROM paper_orders WHERE id=%s", (order_id,)).fetchone())
 
         with patch('plugins.crypto_guard.paper.paper_position_updater.get_mark_price_with_fallback') as mock_mp:
             mock_mp.return_value = {"ok": False, "error": "stale_price", "price_age_seconds": -1.0}
@@ -17452,25 +17703,25 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         self._seed_paper_account()
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (8002, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (8002, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (8002, 8002, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, ?)",
+            "VALUES (8002, 8002, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.72, 0, 0.5, %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (8002, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (8002, 1, 'LINKUSDT', 'SHORT', 14.50, 15.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         self.conn.execute(
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES (8002, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
+            "VALUES (8002, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.89, 'bullish', 'enter_long', "
             "'[]', '[]', '[]', '[]', '[]', 'bullish S signal', '{}', '{\"entry\":14.00,\"stop\":13.50}')",
             (now_iso,),
         )
@@ -17484,11 +17735,11 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         log = self.conn.execute(
             "SELECT event_json FROM paper_trade_logs "
-            "WHERE event_type='conflict_exit' AND json_extract(event_json, '$.trade_id')=8002 "
+            "WHERE event_type='conflict_exit' AND (event_json->>'trade_id')='8002' "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log, "conflict_exit log must be written")
-        ev = json.loads(log["event_json"])
+        ev = _load_json(log["event_json"])
         self.assertIn("mark_price", ev, "conflict_exit log must include mark_price")
         self.assertIn("price_source", ev, "conflict_exit log must include price_source")
         self.assertIn("price_as_of", ev, "conflict_exit log must include price_as_of")
@@ -17507,18 +17758,18 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Tighten stop toward entry on conflict.
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (8003, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, ?)",
+            "VALUES (8003, 'LINKUSDT', 'SHORT', 'market', 'open', 14.50, 15.00, 1, %s)",
             (created_long_ago,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (8003, 8003, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.0, 1.0, 0.0, ?)",
+            "VALUES (8003, 8003, 'LINKUSDT', 'SHORT', 14.50, 15.00, 1, 0.5, 15.0, 0.0, 1.0, 0.0, %s)",
             (created_long_ago,),
         )
         self.conn.execute(
             "INSERT INTO paper_positions(id, account_id, symbol, side, entry_price, current_price, "
-            "quantity, stop_loss, status, updated_at) VALUES (8003, 1, 'LINKUSDT', 'SHORT', 14.50, 14.20, 1, 15.00, 'open', ?)",
+            "quantity, stop_loss, status, updated_at) VALUES (8003, 1, 'LINKUSDT', 'SHORT', 14.50, 14.20, 1, 15.00, 'open', %s)",
             (now_iso,),
         )
         # Conflicting bullish A-grade decisions (A avoids the S-only _should_early_exit
@@ -17529,7 +17780,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
                 "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
                 "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
                 "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-                "VALUES (?, 'LINKUSDT', ?, ?, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
+                "VALUES (%s, 'LINKUSDT', %s, %s, 'scheduled_analysis', 'A', 0.80, 'bullish', 'enter_long', "
                 "'[]', '[]', '[]', '{\"ok\":true}', '[]', 'bullish A signal', '{}', '{\"entry\":14.00,\"stop\":13.50}')",
                 (gid, gid * 1000, now_iso),
             )
@@ -17546,11 +17797,11 @@ class ShadowVTLifecycleTest(unittest.TestCase):
 
         log = self.conn.execute(
             "SELECT event_json FROM paper_trade_logs "
-            "WHERE event_type='stop_loss_adjustment' AND json_extract(event_json, '$.trade_id')=8003 "
+            "WHERE event_type='stop_loss_adjustment' AND (event_json->>'trade_id')='8003' "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log, "stop_loss_adjustment log must be written")
-        ev = json.loads(log["event_json"])
+        ev = _load_json(log["event_json"])
         self.assertIn("mark_price", ev, "stop_loss_adjustment log must include mark_price")
         self.assertIn("price_source", ev, "stop_loss_adjustment log must include price_source")
         self.assertIn("price_as_of", ev, "stop_loss_adjustment log must include price_as_of")
@@ -17571,13 +17822,13 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # past grade/confidence/mfe gates, then fails on mark fetch.
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, stop_loss, quantity, created_at) "
-            "VALUES (8004, 'LINKUSDT', 'LONG', 'market', 'open', 14.50, 14.00, 1, ?)",
+            "VALUES (8004, 'LINKUSDT', 'LONG', 'market', 'open', 14.50, 14.00, 1, %s)",
             (created_long_ago,),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, stop_loss, quantity, "
             "initial_risk_usdt, initial_stop_loss, signal_decay_score, max_favorable_excursion, max_adverse_excursion, created_at) "
-            "VALUES (8004, 8004, 'LINKUSDT', 'LONG', 14.50, 14.00, 1, 0.5, 14.00, 0.0, 1.5, 0.0, ?)",
+            "VALUES (8004, 8004, 'LINKUSDT', 'LONG', 14.50, 14.00, 1, 0.5, 14.00, 0.0, 1.5, 0.0, %s)",
             (created_long_ago,),
         )
         # Bullish-S bias that conflicts with LONG via bias=bearish.
@@ -17585,7 +17836,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "INSERT INTO ga_decisions(id, symbol, analysis_time, analysis_time_utc, decision_type, "
             "signal_grade, confidence, market_bias, decision, skill_result_refs_json, evidence_json, "
             "counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, raw_decision_json, trade_plan_json) "
-            "VALUES (8004, 'LINKUSDT', 1000000, ?, 'scheduled_analysis', 'S', 0.90, 'bearish', 'enter_short', "
+            "VALUES (8004, 'LINKUSDT', 1000000, %s, 'scheduled_analysis', 'S', 0.90, 'bearish', 'enter_short', "
             "'[]', '[]', '[]', '{\"ok\":true}', '[]', 'bearish S signal', '{}', '{\"entry\":13.00,\"stop\":13.50}')",
             (now_iso,),
         )
@@ -17604,7 +17855,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(log,
             "needs_position_recheck log must be written when mark fetch fails for profit protection")
-        ev = json.loads(log["event_json"])
+        ev = _load_json(log["event_json"])
         self.assertIn("mark_price_unavailable_for_profit_protection",
             ev.get("reason", ""),
             "recheck reason must indicate profit-protection mark unavailability")
@@ -17620,12 +17871,12 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # Pre-create order + trade.
         self.conn.execute(
             "INSERT INTO paper_orders(id, symbol, side, order_type, status, entry_price, quantity) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (8005, "BTCUSDT", "LONG", "market", "open", 50000.0, 1.0),
         )
         self.conn.execute(
             "INSERT INTO paper_trades(id, order_id, symbol, side, entry_price, quantity, "
-            "initial_risk_usdt, max_favorable_excursion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "initial_risk_usdt, max_favorable_excursion) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (8005, 8005, "BTCUSDT", "LONG", 50000.0, 1.0, 1000.0, 1500.0),
         )
         self.conn.commit()
@@ -17658,7 +17909,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         # No profit_protection log, no close_position log for trade 8005.
         logs = self.conn.execute(
             "SELECT COUNT(*) AS cnt FROM paper_trade_logs "
-            "WHERE json_extract(event_json, '$.trade_id')=8005 "
+            "WHERE (event_json->>'trade_id')='8005' "
             "AND event_type IN ('profit_protection', 'close_position')"
         ).fetchone()
         self.assertEqual(logs["cnt"], 0,
@@ -17978,7 +18229,7 @@ class ShadowVTLifecycleTest(unittest.TestCase):
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log, "A stop_loss_adjustment log should exist")
-        event = json.loads(log["event_json"])
+        event = _load_json(log["event_json"])
         self.assertIn("mark_price", event, "event_json must contain mark_price")
         self.assertAlmostEqual(event["mark_price"], 105.0)
         self.assertEqual(event["price_source"], "binance_usdm_mark")
@@ -18075,25 +18326,55 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + connect_db + initialize_database pattern). Under greenfield,
+        # initialize_database() writes to PostgreSQL via cfg.database_url and
+        # IGNORES CRYPTO_GUARD_DB, so the legacy setUp left self.conn pointing
+        # at an EMPTY SQLite file (every table read failed with "no such
+        # table"). self.conn is now a pooled PG connection routed at a unique
+        # scratch schema; initialize_database() (run inside make_repo) creates
+        # every table + writes the contract markers. self.tmp is retained
+        # because a few legacy separate-DB test paths still reference
+        # self.tmp.name; those paths are migrated to PG-native form in the
+        # R4-marker / FR-4 / backup-integrity tests below.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+
         self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "cg_hourly.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self.tmp = tempfile.TemporaryDirectory()
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
+        # P9 (PG cutover) K6: seed a default healthy paper account. The FR-6 /
+        # FS-2 account risk-guard tests below do ``UPDATE paper_accounts SET
+        # equity=...`` (no WHERE) to simulate drawdown, then call
+        # AccountRiskGuard.check(). Under SQLite the legacy connect_db +
+        # initialize path seeded this row; the greenfield make_repo path runs
+        # initialize_database() which seeds symbols/strategies but NOT
+        # paper_accounts. Without this row AccountRiskGuard._get_account()
+        # returns None and check() short-circuits to _ok_result (blocked=False,
+        # recovery_status={}), false-greening every blocking assertion. The
+        # seed satisfies the NOT NULL columns (account_name, initial_balance,
+        # current_balance, equity) with initial_balance=10000 so the tests'
+        # equity=9700 -> -3.0% (hard risk_off) / equity=9750 -> -2.5%
+        # (ordinary risk_off) drawdowns match the guard's -2.5%/-3.0%
+        # thresholds. No test in this class INSERTs a paper_accounts row, so
+        # the UNIQUE(account_name) is never hit.
+        self.conn.execute(
+            "INSERT INTO paper_accounts (account_name, initial_balance, current_balance, equity) "
+            "VALUES (%s, %s, %s, %s)",
+            ("test_account", 10000.0, 10000.0, 10000.0),
+        )
+        self.conn.commit()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        self._repo_handle.close()
+        self.tmp.cleanup()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
             os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
-        os.environ.pop("CRYPTO_GUARD_DB", None)
-        self.tmp.cleanup()
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -18220,7 +18501,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             symbol="BTCUSDT", grade="S", confidence=0.9,
             risk_ok=False, final_summary="高等级机会；风控未通过",
         )
-        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=?", (ga_id,)).fetchone()
+        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=%s", (ga_id,)).fetchone()
         row = _decision_row(dict(raw))
         tier = _opportunity_classifier(row)
         self.assertEqual(tier["tier"], "observation")
@@ -18235,7 +18516,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             symbol="BTCUSDT", grade="A", confidence=0.75, trade_plan={},
             final_summary="A 级观察",
         )
-        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=?", (ga_id,)).fetchone()
+        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=%s", (ga_id,)).fetchone()
         row = _decision_row(dict(raw))
         tier = _opportunity_classifier(row)
         self.assertEqual(tier["tier"], "observation")
@@ -18252,7 +18533,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             symbol="BTCUSDT", grade="B", confidence=below,
             risk_ok=True, final_summary="B 级低置信度",
         )
-        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=?", (ga_id,)).fetchone()
+        raw = self.repo.conn.execute("SELECT * FROM ga_decisions WHERE id=%s", (ga_id,)).fetchone()
         row = _decision_row(dict(raw))
         tier = _opportunity_classifier(row)
         # Phase F (07-05): B belongs to observation only — never executable.
@@ -18357,7 +18638,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # Manually set counter_evidence_json to a no-breakthrough list for both
         # rows so the direction-flip check flags the transition.
         self.conn.execute(
-            "UPDATE ga_decisions SET counter_evidence_json=? WHERE symbol='ADAUSDT'",
+            "UPDATE ga_decisions SET counter_evidence_json=%s WHERE symbol='ADAUSDT'",
             (json.dumps(["tempo divergence", "MACD bearish divergence"]),),
         )
         self.conn.commit()
@@ -18522,11 +18803,18 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     # ── P0 test 14: distribution source label clarifies fallback wording ─
 
     def test_distribution_source_label_sqlite_fallback_phrasing(self) -> None:
-        """P2: in_memory_fallback renders as the SQLite-clarified string."""
+        """P2: in_memory_fallback renders as the PostgreSQL-clarified string.
+
+        Greenfield cutover: the in-process fallback now persists grades to
+        PostgreSQL (not SQLite), so the production label reads
+        ``PostgreSQL 实时等级统计（DuckDB 未启用）``. The ``sqlite_fallback``
+        alias is still accepted by the production helper and maps to the same
+        label. The ``duckdb`` success path is unchanged (``DuckDB 时序``).
+        """
         from plugins.crypto_guard.notify.hourly_report import _distribution_source_label
         self.assertEqual(
             _distribution_source_label("in_memory_fallback", {"ok": False}),
-            "SQLite 实时等级统计（DuckDB 未启用）",
+            "PostgreSQL 实时等级统计（DuckDB 未启用）",
         )
         self.assertEqual(
             _distribution_source_label("duckdb", {"ok": True}),
@@ -18569,17 +18857,19 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         """P0-1: On a fresh DB, batch_id/previous_grade/rendered_summary columns
         exist before schema.sql tries to create the batch_id index."""
         # The DB was initialized in setUp; verify the columns exist.
-        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(ga_decisions)").fetchall()}
+        cols = {row["name"] for row in self.conn.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ga_decisions' ORDER BY ordinal_position").fetchall()}
         for col in ("batch_id", "previous_grade", "rendered_summary"):
             self.assertIn(col, cols, f"ga_decisions missing column {col}")
-        # And the index should exist
+        # And the index should exist (pg_catalog.pg_indexes replaces sqlite_master)
         idx = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_ga_decisions_batch'"
+            "SELECT indexname FROM pg_catalog.pg_indexes "
+            "WHERE schemaname = current_schema() AND indexname = 'idx_ga_decisions_batch'"
         ).fetchone()
         self.assertIsNotNone(idx, "idx_ga_decisions_batch index missing")
-        # batch_symbol_status table should also exist
+        # batch_symbol_status table should also exist (information_schema replaces sqlite_master)
         tbl = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = 'batch_symbol_status'"
         ).fetchone()
         self.assertIsNotNone(tbl, "batch_symbol_status table missing")
 
@@ -18600,7 +18890,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="ETHUSDT")
         # Both should be in batch_symbol_status
         rows = self.conn.execute(
-            "SELECT symbol, status FROM batch_symbol_status WHERE batch_id=? ORDER BY symbol",
+            "SELECT symbol, status FROM batch_symbol_status WHERE batch_id=%s ORDER BY symbol",
             (batch_id,),
         ).fetchall()
         symbols = [(r["symbol"], r["status"]) for r in rows]
@@ -18641,7 +18931,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol="BTCUSDT", status="pending")
         # BTC should be 'pending', not 'completed'
         row = self.conn.execute(
-            "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+            "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
             (batch_id, "BTCUSDT"),
         ).fetchone()
         self.assertEqual(row["status"], "pending")
@@ -18815,7 +19105,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # A requeued job should exist in agent_jobs
         requeued = self.conn.execute(
             "SELECT COUNT(*) FROM agent_jobs WHERE job_type='hourly_feishu_report'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertGreater(requeued, 0)
 
     # ── P0-1 (Round 3): max retries → renders with incomplete ─────────
@@ -18961,7 +19251,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # Flip the retry-10 job to ``running`` (a worker claimed it but has not
         # finished) -- this is the exact production hazard.
         self.repo.conn.execute(
-            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=%s",
             (running_job_id,),
         )
 
@@ -19015,11 +19305,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # The successor carries the bumped poll_sequence so the NEXT requeue is
         # also unique.
         import json as _json
-        successor_payload = _json.loads(
-            self.repo.conn.execute(
-                "SELECT payload_json FROM agent_jobs WHERE id=?", (successor["id"],),
-            ).fetchone()["payload_json"]
-        )
+        _pj = self.repo.conn.execute(
+            "SELECT payload_json FROM agent_jobs WHERE id=%s", (successor["id"],),
+        ).fetchone()["payload_json"]
+        successor_payload = _pj if isinstance(_pj, dict) else _json.loads(_pj)
         self.assertEqual(
             successor_payload.get("poll_sequence"), 1,
             "R8-B: the successor must carry poll_sequence=1 (bumped from 0) so the "
@@ -19064,7 +19353,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
                      "poll_sequence": 1},
         )
         self.repo.conn.execute(
-            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP WHERE id=%s",
             (collision_id,),
         )
         future_anchor = (
@@ -19236,7 +19525,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         )
         # Set counter_evidence to NOT contain closed-candle/BOS/CHoCH tokens
         self.conn.execute(
-            "UPDATE ga_decisions SET counter_evidence_json=? WHERE symbol='XRPUSDT'",
+            "UPDATE ga_decisions SET counter_evidence_json=%s WHERE symbol='XRPUSDT'",
             (json.dumps(["tempo divergence", "MACD bearish divergence"]),),
         )
         self.conn.commit()
@@ -19322,7 +19611,20 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     # ── P2-10 (Round 3): batch_symbol_status CHECK constraint ──────────────
 
     def test_batch_symbol_status_check_constraint(self) -> None:
-        """P2-10: batch_symbol_status enforces CHECK(status IN ('pending', 'completed', 'failed'))."""
+        """P2-10: batch_symbol_status enforces CHECK(status IN ('pending', 'completed', 'failed')).
+
+        P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a parent
+        ``analysis_batches`` row for any *valid-status* insert (PG enforces FKs,
+        SQLite did not). The invalid-status insert below is rejected by the CHECK
+        constraint before the FK is evaluated, so it needs no parent row.
+        """
+        # Parent batch row so the valid-status inserts satisfy the FK.
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("test:check", "15m", 1, '["BTCUSDT","ETHUSDT","SOLUSDT"]', "running"),
+        )
+        self.conn.commit()
         # Valid statuses should work
         self.repo.mark_batch_symbol_completed(batch_id="test:check", symbol="BTCUSDT", status="pending")
         self.repo.mark_batch_symbol_completed(batch_id="test:check", symbol="ETHUSDT", status="completed")
@@ -19330,9 +19632,13 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # Invalid status should raise IntegrityError
         with self.assertRaises(Exception):
             self.conn.execute(
-                "INSERT INTO batch_symbol_status(batch_id, symbol, status) VALUES (?, ?, ?)",
+                "INSERT INTO batch_symbol_status(batch_id, symbol, status) VALUES (%s, %s, %s)",
                 ("test:check", "XRPUSDT", "invalid_status"),
             )
+        # P9 (PG cutover): the rejected INSERT aborted the transaction; clear it
+        # so the pooled connection is returned READY in tearDown (PG leaves the
+        # txn INERROR after a constraint violation, SQLite did not).
+        self.conn.rollback()
 
     # ── P2-11 (Round 3): drawdown display uses abs() ──────────────────────
 
@@ -19378,7 +19684,13 @@ class HourlyReportAccuracyTest(unittest.TestCase):
                          "Absent batch should trigger re-enqueue, not render stale data")
 
     def test_r4_check_constraint_enforced(self) -> None:
-        """P1 (R4): batch_symbol_status CHECK constraint rejects invalid status values."""
+        """P1 (R4): batch_symbol_status CHECK constraint rejects invalid status values.
+
+        P9 (PG cutover): the invalid status is rejected by the CHECK constraint
+        before the FK is evaluated, so no parent ``analysis_batches`` row is
+        needed. PG leaves the transaction INERROR after the violation, so roll
+        back before tearDown (SQLite did not abort the txn).
+        """
         try:
             self.conn.execute(
                 "INSERT INTO batch_symbol_status(batch_id, symbol, status) VALUES ('test_batch', 'BTC', 'invalid')"
@@ -19386,29 +19698,106 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             self.fail("CHECK constraint should reject 'invalid' status")
         except Exception:
             pass
+        self.conn.rollback()
 
     def test_r4_rebuild_migration_adds_constraint(self) -> None:
-        """P1 (R4): _ensure_batch_symbol_status_check_constraint adds CHECK if missing."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        """P1 (R4, PG greenfield): the migration GUARDS the CHECK and rebuilds it
+        from a full table rebuild.
 
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute(
-            "CREATE TABLE batch_symbol_status ("
-            "batch_id TEXT NOT NULL, symbol TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
-            "updated_at TEXT, PRIMARY KEY (batch_id, symbol))"
+        The legacy SQLite test called a dedicated ``_ensure_batch_symbol_status_check_constraint``
+        helper to ``ALTER TABLE ... ADD CHECK`` onto a weak table and read
+        ``sqlite_master``. Greenfield PG has no incremental migration: the
+        ``CHECK(status IN ('pending','completed','failed'))`` is created inline by
+        ``schema_postgres.sql`` at ``CREATE TABLE`` time only, and the health probe
+        (``_check_batch_symbol_status_constraint``) introspects ``pg_constraint``
+        to verify it. So the faithful PG contract has two halves:
+
+        (A) Fail-closed guard: with the CHECK dropped but the table still present,
+        ``check_schema_health`` reports it missing AND ``initialize_database()``
+        raises ``RuntimeError`` instead of silently running with a weak table
+        (the documented fail-closed init contract at migrations.py:207-232).
+
+        (B) Rebuild: dropping the table(s) that carry the CHECK and re-running
+        ``initialize_database()`` recreates the CHECK and leaves the table usable.
+        ``batch_symbol_status`` is referenced by the composite FK on ``agent_jobs``,
+        so both are dropped (CASCADE) and recreated together.
+        """
+        from plugins.crypto_guard.storage.migrations import (
+            initialize_database,
+            check_schema_health,
         )
-        self.conn.execute("INSERT INTO batch_symbol_status(batch_id, symbol, status) VALUES ('b1', 'BTC', 'completed')")
+
+        # ── (A) fail-closed: drop the CHECK, table stays ──────────────────────
+        # The CHECK is an inline (auto-named) constraint; find its name and drop
+        # only that constraint (NOT the table, to avoid the agent_jobs composite
+        # FK cascade).
+        ck_name = self.conn.execute(
+            "SELECT con.conname FROM pg_constraint con "
+            "JOIN pg_class cls ON cls.oid = con.conrelid "
+            "JOIN pg_namespace nsp ON nsp.oid = con.connamespace "
+            "WHERE cls.relname='batch_symbol_status' AND con.contype='c' "
+            "  AND nsp.nspname=current_schema()"
+        ).fetchone()["conname"]
+        self.conn.execute(
+            f'ALTER TABLE batch_symbol_status DROP CONSTRAINT "{ck_name}"'
+        )
         self.conn.commit()
 
-        _ensure_batch_symbol_status_check_constraint(self.conn)
+        health = check_schema_health(conn=self.conn)
+        self.assertFalse(
+            health["ok"],
+            "check_schema_health MUST detect a dropped batch_symbol_status CHECK "
+            "constraint (fail-closed guard). got %r" % (health,),
+        )
+        # initialize_database() must refuse to run on this unhealthy schema.
+        with self.assertRaises(RuntimeError):
+            initialize_database()
+        # The failed init left the connection's transaction aborted; clear it so
+        # the pooled connection is returned READY in tearDown (PG leaves the txn
+        # INERROR after a raised/rolled-back init, SQLite did not).
+        self.conn.rollback()
 
-        table_sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        self.assertIn("CHECK", table_sql, "CHECK constraint should be present after rebuild")
+        # ── (B) rebuild: drop the table(s), re-init, CHECK returns ────────────
+        # batch_symbol_status is referenced by agent_jobs' composite FK; drop
+        # both (CASCADE handles the FK) so initialize_database recreates them
+        # with the full constraint set.
+        self.conn.execute("DROP TABLE IF EXISTS agent_jobs CASCADE")
+        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status CASCADE")
+        self.conn.commit()
 
+        initialize_database()
+
+        def _check_present() -> bool:
+            row = self.conn.execute(
+                "SELECT con.conname FROM pg_catalog.pg_constraint con "
+                "JOIN pg_catalog.pg_class cls ON cls.oid = con.conrelid "
+                "JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace "
+                "WHERE cls.relname = 'batch_symbol_status' AND con.contype = 'c' "
+                "  AND nsp.nspname = current_schema()"
+            ).fetchone()
+            return row is not None
+
+        self.assertTrue(_check_present(), "CHECK constraint must be re-added by initialize_database()")
+
+        # The recreated table is usable: a valid status inserts and persists.
+        # P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a
+        # parent ``analysis_batches`` row for the valid-status insert (PG enforces
+        # FKs; SQLite did not). Dropping batch_symbol_status above does not touch
+        # analysis_batches, so we can seed the parent now (after the table is back).
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("b1", "15m", 1, '["BTC"]', "running"),
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "BTC", "completed"),
+        )
+        self.conn.commit()
         row = self.conn.execute(
-            "SELECT status FROM batch_symbol_status WHERE batch_id='b1' AND symbol='BTC'"
+            "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
+            ("b1", "BTC"),
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "completed")
@@ -19439,10 +19828,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # bearish CHoCH structured event in module_analysis_results.
         # FS-1: structure_events must carry close_time + closed=True.
         self.conn.execute(
-            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (%s, %s, %s, %s)",
             ("TESTFLIP", now_ms - 300000, "live", "{}"),
         )
-        snapshot_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        snapshot_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
         event_time = now_ms - 500000
         result_json = _json.dumps({
             "module": "price_action",
@@ -19455,7 +19844,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO module_analysis_results (symbol, timeframe, analysis_time, module, result_json, confidence, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("TESTFLIP", "15m", event_time, "price_action", result_json, 0.8, snapshot_id),
         )
         self.conn.commit()
@@ -19784,7 +20173,8 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(job)
         import json
-        payload = json.loads(job["payload_json"])
+        _pj = job["payload_json"]
+        payload = _pj if isinstance(_pj, dict) else json.loads(_pj)
         self.assertEqual(payload.get("retry_count"), 1)
         self.assertEqual(payload.get("expected_batch_id"), "15m:12345")
         self.assertEqual(payload.get("report_hour_utc"), "2026-06-29T10:00:00Z")
@@ -19873,7 +20263,8 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         job = self.conn.execute(
             "SELECT payload_json FROM agent_jobs WHERE source='hourly_report_requeue' ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        payload = json.loads(job["payload_json"])
+        _pj = job["payload_json"]
+        payload = _pj if isinstance(_pj, dict) else json.loads(_pj)
         self.assertEqual(payload.get("expected_batch_id"), "15m:old_batch_time",
                          "Retry must keep the original expected_batch_id even across 15m boundary")
 
@@ -19932,7 +20323,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
 
         # Seed a stale signal from a previous cycle (no batch_id filter on signals)
         self.conn.execute(
-            "INSERT INTO signals (symbol, timeframe, direction, signal_grade, decision, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO signals (symbol, timeframe, direction, signal_grade, decision, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", "LONG", "S", "create_paper_order", "active", "2026-06-29T00:00:00Z"),
         )
         self.conn.commit()
@@ -20017,57 +20408,77 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     # ══════════════════════════════════════════════════════════════════════
 
     def test_fr4_weak_table_rebuilt_with_exact_constraint(self) -> None:
-        """FR-4: A weak old table is rebuilt with the exact CHECK constraint."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        """FR-4 (PG greenfield): the batch_symbol_status CHECK has the exact expected expression.
+
+        The legacy test dropped the table, called the removed
+        ``_ensure_batch_symbol_status_check_constraint`` helper to rebuild it, and read
+        ``sqlite_master`` to regex-match the CHECK. Under greenfield the CHECK is created once
+        by ``schema_postgres.sql`` (there is no runtime rebuild), so the faithful analog of
+        "rebuilt with the exact CHECK" is to read the live CHECK definition from
+        ``pg_get_constraintdef`` and assert it is exactly ``status IN ('pending','completed','failed')``.
+        """
         import re
 
-        # Drop and recreate without CHECK constraint to simulate old table
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
-
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-
-        sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
+        condef = self.conn.execute(
+            "SELECT pg_get_constraintdef(con.oid) AS def FROM pg_catalog.pg_constraint con "
+            "JOIN pg_catalog.pg_class cls ON cls.oid = con.conrelid "
+            "JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace "
+            "WHERE cls.relname = 'batch_symbol_status' AND con.contype = 'c' "
+            "  AND nsp.nspname = current_schema()"
+        ).fetchone()["def"]
+        # PG normalizes ``status IN ('pending','completed','failed')`` in a CHECK
+        # constraint to ``status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text])``
+        # in pg_get_constraintdef, and wraps the expression in an extra paren pair. After
+        # stripping the ::text casts the canonical live form is:
+        #   CHECK ((status = ANY (ARRAY['pending', 'completed', 'failed'])))
+        condef_clean = re.sub(r"::\w+", "", condef)
         pattern = re.compile(
-            r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
+            r"CHECK\s*\(\s*\(?\s*status\s*=\s*ANY\s*\(\s*ARRAY\s*\["
+            r"\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*"
+            r"\]\s*\)\s*\)+",
             re.IGNORECASE,
         )
-        self.assertTrue(pattern.search(sql), "Exact CHECK constraint must exist after migration")
+        self.assertTrue(
+            pattern.search(condef_clean),
+            f"Exact CHECK constraint must exist; got: {condef!r}",
+        )
 
     def test_fr4_valid_rows_preserved(self) -> None:
-        """FR-4: Valid rows are preserved during migration."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        """FR-4 (PG greenfield): valid rows survive a re-init (no lossy migration path).
 
-        # Drop and recreate without CHECK constraint
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'BTCUSDT', 'completed')"
-        )
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'ETHUSDT', 'failed')"
-        )
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'SOLUSDT', 'pending')"
-        )
+        The legacy test dropped the table, inserted rows into a CHECK-less table, then called
+        the removed ``_ensure_batch_symbol_status_check_constraint`` helper to rebuild+copy and
+        asserted the rows survived the copy. Under greenfield the CHECK is present from
+        ``initialize_database()``, valid rows insert directly, and re-running
+        ``initialize_database()`` is a DDL-skip no-op (schema healthy) that never touches row
+        data -- so valid rows are trivially preserved. This asserts that greenfield contract.
+        """
+        from plugins.crypto_guard.storage.migrations import initialize_database
 
-        _ensure_batch_symbol_status_check_constraint(self.conn)
+        # P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a
+        # parent ``analysis_batches`` row for the valid-status inserts (PG
+        # enforces FKs; SQLite did not).
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("b1", "15m", 1, '["BTCUSDT","ETHUSDT","SOLUSDT"]', "running"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "BTCUSDT", "completed"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "ETHUSDT", "failed"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "SOLUSDT", "pending"),
+        )
+        self.conn.commit()
+
+        # Re-init on the healthy schema is a DDL-skip no-op; rows are untouched.
+        initialize_database()
 
         rows = self.conn.execute(
             "SELECT batch_id, symbol, status FROM batch_symbol_status ORDER BY symbol"
@@ -20078,225 +20489,273 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertEqual(statuses["SOLUSDT"], "pending")
 
     def test_fr4_invalid_statuses_normalized_and_audited(self) -> None:
-        """FR-4: Invalid statuses are normalized to 'pending' and audited without reducing row count."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        """FR-4 (PG greenfield): invalid statuses are rejected at insert -- no normalization needed.
 
-        # Drop and recreate without CHECK constraint
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
+        The legacy test inserted an invalid ``'running'`` row into a CHECK-less table, then called
+        the removed ``_ensure_batch_symbol_status_check_constraint`` helper to normalize it to
+        ``'pending'`` and write an audit key to ``_migration_state``. Under greenfield the CHECK
+        is present from ``initialize_database()``, so an invalid status can NEVER be inserted
+        (``psycopg.errors.CheckViolation`` at insert time) -- the strong guarantee the legacy
+        normalization migration was approximate-enforcing. There is no normalization step and no
+        audit key because invalid rows cannot exist. This asserts the greenfield contract: a valid
+        row coexists, an invalid insert is rejected, and the valid row survives the rejected write.
+        """
+        from psycopg.errors import CheckViolation
+
+        # P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a
+        # parent ``analysis_batches`` row for the valid-status insert (PG
+        # enforces FKs; SQLite did not). The invalid-status insert below is
+        # rejected by the CHECK before the FK is evaluated.
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("b1", "15m", 1, '["ETHUSDT","BTCUSDT"]', "running"),
+        )
+        self.conn.commit()
+
+        # A valid row inserts cleanly.
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "ETHUSDT", "completed"),
+        )
+        self.conn.commit()
+        count_before = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM batch_symbol_status"
+        ).fetchone()["c"]
+
+        # An invalid status is rejected at insert by the CHECK.
+        with self.assertRaises(CheckViolation):
+            self.conn.execute(
+                "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+                ("b1", "BTCUSDT", "running"),
             )
-        """)
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'BTCUSDT', 'running')"
-        )
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'ETHUSDT', 'completed')"
-        )
-        count_before = self.conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0]
+        # The failed statement aborted the transaction; clear it before further queries.
+        self.conn.rollback()
 
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-
-        count_after = self.conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0]
-        self.assertEqual(count_before, count_after, "Row count must not decrease")
-
-        # Invalid status should be normalized to 'pending'
-        btc_status = self.conn.execute(
-            "SELECT status FROM batch_symbol_status WHERE symbol='BTCUSDT'"
+        # Row count is unchanged: the valid row survives, the invalid row never existed.
+        count_after = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM batch_symbol_status"
+        ).fetchone()["c"]
+        self.assertEqual(count_before, count_after, "Rejected invalid insert must not change row count")
+        eth_status = self.conn.execute(
+            "SELECT status FROM batch_symbol_status WHERE symbol=%s",
+            ("ETHUSDT",),
         ).fetchone()["status"]
-        self.assertEqual(btc_status, "pending")
-
-        # Audit finding should exist
-        audit = self.conn.execute(
-            "SELECT key FROM _migration_state WHERE key LIKE 'batch_symbol_status_normalize:b1:BTCUSDT%'"
-        ).fetchone()
-        self.assertIsNotNone(audit, "Audit finding must be recorded for invalid status")
-        self.assertIn("original_status=running", audit["key"])
+        self.assertEqual(eth_status, "completed")
 
     def test_fr4_wrong_check_constraint_fails_schema_health(self) -> None:
-        """FR-4: Wrong or unrelated CHECK constraints fail schema health."""
+        """FR-4 (PG greenfield): a wrong CHECK on batch_symbol_status.status
+        fails schema health.
+
+        The legacy SQLite test ``DROP TABLE`` + ``CREATE TABLE`` to swap in a
+        different CHECK. Under PG that is impossible: the R8-A composite FK
+        ``fk_agent_job_batch_symbol`` makes ``batch_symbol_status`` depended-on
+        by ``agent_jobs`` (``DROP`` raises ``DependentObjectsStillExist``). The
+        faithful PG-native analog: drop the exact CHECK constraint
+        (``batch_symbol_status_status_check``) and add a WRONG one
+        (``CHECK(status != '')``), then assert ``check_schema_health`` reports
+        the ``CHECK(status IN ('pending','completed','failed'))`` constraint as
+        missing. Restored in ``tearDown``-class schema reset via
+        ``initialize_database()``.
+        """
         from plugins.crypto_guard.storage.migrations import check_schema_health
 
-        # Drop and recreate with a different CHECK (not on status IN)
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(batch_id != ''),
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
+        # Drop every CHECK on batch_symbol_status.status, then add a wrong one.
+        # The production CHECK is auto-named ``batch_symbol_status_status_check``;
+        # drop-by-introspection is robust to the auto-name.
+        self.conn.execute(
+            """
+            ALTER TABLE batch_symbol_status
+              DROP CONSTRAINT IF EXISTS batch_symbol_status_status_check
+            """
+        )
+        # A wrong CHECK (admits any non-empty status, not the 3-value set).
+        self.conn.execute(
+            "ALTER TABLE batch_symbol_status ADD CONSTRAINT batch_symbol_status_status_check "
+            "CHECK(status != '')"
+        )
+        self.conn.commit()
 
         result = check_schema_health(conn=self.conn)
         constraint_missing = any(
             "CHECK(status" in m.get("column", "") for m in result.get("missing_columns", [])
         )
-        self.assertTrue(constraint_missing, "Wrong CHECK constraint should fail schema health")
+        self.assertTrue(
+            constraint_missing,
+            "Wrong CHECK constraint should fail schema health "
+            "(got missing_columns=%r)" % (result.get("missing_columns", []),),
+        )
 
     def test_fr4_residual_temp_table_handled(self) -> None:
-        """FR-4: A residual temporary table is handled safely."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        """FR-4 (PG greenfield): a residual temp-named table does not break initialize_database().
 
-        # Create a residual temp table from a previous failed migration
-        self.conn.execute("DROP TABLE IF EXISTS _batch_symbol_status_new")
-        self.conn.execute("""
-            CREATE TABLE _batch_symbol_status_new (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
-
-        # Drop and recreate without CHECK
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
-
-        # Should succeed — residual temp table is cleaned up
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-
-        # Verify the new table exists with constraint
-        import re
-        sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        pattern = re.compile(
-            r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
-            re.IGNORECASE,
-        )
-        self.assertTrue(pattern.search(sql))
-
-    def test_fr4_migration_idempotent(self) -> None:
-        """FR-4: Running the migration twice is idempotent."""
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
-
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-
-        # Should still have the constraint
-        import re
-        sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        pattern = re.compile(
-            r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
-            re.IGNORECASE,
-        )
-        self.assertTrue(pattern.search(sql))
-
-    def test_fr4_fault_injection_rolls_back(self) -> None:
-        """FR-4: Fault injection rolls back the entire rebuild via SAVEPOINT.
-
-        P1 fix: actually inject a fault mid-migration (drop-table step) and
-        verify the SAVEPOINT rollback preserves the original table + data +
-        schema (i.e. the table still has NO CHECK constraint after rollback).
+        The legacy test created a leftover ``_batch_symbol_status_new`` table (from a failed
+        drop-swap migration), then called the removed ``_ensure_batch_symbol_status_check_constraint``
+        helper which cleaned it up. Under greenfield there is no drop-swap migration, so no such
+        residual table is ever created; ``initialize_database()`` only manages its own tables and
+        ignores stray-named tables. The faithful analog: seed a stray ``_batch_symbol_status_new``,
+        re-run ``initialize_database()``, assert it succeeds and the real ``batch_symbol_status``
+        CHECK is intact (the stray table is harmless).
         """
-        from plugins.crypto_guard.storage.migrations import _ensure_batch_symbol_status_check_constraint
+        from plugins.crypto_guard.storage.migrations import initialize_database
 
-        # Drop and recreate without CHECK — this is the "dirty" pre-migration state
-        self.conn.execute("DROP TABLE IF EXISTS batch_symbol_status")
-        self.conn.execute("""
-            CREATE TABLE batch_symbol_status (
-                batch_id TEXT NOT NULL, symbol TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-        """)
-        # Seed rows that must survive a failed migration
+        # Seed a stray temp-named table (harmless leftover from a hypothetical failed migration).
+        self.conn.execute("DROP TABLE IF EXISTS _batch_symbol_status_new")
         self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'BTCUSDT', 'completed')"
-        )
-        self.conn.execute(
-            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES ('b1', 'ETHUSDT', 'running')"
+            "CREATE TABLE _batch_symbol_status_new ("
+            "batch_id TEXT NOT NULL, symbol TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', updated_at TEXT, "
+            "PRIMARY KEY (batch_id, symbol))"
         )
         self.conn.commit()
-        original_count = self.conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0]
-        self.assertEqual(original_count, 2)
 
-        # Capture the original table sql (no CHECK) to verify rollback restores it
-        original_sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        self.assertNotIn("CHECK", original_sql)
+        # Re-init must succeed despite the stray table (it is not in the managed schema).
+        initialize_database()
 
-        # Inject a fault by wrapping the connection. sqlite3.Connection.execute
-        # is read-only, so we use a proxy that intercepts execute() calls and
-        # raises on the DROP TABLE batch_symbol_status step (the swap, after
-        # _batch_symbol_status_new is populated). This forces SAVEPOINT rollback.
-        class _FaultInjectingConn:
-            def __init__(self, real):
-                self._real = real
-                self.drop_attempted = False
-            def execute(self, sql, params=()):
-                sql_stripped = sql.strip().upper() if isinstance(sql, str) else ""
-                if sql_stripped.startswith("DROP TABLE BATCH_SYMBOL_STATUS"):
-                    self.drop_attempted = True
-                    raise sqlite3.OperationalError("INJECTED FAULT: forced failure during table swap")
-                return self._real.execute(sql, params)
-            def commit(self):
-                return self._real.commit()
-            def rollback(self):
-                return self._real.rollback()
-            @property
-            def row_factory(self):
-                return self._real.row_factory
-            @row_factory.setter
-            def row_factory(self, v):
-                self._real.row_factory = v
-            def close(self):
-                return self._real.close()
-
-        proxy = _FaultInjectingConn(self.conn)
-        with self.assertRaises(sqlite3.OperationalError) as ctx:
-            _ensure_batch_symbol_status_check_constraint(proxy)
-        self.assertIn("INJECTED FAULT", str(ctx.exception))
-        self.assertTrue(proxy.drop_attempted, "Fault must be injected at the DROP TABLE step")
-
-        # Verify SAVEPOINT rollback restored the original state.
-        # Note: the migration uses SAVEPOINT, which on rollback restores the
-        # pre-SAVEPOINT state. The original table + rows must be intact.
-        after_count = self.conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0]
-        self.assertEqual(after_count, original_count, "Row count must be preserved after rollback")
-
-        # Original rows must still be present with their original statuses
-        rows = self.conn.execute(
-            "SELECT symbol, status FROM batch_symbol_status WHERE batch_id='b1' ORDER BY symbol"
-        ).fetchall()
-        symbols = [(r["symbol"], r["status"]) for r in rows]
-        self.assertIn(("BTCUSDT", "completed"), symbols)
-        self.assertIn(("ETHUSDT", "running"), symbols)  # invalid status preserved
-
-        # Original table sql (no CHECK) must be restored — rollback undid the swap
-        after_sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        self.assertNotIn("CHECK", after_sql, "Rollback must restore the original schema without CHECK")
-
-        # The temp table must NOT leak
-        temp = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='_batch_symbol_status_new'"
+        # The real batch_symbol_status CHECK is intact.
+        row = self.conn.execute(
+            "SELECT con.conname FROM pg_catalog.pg_constraint con "
+            "JOIN pg_catalog.pg_class cls ON cls.oid = con.conrelid "
+            "JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace "
+            "WHERE cls.relname = 'batch_symbol_status' AND con.contype = 'c' "
+            "  AND nsp.nspname = current_schema()"
         ).fetchone()
-        self.assertIsNone(temp, "Temp table must be cleaned up (rollback drops it)")
+        self.assertIsNotNone(row, "CHECK constraint must remain intact despite stray temp table")
 
-        # Now run the migration without the fault — it must succeed
-        _ensure_batch_symbol_status_check_constraint(self.conn)
-        final_sql = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()["sql"]
-        self.assertIn("CHECK", final_sql, "Migration must succeed after fault is removed")
+    def test_fr4_migration_idempotent(self) -> None:
+        """FR-4 (PG greenfield): CHECK constraint present + idempotent + enforced.
+
+        The legacy test called the removed ``_ensure_batch_symbol_status_check_constraint``
+        helper twice and read ``sqlite_master`` (neither exists under greenfield: the
+        CHECK is created by schema_postgres.sql during initialize_database(), and PG
+        catalogs replace sqlite_master). The greenfield contract:
+          1. the CHECK on batch_symbol_status.status is present after initialize_database();
+          2. re-running initialize_database() on the healthy schema is a DDL-skip no-op
+             (advisory-locked single transaction, IF NOT EXISTS / ON CONFLICT) so the
+             CHECK survives;
+          3. the CHECK is enforced -- a valid status inserts, an invalid status raises
+             psycopg.errors.CheckViolation.
+        """
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        from psycopg.errors import CheckViolation
+
+        def _check_present() -> bool:
+            row = self.conn.execute(
+                "SELECT con.conname FROM pg_catalog.pg_constraint con "
+                "JOIN pg_catalog.pg_class cls ON cls.oid = con.conrelid "
+                "JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace "
+                "WHERE cls.relname = 'batch_symbol_status' AND con.contype = 'c' "
+                "  AND nsp.nspname = current_schema()"
+            ).fetchone()
+            return row is not None
+
+        # 1. Present after the setUp-time initialize_database().
+        self.assertTrue(_check_present(), "CHECK constraint must exist after init")
+
+        # 2. Re-init on the already-healthy schema is a DDL-skip no-op; CHECK survives.
+        initialize_database()
+        self.assertTrue(_check_present(), "CHECK constraint must survive re-init")
+
+        # 3. Enforced: a valid status inserts; an invalid status raises CheckViolation.
+        # P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a
+        # parent ``analysis_batches`` row for the valid-status insert (PG enforces
+        # FKs; SQLite did not). The invalid-status insert is rejected by the CHECK
+        # before the FK is evaluated.
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("b1", "15m", 1, '["BTCUSDT","ETHUSDT"]', "running"),
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "BTCUSDT", "completed"),
+        )
+        self.conn.commit()
+        with self.assertRaises(CheckViolation):
+            self.conn.execute(
+                "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+                ("b1", "ETHUSDT", "running"),
+            )
+        # The failed statement aborted this transaction; clear it before teardown.
+        self.conn.rollback()
+
+    def test_fr4_fault_injection_rolls_back(self) -> None:
+        """FR-4 (PG greenfield): a failed write rolls back, preserving committed data.
+
+        The legacy test injected a fault into the removed
+        ``_ensure_batch_symbol_status_check_constraint`` drop-swap migration and
+        verified SAVEPOINT rollback preserved a deliberately-invalid ``'running'``
+        row (seeded while the CHECK was absent). Under greenfield the CHECK is
+        present from initialize_database(), so an invalid status cannot be seeded
+        at all and there is no drop-swap migration. The faithful greenfield
+        analog of the contract ("a fault rolls back, preserving the original
+        committed state") is: an invalid-status INSERT raises CheckViolation and
+        the transaction rolls back, leaving the previously-committed valid rows
+        intact and the CHECK constraint still in place. This proves PG's CHECK
+        enforcement + transaction atomicity preserve data consistency on a
+        failed write.
+        """
+        from psycopg.errors import CheckViolation
+
+        # P9 (PG cutover): the FK ``fk_batch_symbol_status_batch`` requires a
+        # parent ``analysis_batches`` row for the valid-status inserts (PG
+        # enforces FKs; SQLite did not).
+        self.conn.execute(
+            "INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time, "
+            "enabled_symbols_json, status) VALUES (%s, %s, %s, %s, %s)",
+            ("b1", "15m", 1, '["BTCUSDT","ETHUSDT","XRPUSDT"]', "running"),
+        )
+        self.conn.commit()
+
+        # Commit two valid rows.
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "BTCUSDT", "completed"),
+        )
+        self.conn.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+            ("b1", "ETHUSDT", "pending"),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS c FROM batch_symbol_status").fetchone()["c"],
+            2,
+        )
+
+        # A failed (invalid-status) INSERT raises and aborts the transaction.
+        with self.assertRaises(CheckViolation):
+            self.conn.execute(
+                "INSERT INTO batch_symbol_status (batch_id, symbol, status) VALUES (%s, %s, %s)",
+                ("b1", "XRPUSDT", "running"),
+            )
+        self.conn.rollback()
+
+        # The committed valid rows survive the failed write's rollback.
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS c FROM batch_symbol_status").fetchone()["c"],
+            2,
+            "Committed valid rows must survive a failed write's rollback",
+        )
+        rows = {
+            (r["symbol"], r["status"])
+            for r in self.conn.execute(
+                "SELECT symbol, status FROM batch_symbol_status WHERE batch_id = %s",
+                ("b1",),
+            )
+        }
+        self.assertIn(("BTCUSDT", "completed"), rows)
+        self.assertIn(("ETHUSDT", "pending"), rows)
+
+        # The CHECK constraint survives (a failed write cannot remove it).
+        chk = self.conn.execute(
+            "SELECT con.conname FROM pg_catalog.pg_constraint con "
+            "JOIN pg_catalog.pg_class cls ON cls.oid = con.conrelid "
+            "JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace "
+            "WHERE cls.relname = 'batch_symbol_status' AND con.contype = 'c' "
+            "  AND nsp.nspname = current_schema()"
+        ).fetchone()
+        self.assertIsNotNone(chk, "CHECK constraint must survive a failed write")
 
     # ══════════════════════════════════════════════════════════════════════
     # FR-5: Fail-Closed Structured Direction Confirmation Tests
@@ -20427,10 +20886,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # Seed a market_snapshot row + module_analysis_results row with the
         # FS-1 structure_events shape: close_time + closed=True.
         self.conn.execute(
-            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (%s, %s, %s, %s)",
             ("BTCUSDT", event_time, "live", "{}"),
         )
-        snapshot_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        snapshot_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
         result_json = _json.dumps({
             "module": "price_action",
             "structure_events": [
@@ -20442,7 +20901,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO module_analysis_results (symbol, timeframe, analysis_time, module, result_json, confidence, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", event_time, "price_action", result_json, 0.8, snapshot_id),
         )
         self.conn.commit()
@@ -20611,10 +21070,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         old_close_time = 1750000050000
 
         self.conn.execute(
-            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (%s, %s, %s, %s)",
             ("LTCUSDT", cur_ts, "live", "{}"),
         )
-        snapshot_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        snapshot_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
         result_json = _json.dumps({
             "module": "price_action",
             "structure_events": [
@@ -20626,7 +21085,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO module_analysis_results (symbol, timeframe, analysis_time, module, result_json, confidence, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("LTCUSDT", "1h", cur_ts, "price_action", result_json, 0.8, snapshot_id),
         )
         self.conn.commit()
@@ -20651,10 +21110,10 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         new_close_time = 1750000500000  # between prev and cur
 
         self.conn.execute(
-            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO market_snapshots (symbol, analysis_time, mode, snapshot_json) VALUES (%s, %s, %s, %s)",
             ("BTCUSDT", cur_ts, "live", "{}"),
         )
-        snapshot_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        snapshot_id = self.conn.execute("SELECT lastval()").fetchone()["lastval"]
         result_json = _json.dumps({
             "module": "price_action",
             "structure_events": [
@@ -20666,7 +21125,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         })
         self.conn.execute(
             "INSERT INTO module_analysis_results (symbol, timeframe, analysis_time, module, result_json, confidence, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", cur_ts, "price_action", result_json, 0.8, snapshot_id),
         )
         self.conn.commit()
@@ -20689,14 +21148,14 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [50, 51, 52]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("ADAUSDT", "LONG", -0.8, closed_at),
             )
         # Profitable trades today to keep daily avg_r > -0.5
         for hours_ago in [1, 2, 3, 4, 5]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("XRPUSDT", "LONG", 0.7, closed_at),
             )
 
@@ -20729,7 +21188,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [3, 6, 9]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("ADAUSDT", "LONG", -0.8, closed_at),
             )
         # Profitable trades older but they cannot lift recovery because
@@ -20737,7 +21196,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for i in range(10):
             past_at = (frozen_now - timedelta(hours=30 + i)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("XRPUSDT", "LONG", 0.5, past_at),
             )
 
@@ -20749,54 +21208,26 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         self.assertIn("avg_r", result.get("blocked_reason", ""))
 
     def test_fs4_real_backup_file_exists_and_passes_integrity_check(self) -> None:
-        """FS-6 #9: A real backup file exists and passes PRAGMA integrity_check.
+        """FS-6 #9 (PG greenfield): the schema-integrity check passes on a
+        freshly-initialized schema.
 
-        The backup is created as part of FS-4 production runbook. This test
-        verifies the backup file exists at the expected path and that SQLite
-        can open it and integrity_check returns 'ok'.
+        The legacy test verified a SQLite backup file existed and passed
+        ``PRAGMA integrity_check``. Under greenfield there is no SQLite file
+        (``cfg.database_path`` is removed and raises) and no PRAGMA; the
+        PG-native integrity check is ``check_schema_health()``, which
+        introspects information_schema / pg_catalog. This asserts it returns ok
+        on the current scratch schema -- the greenfield integrity contract. (PG
+        backup-file verification via pg_dump / restore is a production-runbook
+        ops concern, covered by the release contract, not a unit test against
+        the scratch schema.)
         """
-        import os
-        import sqlite3 as _sqlite3
-        from plugins.crypto_guard.config.loader import load_config
+        from plugins.crypto_guard.storage.migrations import check_schema_health
 
-        cfg = load_config()
-        db_path = cfg.database_path
-        db_dir = os.path.dirname(db_path)
-        # Look for any FS-4 timestamped backup in the data directory.
-        # Pattern: crypto_guard_<timestamp>.sqlite3.bak or similar.
-        candidates = []
-        if os.path.isdir(db_dir):
-            for name in os.listdir(db_dir):
-                full = os.path.join(db_dir, name)
-                if not os.path.isfile(full):
-                    continue
-                if name.endswith(".bak") or name.endswith(".backup") or "_backup_" in name or "pre_r4" in name:
-                    candidates.append(full)
-        # If no timestamped backup exists yet (FS-4 not yet executed), create
-        # a test-scoped backup copy of the current DB and verify integrity.
-        if not candidates:
-            test_backup = os.path.join(db_dir, "crypto_guard_fs4_test_backup.sqlite3.bak")
-            import shutil
-            shutil.copy2(db_path, test_backup)
-            candidates = [test_backup]
-            try:
-                self._verify_backup_integrity(candidates[0])
-            finally:
-                os.remove(test_backup)
-        else:
-            self._verify_backup_integrity(candidates[0])
-
-    def _verify_backup_integrity(self, backup_path: str) -> None:
-        import os
-        import sqlite3 as _sqlite3
-        self.assertTrue(os.path.exists(backup_path), f"Backup file must exist: {backup_path}")
-        self.assertGreater(os.path.getsize(backup_path), 0, "Backup file must be non-empty")
-        conn = _sqlite3.connect(backup_path)
-        try:
-            row = conn.execute("PRAGMA integrity_check").fetchone()
-            self.assertEqual(row[0], "ok", f"Backup integrity_check failed: {row[0]}")
-        finally:
-            conn.close()
+        health = check_schema_health()
+        self.assertTrue(
+            health["ok"],
+            f"Schema integrity check must pass on a freshly-initialized schema: {health}",
+        )
 
     def test_fs5_non_executable_opportunity_watch_no_warning(self) -> None:
         """FS-6 #10: Non-executable opportunity_watch below execution
@@ -20847,14 +21278,19 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             "  signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "  evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, "
             "  final_summary, raw_decision_json, trade_plan_json, rendered_summary, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "RETURNING id",
             (symbol, at, analysis_time_utc, "scheduled_analysis", grade, float(confidence),
              "bullish", "middle", decision, "[]", "[]", "[]",
              f'{{"ok": {"true" if risk_ok else "false"}}}', "[]",
              final_summary, "{}", "{}", "", created_at),
         )
+        # P9 (PG cutover) K3: psycopg3 cursors have no ``lastrowid`` (SQLite-only).
+        # ga_decisions.id is BIGINT IDENTITY, so RETURNING id + fetchone replaces it.
+        # Fetch BEFORE commit: after commit the RETURNING portal is closed.
+        new_id = cur.fetchone()["id"]
         self.conn.commit()
-        return int(cur.lastrowid)
+        return int(new_id)
 
     def test_fs5_pre_marker_summary_conflict_is_legacy_info(self) -> None:
         """FS-6 #11: Pre-marker summary conflicts are legacy information.
@@ -20870,7 +21306,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state (key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
+            "INSERT INTO _migration_state(key, applied_at) VALUES (%s, CURRENT_TIMESTAMP) ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
             (R4_CONTRACT_MARKER_KEY,),
         )
         # Insert a summary-execution-conflict decision with created_at = NOW - 1 day
@@ -20904,7 +21340,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         )
         # Marker applied at 2026-06-01 00:00:00
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES (?, ?)",
+            "INSERT INTO _migration_state(key, applied_at) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
             (R4_CONTRACT_MARKER_KEY, "2026-06-01 00:00:00"),
         )
         # Post-marker decision (created after marker)
@@ -20940,7 +21376,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state (key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES (?, ?)",
+            "INSERT INTO _migration_state(key, applied_at) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
             (R4_CONTRACT_MARKER_KEY, "2026-06-01 00:00:00"),
         )
         # Pre-marker decision with text-only liquidity-sweep conflict
@@ -20968,173 +21404,160 @@ class HourlyReportAccuracyTest(unittest.TestCase):
     def test_r4_marker_written_after_full_initialize(self) -> None:
         """R4 marker is written after a full successful initialize_database.
 
-        Verifies that on a fresh temp DB, initialize_database() succeeds,
-        schema health passes, and the R4 contract marker exists in
-        _migration_state.
+        Under greenfield, setUp's make_repo() already ran initialize_database()
+        on this test's isolated scratch schema, which writes the R4 contract
+        marker inside the advisory-locked single transaction. This asserts the
+        marker exists with a non-null applied_at. (The legacy version spun up a
+        separate temp SQLite DB via ``dataclasses.replace(load_config(),
+        database_path=...)`` + ``connect_db``; ``database_path`` is removed in
+        greenfield and initialize_database writes to PG via cfg.database_url, so
+        the marker is queried on self.conn directly.)
         """
-        import dataclasses
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-
-        tmp_db = os.path.join(self.tmp.name, "r4_marker_full.sqlite3")
-        cfg = dataclasses.replace(load_config(), database_path=tmp_db)
-        result = initialize_database(cfg)
-        self.assertTrue(result["ok"])
-
-        conn = connect_db(tmp_db)
-        try:
-            row = conn.execute(
-                "SELECT applied_at FROM _migration_state WHERE key = ?",
-                ("hourly_report_accuracy_r4_contract_v1",),
-            ).fetchone()
-            self.assertIsNotNone(row, "R4 marker must exist after full init")
-            self.assertIsNotNone(row["applied_at"])
-        finally:
-            conn.close()
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s",
+            ("hourly_report_accuracy_r4_contract_v1",),
+        ).fetchone()
+        self.assertIsNotNone(row, "R4 marker must exist after full init")
+        self.assertIsNotNone(row["applied_at"])
 
     def test_r4_marker_absent_when_late_migration_fails(self) -> None:
-        """R4 marker is NOT written when a late migration raises.
+        """R4 marker is NOT written when a late migration step raises.
 
-        Mocks a migration that runs in the second half of initialize_database
-        (after _apply_hourly_report_accuracy_migration) to raise. Verifies
-        initialize_database() propagates the exception AND the R4 marker is
-        absent from _migration_state.
+        Greenfield contract: initialize_database() runs every schema/seed/marker
+        write inside ONE advisory-locked transaction. A failure in any step AFTER
+        the R4 marker write rolls back the WHOLE transaction, so the R4 marker
+        inserted earlier in that same transaction is removed. We patch
+        ``_ensure_btc9_trade_gate_contract_marker`` -- which runs immediately
+        AFTER the R4 marker (migrations.py marker order 113 -> 114) -- to raise.
+
+        setUp already ran a successful initialize_database() (so the marker is
+        present); we first delete the marker + commit to make the schema
+        marker-less (while still healthy), then re-run initialize_database() with
+        the late step patched to raise, and assert the marker is absent after the
+        rollback. (The legacy version patched the removed
+        ``_apply_candidate_cap_cleanup`` helper and spun up a temp SQLite DB via
+        ``dataclasses.replace(database_path=...)``; neither exists in greenfield.)
         """
-        import dataclasses
         from plugins.crypto_guard.storage import migrations as mig_mod
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
 
-        tmp_db = os.path.join(self.tmp.name, "r4_marker_late_fail.sqlite3")
-        cfg = dataclasses.replace(load_config(), database_path=tmp_db)
+        R4_KEY = "hourly_report_accuracy_r4_contract_v1"
+        # Make the schema marker-less (but still healthy) so the re-init's R4
+        # marker write is observable as a fresh insert inside the failing txn.
+        self.conn.execute("DELETE FROM _migration_state WHERE key = %s", (R4_KEY,))
+        self.conn.commit()
 
-        original = mig_mod._apply_candidate_cap_cleanup
+        original = mig_mod._ensure_btc9_trade_gate_contract_marker
 
-        def _boom(conn):
+        def _boom(cur):
             raise RuntimeError("simulated late-migration failure")
 
-        # Patch a function called AFTER _apply_hourly_report_accuracy_migration
-        # but BEFORE the marker write. _apply_candidate_cap_cleanup is the
-        # last migration step before the schema-health gate + marker write.
-        mig_mod._apply_candidate_cap_cleanup = _boom
+        mig_mod._ensure_btc9_trade_gate_contract_marker = _boom
         try:
             with self.assertRaises(RuntimeError) as ctx:
-                mig_mod.initialize_database(cfg)
+                initialize_database()
             self.assertIn("simulated late-migration failure", str(ctx.exception))
         finally:
-            mig_mod._apply_candidate_cap_cleanup = original
+            mig_mod._ensure_btc9_trade_gate_contract_marker = original
 
-        conn = connect_db(tmp_db)
-        try:
-            # _migration_state table may or may not exist; query defensively.
-            try:
-                row = conn.execute(
-                    "SELECT applied_at FROM _migration_state WHERE key = ?",
-                    ("hourly_report_accuracy_r4_contract_v1",),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                row = None
-            self.assertIsNone(
-                row,
-                "R4 marker MUST NOT exist when a late migration failed",
-            )
-        finally:
-            conn.close()
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s",
+            (R4_KEY,),
+        ).fetchone()
+        self.assertIsNone(
+            row,
+            "R4 marker MUST NOT exist when a late migration failed (rollback removed it)",
+        )
 
     def test_r4_marker_not_written_when_schema_health_fails(self) -> None:
-        """R4 marker is NOT written when schema health check fails.
+        """R4 marker is NOT written when the post-init schema health gate fails.
 
-        Mocks check_schema_health to return ok=False. Verifies
-        initialize_database() raises RuntimeError AND the R4 marker is absent.
+        Greenfield contract: initialize_database() runs a post-init health gate
+        via the module-level ``_check_schema_health_on_conn`` (migrations.py line
+        123); if it returns ok=False, init raises RuntimeError ``"schema health
+        check failed after init: ..."`` and rolls back the WHOLE transaction,
+        removing the R4 marker written earlier in that same transaction.
+
+        The legacy version patched the public ``check_schema_health``, but
+        initialize_database calls ``_check_schema_health_on_conn`` (not the
+        public wrapper). We delete the setUp-time marker first, then re-run
+        initialize_database with a stateful patch on
+        ``_check_schema_health_on_conn`` that returns the REAL (ok) health on
+        the pre-probe (line 103, so init DDL-skips on the healthy schema and
+        re-inserts the R4 marker in the txn) and ok=False on the post-gate (line
+        123, so init raises + rolls back), and assert the marker is absent after
+        the rollback.
         """
-        import dataclasses
         from plugins.crypto_guard.storage import migrations as mig_mod
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.storage.migrations import initialize_database
 
-        tmp_db = os.path.join(self.tmp.name, "r4_marker_health_fail.sqlite3")
-        cfg = dataclasses.replace(load_config(), database_path=tmp_db)
+        R4_KEY = "hourly_report_accuracy_r4_contract_v1"
+        self.conn.execute("DELETE FROM _migration_state WHERE key = %s", (R4_KEY,))
+        self.conn.commit()
 
-        original_health = mig_mod.check_schema_health
+        original_health = mig_mod._check_schema_health_on_conn
+        _calls = {"n": 0}
 
-        def _bad_health(*, conn=None, config=None):
+        def _bad_health_post_only(*args, **kwargs):
+            # 1st call = pre-probe (line 103): real health -> DDL-skip.
+            # 2nd call = post-gate (line 123): ok=False -> raise + rollback.
+            _calls["n"] += 1
+            if _calls["n"] == 1:
+                return original_health(*args, **kwargs)
             return {"ok": False, "missing_columns": [{"table": "x", "column": "y"}], "tables_checked": []}
 
-        mig_mod.check_schema_health = _bad_health
+        mig_mod._check_schema_health_on_conn = _bad_health_post_only
         try:
             with self.assertRaises(RuntimeError) as ctx:
-                mig_mod.initialize_database(cfg)
+                initialize_database()
             self.assertIn("schema health check failed", str(ctx.exception))
         finally:
-            mig_mod.check_schema_health = original_health
+            mig_mod._check_schema_health_on_conn = original_health
 
-        conn = connect_db(tmp_db)
-        try:
-            try:
-                row = conn.execute(
-                    "SELECT applied_at FROM _migration_state WHERE key = ?",
-                    ("hourly_report_accuracy_r4_contract_v1",),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                row = None
-            self.assertIsNone(
-                row,
-                "R4 marker MUST NOT exist when schema health check failed",
-            )
-        finally:
-            conn.close()
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s",
+            (R4_KEY,),
+        ).fetchone()
+        self.assertIsNone(
+            row,
+            "R4 marker MUST NOT exist when schema health check failed (rollback removed it)",
+        )
 
     def test_r4_marker_timestamp_is_idempotent(self) -> None:
         """R4 marker applied_at does not change on re-initialization.
 
-        Sets the marker's applied_at to a fixed sentinel value, then runs
-        initialize_database() again. INSERT OR IGNORE must leave the sentinel
-        intact, proving the marker is not refreshed on re-init.
+        Greenfield contract: ``_ensure_marker`` uses
+        ``INSERT INTO _migration_state ... ON CONFLICT (key) DO NOTHING``, so
+        applied_at is written exactly once and never refreshed on re-init. This
+        sets the marker's applied_at to a fixed sentinel datetime, re-runs
+        initialize_database(), and asserts the sentinel survives unchanged.
+        (The legacy version used a string sentinel + a temp SQLite DB; under
+        greenfield applied_at is a TIMESTAMPTZ decoded to a datetime, so the
+        sentinel is a timezone-aware datetime compared datetime-to-datetime.)
         """
-        import dataclasses
+        from datetime import datetime, timezone
         from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
 
-        tmp_db = os.path.join(self.tmp.name, "r4_marker_idem.sqlite3")
-        cfg = dataclasses.replace(load_config(), database_path=tmp_db)
+        R4_KEY = "hourly_report_accuracy_r4_contract_v1"
+        sentinel = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.conn.execute(
+            "UPDATE _migration_state SET applied_at = %s WHERE key = %s",
+            (sentinel, R4_KEY),
+        )
+        self.conn.commit()
 
-        initialize_database(cfg)
-        sentinel = "2000-01-01 00:00:00"
-        conn = connect_db(tmp_db)
-        try:
-            row = conn.execute(
-                "SELECT applied_at FROM _migration_state WHERE key = ?",
-                ("hourly_report_accuracy_r4_contract_v1",),
-            ).fetchone()
-            self.assertIsNotNone(row)
-            # Overwrite applied_at with a fixed sentinel. If the second init
-            # runs INSERT OR IGNORE, this sentinel survives. If it incorrectly
-            # uses INSERT OR REPLACE / UPDATE, the sentinel is lost.
-            conn.execute(
-                "UPDATE _migration_state SET applied_at = ? WHERE key = ?",
-                (sentinel, "hourly_report_accuracy_r4_contract_v1"),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        # Re-init: ON CONFLICT DO NOTHING leaves applied_at intact.
+        initialize_database()
 
-        initialize_database(cfg)
-
-        conn = connect_db(tmp_db)
-        try:
-            second = conn.execute(
-                "SELECT applied_at FROM _migration_state WHERE key = ?",
-                ("hourly_report_accuracy_r4_contract_v1",),
-            ).fetchone()
-            self.assertIsNotNone(second)
-            self.assertEqual(
-                sentinel, second["applied_at"],
-                "R4 marker applied_at MUST NOT be refreshed on re-init",
-            )
-        finally:
-            conn.close()
+        second = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s",
+            (R4_KEY,),
+        ).fetchone()
+        self.assertIsNotNone(second)
+        self.assertEqual(
+            second["applied_at"], sentinel,
+            "R4 marker applied_at MUST NOT be refreshed on re-init",
+        )
 
     # ══════════════════════════════════════════════════════════════════════
     # FR-6: Account Risk Guard Ordering Tests (additional)
@@ -21150,7 +21573,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         frozen_now = datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc)
         closed_at = (frozen_now - timedelta(hours=1)).isoformat()
         self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
             ("BTCUSDT", "LONG", -1.0, closed_at),
         )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21169,7 +21592,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [1, 2, 3]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("ETHUSDT", "LONG", -0.8, closed_at),
             )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21188,14 +21611,14 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         # Loss was 2 hours ago, within 48h cooldown
         closed_at = (frozen_now - timedelta(hours=2)).isoformat()
         self.conn.execute(
-            "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
             ("BTCUSDT", "LONG", -1.0, closed_at),
         )
         # Also insert enough profitable trades to make recovery eligible
         for i in range(10):
             past_at = (frozen_now - timedelta(hours=25 + i)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("XRPUSDT", "LONG", 0.5, past_at),
             )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21229,7 +21652,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [25, 26, 27]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("ADAUSDT", "LONG", -0.8, closed_at),
             )
         # Insert 10 profitable trades >28h ago so the recent 10-sample avg_r
@@ -21239,7 +21662,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for i in range(10):
             past_at = (frozen_now - timedelta(hours=30 + i)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("XRPUSDT", "LONG", 0.5, past_at),
             )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21277,7 +21700,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [50, 51, 52]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("ADAUSDT", "LONG", -0.8, closed_at),
             )
         # 5 profitable trades today (within UTC+8 day) to keep daily avg_r > -0.5
@@ -21285,7 +21708,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for hours_ago in [1, 2, 3, 4, 5]:
             closed_at = (frozen_now - timedelta(hours=hours_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("XRPUSDT", "LONG", 0.7, closed_at),
             )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21318,7 +21741,7 @@ class HourlyReportAccuracyTest(unittest.TestCase):
         for minutes_ago in [30, 60]:
             closed_at = (frozen_now - timedelta(minutes=minutes_ago)).isoformat()
             self.conn.execute(
-                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO paper_trades (symbol, side, pnl_r, closed_at) VALUES (%s, %s, %s, %s)",
                 ("BTCUSDT", "LONG", -1.2, closed_at),
             )
         guard = AccountRiskGuard(self.repo, now_provider=lambda: frozen_now)
@@ -21364,24 +21787,39 @@ class Btc9RegressionChainTest(unittest.TestCase):
             return_value=False,
         )
         self._broker_md_patcher.start()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real PG test
+        # DB (replaces CRYPTO_GUARD_DB=<tmp>.sqlite3 + connect_db +
+        # initialize_database, which now initializes PostgreSQL and leaves the
+        # SQLite file empty -> "no such table"). self.tmp is retained so the
+        # few legacy ``self.tmp.name``-based separate-DB test paths
+        # (concurrent / old-prod / no-dedupe) still resolve a real temp
+        # directory; those bodies are migrated separately.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
-        # Seed paper account
-        self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
-        )
-        self.conn.commit()
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
+        # Seed paper account (idempotent). account_name MUST be 'default' to match
+        # production ensure_paper_account()/update_paper_account_from_snapshot()
+        # defaults: their INSERT ... ON CONFLICT(account_name) DO NOTHING then hits
+        # this seed's account_name conflict (no-op + re-read id=1) instead of
+        # falling through to the IDENTITY sequence. A seed with a different name
+        # (e.g. 'test_account') leaves no account_name conflict, so the INSERT
+        # reaches nextval(identity)=1 and collides with this explicit id=1 row ->
+        # paper_accounts_pkey UniqueViolation (id)=(1). id stays 1 either way.
+        with self.conn.transaction():
+            self.conn.execute(
+                "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+                "VALUES (1, 'default', 10000.0, 10000.0, 10000.0) "
+                "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+                "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+                "equity=EXCLUDED.equity"
+            )
 
     def tearDown(self) -> None:
         self._broker_md_patcher.stop()
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -21417,13 +21855,17 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "  signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "  evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, "
             "  final_summary, raw_decision_json, trade_plan_json, rendered_summary, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "RETURNING id",
             (symbol, at, analysis_time_utc, "scheduled_analysis", signal_grade, float(confidence),
              market_bias, trend_stage, "trade_plan_available", "[]", evidence_json, "[]",
              risk_check_json, "[]", "test", raw_decision_json, plan_json, "", analysis_time_utc),
         )
+        # P9 (PG cutover) K3: psycopg3 cursors have no lastrowid; RETURNING id + fetchone
+        # replaces it. Fetch BEFORE commit (the RETURNING portal closes after commit).
+        new_id = cur.fetchone()["id"]
         self.conn.commit()
-        return int(cur.lastrowid)
+        return int(new_id)
 
     def _insert_pending_order(
         self,
@@ -21441,11 +21883,13 @@ class Btc9RegressionChainTest(unittest.TestCase):
         cur = self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, "
             "  status, created_at, expires_at, ga_decision_id) "
-            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s) RETURNING id",
             (symbol, side, order_type, entry_price, stop_loss, status, created_at, created_at, ga_decision_id),
         )
+        # P9 (PG cutover) K3: psycopg3 cursors have no lastrowid; RETURNING id + fetchone.
+        new_id = cur.fetchone()["id"]
         self.conn.commit()
-        return int(cur.lastrowid)
+        return int(new_id)
 
     # --- Test 1: Fix 1 ---
     def test_fallback_llm_failed_downgrades_to_watch(self) -> None:
@@ -21596,7 +22040,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             analysis_time=1750000000000 + 3600_000,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # limit 触发价在 high/low 之间
         market = {"open": 60100.0, "high": 60300.0, "low": 60150.0, "close": 60250.0}
@@ -21604,7 +22048,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertFalse(result.get("filled"), "Fix 5: GA 冲突时不得成交")
         self.assertEqual(result.get("skip_reason"), "ga_conflict_cancelled")
         # 订单状态变为 revalidator_cancelled
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "revalidator_cancelled")
 
     # --- Test 6: Fix 6 ---
@@ -21620,7 +22064,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60200.0, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # 阴线插针：open=60250, close=60180（阴线）, high=60400, low=60100
         # body=70, range=300, 300 > 2*70=140 → 插针
@@ -21629,7 +22073,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertFalse(result.get("filled"), "Fix 6: 阴线插针不得成交")
         self.assertEqual(result.get("skip_reason"), "unhealthy_kline")
         # 订单保持 pending
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "pending")
 
     # --- Test 7: Fix 7 ---
@@ -21673,8 +22117,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         from plugins.crypto_guard.diagnostics.report_diagnostics import R4_CONTRACT_MARKER_KEY
         # 写入 R4 contract marker，applied_at 早于所有测试数据，使 BTC#9 诊断生效
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES (?, '2020-01-01 00:00:00')",
+            "INSERT INTO _migration_state(key, applied_at) VALUES (%s, '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
             (R4_CONTRACT_MARKER_KEY,),
         )
         self.conn.commit()
@@ -21717,7 +22160,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "metrics": {"htf_support": {"ok": True, "reason": "高周期不支持做多：4H=bullish"}},
         })
         self.conn.execute(
-            "UPDATE ga_decisions SET risk_check_json=? WHERE id=?",
+            "UPDATE ga_decisions SET risk_check_json=%s WHERE id=%s",
             (risk_check_bad, ga3),
         )
 
@@ -21736,7 +22179,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             },
         })
         self.conn.execute(
-            "UPDATE ga_decisions SET market_regime_gate_json=? WHERE id=?",
+            "UPDATE ga_decisions SET market_regime_gate_json=%s WHERE id=%s",
             (regime_gate_bad, ga4),
         )
 
@@ -21749,7 +22192,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, "
             "  status, created_at, expires_at, ga_decision_id, fill_method, filled_at) "
-            "VALUES (?, 'LONG', 'limit', 0.5, 0.48, 1, 'open', ?, ?, ?, 'limit_range_touch', ?)",
+            "VALUES (%s, 'LONG', 'limit', 0.5, 0.48, 1, 'open', %s, %s, %s, 'limit_range_touch', %s)",
             ("XRPUSDT", "2026-06-16 00:00:00", "2026-06-16 08:00:00", ga5_old, "2026-06-16 01:00:00"),
         )
         # 最新 GA 在 filled_at 之前已转空（使用更大的 analysis_time 确保排序在后）
@@ -21781,7 +22224,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2025-01-01T00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2025-01-01T00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -21821,8 +22264,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
         from plugins.crypto_guard.diagnostics.report_diagnostics import R4_CONTRACT_MARKER_KEY
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES (?, '2020-01-01 00:00:00')",
+            "INSERT INTO _migration_state(key, applied_at) VALUES (%s, '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
             (R4_CONTRACT_MARKER_KEY,),
         )
         self.conn.commit()
@@ -21832,7 +22274,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "  signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "  evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, "
             "  final_summary, raw_decision_json, trade_plan_json, rendered_summary, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", 1750000000000, "2025-06-16T00:00:00Z", "scheduled_analysis",
              "A", 0.85, "bullish", "middle", "trade_plan_available", "[]",
              '[{"a": 1}]', "[]", "{}", "[]", "test", "{}", "{}", "", "2025-06-16T00:00:00Z"),
@@ -21864,7 +22306,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # BTC#9 real candle: open=60316.1, high=60339.1, low=60134.0, close=60199.5
         # prev_close=60350.0 (previous candle closed higher)
@@ -21900,7 +22342,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_new,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         market = {"open": 60200.0, "high": 60300.0, "low": 60150.0, "close": 60250.0}
         result = _revalidate_pending_before_fill(self.repo, order, market, event_time=1700000001000 + 60000)
@@ -21967,8 +22409,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00')",
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at",
         )
         self.conn.commit()
 
@@ -22038,13 +22479,13 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Assert: no fill occurred
         row = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order_id,),
+            "SELECT status FROM paper_orders WHERE id=%s", (order_id,),
         ).fetchone()
         self.assertEqual(row["status"], "pending",
                          "E3: order must remain pending — no single candle touches entry")
 
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(trade_count["cnt"], 0,
@@ -22052,7 +22493,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Assert: cursor advanced to last candle's close_time
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["last_processed_candle_time"], base_ms + 180000,
@@ -22118,7 +22559,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -22180,7 +22621,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Verify: order is filled then closed via stop_loss
         trade_row = self.conn.execute(
             "SELECT close_reason, closed_at, entry_price FROM paper_trades "
-            "WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "E2: trade must exist")
@@ -22190,7 +22631,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Verify: cursor advanced to SL candle's close_time
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["status"], "closed",
@@ -22211,7 +22652,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # First fill: bullish candle with healthy wick ratio
         candle_fill = {"open": 60250.0, "high": 60450.0, "low": 60190.0, "close": 60400.0,
@@ -22220,7 +22661,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertTrue(result1.get("filled"), "first fill should succeed")
         # Restart: same order is now "open", try to fill again with same candle
         order2 = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # fill_order_if_triggered checks for existing open trade and skips
         result2 = fill_order_if_triggered(self.repo, order2, candle_fill, event_time=1750000000000 + 4_000_000)
@@ -22249,7 +22690,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
             (1750000001000, order_id),
         )
         self.conn.commit()
@@ -22263,7 +22704,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Assert: cursor unchanged
         row = self.conn.execute(
-            "SELECT status, last_processed_candle_time FROM paper_orders WHERE id=?",
+            "SELECT status, last_processed_candle_time FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(row["status"], "pending",
@@ -22273,7 +22714,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Assert: no trade created
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(trade_count["cnt"], 0,
@@ -22282,7 +22723,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Assert: no fill alert enqueued (paper_event_alert with fill)
         alert_count = self.conn.execute(
             "SELECT COUNT(*) AS cnt FROM agent_jobs WHERE job_type='paper_event_alert' "
-            "AND json_extract(payload_json, '$.event_type')='fill'"
+            "AND (payload_json::jsonb ->> 'event_type')='fill'"
         ).fetchone()
         self.assertEqual(alert_count["cnt"], 0,
                          "E1: no fill alert should be enqueued on network error")
@@ -22315,7 +22756,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         # Set take_profit_json on the order
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -22340,7 +22781,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Trade should be closed with stop_loss
         trade_row = self.conn.execute(
-            "SELECT close_reason, closed_at FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT close_reason, closed_at FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "trade must exist")
@@ -22349,7 +22790,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must advance to SL candle's close_time
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["status"], "closed")
@@ -22373,7 +22814,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -22397,7 +22838,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
                 update_paper_positions(self.repo)
 
         trade_row = self.conn.execute(
-            "SELECT close_reason, closed_at FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT close_reason, closed_at FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "trade must exist")
@@ -22405,7 +22846,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertEqual(trade_row["close_reason"], "take_profit")
 
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["status"], "closed")
@@ -22430,7 +22871,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -22456,7 +22897,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         trade_row = self.conn.execute(
             "SELECT close_reason, closed_at, stop_take_path_json FROM paper_trades "
-            "WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "trade must exist")
@@ -22464,8 +22905,14 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertEqual(trade_row["close_reason"], "stop_loss",
                          "SL must win when both SL and TP hit same candle")
 
-        # Verify ambiguous_intrabar is recorded in path
-        path = json.loads(trade_row["stop_take_path_json"] or "[]")
+        # Verify ambiguous_intrabar is recorded in path. PG returns JSONB
+        # already deserialized to a Python list, so use the value directly and
+        # guard the legacy string form for safety.
+        path = trade_row["stop_take_path_json"]
+        if isinstance(path, str):
+            path = json.loads(path)
+        if path is None:
+            path = []
         has_ambiguous = any(
             isinstance(e, dict) and e.get("details", {}).get("ambiguous_intrabar")
             for e in path
@@ -22491,7 +22938,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 130.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -22521,7 +22968,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Trade should still be open (no SL/TP hit)
         trade_row = self.conn.execute(
-            "SELECT closed_at FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT closed_at FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "trade must exist")
@@ -22530,7 +22977,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must advance to LAST candle's close_time, not stuck at fill candle
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["status"], "open")
@@ -22868,48 +23315,28 @@ class Btc9RegressionChainTest(unittest.TestCase):
     # --- Phase A tests ---
 
     def test_a5_hourly_report_default_db_healthy_repo_db_missing_column(self) -> None:
-        """A5/Section10: default DB healthy, repo DB missing column → schema_unhealthy."""
-        import sqlite3
-        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        """A5/Section10: repo DB missing a required column -> build_hourly_report schema_unhealthy.
 
-        # Create a fresh DB missing a required column
-        bad_conn = sqlite3.connect(":memory:")
-        bad_conn.row_factory = sqlite3.Row
-        # Create minimal schema but miss a required column
-        bad_conn.executescript("""
-            CREATE TABLE symbols(symbol TEXT PRIMARY KEY, base_asset TEXT, quote_asset TEXT, category TEXT, enabled INTEGER, source TEXT, default_timeframes TEXT, notes TEXT, updated_at TEXT);
-            CREATE TABLE skill_feedback_memory(id INTEGER PRIMARY KEY AUTOINCREMENT, pattern_type TEXT, affected_symbols TEXT, affected_sides TEXT);
-            CREATE TABLE ga_decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, analysis_time INTEGER, analysis_time_utc TEXT, created_at TEXT, market_bias TEXT, signal_grade TEXT, confidence REAL, trend_stage TEXT, summary TEXT, decision TEXT, has_trade_plan INTEGER, trade_plan_json TEXT, risk_check_json TEXT, feishu_actions_json TEXT, raw_decision_json TEXT, batch_id TEXT, previous_grade TEXT, rendered_summary TEXT);
-            ALTER TABLE ga_decisions ADD COLUMN account_feedback_gate_json TEXT;
-            ALTER TABLE ga_decisions ADD COLUMN market_regime_gate_json TEXT;
-            CREATE TABLE opportunity_watches(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, direction TEXT, watch_reason TEXT, watch_condition_json TEXT, status TEXT, ga_decision_id INTEGER, created_at TEXT, expires_at TEXT, dedupe_key TEXT);
-            CREATE TABLE paper_positions(id INTEGER PRIMARY KEY, account_id INTEGER, symbol TEXT, side TEXT, entry_price REAL, current_price REAL, quantity REAL, stop_loss REAL, take_profit_json TEXT, unrealized_pnl REAL, unrealized_pnl_pct REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, status TEXT, updated_at TEXT, closed_at TEXT);
-            CREATE TABLE strategy_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_id INTEGER, ga_decision_id INTEGER, paper_trade_id INTEGER, outcome_source TEXT, shadow_virtual_trade_id INTEGER, is_shadow INTEGER, pnl_r REAL);
-            CREATE TABLE paper_orders(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, order_type TEXT, entry_price REAL, trigger_price REAL, stop_loss REAL, initial_stop_loss REAL, quantity REAL, risk_percent REAL, take_profit_json TEXT, status TEXT, source TEXT, reason TEXT, risk_check_passed INTEGER, signal_id INTEGER, ga_decision_id INTEGER, created_at TEXT, expires_at TEXT, filled_at TEXT, closed_at TEXT, cancelled_at TEXT, cancel_reason TEXT, invalidated_by_ga_decision_id INTEGER, last_processed_candle_time INTEGER, fill_method TEXT);
-            CREATE TABLE paper_trades(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, signal_id INTEGER, market_snapshot_id INTEGER, symbol TEXT, side TEXT, entry_price REAL, stop_loss REAL, initial_stop_loss REAL, initial_risk_usdt REAL, take_profit_json TEXT, quantity REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, entry_efficiency REAL, exit_efficiency REAL, signal_decay_score REAL, stop_take_path_json TEXT, fill_method TEXT, closed_at TEXT, close_reason TEXT, exit_price REAL, pnl REAL, pnl_percent REAL, pnl_r REAL);
-            CREATE TABLE shadow_virtual_trades(id INTEGER PRIMARY KEY AUTOINCREMENT, strategy_name TEXT, status TEXT, entry_type TEXT, opened_at TEXT, expires_at TEXT, last_processed_candle_time INTEGER);
-            CREATE TABLE analysis_batches(batch_id TEXT PRIMARY KEY, interval TEXT, analysis_time INTEGER, enabled_symbols TEXT, completed_symbols TEXT, failed_symbols TEXT, pending_symbols TEXT, status TEXT, created_at TEXT);
-            CREATE TABLE batch_symbol_status(id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT, symbol TEXT, status TEXT, error_message TEXT, created_at TEXT);
-            CREATE TABLE paper_trade_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, event_type TEXT, symbol TEXT, side TEXT, price REAL, quantity REAL, pnl REAL, pnl_pct REAL, reason TEXT, event_json TEXT, created_at TEXT);
-            CREATE TABLE agent_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_type TEXT, source TEXT, session_id TEXT, status TEXT, priority INTEGER, payload TEXT, result TEXT, error_message TEXT, created_at TEXT, started_at TEXT, completed_at TEXT, scheduled_at TEXT);
-            CREATE TABLE paper_equity_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, account_equity REAL, unrealized_pnl REAL, realized_pnl REAL, snapshot_json TEXT, created_at TEXT);
-            CREATE TABLE paper_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, balance REAL, created_at TEXT);
-            CREATE TABLE signals(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, ga_decision_id INTEGER, market_snapshot_id INTEGER, ga_decision_json TEXT, decision TEXT, signal_grade TEXT, confidence REAL, direction TEXT, trend_stage TEXT, summary TEXT, created_at TEXT);
-            CREATE TABLE market_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, analysis_time_utc INTEGER, mode TEXT, snapshot_json TEXT, data_quality_json TEXT, created_at TEXT);
-            CREATE TABLE alert_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, receive_id TEXT, receive_id_type TEXT, text TEXT, alert_type TEXT, symbol TEXT, priority INTEGER, status TEXT, created_at TEXT, sent_at TEXT, error_message TEXT, session_id TEXT, dedupe_key TEXT);
-            CREATE TABLE skill_feedback_memory_target(skill_name TEXT);
-            CREATE TABLE evolution_triggers(id INTEGER PRIMARY KEY AUTOINCREMENT, trigger_type TEXT, strategy_name TEXT, symbol TEXT, trigger_value REAL, created_at TEXT);
-            CREATE TABLE trade_reviews(id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, review_json TEXT, created_at TEXT);
-            CREATE TABLE strategy_evaluations_backup(id INTEGER PRIMARY KEY);
-        """)
-        # Intentionally do NOT add 'updated_at' to paper_positions — this is the missing column
-        # Actually paper_positions already has updated_at above. Let's drop it to simulate missing.
-        # Instead, create a fresh table without it:
-        bad_conn.execute("DROP TABLE paper_positions")
-        bad_conn.execute("CREATE TABLE paper_positions(id INTEGER PRIMARY KEY, account_id INTEGER, symbol TEXT, side TEXT, entry_price REAL, current_price REAL, quantity REAL, stop_loss REAL, take_profit_json TEXT, unrealized_pnl REAL, unrealized_pnl_pct REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, status TEXT, closed_at TEXT)")
-        bad_repo = CryptoGuardRepository(bad_conn)
-        result = build_hourly_report(bad_repo)
+        PG cutover: the legacy test built a SQLite :memory: DB missing a column
+        and passed it to the repo. That was a false green on PG -- check_schema_health
+        on a sqlite3 connection raises AttributeError, which the health check
+        catches and reports as ok=False, so the assertion passed for the wrong
+        reason. The greenfield repo is PG-only, so we instead drop the required
+        ``updated_at`` column from ``paper_positions`` on the per-test scratch
+        schema (paper_positions.updated_at is in _REQUIRED_COLUMNS) and verify
+        check_schema_health -- called first by build_hourly_report -- detects the
+        missing column -> ok=False -> schema_unhealthy.
+        """
+        from plugins.crypto_guard.notify.hourly_report import build_hourly_report
+
+        # Drop a required column to make the scratch schema unhealthy. Wrapped in
+        # a transaction so the DDL is visible to the read-only health probe that
+        # runs next. self.repo wraps self.conn (the same pooled connection), so
+        # its health probe sees the missing column.
+        with self.conn.transaction():
+            self.conn.execute("ALTER TABLE paper_positions DROP COLUMN updated_at")
+
+        result = build_hourly_report(self.repo)
         self.assertFalse(result["ok"], "repo DB missing column should make schema unhealthy")
         self.assertEqual(result["error"], "schema_unhealthy")
 
@@ -23162,24 +23589,31 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60200.0, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         market = {"open": 60200.0, "high": 60400.0, "low": 60150.0, "close": 60350.0}
         et = utc_ms()
         result = fill_order_if_triggered(self.repo, order, market, event_time=et)
         self.assertTrue(result.get("filled"), "Fill should succeed with event_time")
 
-        # Verify the order's filled_at matches the event_time ISO
-        row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        # Verify the order's filled_at matches the event_time. PG returns
+        # TIMESTAMPTZ as a tz-aware datetime, not an ISO string, so compare
+        # against a datetime built from the event_time ms.
+        row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         from plugins.crypto_guard.utils import iso_utc_from_ms
-        expected_iso = iso_utc_from_ms(et)
-        self.assertEqual(row["filled_at"], expected_iso,
+        expected_iso = iso_utc_from_ms(et)  # JSONB-embedded ts stays an ISO string
+        expected_dt = datetime.fromtimestamp(et // 1000, tz=timezone.utc)
+        self.assertEqual(row["filled_at"], expected_dt,
                         "filled_at should use event_time, not wall clock")
 
-        # Verify the trade's stop_take_path_json has the event_time ts
-        trade = self.conn.execute("SELECT stop_take_path_json FROM paper_trades WHERE order_id=?", (order_id,)).fetchone()
+        # Verify the trade's stop_take_path_json has the event_time ts. PG
+        # returns JSONB already deserialized to a Python list, so use the value
+        # directly (guard the legacy string form for safety).
+        trade = self.conn.execute("SELECT stop_take_path_json FROM paper_trades WHERE order_id=%s", (order_id,)).fetchone()
         import json
-        path = json.loads(trade["stop_take_path_json"])
+        path = trade["stop_take_path_json"]
+        if isinstance(path, str):
+            path = json.loads(path)
         self.assertEqual(path[0]["ts"], expected_iso,
                         "stop_take_path ts should use event_time")
 
@@ -23197,7 +23631,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60200.0, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         market = {"open": 60200.0, "high": 60400.0, "low": 60150.0, "close": 60350.0}
         # No event_time — should fail-closed for limit orders
@@ -23244,7 +23678,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # Bullish candle (close=60200 >= open=60150) BUT close < entry (60232.1)
         # low=60100 <= entry <= high=60300, so entry zone is touched.
@@ -23271,7 +23705,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=60700.0, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # Bearish candle (close=60250 <= open=60300) BUT close > entry (60232.1)
         # low=60100 <= entry <= high=60400, so entry zone is touched.
@@ -23298,7 +23732,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=60232.1, stop_loss=59750.2, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         # Real BTC#9 candle: low=60190 < entry, close=60400 > entry, bullish
         candle_fill = {"open": 60250.0, "high": 60450.0, "low": 60190.0, "close": 60400.0,
@@ -23307,7 +23741,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertTrue(result.get("filled"),
                         "C1: real BTC#9 candle with close >= entry must fill — entry reclaimed")
         # Verify order is filled
-        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        row = self.conn.execute("SELECT status FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertEqual(row["status"], "open")
 
     # --- BTC#9 Phase C: C5 paged backfill integration test ---
@@ -23332,7 +23766,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -23393,7 +23827,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Verify: cursor advanced to last candle's close_time
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         expected_cursor = base_ms + 1200 * 60000
@@ -23404,7 +23838,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Verify: no duplicate candle processing (check no duplicate fills)
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(trade_count["cnt"], 0,
@@ -23420,8 +23854,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
         # Seed LLM-failed GA decision + non-cancelled order (pre-contract data)
@@ -23448,8 +23881,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
         # Seed LLM-failed GA decision + non-cancelled order (post-contract data)
@@ -23478,8 +23910,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
         # Case 1: Bare string confirmation — should be flagged (validator rejects non-dict)
@@ -23526,17 +23957,17 @@ class Btc9RegressionChainTest(unittest.TestCase):
         import json as _json2
         self.conn.execute(
             "INSERT INTO market_snapshots(symbol, analysis_time, mode, snapshot_json) "
-            "VALUES (?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s)",
             ("BNBUSDT", 1750000000000 + 2000, "scheduled", "{}"),
         )
-        snapshot_id = self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        snapshot_id = self.conn.execute("SELECT lastval() AS id").fetchone()["id"]
         self.conn.execute(
-            "UPDATE ga_decisions SET snapshot_id=? WHERE id=?",
+            "UPDATE ga_decisions SET snapshot_id=%s WHERE id=%s",
             (snapshot_id, ga2),
         )
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             ("BNBUSDT", "15m", 1750000000000 + 2000, "price_action",
              _json2.dumps({
                  "structure_events": [
@@ -23639,7 +24070,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # close_time (T+60000), so _latest_ga_decision(max_analysis_time=T+60000)
         # should only find the original bullish GA, not the future bearish one.
         order_row = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order_id,),
+            "SELECT status FROM paper_orders WHERE id=%s", (order_id,),
         ).fetchone()
         self.assertNotEqual(order_row["status"], "revalidator_cancelled",
                             "E: future GA must not cancel order — time upper bound prevents future-function")
@@ -24258,7 +24689,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Set trade_plan_json on ga_decisions (where the diagnostic query reads it)
         # and ensure snapshot_id is NULL (no provenance data)
         self.conn.execute(
-            "UPDATE ga_decisions SET trade_plan_json=?, snapshot_id=NULL WHERE id=?",
+            "UPDATE ga_decisions SET trade_plan_json=%s, snapshot_id=NULL WHERE id=%s",
             (_json.dumps(plan), ga_id),
         )
         self.conn.commit()
@@ -24295,7 +24726,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json.dumps({
                  "structure_events": [
@@ -24345,7 +24776,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed module_analysis_results with events that DON'T have the matching rule_id
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json.dumps({
                  "structure_events": [
@@ -24396,7 +24827,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         # Seed feishu_events with a matching event_id AND structured payload
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_feishu_001", "structure_event",
              _json4.dumps({
                  "symbol": "BTCUSDT",
@@ -24444,7 +24875,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         # Seed feishu_events with matching event_id but NO payload_json
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type) VALUES (?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type) VALUES (%s, %s)",
             ("det_unrelated_001", "bot_heartbeat"),
         )
         self.conn.commit()
@@ -24479,7 +24910,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed module_analysis_results with matching rule_id but WRONG symbol
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("ETHUSDT", "15m", conf_close_time, "price_action",
              _json5.dumps({
                  "structure_events": [
@@ -24526,7 +24957,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json6.dumps({
                  "structure_events": [
@@ -24573,7 +25004,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json7.dumps({
                  "structure_events": [
@@ -24617,7 +25048,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
     def test_r3b_historical_fill_writes_event_time_everywhere(self) -> None:
         """R3-B: Historical fill writes identical event time to order, trade, position, log, and alert payload."""
         from plugins.crypto_guard.paper.paper_broker import fill_order_if_triggered
-        from plugins.crypto_guard.utils import iso_utc_from_ms, utc_ms
+        from plugins.crypto_guard.utils import utc_ms
 
         ga_id = self._seed_ga_decision(
             symbol="BTCUSDT", market_bias="bullish", signal_grade="A",
@@ -24628,23 +25059,23 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         market = {"open": 99.0, "high": 103.0, "low": 98.0, "close": 102.0}
         et = utc_ms()
         result = fill_order_if_triggered(self.repo, order, market, event_time=et)
         self.assertTrue(result.get("filled"), "Fill should succeed")
 
-        expected_iso = iso_utc_from_ms(et)
+        expected_dt = datetime.fromtimestamp(et // 1000, tz=timezone.utc)
 
         # Check order.filled_at
-        order_row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=?", (order_id,)).fetchone()
-        self.assertEqual(order_row["filled_at"], expected_iso,
+        order_row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
+        self.assertEqual(order_row["filled_at"], expected_dt,
                          "R3-B: filled_at should use event_time")
 
         # Check paper_trade_logs open_position event
@@ -24652,16 +25083,16 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT created_at FROM paper_trade_logs WHERE event_type='open_position' AND symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log_row, "R3-B: open_position log must exist")
-        self.assertEqual(log_row["created_at"], expected_iso,
+        self.assertEqual(log_row["created_at"], expected_dt,
                          "R3-B: log created_at should use event_time")
 
         # Check paper_trades.created_at uses event_time, not CURRENT_TIMESTAMP
         trade_row = self.conn.execute(
-            "SELECT created_at FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT created_at FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row, "R3-B: paper_trades row must exist")
-        self.assertEqual(trade_row["created_at"], expected_iso,
+        self.assertEqual(trade_row["created_at"], expected_dt,
                          "R4-D1: paper_trades.created_at must use event_time, not CURRENT_TIMESTAMP")
 
         # Check paper_positions.opened_at uses event_time, not CURRENT_TIMESTAMP
@@ -24669,7 +25100,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT opened_at FROM paper_positions WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(pos_opened_row, "R3-B: position must exist")
-        self.assertEqual(pos_opened_row["opened_at"], expected_iso,
+        self.assertEqual(pos_opened_row["opened_at"], expected_dt,
                          "R4-D1: paper_positions.opened_at must use event_time, not CURRENT_TIMESTAMP")
 
         # Check paper_positions updated_at
@@ -24677,13 +25108,12 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT updated_at FROM paper_positions WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(pos_row, "R3-B: position must exist")
-        self.assertEqual(pos_row["updated_at"], expected_iso,
+        self.assertEqual(pos_row["updated_at"], expected_dt,
                          "R3-B: position updated_at should use event_time")
 
     def test_r3b_historical_sl_writes_closing_candle_time_everywhere(self) -> None:
         """R3-B: Historical SL writes the closing candle time everywhere."""
         from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
-        from plugins.crypto_guard.utils import iso_utc_from_ms
         from unittest.mock import patch
 
         ga_id = self._seed_ga_decision(
@@ -24695,7 +25125,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -24716,21 +25146,21 @@ class Btc9RegressionChainTest(unittest.TestCase):
                 mock_mp.return_value = {"markPrice": "102.0"}
                 update_paper_positions(self.repo)
 
-        expected_close_iso = iso_utc_from_ms(base_ms + 120000)
+        expected_close_dt = datetime.fromtimestamp((base_ms + 120000) / 1000, tz=timezone.utc)
 
         # Check paper_trades.closed_at
         trade_row = self.conn.execute(
-            "SELECT closed_at, close_reason FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT closed_at, close_reason FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row["closed_at"])
         self.assertEqual(trade_row["close_reason"], "stop_loss")
-        self.assertEqual(trade_row["closed_at"], expected_close_iso,
+        self.assertEqual(trade_row["closed_at"], expected_close_dt,
                          "R3-B: trade closed_at should use SL candle close_time")
 
         # Check paper_orders.closed_at
-        order_row = self.conn.execute("SELECT closed_at FROM paper_orders WHERE id=?", (order_id,)).fetchone()
-        self.assertEqual(order_row["closed_at"], expected_close_iso,
+        order_row = self.conn.execute("SELECT closed_at FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
+        self.assertEqual(order_row["closed_at"], expected_close_dt,
                          "R3-B: order closed_at should use SL candle close_time")
 
         # Check close_position log
@@ -24738,7 +25168,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT created_at FROM paper_trade_logs WHERE event_type='close_position' AND symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(log_row, "R3-B: close_position log must exist")
-        self.assertEqual(log_row["created_at"], expected_close_iso,
+        self.assertEqual(log_row["created_at"], expected_close_dt,
                          "R3-B: close log created_at should use SL candle close_time")
 
         # Check paper_positions.closed_at
@@ -24746,7 +25176,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT closed_at FROM paper_positions WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(pos_row, "R3-B: position must exist")
-        self.assertEqual(pos_row["closed_at"], expected_close_iso,
+        self.assertEqual(pos_row["closed_at"], expected_close_dt,
                          "R3-B: position closed_at should use SL candle close_time")
 
     def test_r4_d1_paper_trade_created_at_uses_event_time_not_current_timestamp(self) -> None:
@@ -24757,7 +25187,6 @@ class Btc9RegressionChainTest(unittest.TestCase):
         replay fills to be stamped with the replay execution time instead of the
         candle event time.
         """
-        from plugins.crypto_guard.utils import iso_utc_from_ms
 
         ga_id = self._seed_ga_decision(
             symbol="BTCUSDT", market_bias="bullish", signal_grade="A",
@@ -24768,17 +25197,17 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # Use a fixed historical event_time far from wall-clock
         historical_event_time = 1750000000000  # well in the past
-        expected_iso = iso_utc_from_ms(historical_event_time)
+        expected_dt = datetime.fromtimestamp(historical_event_time / 1000, tz=timezone.utc)
 
         trade_id = self.repo.create_paper_trade(
             order, 100.0, fill_method="limit", event_time=historical_event_time,
@@ -24787,9 +25216,9 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # paper_trades.created_at must match event_time, not CURRENT_TIMESTAMP
         trade_row = self.conn.execute(
-            "SELECT created_at FROM paper_trades WHERE id=?", (trade_id,)
+            "SELECT created_at FROM paper_trades WHERE id=%s", (trade_id,)
         ).fetchone()
-        self.assertEqual(trade_row["created_at"], expected_iso,
+        self.assertEqual(trade_row["created_at"], expected_dt,
                          "R4-D1: paper_trades.created_at must use event_time, not CURRENT_TIMESTAMP")
 
     def test_r4_d1_paper_position_opened_at_uses_event_time_not_current_timestamp(self) -> None:
@@ -24799,7 +25228,6 @@ class Btc9RegressionChainTest(unittest.TestCase):
         so SQLite fell back to CURRENT_TIMESTAMP (wall-clock), causing position open
         timestamp to reflect replay execution time instead of candle event time.
         """
-        from plugins.crypto_guard.utils import iso_utc_from_ms
 
         ga_id = self._seed_ga_decision(
             symbol="BTCUSDT", market_bias="bullish", signal_grade="A",
@@ -24810,16 +25238,16 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         historical_event_time = 1750000000000
-        expected_iso = iso_utc_from_ms(historical_event_time)
+        expected_dt = datetime.fromtimestamp(historical_event_time / 1000, tz=timezone.utc)
 
         self.repo.create_paper_trade(
             order, 100.0, fill_method="limit", event_time=historical_event_time,
@@ -24831,12 +25259,11 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "SELECT opened_at FROM paper_positions WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(pos_row, "R4-D1: position must exist")
-        self.assertEqual(pos_row["opened_at"], expected_iso,
+        self.assertEqual(pos_row["opened_at"], expected_dt,
                          "R4-D1: paper_positions.opened_at must use event_time, not CURRENT_TIMESTAMP")
 
     def test_r4_d1_position_update_does_not_overwrite_opened_at(self) -> None:
         """R4-D1: UPDATE branch of upsert_paper_position_from_trade must not overwrite opened_at."""
-        from plugins.crypto_guard.utils import iso_utc_from_ms
 
         ga_id = self._seed_ga_decision(
             symbol="BTCUSDT", market_bias="bullish", signal_grade="A",
@@ -24847,16 +25274,16 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         fill_event_time = 1750000000000
-        expected_opened_iso = iso_utc_from_ms(fill_event_time)
+        expected_opened_dt = datetime.fromtimestamp(fill_event_time / 1000, tz=timezone.utc)
 
         # Create trade + position with fill event_time
         trade_id = self.repo.create_paper_trade(
@@ -24879,16 +25306,15 @@ class Btc9RegressionChainTest(unittest.TestCase):
         pos_row = self.conn.execute(
             "SELECT opened_at, updated_at FROM paper_positions WHERE symbol='BTCUSDT' ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        self.assertEqual(pos_row["opened_at"], expected_opened_iso,
+        self.assertEqual(pos_row["opened_at"], expected_opened_dt,
                          "R4-D1: opened_at must not be overwritten on UPDATE")
-        expected_updated_iso = iso_utc_from_ms(update_event_time)
-        self.assertEqual(pos_row["updated_at"], expected_updated_iso,
+        expected_updated_dt = datetime.fromtimestamp(update_event_time / 1000, tz=timezone.utc)
+        self.assertEqual(pos_row["updated_at"], expected_updated_dt,
                          "R4-D1: updated_at should reflect the latest update event_time")
 
     def test_r3b_historical_tp_writes_closing_candle_time_everywhere(self) -> None:
         """R3-B: Historical TP writes the closing candle time everywhere."""
         from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
-        from plugins.crypto_guard.utils import iso_utc_from_ms
         from unittest.mock import patch
 
         ga_id = self._seed_ga_decision(
@@ -24900,7 +25326,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -24921,15 +25347,15 @@ class Btc9RegressionChainTest(unittest.TestCase):
                 mock_mp.return_value = {"markPrice": "102.0"}
                 update_paper_positions(self.repo)
 
-        expected_close_iso = iso_utc_from_ms(base_ms + 120000)
+        expected_close_dt = datetime.fromtimestamp((base_ms + 120000) / 1000, tz=timezone.utc)
 
         trade_row = self.conn.execute(
-            "SELECT closed_at, close_reason FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT closed_at, close_reason FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row["closed_at"])
         self.assertEqual(trade_row["close_reason"], "take_profit")
-        self.assertEqual(trade_row["closed_at"], expected_close_iso,
+        self.assertEqual(trade_row["closed_at"], expected_close_dt,
                          "R3-B: trade closed_at should use TP candle close_time")
 
     def test_r3b_missing_replay_event_time_creates_no_trade(self) -> None:
@@ -24944,7 +25370,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # create_paper_trade without event_time and without allow_wall_clock must raise
@@ -24953,7 +25379,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Verify no trade was created
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?", (order_id,)
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s", (order_id,)
         ).fetchone()
         self.assertEqual(int(trade_count["cnt"]), 0, "R3-B: no trade should be created without event_time")
 
@@ -24971,7 +25397,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
         market = {"open": 99.0, "high": 103.0, "low": 98.0, "close": 102.0}
         # No event_time — should use wall clock (market orders don't require event_time)
@@ -24979,13 +25405,12 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertTrue(result.get("filled"), "R3-B: live mode market order should fill with wall clock")
 
         # Verify filled_at is not None
-        order_row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        order_row = self.conn.execute("SELECT filled_at FROM paper_orders WHERE id=%s", (order_id,)).fetchone()
         self.assertIsNotNone(order_row["filled_at"], "R3-B: filled_at should be set in live mode")
 
     def test_r3b_replay_crossing_utc_day_boundary_attributed_to_candle_day(self) -> None:
         """R3-B: A replay crossing a UTC day boundary is attributed to the candle day."""
         from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
-        from plugins.crypto_guard.utils import iso_utc_from_ms
         from unittest.mock import patch
 
         # Use a base_ms near UTC midnight boundary
@@ -25001,7 +25426,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 110.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -25026,13 +25451,13 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # The SL candle close_time is base_ms + 120000 = 1730496060000
         # which is 2024-11-02T00:01:00Z (next UTC day from the fill)
         # Verify trade closed_at uses the SL candle's close_time, not wall clock
-        expected_close_iso = iso_utc_from_ms(base_ms + 120000)
+        expected_close_dt = datetime.fromtimestamp((base_ms + 120000) / 1000, tz=timezone.utc)
         trade_row = self.conn.execute(
-            "SELECT closed_at FROM paper_trades WHERE order_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT closed_at FROM paper_trades WHERE order_id=%s ORDER BY id DESC LIMIT 1",
             (order_id,),
         ).fetchone()
         self.assertIsNotNone(trade_row["closed_at"])
-        self.assertEqual(trade_row["closed_at"], expected_close_iso,
+        self.assertEqual(trade_row["closed_at"], expected_close_dt,
                          "R3-B: closed_at must use candle event time across UTC day boundary")
 
     # ===== R3-C: Preserve Cursor on Transient GA Failure =====
@@ -25053,7 +25478,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Set cursor to a known value
         cursor_before = 1750000000000
         self.conn.execute(
-            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
             (cursor_before, order_id),
         )
         self.conn.commit()
@@ -25075,21 +25500,21 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must be unchanged
         cursor_after = self.conn.execute(
-            "SELECT last_processed_candle_time FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT last_processed_candle_time FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()["last_processed_candle_time"]
         self.assertEqual(cursor_after, cursor_before,
                          "R3-C: cursor must be preserved on ga_recheck_unavailable")
 
         # Order must still be pending
         status = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT status FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()["status"]
         self.assertEqual(status, "pending",
                          "R3-C: order must remain pending on ga_recheck_unavailable")
 
         # No trade should have been created
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?", (order_id,)
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s", (order_id,)
         ).fetchone()["cnt"]
         self.assertEqual(trade_count, 0,
                          "R3-C: no trade should be created on ga_recheck_unavailable")
@@ -25108,7 +25533,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
             (1750000000000, order_id),
         )
         self.conn.commit()
@@ -25161,7 +25586,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
             (1750000000000, order_id),
         )
         self.conn.commit()
@@ -25186,7 +25611,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         audit_count = self.conn.execute(
             "SELECT COUNT(*) AS cnt FROM paper_trade_logs "
             "WHERE event_type='pending_order_retryable_skip' "
-            "AND json_extract(event_json, '$.order_id')=?",
+            "AND (event_json::jsonb ->> 'order_id')::bigint=%s",
             (order_id,),
         ).fetchone()["cnt"]
         self.assertEqual(audit_count, 1,
@@ -25204,7 +25629,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         row and both INSERT. The UNIQUE constraint on dedupe_key eliminates
         this race — the second INSERT raises IntegrityError.
         """
-        import sqlite3
+        from psycopg.errors import UniqueViolation
         from plugins.crypto_guard.paper.paper_position_updater import _log_retryable_skip_audit
 
         ga_id = self._seed_ga_decision(
@@ -25217,7 +25642,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         candle_close_time = 1750000060000
@@ -25232,9 +25657,10 @@ class Btc9RegressionChainTest(unittest.TestCase):
         _log_retryable_skip_audit(self.repo, order, candle_close_time, skip_reason, fill_result)
         self.conn.commit()
 
-        # Direct INSERT with same dedupe_key should raise IntegrityError
-        with self.assertRaises(sqlite3.IntegrityError,
-                               msg="R4-D4: duplicate dedupe_key INSERT must raise IntegrityError"):
+        # Direct INSERT with same dedupe_key should raise UniqueViolation (PG
+        # equivalent of SQLite's IntegrityError on the partial unique dedupe index)
+        with self.assertRaises(UniqueViolation,
+                               msg="R4-D4: duplicate dedupe_key INSERT must raise UniqueViolation"):
             self.repo.log_paper_trade_event(
                 position_id=None,
                 event_type="pending_order_retryable_skip",
@@ -25252,7 +25678,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Verify exactly one row exists with this dedupe_key
         count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE dedupe_key=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE dedupe_key=%s",
             (f"retryable_skip:{order_id}:{candle_close_time}:{skip_reason}",),
         ).fetchone()["cnt"]
         self.assertEqual(count, 1,
@@ -25263,55 +25689,28 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         Regression: the R4 test renamed to 'sequential' in R5-D5 made only
         sequential calls. This test uses threading.Barrier to synchronize two
-        threads to fire INSERT at the same instant, with separate connections
-        to a file-based SQLite DB in WAL mode. The UNIQUE partial index on
-        dedupe_key must ensure exactly one INSERT succeeds and the other
-        raises IntegrityError.
+        threads to fire INSERT at the same instant, with separate PostgreSQL
+        connections (direct_conn, both routed at the same scratch schema). The
+        UNIQUE partial index on dedupe_key must ensure exactly one INSERT
+        succeeds and the other raises psycopg.errors.UniqueViolation.
         """
-        import sqlite3
         import threading
         from concurrent.futures import ThreadPoolExecutor
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from psycopg.errors import UniqueViolation
+        from plugins.crypto_guard.tests.pg_fixtures import direct_conn
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
-        # Use a file-based DB with WAL mode for true concurrency
-        concurrent_db_path = os.path.join(self.tmp.name, "concurrent_test.sqlite3")
-
-        # Set up the DB with schema (including dedupe_key column and index)
-        setup_conn = connect_db(concurrent_db_path)
-        try:
-            setup_conn.execute(
-                "CREATE TABLE IF NOT EXISTS paper_trade_logs ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  position_id INTEGER,"
-                "  event_type TEXT NOT NULL,"
-                "  symbol TEXT NOT NULL,"
-                "  side TEXT,"
-                "  price REAL,"
-                "  quantity REAL,"
-                "  pnl REAL,"
-                "  pnl_pct REAL,"
-                "  reason TEXT,"
-                "  event_json TEXT,"
-                "  dedupe_key TEXT,"
-                "  created_at TEXT DEFAULT CURRENT_TIMESTAMP"
-                ")"
-            )
-            setup_conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trade_logs_dedupe_key "
-                "ON paper_trade_logs(dedupe_key) WHERE dedupe_key IS NOT NULL"
-            )
-            setup_conn.commit()
-        finally:
-            setup_conn.close()
-
+        # The scratch schema (setUp via make_repo) already ran initialize_database,
+        # so paper_trade_logs + the UNIQUE partial index idx_paper_trade_logs_dedupe_key
+        # already exist. Two independent direct connections provide true concurrency.
+        schema = self._repo_handle.schema
         dedupe_key = "concurrent_test_key_001"
         barrier = threading.Barrier(2)
         results: list[dict] = []
 
         def insert_attempt(thread_id: int) -> dict:
-            """Each thread gets its own connection and tries to INSERT."""
-            conn = connect_db(concurrent_db_path)
+            """Each thread gets its own direct connection and tries to INSERT."""
+            conn = direct_conn(schema)
             try:
                 repo = CryptoGuardRepository(conn)
                 # Synchronize: both threads reach the barrier, then race to INSERT
@@ -25332,9 +25731,20 @@ class Btc9RegressionChainTest(unittest.TestCase):
                 )
                 conn.commit()
                 return {"thread_id": thread_id, "success": True, "error": None}
-            except sqlite3.IntegrityError as e:
-                return {"thread_id": thread_id, "success": False, "error": "IntegrityError"}
+            except UniqueViolation:
+                # log_paper_trade_event wraps the INSERT in a transaction CM;
+                # the UniqueViolation aborts that transaction. Roll back so the
+                # connection is clean before close.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return {"thread_id": thread_id, "success": False, "error": "UniqueViolation"}
             except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return {"thread_id": thread_id, "success": False, "error": str(e)}
             finally:
                 conn.close()
@@ -25344,7 +25754,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             futures = [executor.submit(insert_attempt, i) for i in range(2)]
             results = [f.result() for f in futures]
 
-        # Verify exactly one succeeded and the other got IntegrityError
+        # Verify exactly one succeeded and the other got UniqueViolation
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
 
@@ -25352,105 +25762,74 @@ class Btc9RegressionChainTest(unittest.TestCase):
                          f"R5-D5: exactly one thread must succeed, got {len(successes)}: {results}")
         self.assertEqual(len(failures), 1,
                          f"R5-D5: exactly one thread must fail, got {len(failures)}: {results}")
-        self.assertIn("IntegrityError", str(failures[0]["error"]),
-                      f"R5-D5: failure must be IntegrityError, got: {failures[0]['error']}")
+        self.assertIn("UniqueViolation", str(failures[0]["error"]),
+                      f"R5-D5: failure must be UniqueViolation, got: {failures[0]['error']}")
 
-        # Verify exactly one row exists with this dedupe_key
-        verify_conn = connect_db(concurrent_db_path)
-        try:
-            count = verify_conn.execute(
-                "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE dedupe_key=?",
-                (dedupe_key,),
-            ).fetchone()["cnt"]
-            self.assertEqual(count, 1,
-                             "R5-D5: exactly one row per dedupe_key despite concurrent INSERT")
-        finally:
-            verify_conn.close()
+        # Verify exactly one row exists with this dedupe_key (pooled conn, same schema)
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM paper_trade_logs WHERE dedupe_key=%s",
+            (dedupe_key,),
+        ).fetchone()["cnt"]
+        self.assertEqual(count, 1,
+                         "R5-D5: exactly one row per dedupe_key despite concurrent INSERT")
 
     def test_r4_d4_dedupe_key_column_exists(self) -> None:
         """R4-D4: paper_trade_logs.dedupe_key column exists with UNIQUE partial index."""
-        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(paper_trade_logs)").fetchall()}
+        cols = {row["name"] for row in self.conn.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'paper_trade_logs' ORDER BY ordinal_position").fetchall()}
         self.assertIn("dedupe_key", cols,
                          "R4-D4: dedupe_key column must exist on paper_trade_logs")
 
-        # Verify the UNIQUE partial index exists
+        # Verify the UNIQUE partial index exists (pg_catalog.pg_indexes replaces sqlite_master)
         indexes = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='paper_trade_logs'"
+            "SELECT indexname FROM pg_catalog.pg_indexes "
+            "WHERE schemaname = current_schema() AND tablename = 'paper_trade_logs'"
         ).fetchall()
-        index_names = {r["name"] for r in indexes}
+        index_names = {r["indexname"] for r in indexes}
         self.assertIn("idx_paper_trade_logs_dedupe_key", index_names,
                          "R4-D4: UNIQUE partial index on dedupe_key must exist")
 
-    def test_r5_d1_migration_does_not_crash_on_missing_dedupe_key_column(self) -> None:
-        """R5-D1: initialize_database must not crash on a production DB that has
-        paper_trade_logs but no dedupe_key column.
+    def test_r5_d1_initialize_database_fail_closed_on_missing_dedupe_key_column(self) -> None:
+        """R5-D1 (greenfield): initialize_database is fail-closed on a schema
+        missing the dedupe_key column — it raises RuntimeError (health gate) and
+        does NOT silently leave an unhealthy schema behind.
 
-        Regression: schema.sql's CREATE UNIQUE INDEX ON paper_trade_logs(dedupe_key)
-        ran inside executescript BEFORE the migration that adds the dedupe_key
-        column. On old DBs that have paper_trade_logs without the column,
-        executescript crashed with OperationalError("no such column: dedupe_key").
-
-        Fix: removed the CREATE UNIQUE INDEX from schema.sql; the migration
-        function (_apply_paper_trade_logs_dedupe_key_migration) owns both
-        _add_column and the index, and runs AFTER executescript.
+        Legacy (SQLite) premise: an old prod DB had paper_trade_logs without
+        dedupe_key and a migration ALTERed the table to add it. Under the
+        PostgreSQL greenfield cutover there is no such migration: the column is
+        created fresh by schema_postgres.sql, and initialize_database's contract
+        is fail-closed — if the schema is unhealthy (e.g. someone dropped the
+        column), the post-init health gate raises RuntimeError and rolls back
+        the init transaction (no marker/seed residue survives). This test drops
+        the column on the scratch schema and asserts that fail-closed contract.
         """
         from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.config.loader import load_config
-        from pathlib import Path
 
-        # Simulate an old production DB: create paper_trade_logs WITHOUT dedupe_key
-        old_db_path = os.path.join(self.tmp.name, "old_prod.sqlite3")
-        conn = connect_db(old_db_path)
-        try:
-            conn.execute(
-                "CREATE TABLE paper_trade_logs ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  position_id INTEGER,"
-                "  event_type TEXT NOT NULL,"
-                "  symbol TEXT NOT NULL,"
-                "  side TEXT,"
-                "  price REAL,"
-                "  quantity REAL,"
-                "  pnl REAL,"
-                "  pnl_pct REAL,"
-                "  reason TEXT,"
-                "  event_json TEXT,"
-                "  created_at TEXT DEFAULT CURRENT_TIMESTAMP"
-                ")"
+        # Simulate an unhealthy schema: drop the dedupe_key column (PG cascades
+        # the dependent partial unique index automatically).
+        with self.conn.transaction():
+            self.conn.execute(
+                "ALTER TABLE paper_trade_logs DROP COLUMN IF EXISTS dedupe_key"
             )
-            conn.execute(
-                "CREATE INDEX idx_paper_trade_logs_symbol_time "
-                "ON paper_trade_logs(symbol, created_at)"
-            )
-            conn.commit()
-        finally:
-            conn.close()
 
-        # Now run initialize_database on this old DB — must NOT crash
-        import dataclasses as _dc
-        cfg = load_config()
-        cfg = _dc.replace(cfg, database_path=Path(old_db_path))
-        result = initialize_database(config=cfg)
-        self.assertTrue(result["ok"],
-                        "R5-D1: initialize_database must succeed on old DB without dedupe_key")
+        # initialize_database must NOT silently succeed on an unhealthy schema.
+        # The post-init health gate raises RuntimeError and rolls back.
+        with self.assertRaises(
+            RuntimeError,
+            msg="R5-D1: initialize_database must fail-closed on missing dedupe_key",
+        ):
+            initialize_database()
 
-        # Verify the column and index were added
-        conn2 = connect_db(old_db_path)
-        try:
-            cols = {row["name"] for row in conn2.execute("PRAGMA table_info(paper_trade_logs)").fetchall()}
-            self.assertIn("dedupe_key", cols,
-                          "R5-D1: dedupe_key column must exist after migration")
-
-            idx = conn2.execute(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_paper_trade_logs_dedupe_key'"
-            ).fetchone()
-            self.assertIsNotNone(idx, "R5-D1: dedupe_key unique index must exist after migration")
-            # Verify partial index WHERE clause
-            self.assertIn("dedupe_key IS NOT NULL", idx["sql"],
-                          "R5-D1: index must be partial (WHERE dedupe_key IS NOT NULL)")
-        finally:
-            conn2.close()
+        # The column is still missing: greenfield initialize_database does not
+        # auto-repair a dropped column (CREATE TABLE IF NOT EXISTS is a no-op on
+        # an existing table; the RuntimeError rolled the init transaction back,
+        # leaving the schema as the test left it).
+        cols = {row["name"] for row in self.conn.execute(
+            "SELECT column_name AS name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'paper_trade_logs' "
+            "ORDER BY ordinal_position"
+        ).fetchall()}
+        self.assertNotIn("dedupe_key", cols,
+                         "R5-D1: greenfield initialize_database must not auto-add a dropped column")
 
     def test_r5_d4_schema_health_reports_missing_dedupe_key(self) -> None:
         """R5-D4: check_schema_health must report ok=False when paper_trade_logs.dedupe_key
@@ -25460,55 +25839,33 @@ class Btc9RegressionChainTest(unittest.TestCase):
         in required_columns or idx_paper_trade_logs_dedupe_key in required_indexes.
         A production DB missing the contract would report ok=True, hiding the gap.
         """
-        import sqlite3
         from plugins.crypto_guard.storage.migrations import check_schema_health
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
 
-        # Create a DB with paper_trade_logs but NO dedupe_key column and NO index
-        bad_db_path = os.path.join(self.tmp.name, "no_dedupe.sqlite3")
-        conn = connect_db(bad_db_path)
-        try:
-            conn.execute(
-                "CREATE TABLE paper_trade_logs ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  position_id INTEGER,"
-                "  event_type TEXT NOT NULL,"
-                "  symbol TEXT NOT NULL,"
-                "  side TEXT,"
-                "  price REAL,"
-                "  quantity REAL,"
-                "  pnl REAL,"
-                "  pnl_pct REAL,"
-                "  reason TEXT,"
-                "  event_json TEXT,"
-                "  created_at TEXT DEFAULT CURRENT_TIMESTAMP"
-                ")"
-            )
-            conn.execute(
-                "CREATE TABLE _migration_state (key TEXT PRIMARY KEY, applied_at TEXT)"
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        # check_schema_health should report the missing column and index
-        conn2 = connect_db(bad_db_path)
-        try:
-            health = check_schema_health(conn=conn2)
-            self.assertFalse(health["ok"],
-                             "R5-D4: schema health must be False when dedupe_key is missing")
-            missing_str = str(health.get("missing_columns", []))
-            self.assertIn("dedupe_key", missing_str,
-                          "R5-D4: missing_columns must include dedupe_key")
-            self.assertIn("idx_paper_trade_logs_dedupe_key", missing_str,
-                          "R5-D4: missing_columns must include the index name")
-        finally:
-            conn2.close()
-
-        # Also verify the healthy DB (from setUp) reports ok=True
+        # Positive control FIRST: the healthy scratch schema (from setUp,
+        # dedupe_key still present) must report ok=True. This must run before
+        # the DROP below -- check_schema_health on the SAME connection after
+        # the DROP would (correctly) report ok=False, so a trailing positive
+        # control would be a false failure.
         health_ok = check_schema_health(conn=self.conn)
         self.assertTrue(health_ok["ok"],
                         "R5-D4: healthy DB with dedupe_key must report ok=True")
+
+        # Simulate an unhealthy schema: drop the dedupe_key column on the
+        # scratch schema (PG cascades the dependent partial unique index).
+        with self.conn.transaction():
+            self.conn.execute(
+                "ALTER TABLE paper_trade_logs DROP COLUMN IF EXISTS dedupe_key"
+            )
+
+        # check_schema_health should report the missing column and index.
+        health = check_schema_health(conn=self.conn)
+        self.assertFalse(health["ok"],
+                         "R5-D4: schema health must be False when dedupe_key is missing")
+        missing_str = str(health.get("missing_columns", []))
+        self.assertIn("dedupe_key", missing_str,
+                      "R5-D4: missing_columns must include dedupe_key")
+        self.assertIn("idx_paper_trade_logs_dedupe_key", missing_str,
+                      "R5-D4: missing_columns must include the index name")
 
     def test_r3c_cancel_race_lost_preserves_cursor(self) -> None:
         """R3-C: cancel_race_lost is retryable — cursor preserved, no trade created."""
@@ -25526,7 +25883,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         cursor_before = 1750000000000
         self.conn.execute(
-            "UPDATE paper_orders SET last_processed_candle_time=? WHERE id=?",
+            "UPDATE paper_orders SET last_processed_candle_time=%s WHERE id=%s",
             (cursor_before, order_id),
         )
         self.conn.commit()
@@ -25550,7 +25907,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
                     update_paper_positions(self.repo)
 
         cursor_after = self.conn.execute(
-            "SELECT last_processed_candle_time FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT last_processed_candle_time FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()["last_processed_candle_time"]
         self.assertEqual(cursor_after, cursor_before,
                          "R3-C: cursor must be preserved on cancel_race_lost")
@@ -25573,12 +25930,12 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         # Override created_at to a fixed time
         self.conn.execute(
-            "UPDATE paper_orders SET created_at=? WHERE id=?",
+            "UPDATE paper_orders SET created_at=%s WHERE id=%s",
             (created_iso, order_id),
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # Seed a GA decision 60s after order.created_at (clearly newer), bearish+grade B
@@ -25596,14 +25953,17 @@ class Btc9RegressionChainTest(unittest.TestCase):
                          "R3-D: order without ga_decision_id should be cancelled by newer conflicting GA")
         self.assertEqual(result.get("skip_reason"), "ga_conflict_cancelled")
 
-        # Verify cancelled_at uses event_time, not wall clock
-        expected_cancel_iso = iso_utc_from_ms(base_ms + 120000)
+        # Verify cancelled_at uses event_time, not wall clock. PG stores the
+        # cancelled_at TIMESTAMPTZ column as a tz-aware datetime (the production
+        # writer passes iso_utc_from_ms(event_time), which PG parses), so compare
+        # against a datetime built from the same event_time ms.
+        expected_cancel_dt = datetime.fromtimestamp((base_ms + 120000) / 1000, tz=timezone.utc)
         order_row = self.conn.execute(
-            "SELECT cancelled_at, status FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT cancelled_at, status FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()
         self.assertEqual(order_row["status"], "revalidator_cancelled")
-        self.assertEqual(order_row["cancelled_at"], expected_cancel_iso,
-                         "R3-D: cancelled_at must use event_time ISO, not wall clock")
+        self.assertEqual(order_row["cancelled_at"], expected_cancel_dt,
+                         "R3-D: cancelled_at must use event_time, not wall clock")
 
     def test_r3d_baseline_unavailable_when_no_ga_id_and_no_created_at(self) -> None:
         """R3-D: ga_recheck_baseline_unavailable when order has no ga_decision_id and no created_at."""
@@ -25615,11 +25975,11 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         # Null out created_at to simulate missing baseline
         self.conn.execute(
-            "UPDATE paper_orders SET created_at=NULL WHERE id=?", (order_id,)
+            "UPDATE paper_orders SET created_at=NULL WHERE id=%s", (order_id,)
         )
         self.conn.commit()
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         from plugins.crypto_guard.utils import utc_ms
@@ -25640,7 +26000,6 @@ class Btc9RegressionChainTest(unittest.TestCase):
     def test_r3d_conflict_cancel_uses_event_time_not_wall_clock(self) -> None:
         """R3-D: Historical conflict cancellation uses candle event_time for cancelled_at."""
         from plugins.crypto_guard.paper.paper_broker import _revalidate_pending_before_fill
-        from plugins.crypto_guard.utils import iso_utc_from_ms
 
         base_ms = 1750000000000
         ga_id = self._seed_ga_decision(
@@ -25659,7 +26018,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
 
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         market = {"open": 99.0, "high": 103.0, "low": 98.0, "close": 102.0,
@@ -25670,11 +26029,14 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertFalse(result.get("proceed"))
         self.assertEqual(result.get("skip_reason"), "ga_conflict_cancelled")
 
-        expected_cancel_iso = iso_utc_from_ms(candle_event_time)
+        # PG stores cancelled_at (TIMESTAMPTZ) as a tz-aware datetime; the
+        # production writer passes iso_utc_from_ms(event_time) which PG parses,
+        # so compare against a datetime built from the same event_time ms.
+        expected_cancel_dt = datetime.fromtimestamp(candle_event_time / 1000, tz=timezone.utc)
         order_row = self.conn.execute(
-            "SELECT cancelled_at FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT cancelled_at FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()
-        self.assertEqual(order_row["cancelled_at"], expected_cancel_iso,
+        self.assertEqual(order_row["cancelled_at"], expected_cancel_dt,
                          "R3-D: cancelled_at must use candle event_time, not utc_iso()")
 
     def test_r3d_ga_recheck_unavailable_distinct_from_baseline_unavailable(self) -> None:
@@ -25691,7 +26053,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=95.0, ga_decision_id=ga_id,
         )
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # Patch _latest_ga_decision to raise — should return ga_recheck_unavailable (NOT baseline)
@@ -25727,7 +26089,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
 
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # Patch log_paper_trade_event to raise during SAVEPOINT
@@ -25744,7 +26106,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Order must still be pending (SAVEPOINT rolled back)
         status = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT status FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone()["status"]
         self.assertEqual(status, "pending",
                          "R3-D: SAVEPOINT rollback must leave order pending")
@@ -25771,7 +26133,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
 
         order = dict(self.conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            "SELECT * FROM paper_orders WHERE id=%s", (order_id,)
         ).fetchone())
 
         # Use a wrapper connection that raises on the latest_ga_analysis_time query
@@ -25786,7 +26148,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             def execute(self, sql, *params):
                 # The latest_ga_analysis_time read is the second query that
                 # hits "SELECT analysis_time FROM ga_decisions WHERE id=?"
-                if "SELECT analysis_time FROM ga_decisions WHERE id=?" in sql:
+                if "SELECT analysis_time FROM ga_decisions WHERE id=%s" in sql:
                     call_count["n"] += 1
                     if call_count["n"] == 2:
                         raise Exception("simulated DB error on latest_ga_analysis_time read")
@@ -25824,8 +26186,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -25865,7 +26226,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         )
         # Link the GA decision to the snapshot
         self.conn.execute(
-            "UPDATE ga_decisions SET snapshot_id=9001 WHERE id=?", (ga_id,)
+            "UPDATE ga_decisions SET snapshot_id=9001 WHERE id=%s", (ga_id,)
         )
         self.conn.commit()
         self._insert_pending_order(
@@ -25893,8 +26254,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2099-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -25932,8 +26292,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -25954,7 +26313,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, "
             "  result_json, confidence, snapshot_id) "
-            "VALUES ('BTCUSDT', '15m', 1750000000000, 'price_action', ?, 0.8, 9002)",
+            "VALUES ('BTCUSDT', '15m', 1750000000000, 'price_action', %s, 0.8, 9002)",
             (_j.dumps({"structure_events": [matching_event]}),)
         )
         self.conn.commit()
@@ -25980,7 +26339,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             trade_plan=plan_valid,
         )
         self.conn.execute(
-            "UPDATE ga_decisions SET snapshot_id=9002 WHERE id=?", (ga_id,)
+            "UPDATE ga_decisions SET snapshot_id=9002 WHERE id=%s", (ga_id,)
         )
         self.conn.commit()
         self._insert_pending_order(
@@ -26005,8 +26364,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS _migration_state(key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00') ON CONFLICT (key) DO UPDATE SET applied_at = EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -26027,17 +26385,20 @@ class Btc9RegressionChainTest(unittest.TestCase):
                 "  signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
                 "  evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, "
                 "  final_summary, raw_decision_json, trade_plan_json, rendered_summary, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
                 ("BTCUSDT", at, at_utc, "scheduled_analysis", "A", 0.85,
                  "bullish", "middle", "trade_plan_available", "[]", "{}", "[]",
                  '{"ok":true}', "[]", "test", "{}", plan_json, "", at_utc),
             )
-            ga_id = int(cur.lastrowid)
+            # P9 (PG cutover) K3: psycopg3 cursors have no lastrowid; RETURNING id + fetchone
+            # (fetched immediately, before the loop's final commit).
+            ga_id = int(cur.fetchone()["id"])
             created_at = datetime.now(timezone.utc).isoformat()
             self.conn.execute(
                 "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, quantity, "
                 "  status, created_at, expires_at, ga_decision_id) "
-                "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s)",
                 ("BTCUSDT", "LONG", "limit", 60000.0, 59500.0, "pending", created_at, created_at, ga_id),
             )
         self.conn.commit()
@@ -26353,7 +26714,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -26405,7 +26766,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
                         "R3-G: page 3 startTime must be > page 2 last close")
         # Verify cursor advanced
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["last_processed_candle_time"],
@@ -26426,7 +26787,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -26462,7 +26823,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must be at last page-1 candle's close_time (page 2 failed)
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         expected_cursor = base_ms + 500 * 60000
@@ -26485,7 +26846,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -26533,7 +26894,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must be at the last unique candle, not the duplicate
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         expected_cursor = base_ms + 600 * 60000
@@ -26541,7 +26902,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
                          "R3-G: cursor must reflect deduplicated last candle")
         # No duplicate trades
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(trade_count["cnt"], 0,
@@ -26567,7 +26928,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -26611,7 +26972,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Exactly ONE trade should be created (not two from duplicate candle)
         trade_count = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=?",
+            "SELECT COUNT(*) AS cnt FROM paper_trades WHERE order_id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(int(trade_count["cnt"]), 1,
@@ -26619,7 +26980,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must be at the last unique candle (base_ms + 4*60000)
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         self.assertEqual(cursor_row["last_processed_candle_time"],
@@ -26721,7 +27082,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
             entry_price=100.0, stop_loss=90.0, ga_decision_id=ga_id,
         )
         self.conn.execute(
-            "UPDATE paper_orders SET take_profit_json=? WHERE id=?",
+            "UPDATE paper_orders SET take_profit_json=%s WHERE id=%s",
             (json.dumps([{"price": 200.0, "ratio": 1.0}]), order_id),
         )
         self.conn.commit()
@@ -26759,7 +27120,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         # Cursor must be at last valid page-1 candle
         cursor_row = self.conn.execute(
-            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=?",
+            "SELECT last_processed_candle_time, status FROM paper_orders WHERE id=%s",
             (order_id,),
         ).fetchone()
         expected_cursor = base_ms + 500 * 60000
@@ -26847,7 +27208,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "5m", conf_close_time, "price_action",
              _json_r6d2_1.dumps({
                  "structure_events": [
@@ -26894,7 +27255,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json_r6d2_2.dumps({
                  "structure_events": [
@@ -26946,7 +27307,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json_r6d2_3.dumps({
                  "structure_events": [
@@ -27001,7 +27362,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # R6-D2: no tolerance → this must be rejected
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", analysis_time + 1, "price_action",
              _json_r6d2_4.dumps({
                  "structure_events": [
@@ -27050,7 +27411,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed feishu_events with matching event_id and a payload that has
         # symbol, direction, close_time, price but NO timeframe
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_tf_001", "trading_signal",
              _json_r6d2_5a.dumps({
                  "symbol": "BTCUSDT",
@@ -27091,7 +27452,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         conf_close_time = 1750000000000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_dir_001", "trading_signal",
              _json_r6d2_5b.dumps({
                  "symbol": "BTCUSDT",
@@ -27132,7 +27493,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         conf_close_time = 1750000000000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_et_001", "trading_signal",
              _json_r6d2_5c.dumps({
                  "symbol": "BTCUSDT",
@@ -27173,7 +27534,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         conf_close_time = 1750000000000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_price_001", "trading_signal",
              _json_r6d2_5d.dumps({
                  "symbol": "BTCUSDT",
@@ -27214,7 +27575,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
 
         conf_close_time = 1750000000000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_ct_001", "trading_signal",
              _json_r6d2_5e.dumps({
                  "symbol": "BTCUSDT",
@@ -27263,7 +27624,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed a module_analysis_results row for ETHUSDT (different symbol)
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("ETHUSDT", "15m", conf_close_time, "price_action",
              _json_r7d1a.dumps({
                  "structure_events": [
@@ -27315,7 +27676,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed a module_analysis_results row that the old global fallback would find
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", 1750000000000, "price_action",
              _json_r7d1b.dumps({
                  "structure_events": [
@@ -27371,7 +27732,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         analysis_time = conf_close_time + 60000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_no_closed_001", "trading_signal",
              _json_r7d2a.dumps({
                  "symbol": "BTCUSDT",
@@ -27414,7 +27775,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         analysis_time = conf_close_time + 60000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_str_closed_001", "trading_signal",
              _json_r7d2b.dumps({
                  "symbol": "BTCUSDT",
@@ -27458,7 +27819,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         analysis_time = conf_close_time  # Upper bound equals close_time
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_future_001", "trading_signal",
              _json_r7d2c.dumps({
                  "symbol": "BTCUSDT",
@@ -27505,7 +27866,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         conf_close_time = 1750000000000
         analysis_time = conf_close_time + 60000
         self.conn.execute(
-            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (?, ?, ?)",
+            "INSERT INTO feishu_events(event_id, event_type, payload_json) VALUES (%s, %s, %s)",
             ("det_fe_ct_mismatch_001", "trading_signal",
              _json_r7d2d.dumps({
                  "symbol": "BTCUSDT",
@@ -27550,7 +27911,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         analysis_time = conf_close_time + 60000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time, "price_action",
              _json_r7d2e.dumps({
                  "structure_events": [
@@ -27599,7 +27960,7 @@ class Btc9RegressionChainTest(unittest.TestCase):
         # Seed a row with analysis_time well after conf_close_time + 60000
         self.conn.execute(
             "INSERT INTO module_analysis_results(symbol, timeframe, analysis_time, module, result_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             ("BTCUSDT", "15m", conf_close_time + 120000, "price_action",
              _json_r7d2f.dumps({
                  "structure_events": [
@@ -27678,40 +28039,76 @@ class Btc9RegressionChainTest(unittest.TestCase):
         self.assertIn("dedupe_key", missing_str,
                       "R7-D3: missing_columns must mention dedupe_key")
 
-    def test_r7_d3_schema_health_failcloses_when_pragma_fails(self) -> None:
-        """R7-D3: check_schema_health must fail-closed (report a missing item)
-        when PRAGMA index_info raises an exception, instead of silently passing.
+    def test_r7_d3_schema_health_failcloses_when_catalog_probe_fails(self) -> None:
+        """R7-D3: check_schema_health must fail-closed (report ok=False with the
+        probe error) when a pg_catalog/information_schema probe raises an
+        exception, instead of silently passing.
+
+        PG cutover: the legacy SQLite test simulated a ``PRAGMA index_info``
+        failure. The greenfield health probe introspects ``information_schema``
+        / ``pg_catalog`` (never PRAGMA), so we simulate a catalog-query failure
+        by wrapping the conn's cursor to raise on the first catalog SELECT.
+        check_schema_health wraps the probe in ``conn.transaction()`` (a
+        SAVEPOINT on the pooled INTRANS conn) and catches the exception ->
+        ok=False with "check raised: ..." in missing_columns, preserving the
+        caller's outer transaction.
         """
         from plugins.crypto_guard.storage.migrations import check_schema_health
-        from plugins.crypto_guard.storage import migrations as mig_mod
-        from unittest import mock
 
         # Fresh DB should be healthy
         result = check_schema_health(conn=self.conn)
         self.assertTrue(result["ok"],
                          f"R7-D3: fresh DB should be healthy: {result.get('missing_columns')}")
 
-        # Simulate PRAGMA index_info failure by patching the conn.execute
-        # to raise on the PRAGMA query. We use a wrapper conn.
-        class _PragmaFailConn:
+        # Simulate a catalog-probe failure by wrapping the conn so its cursor
+        # raises on information_schema / pg_catalog SELECTs (the real probe path
+        # used by _introspect_schema_health). transaction() and every other
+        # attribute proxy to the real pooled conn; only execute is intercepted
+        # (both conn-level and cursor-level), so the SAVEPOINT in
+        # check_schema_health still opens on the real conn and rolls back
+        # cleanly when the probe raises.
+        class _CatalogFailConn:
             def __init__(self, real_conn):
                 self._real = real_conn
 
+            def transaction(self, *args, **kwargs):
+                return self._real.transaction(*args, **kwargs)
+
             def execute(self, sql, *args, **kwargs):
-                if "PRAGMA index_info" in sql:
-                    raise RuntimeError("simulated PRAGMA failure")
+                if "information_schema" in sql.lower() or "pg_catalog" in sql.lower():
+                    raise RuntimeError("simulated catalog probe failure")
                 return self._real.execute(sql, *args, **kwargs)
+
+            def cursor(self, *args, **kwargs):
+                real_cur = self._real.cursor(*args, **kwargs)
+
+                class _FailCur:
+                    def execute(self, sql, *a, **kw):
+                        if "information_schema" in sql.lower() or "pg_catalog" in sql.lower():
+                            raise RuntimeError("simulated catalog probe failure")
+                        return real_cur.execute(sql, *a, **kw)
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return real_cur.__exit__(exc_type, exc, tb)
+
+                    def __getattr__(self, name):
+                        return getattr(real_cur, name)
+
+                return _FailCur()
 
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
-        fail_conn = _PragmaFailConn(self.conn)
+        fail_conn = _CatalogFailConn(self.conn)
         result = check_schema_health(conn=fail_conn)
         self.assertFalse(result["ok"],
-                         "R7-D3: PRAGMA failure must fail-closed (not silently pass)")
+                         "R7-D3: catalog probe failure must fail-closed (not silently pass)")
         missing_str = json.dumps(result.get("missing_columns", []))
-        self.assertIn("PRAGMA", missing_str,
-                      "R7-D3: missing_columns must mention PRAGMA failure")
+        self.assertIn("check raised", missing_str,
+                      "R7-D3: missing_columns must mention the catalog probe failure")
 
 
 
@@ -27765,23 +28162,28 @@ class TestR8SnapshotPathContract(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + connect_db + initialize_database pattern). self.conn is a pooled
+        # psycopg.Connection bound to a fresh schema; self.repo wraps it.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         # Seed paper account
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
         self.conn.commit()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -28326,23 +28728,28 @@ class TestR10SnapshotAuthoritativeAnalysisTime(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + connect_db + initialize_database pattern). self.conn is a pooled
+        # psycopg.Connection bound to a fresh schema; self.repo wraps it.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         # Seed paper account
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
         self.conn.commit()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -28907,24 +29314,31 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
             return_value=False,
         )
         self._broker_md_patcher.start()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        # P9 PG cutover: replace the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3 +
+        # initialize_database + connect_db scaffolding with a per-test
+        # isolated scratch schema on the real PostgreSQL test DB. The two
+        # seed INSERTs below are already PG-native (ON CONFLICT ... DO
+        # UPDATE ... EXCLUDED / ON CONFLICT DO NOTHING, TRUE), so only the
+        # connection scaffolding changes.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self.conn.commit()
 
     def tearDown(self) -> None:
         self._broker_md_patcher.stop()
-        self.conn.close()
+        # P9 PG cutover: release the pooled connection + drop the scratch
+        # schema (replaces the legacy self.conn.close() on the SQLite file).
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -29223,9 +29637,9 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         self.assertGreater(result["pages_fetched"], 0, "AC5: at least pages 1-2 fetched")
         # Pages 1-2 must be persisted
         count = self.conn.execute(
-            "SELECT COUNT(*) FROM candles WHERE symbol='BTCUSDT' AND interval=? AND close_time <= ?",
+            "SELECT COUNT(*) FROM candles WHERE symbol='BTCUSDT' AND interval=%s AND close_time <= %s",
             (interval, analysis_time),
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertGreater(count, 0, "AC5: pages 1-2 must be persisted")
 
     # ------------------------------------------------------------------
@@ -29312,8 +29726,8 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
 
         # No duplicate open_time rows
         dup_count = self.conn.execute(
-            "SELECT open_time, COUNT(*) as c FROM candles WHERE symbol='BTCUSDT' AND interval=? "
-            "GROUP BY open_time HAVING c > 1",
+            "SELECT open_time, COUNT(*) as c FROM candles WHERE symbol='BTCUSDT' AND interval=%s "
+            "GROUP BY open_time HAVING COUNT(*) > 1",
             (interval,),
         ).fetchall()
         self.assertEqual(len(dup_count), 0, "AC7: no duplicate open_time rows after overlapping pages")
@@ -29438,7 +29852,7 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         # No paper order should be created
         order_count = self.conn.execute(
             "SELECT COUNT(*) FROM paper_orders WHERE symbol='BTCUSDT'"
-        ).fetchone()[0]
+        ).fetchone()["count"]
         self.assertEqual(order_count, 0, "AC11: no paper order must be created when degraded")
 
     # ------------------------------------------------------------------
@@ -29737,8 +30151,11 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         # only 2 candles remain to be fetched).
         resume_open = analysis_time - 3 * span
         self.conn.execute(
-            "INSERT OR REPLACE INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (symbol, interval) DO UPDATE SET "
+            "last_open_time_fetched=EXCLUDED.last_open_time_fetched, "
+            "last_updated_ms=EXCLUDED.last_updated_ms",
             ("BTCUSDT", interval, resume_open, 0),
         )
         self.conn.commit()
@@ -29808,12 +30225,12 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         end_open = analysis_time - self._interval_ms(interval)
         self._seed_contiguous_candles("BTCUSDT", interval, 10, end_open_time=end_open)
 
-        before = self.conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+        before = self.conn.execute("SELECT COUNT(*) FROM candles").fetchone()["count"]
 
         # --dry-run must not raise and must not modify the DB
         rc = main(["--dry-run", "--symbol", "BTCUSDT", "--interval", interval])
 
-        after = self.conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+        after = self.conn.execute("SELECT COUNT(*) FROM candles").fetchone()["count"]
         self.assertEqual(before, after, "AC20: --dry-run must not modify candles table")
         self.assertEqual(rc, 0, "AC20: --dry-run must return 0")
 
@@ -29833,7 +30250,7 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         content = test_file.read_text(encoding="utf-8")
         # Find all import lines that reference a data source
         forbidden_patterns = [
-            r"from\s+plugins\.crypto_guard\.data\.(?!binance_rest|candle_store|candle_backfill|market_data_health|symbol_registry)",
+            r"from\\s+plugins\\.crypto_guard\\.data\\.(%s!binance_rest|candle_store|candle_backfill|market_data_health|symbol_registry)",
             r"import\s+ccxt",
             r"import\s+yfinance",
             r"from\s+yfinance",
@@ -30319,7 +30736,7 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
             "signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, "
             "raw_decision_json) "
-            "VALUES (?, ?, ?, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
+            "VALUES (%s, %s, %s, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
             "'[]', '[]', '[]', '{}', '[]', 'bullish', '{}')",
             ("BTCUSDT", ga_analysis_time, "2026-01-01T00:00:00Z"),
         )
@@ -30335,7 +30752,8 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, "
             "quantity, status, created_at, expires_at) "
-            "VALUES (?, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            "VALUES (%s, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', "
+            "'2026-01-01T00:00:00Z'::timestamptz, '2026-01-02T00:00:00Z'::timestamptz)",
             ("BTCUSDT",),
         )
         self.conn.commit()
@@ -30358,7 +30776,7 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
 
         # The order must remain pending (not cancelled, not filled).
         updated_order = self.repo.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order["id"],)
+            "SELECT status FROM paper_orders WHERE id=%s", (order["id"],)
         ).fetchone()
         self.assertEqual(str(updated_order["status"]), "pending",
                          "AC44: order must remain 'pending' after market-data gate blocks fill")
@@ -30501,7 +30919,7 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         # write was committed (the row exists after a separate connection
         # reads it). For the test, we just verify the row is in the table.
         row = self.conn.execute(
-            "SELECT lock_name, owner FROM task_locks WHERE lock_name=?",
+            "SELECT lock_name, owner FROM task_locks WHERE lock_name=%s",
             (lock_name,),
         ).fetchone()
         self.assertIsNotNone(row, "P0-7: lock row must exist after acquire_lock")
@@ -30530,8 +30948,11 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
 
         # Seed stale progress that would skip all gaps if resume were on
         self.conn.execute(
-            "INSERT OR REPLACE INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (symbol, interval) DO UPDATE SET "
+            "last_open_time_fetched=EXCLUDED.last_open_time_fetched, "
+            "last_updated_ms=EXCLUDED.last_updated_ms",
             ("BTCUSDT", interval, analysis_time, 0),  # at analysis_time = all done
         )
         self.conn.commit()
@@ -30646,9 +31067,9 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO market_snapshots(id, symbol, analysis_time, mode, "
             "snapshot_json, data_quality_json, created_at) "
-            "VALUES (1, 'BTCUSDT', ?, 'scheduled', '{}', "
-            "'{\"status\":\"insufficient\",\"analysis_degraded\":true}', ?)",
-            (future_ms, future_utc),
+            "VALUES (1, 'BTCUSDT', %s, 'scheduled', '{}', "
+            "'{\"status\":\"insufficient\",\"analysis_degraded\":true}', '2099-01-01T00:00:00Z'::timestamptz)",
+            (future_ms,),
         )
         # Seed a ga_decision with degraded data but no trade plan (monitor_only)
         self.conn.execute(
@@ -30657,10 +31078,10 @@ class TestMarketDataCompletenessP0(unittest.TestCase):
             "decision, skill_result_refs_json, evidence_json, counter_evidence_json, "
             "risk_check_json, feishu_actions_json, final_summary, raw_decision_json, "
             "trade_plan_json, snapshot_id, created_at) "
-            "VALUES (1, 'BTCUSDT', ?, ?, 'scheduled_analysis', "
+            "VALUES (1, 'BTCUSDT', %s, %s, 'scheduled_analysis', "
             "'C', 0.3, 'unknown', 'unknown', 'monitor_only', '[]', '[]', '[]', "
-            "'{\"ok\":false}', '[]', 'test', '{}', NULL, 1, ?)",
-            (future_ms, future_utc, future_utc),
+            "'{\"ok\":false}', '[]', 'test', '{}', NULL, 1, '2099-01-01T00:00:00Z'::timestamptz)",
+            (future_ms, future_utc),
         )
         self.conn.commit()
 
@@ -30708,24 +31129,26 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
             return_value=False,
         )
         self._broker_md_patcher.start()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        # P9 PG cutover: replace the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3 +
+        # initialize_database + connect_db scaffolding with a per-test
+        # isolated scratch schema on the real PostgreSQL test DB.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
-        self.conn.execute("INSERT OR IGNORE INTO symbols(symbol, enabled) VALUES ('BTCUSDT', 1)")
+        self.conn.execute("INSERT INTO symbols(symbol, enabled) VALUES ('BTCUSDT', TRUE) ON CONFLICT (symbol) DO NOTHING")
         self.conn.commit()
 
     def tearDown(self) -> None:
         self._broker_md_patcher.stop()
-        self.conn.close()
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -30852,7 +31275,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
             "signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, "
             "raw_decision_json) "
-            "VALUES (?, ?, ?, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
+            "VALUES (%s, %s, %s, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
             "'[]', '[]', '[]', '{}', '[]', 'bullish', '{}')",
             ("BTCUSDT", ga_time, "2026-01-01T00:00:00Z"),
         )
@@ -30866,7 +31289,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, "
             "quantity, status, created_at, expires_at) "
-            "VALUES (?, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            "VALUES (%s, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', '2026-01-01T00:00:00Z'::timestamptz, '2026-01-02T00:00:00Z'::timestamptz)",
             ("BTCUSDT",),
         )
         self.conn.commit()
@@ -30912,7 +31335,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
             "signal_grade, confidence, market_bias, trend_stage, decision, skill_result_refs_json, "
             "evidence_json, counter_evidence_json, risk_check_json, feishu_actions_json, final_summary, "
             "raw_decision_json) "
-            "VALUES (?, ?, ?, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
+            "VALUES (%s, %s, %s, 'scheduled', 'A', 0.80, 'bullish', 'early', 'trade_plan_available', "
             "'[]', '[]', '[]', '{}', '[]', 'bullish', '{}')",
             ("BTCUSDT", ga_time, "2026-01-01T00:00:00Z"),
         )
@@ -30924,7 +31347,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders(symbol, side, order_type, entry_price, stop_loss, "
             "quantity, status, created_at, expires_at) "
-            "VALUES (?, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            "VALUES (%s, 'LONG', 'limit', 100.0, 95.0, 1.0, 'pending', '2026-01-01T00:00:00Z'::timestamptz, '2026-01-02T00:00:00Z'::timestamptz)",
             ("BTCUSDT",),
         )
         self.conn.commit()
@@ -31088,7 +31511,8 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         with patch("plugins.crypto_guard.tools.repair_market_data.backfill_symbol_interval", side_effect=fake_backfill), \
              patch("plugins.crypto_guard.tools.repair_market_data.assess_health", return_value={"ready": False, "contiguous_tail_count": 0, "reason": "test", "required_count": 10, "missing_ranges": [(1, 2)]}), \
              patch("plugins.crypto_guard.tools.repair_market_data.compute_missing_ranges", return_value=[(1, 2)]), \
-             patch("plugins.crypto_guard.tools.repair_market_data.connect_db", return_value=self.conn), \
+             patch("plugins.crypto_guard.tools.repair_market_data.initialize_database"), \
+             patch("plugins.crypto_guard.storage.pg_db.get_conn", return_value=self.conn), \
              patch("plugins.crypto_guard.tools.repair_market_data.load_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(spec=CryptoGuardConfig)
             mock_cfg.return_value.database_path = "dummy"
@@ -31115,7 +31539,8 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         with patch("plugins.crypto_guard.tools.repair_market_data.backfill_symbol_interval", side_effect=fake_backfill), \
              patch("plugins.crypto_guard.tools.repair_market_data.assess_health", return_value={"ready": False, "contiguous_tail_count": 0, "reason": "test", "required_count": 10, "missing_ranges": [(1, 2)]}), \
              patch("plugins.crypto_guard.tools.repair_market_data.compute_missing_ranges", return_value=[(1, 2)]), \
-             patch("plugins.crypto_guard.tools.repair_market_data.connect_db", return_value=self.conn), \
+             patch("plugins.crypto_guard.tools.repair_market_data.initialize_database"), \
+             patch("plugins.crypto_guard.storage.pg_db.get_conn", return_value=self.conn), \
              patch("plugins.crypto_guard.tools.repair_market_data.load_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(spec=CryptoGuardConfig)
             mock_cfg.return_value.database_path = "dummy"
@@ -31291,8 +31716,10 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
         # would skip all gaps if trusted blindly.
         far_future = analysis_time + 999 * span
         self.conn.execute(
-            "INSERT OR REPLACE INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (symbol, interval) DO UPDATE SET last_open_time_fetched=EXCLUDED.last_open_time_fetched, "
+            "last_updated_ms=EXCLUDED.last_updated_ms",
             ("BTCUSDT", interval, far_future, 0),
         )
         self.conn.commit()
@@ -31656,7 +32083,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
 
         # Clear any existing candles for this symbol/interval.
         self.conn.execute(
-            "DELETE FROM candles WHERE symbol=? AND interval=?",
+            "DELETE FROM candles WHERE symbol=%s AND interval=%s",
             ("BTCUSDT", interval),
         )
         self.conn.commit()
@@ -31692,7 +32119,7 @@ class TestMarketDataCompletenessR2Fixes(unittest.TestCase):
 
         # --- Positive control: seed all 10 expected open_times exactly ---
         self.conn.execute(
-            "DELETE FROM candles WHERE symbol=? AND interval=?",
+            "DELETE FROM candles WHERE symbol=%s AND interval=%s",
             ("BTCUSDT", interval),
         )
         self.conn.commit()
@@ -32189,22 +32616,25 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 PG cutover: replace the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3 +
+        # initialize_database + connect_db scaffolding with a per-test
+        # isolated scratch schema on the real PostgreSQL test DB.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
         self.conn.commit()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -32775,7 +33205,11 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         # tests that assert on it.
         try:
             import json as _json
-            _raw = _json.loads(row.get("raw_decision_json") or "{}")
+            _rawval = row.get("raw_decision_json")
+            # P9 PG cutover: psycopg returns JSONB already decoded to a dict
+            # (not a str); legacy json.loads(dict) raised TypeError and
+            # silently coerced to "". Only json.loads() the str shape.
+            _raw = _rawval if isinstance(_rawval, dict) else _json.loads(_rawval or "{}")
             _original_llm_summary = _raw.get("raw_llm_summary") or ""
         except (ValueError, TypeError):
             _original_llm_summary = ""
@@ -33081,7 +33515,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         direct = self.repo.conn.execute(
             "SELECT final_summary, rendered_summary, signal_grade, "
             "market_bias, trend_stage, decision, raw_decision_json "
-            "FROM ga_decisions WHERE id=?",
+            "FROM ga_decisions WHERE id=%s",
             (int(ga_id),),
         ).fetchone()
         self.assertIsNotNone(direct, "DB roundtrip: row must exist")
@@ -33149,7 +33583,10 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         # 3. raw_decision_json must preserve the structured fields
         #    (timeframe_context, alignment, htf_conflict,
         #    market_reason_codes) so diagnostics can audit them post-hoc.
-        raw = _json.loads(direct["raw_decision_json"] or "{}")
+        _rawval = direct["raw_decision_json"]
+        # P9 PG cutover: psycopg returns JSONB already decoded to a dict; only
+        # json.loads() the str shape (SQLite/legacy).
+        raw = _rawval if isinstance(_rawval, dict) else _json.loads(_rawval or "{}")
         for field in ("timeframe_context", "alignment", "htf_conflict", "market_reason_codes"):
             self.assertIn(
                 field, raw,
@@ -33308,7 +33745,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         """
         # Remove the marker so it's missing.
         self.conn.execute(
-            "DELETE FROM _migration_state WHERE key=?",
+            "DELETE FROM _migration_state WHERE key=%s",
             ("hourly_report_accuracy_r4_contract_v1",),
         )
         self.conn.commit()
@@ -33339,7 +33776,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         """
         # Remove ONLY the semantic-accuracy marker; keep R4 intact.
         self.conn.execute(
-            "DELETE FROM _migration_state WHERE key=?",
+            "DELETE FROM _migration_state WHERE key=%s",
             ("hourly_market_semantic_accuracy_contract_v1",),
         )
         self.conn.commit()
@@ -33383,7 +33820,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         old_created = "2023-11-14T00:00:00Z"
         # Temporarily set the marker to a recent time so old_at is pre-marker.
         self.conn.execute(
-            "UPDATE _migration_state SET applied_at=? WHERE key=?",
+            "UPDATE _migration_state SET applied_at=%s::timestamptz WHERE key=%s",
             ("2026-07-01T00:00:00Z", "hourly_report_accuracy_r4_contract_v1"),
         )
         self.conn.commit()
@@ -33395,7 +33832,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         )
         # Override created_at to be pre-marker.
         self.conn.execute(
-            "UPDATE ga_decisions SET created_at=? WHERE symbol='LEGACYUSDT'",
+            "UPDATE ga_decisions SET created_at=%s::timestamptz WHERE symbol='LEGACYUSDT'",
             (old_created,),
         )
         self.conn.commit()
@@ -33527,7 +33964,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         # Seed the raw_decision_json with 1D bearish + 1H bullish profile
         # context so the diagnostic can detect the countertrend.
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTHTF'",
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='FAULTHTF'",
             (json.dumps({
                 "snapshot": {
                     "profiles": {
@@ -33555,7 +33992,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             },
         )
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTHTF2'",
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='FAULTHTF2'",
             (json.dumps({
                 "timeframe_context": {
                     "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
@@ -33804,7 +34241,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         so the 13+ SQL consumers in
         ``diagnostics/state_consistency.py`` that filter via
         ``datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', ''))
-        >= datetime(?)`` do not silently drop the row.
+        >= datetime(%s)`` do not silently drop the row.
 
         Pre-R13 (Phase G of this task) the controller was changed to
         write ``analysis_time_utc`` as a Unix-ms integer to satisfy
@@ -33836,13 +34273,12 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         )
 
         # 1. Insert the BTC#9 marker so the cutoff-gated diagnostics run.
+        # _migration_state is created by initialize_database (schema_postgres.sql)
+        # with applied_at TIMESTAMPTZ; mirror the PG-native upsert here.
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS _migration_state("
-            "key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _migration_state(key, applied_at) "
-            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00')"
+            "INSERT INTO _migration_state(key, applied_at) "
+            "VALUES ('btc9_trade_gate_contract_v1', '2020-01-01 00:00:00'::timestamptz) "
+            "ON CONFLICT (key) DO UPDATE SET applied_at=EXCLUDED.applied_at"
         )
         self.conn.commit()
 
@@ -33910,7 +34346,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_orders (symbol, side, order_type, "
             "entry_price, stop_loss, status, ga_decision_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::timestamptz)",
             ("BTCUSDT", "LONG", "limit", 100.0, 95.0, "open", ga_id,
              "2025-06-15T00:00:00Z"),
         )
@@ -33920,9 +34356,8 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         # filter used in _check_fallback_llm_failed_created_paper_order.
         row = self.conn.execute(
             "SELECT gd.id, gd.analysis_time_utc FROM ga_decisions gd "
-            "WHERE gd.id = ? "
-            "AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), "
-            "'Z', '')) >= datetime(?)",
+            "WHERE gd.id = %s "
+            "AND gd.analysis_time_utc::timestamptz >= %s::timestamptz",
             (ga_id, "2020-01-01 00:00:00"),
         ).fetchone()
         self.assertIsNotNone(
@@ -34496,7 +34931,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             rendered_summary="错误的摘要文本",
         )
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTDRIFT'",
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='FAULTDRIFT'",
             (json.dumps({
                 "symbol": "FAULTDRIFT",
                 "analysis_time_utc": self._ANALYSIS_TIME_MS,
@@ -34535,7 +34970,7 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             trend_stage="range", final_summary="中性震荡",
         )
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json=? WHERE symbol='FAULTMISSING'",
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='FAULTMISSING'",
             (json.dumps({
                 "symbol": "FAULTMISSING",
                 "signal_grade": "C", "confidence": 0.3,
@@ -34838,12 +35273,6 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         0.3/unknown). The loaded TF's real analysis must flow through
         (R4 force-unknown must NOT fire for partial_tf_mode).
         """
-        import os
-        import tempfile
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
         from plugins.crypto_guard.reasoning.market_state_builder import (
             build_market_state_snapshot,
         )
@@ -34851,112 +35280,98 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             normalize_market_semantics,
         )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = os.path.join(tmp, "replay.db")
-            old = os.environ.get("CRYPTO_GUARD_DB")
-            os.environ["CRYPTO_GUARD_DB"] = db_path
-            try:
-                cfg = load_config()
-                initialize_database(cfg)
-                conn = connect_db(db_path)
-                try:
-                    repo = CryptoGuardRepository(conn)
-                    # Use a 15m-aligned close_time so assess_health sees
-                    # last_close_time == expected_last_close_time (no staleness).
-                    # 1_783_155_599_999 = 1981284 * 900000 - 1 (valid 15m close).
-                    LAST_CLOSE = 1_783_155_599_999
-                    span_15m = 15 * 60 * 1000
-                    base_close = LAST_CLOSE - (260 - 1) * span_15m
-                    candles = []
-                    for i in range(260):
-                        ct_close = base_close + i * span_15m
-                        candles.append({
-                            "symbol": "TESTUSDT",
-                            "interval": "15m",
-                            "open_time": ct_close - span_15m + 1,
-                            "close_time": ct_close,
-                            "open": 100.0 + i * 0.5,
-                            "high": 101.0 + i * 0.5,
-                            "low": 99.0 + i * 0.5,
-                            "close": 100.5 + i * 0.5,
-                            "volume": 1000.0,
-                            "quote_volume": 100000.0,
-                            "trades": 100,
-                            "closed": True,
-                        })
-                    repo.upsert_candles(candles)
-                    # analysis_time = LAST_CLOSE + 1 (just after the last close).
-                    analysis_time = LAST_CLOSE + 1
+        # P9 PG cutover: run against the class's per-test PG scratch schema
+        # (self.repo) instead of spinning up a throwaway SQLite DB.
+        repo = self.repo
+        # Use a 15m-aligned close_time so assess_health sees
+        # last_close_time == expected_last_close_time (no staleness).
+        # 1_783_155_599_999 = 1981284 * 900000 - 1 (valid 15m close).
+        LAST_CLOSE = 1_783_155_599_999
+        span_15m = 15 * 60 * 1000
+        base_close = LAST_CLOSE - (260 - 1) * span_15m
+        candles = []
+        for i in range(260):
+            ct_close = base_close + i * span_15m
+            candles.append({
+                "symbol": "TESTUSDT",
+                "interval": "15m",
+                "open_time": ct_close - span_15m + 1,
+                "close_time": ct_close,
+                "open": 100.0 + i * 0.5,
+                "high": 101.0 + i * 0.5,
+                "low": 99.0 + i * 0.5,
+                "close": 100.5 + i * 0.5,
+                "volume": 1000.0,
+                "quote_volume": 100000.0,
+                "trades": 100,
+                "closed": True,
+            })
+        repo.upsert_candles(candles)
+        # analysis_time = LAST_CLOSE + 1 (just after the last close).
+        analysis_time = LAST_CLOSE + 1
 
-                    snapshot = build_market_state_snapshot(
-                        repo,
-                        symbol="TESTUSDT",
-                        analysis_time_utc=analysis_time,
-                        mode="shadow_test",
-                        timeframes=["15m"],
-                    )
+        snapshot = build_market_state_snapshot(
+            repo,
+            symbol="TESTUSDT",
+            analysis_time_utc=analysis_time,
+            mode="shadow_test",
+            timeframes=["15m"],
+        )
 
-                    # Pass 7 P0: snapshot must be marked partial_tf_mode=True
-                    # (NOT analysis_degraded=True — that would route ga_judge
-                    # into the degraded path and destroy real trade samples).
-                    self.assertTrue(
-                        bool(snapshot.get("partial_tf_mode")),
-                        "Pass 7 P0: shadow_test with <4 TFs must set partial_tf_mode=True",
-                    )
-                    self.assertFalse(
-                        bool(snapshot.get("analysis_degraded")),
-                        "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True (would route ga_judge into degraded path)",
-                    )
-                    # 15m health must be ready (260 healthy closed candles).
-                    health_15m = (snapshot.get("data_quality") or {}).get("health", {}).get("15m") or {}
-                    self.assertTrue(
-                        bool(health_15m.get("ready")),
-                        f"Pass 6 Fix #2: 15m health must be ready; got {health_15m}",
-                    )
-                    # Loaded 15m TF must have real (non-unknown) trend_stage
-                    # and market_structure — the R4 force-unknown path must
-                    # NOT fire for partial_tf_mode.
-                    prof_15m = (snapshot.get("profiles") or {}).get("15m") or {}
-                    self.assertNotEqual(
-                        str(prof_15m.get("trend_stage") or "").lower(), "unknown",
-                        "Pass 6 Fix #2: 15m trend_stage must not be force-unknown in partial_tf_mode",
-                    )
+        # Pass 7 P0: snapshot must be marked partial_tf_mode=True
+        # (NOT analysis_degraded=True — that would route ga_judge
+        # into the degraded path and destroy real trade samples).
+        self.assertTrue(
+            bool(snapshot.get("partial_tf_mode")),
+            "Pass 7 P0: shadow_test with <4 TFs must set partial_tf_mode=True",
+        )
+        self.assertFalse(
+            bool(snapshot.get("analysis_degraded")),
+            "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True (would route ga_judge into degraded path)",
+        )
+        # 15m health must be ready (260 healthy closed candles).
+        health_15m = (snapshot.get("data_quality") or {}).get("health", {}).get("15m") or {}
+        self.assertTrue(
+            bool(health_15m.get("ready")),
+            f"Pass 6 Fix #2: 15m health must be ready; got {health_15m}",
+        )
+        # Loaded 15m TF must have real (non-unknown) trend_stage
+        # and market_structure — the R4 force-unknown path must
+        # NOT fire for partial_tf_mode.
+        prof_15m = (snapshot.get("profiles") or {}).get("15m") or {}
+        self.assertNotEqual(
+            str(prof_15m.get("trend_stage") or "").lower(), "unknown",
+            "Pass 6 Fix #2: 15m trend_stage must not be force-unknown in partial_tf_mode",
+        )
 
-                    # Run a high-grade decision through normalize — must NOT
-                    # be forced to C/0.3/unknown/monitor_only by the 4-TF
-                    # fail-closed.
-                    decision = {
-                        "symbol": "TESTUSDT",
-                        "signal_grade": "S",
-                        "market_bias": "bullish",
-                        "trend_stage": "middle",
-                        "confidence": 0.88,
-                        "decision": "trade_plan_available",
-                        "has_trade_plan": True,
-                        "trade_plan": {"side": "LONG", "entry_type": "limit"},
-                        "suggested_actions": ["create_paper_order"],
-                        "analysis_time_utc": analysis_time,
-                    }
-                    result = normalize_market_semantics(decision, snapshot, {})
-                    self.assertNotIn(
-                        "data_incomplete", result.get("market_reason_codes") or [],
-                        "Pass 6 Fix #2: shadow_test partial-TF must not trigger data_incomplete fail-closed",
-                    )
-                    self.assertNotEqual(
-                        str(result.get("decision") or ""), "monitor_only",
-                        "Pass 6 Fix #2: shadow_test partial-TF must not be forced to monitor_only by 4-TF gate",
-                    )
-                    self.assertGreater(
-                        float(result.get("confidence") or 0), 0.3,
-                        "Pass 6 Fix #2: shadow_test partial-TF confidence must not be capped at 0.3 by 4-TF gate",
-                    )
-                finally:
-                    conn.close()
-            finally:
-                if old is not None:
-                    os.environ["CRYPTO_GUARD_DB"] = old
-                else:
-                    os.environ.pop("CRYPTO_GUARD_DB", None)
+        # Run a high-grade decision through normalize — must NOT
+        # be forced to C/0.3/unknown/monitor_only by the 4-TF
+        # fail-closed.
+        decision = {
+            "symbol": "TESTUSDT",
+            "signal_grade": "S",
+            "market_bias": "bullish",
+            "trend_stage": "middle",
+            "confidence": 0.88,
+            "decision": "trade_plan_available",
+            "has_trade_plan": True,
+            "trade_plan": {"side": "LONG", "entry_type": "limit"},
+            "suggested_actions": ["create_paper_order"],
+            "analysis_time_utc": analysis_time,
+        }
+        result = normalize_market_semantics(decision, snapshot, {})
+        self.assertNotIn(
+            "data_incomplete", result.get("market_reason_codes") or [],
+            "Pass 6 Fix #2: shadow_test partial-TF must not trigger data_incomplete fail-closed",
+        )
+        self.assertNotEqual(
+            str(result.get("decision") or ""), "monitor_only",
+            "Pass 6 Fix #2: shadow_test partial-TF must not be forced to monitor_only by 4-TF gate",
+        )
+        self.assertGreater(
+            float(result.get("confidence") or 0), 0.3,
+            "Pass 6 Fix #2: shadow_test partial-TF confidence must not be capped at 0.3 by 4-TF gate",
+        )
 
     # ── Pass 7 P0) partial_tf_mode must produce real trade samples via real run_ga_sop_decision ─
 
@@ -34971,108 +35386,88 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
         decision + normalize call), so it catches the actual routing bug that
         the Pass 6 test missed.
         """
-        import os
-        import tempfile
         import math
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
         from plugins.crypto_guard.reasoning.market_state_builder import (
             build_market_state_snapshot,
         )
         from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = os.path.join(tmp, "replay.db")
-            old = os.environ.get("CRYPTO_GUARD_DB")
-            os.environ["CRYPTO_GUARD_DB"] = db_path
-            try:
-                cfg = load_config()
-                initialize_database(cfg)
-                conn = connect_db(db_path)
-                try:
-                    repo = CryptoGuardRepository(conn)
-                    # Strongly trending 15m candles with periodic pullbacks so
-                    # swings form HH/HL pattern → market_structure=bullish →
-                    # trend_stage=middle → real trade plan path fires.
-                    # 260 candles, each 15m apart, trending up from 100 → ~250
-                    # with small pullbacks every ~10 bars to create swings.
-                    LAST_CLOSE = 1_783_155_599_999
-                    span_15m = 15 * 60 * 1000
-                    base_close = LAST_CLOSE - (260 - 1) * span_15m
-                    candles = []
-                    for i in range(260):
-                        ct_close = base_close + i * span_15m
-                        # Trending up with small pullback oscillation
-                        trend = 100.0 + i * 0.6
-                        pullback = 2.0 * math.sin(i / 5.0)
-                        open_p = trend + pullback - 0.3
-                        close_p = trend + pullback + 0.3
-                        high_p = max(open_p, close_p) + 0.8
-                        low_p = min(open_p, close_p) - 0.8
-                        candles.append({
-                            "symbol": "TESTUSDT",
-                            "interval": "15m",
-                            "open_time": ct_close - span_15m + 1,
-                            "close_time": ct_close,
-                            "open": open_p,
-                            "high": high_p,
-                            "low": low_p,
-                            "close": close_p,
-                            "volume": 1000.0,
-                            "quote_volume": 100000.0,
-                            "trades": 100,
-                            "closed": True,
-                        })
-                    repo.upsert_candles(candles)
-                    analysis_time = LAST_CLOSE + 1
+        # P9 PG cutover: run against the class's per-test PG scratch schema
+        # (self.repo) instead of spinning up a throwaway SQLite DB.
+        repo = self.repo
+        # Strongly trending 15m candles with periodic pullbacks so
+        # swings form HH/HL pattern → market_structure=bullish →
+        # trend_stage=middle → real trade plan path fires.
+        # 260 candles, each 15m apart, trending up from 100 → ~250
+        # with small pullbacks every ~10 bars to create swings.
+        LAST_CLOSE = 1_783_155_599_999
+        span_15m = 15 * 60 * 1000
+        base_close = LAST_CLOSE - (260 - 1) * span_15m
+        candles = []
+        for i in range(260):
+            ct_close = base_close + i * span_15m
+            # Trending up with small pullback oscillation
+            trend = 100.0 + i * 0.6
+            pullback = 2.0 * math.sin(i / 5.0)
+            open_p = trend + pullback - 0.3
+            close_p = trend + pullback + 0.3
+            high_p = max(open_p, close_p) + 0.8
+            low_p = min(open_p, close_p) - 0.8
+            candles.append({
+                "symbol": "TESTUSDT",
+                "interval": "15m",
+                "open_time": ct_close - span_15m + 1,
+                "close_time": ct_close,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "volume": 1000.0,
+                "quote_volume": 100000.0,
+                "trades": 100,
+                "closed": True,
+            })
+        repo.upsert_candles(candles)
+        analysis_time = LAST_CLOSE + 1
 
-                    snapshot = build_market_state_snapshot(
-                        repo,
-                        symbol="TESTUSDT",
-                        analysis_time_utc=analysis_time,
-                        mode="shadow_test",
-                        timeframes=["15m"],
-                    )
+        snapshot = build_market_state_snapshot(
+            repo,
+            symbol="TESTUSDT",
+            analysis_time_utc=analysis_time,
+            mode="shadow_test",
+            timeframes=["15m"],
+        )
 
-                    # Pass 7 P0 contract: partial_tf_mode=True, analysis_degraded=False
-                    self.assertTrue(
-                        bool(snapshot.get("partial_tf_mode")),
-                        "Pass 7 P0: shadow_test <4 TFs must set partial_tf_mode=True",
-                    )
-                    self.assertFalse(
-                        bool(snapshot.get("analysis_degraded")),
-                        "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True",
-                    )
+        # Pass 7 P0 contract: partial_tf_mode=True, analysis_degraded=False
+        self.assertTrue(
+            bool(snapshot.get("partial_tf_mode")),
+            "Pass 7 P0: shadow_test <4 TFs must set partial_tf_mode=True",
+        )
+        self.assertFalse(
+            bool(snapshot.get("analysis_degraded")),
+            "Pass 7 P0: shadow_test partial-TF must NOT set analysis_degraded=True",
+        )
 
-                    # Run the REAL production decision path
-                    decision = run_ga_sop_decision(snapshot)
+        # Run the REAL production decision path
+        decision = run_ga_sop_decision(snapshot)
 
-                    # The decision must NOT be the degraded fallback shape.
-                    # If ga_judge routes into the degraded branch, decision
-                    # becomes monitor_only/C/0.3/unknown with strategy_name
-                    # "ga_sop_degraded" — that's the bug we're fixing.
-                    self.assertNotEqual(
-                        str(decision.get("strategy_name") or ""), "ga_sop_degraded",
-                        "Pass 7 P0: real run_ga_sop_decision must NOT route into degraded path for partial_tf_mode",
-                    )
-                    self.assertNotIn(
-                        "data_incomplete", decision.get("market_reason_codes") or [],
-                        "Pass 7 P0: real run_ga_sop_decision must NOT add data_incomplete for partial_tf_mode",
-                    )
-                    # Confidence must NOT be capped at 0.3 (the degraded cap)
-                    self.assertGreater(
-                        float(decision.get("confidence") or 0), 0.3,
-                        f"Pass 7 P0: real run_ga_sop_decision confidence must not be capped at 0.3; got {decision.get('confidence')}",
-                    )
-                finally:
-                    conn.close()
-            finally:
-                if old is not None:
-                    os.environ["CRYPTO_GUARD_DB"] = old
-                else:
-                    os.environ.pop("CRYPTO_GUARD_DB", None)
+        # The decision must NOT be the degraded fallback shape.
+        # If ga_judge routes into the degraded branch, decision
+        # becomes monitor_only/C/0.3/unknown with strategy_name
+        # "ga_sop_degraded" — that's the bug we're fixing.
+        self.assertNotEqual(
+            str(decision.get("strategy_name") or ""), "ga_sop_degraded",
+            "Pass 7 P0: real run_ga_sop_decision must NOT route into degraded path for partial_tf_mode",
+        )
+        self.assertNotIn(
+            "data_incomplete", decision.get("market_reason_codes") or [],
+            "Pass 7 P0: real run_ga_sop_decision must NOT add data_incomplete for partial_tf_mode",
+        )
+        # Confidence must NOT be capped at 0.3 (the degraded cap)
+        self.assertGreater(
+            float(decision.get("confidence") or 0), 0.3,
+            f"Pass 7 P0: real run_ga_sop_decision confidence must not be capped at 0.3; got {decision.get('confidence')}",
+        )
 
     # ── Pass 7 P1 #2) LLM candidate must not write internal marker fields ─
 
@@ -35286,23 +35681,28 @@ class TestPhaseA07_05BaselineFailures(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
         os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + initialize_database + connect_db pattern). self.conn is a pooled
+        # psycopg.Connection bound to a fresh schema; self.repo wraps it.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         # Seed a paper account so risk gates have an account to read.
         self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
+            "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+            "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+            "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+            "equity=EXCLUDED.equity"
         )
         self.conn.commit()
 
     def tearDown(self) -> None:
-        self.conn.close()
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         if self._old_llm is None:
             os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
         else:
@@ -36464,18 +36864,20 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        initialize_database()
-        self.conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
-        self.conn.close()
-        os.environ.pop("CRYPTO_GUARD_DB", None)
+        self._repo_handle.close()
+        if self._old_llm is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
         self.tmp.cleanup()
 
     def _insert_decision(self, *, raw: dict, decision: str = "no_edge",
@@ -36498,7 +36900,8 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
                 evidence_json, counter_evidence_json, risk_check_json, trade_plan_json,
                 opportunity_watch_json, feishu_actions_json, final_summary, raw_decision_json,
                 created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', %s, CURRENT_TIMESTAMP)
+            RETURNING id
             """,
             (raw.get("symbol", "BTCUSDT"), int(analysis_time),
              "2026-07-05T19:59:59Z", "scheduled", grade, confidence,
@@ -36506,7 +36909,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
              decision, _json.dumps(raw, ensure_ascii=False)),
         )
         self.conn.commit()
-        return int(cur.lastrowid)
+        return int(cur.fetchone()["id"])
 
     def test_missing_candidate_on_llm_failure_caught(self):
         """Phase E contract: llm_status=failed without candidate_trade_plan."""
@@ -36671,7 +37074,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
             CONTINUITY_CONTRACT_MARKER_KEY,
         )
         row = self.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
             (CONTINUITY_CONTRACT_MARKER_KEY,),
         ).fetchone()
         self.assertIsNotNone(row)
@@ -36694,7 +37097,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
             INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time,
                                           started_at, status, enabled_symbols_json,
                                           completed_symbols_json, failed_symbols_json)
-            VALUES (?, '15m', ?, ?, 'failed', '[]', '[]', '["BTCUSDT"]')
+            VALUES (%s, '15m', %s, %s::timestamptz, 'failed', '[]', '[]', '["BTCUSDT"]')
             """,
             ("old_failed_batch", 1_783_281_599_000, old_started),
         )
@@ -36719,7 +37122,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
             INSERT INTO analysis_batches(batch_id, primary_interval, analysis_time,
                                           started_at, status, enabled_symbols_json,
                                           completed_symbols_json, failed_symbols_json)
-            VALUES (?, '15m', ?, ?, 'failed', '[]', '[]', '["BTCUSDT"]')
+            VALUES (%s, '15m', %s, %s::timestamptz, 'failed', '[]', '[]', '["BTCUSDT"]')
             """,
             ("recent_failed_batch", 1_783_281_599_000, recent_started),
         )
@@ -36737,7 +37140,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
         )
         # Move the marker forward by 1 hour so the seeded row is pre-marker.
         self.conn.execute(
-            "UPDATE _migration_state SET applied_at=? WHERE key=?",
+            "UPDATE _migration_state SET applied_at=%s::timestamptz WHERE key=%s",
             ("2026-07-05T21:00:00Z", CONTINUITY_CONTRACT_MARKER_KEY),
         )
         self._insert_decision(raw={
@@ -36748,7 +37151,7 @@ class TestPhaseH07_05DiagnosticsAndReportUX(unittest.TestCase):
         })
         # Set the row's created_at to before the marker.
         self.conn.execute(
-            "UPDATE ga_decisions SET created_at=? WHERE id=(SELECT MAX(id) FROM ga_decisions)",
+            "UPDATE ga_decisions SET created_at=%s::timestamptz WHERE id=(SELECT MAX(id) FROM ga_decisions)",
             ("2026-07-05T19:30:00Z",),
         )
         self.conn.commit()
@@ -36799,26 +37202,20 @@ class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import tempfile
-        from pathlib import Path
-        from plugins.crypto_guard.config import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        self._tmp = Path(tempfile.mkdtemp(prefix="cg_phase_h_real_"))
-        db_path = self._tmp / "real.db"
-        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
-        self.cfg = load_config()
-        initialize_database(self.cfg)
-        self.conn = connect_db(self.cfg.database_path)
-        self.repo = CryptoGuardRepository(self.conn)
+        self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
-        import shutil
-        self.conn.close()
-        shutil.rmtree(self._tmp, ignore_errors=True)
-        os.environ.pop("CRYPTO_GUARD_DB", None)
+        self._repo_handle.close()
+        if self._old_llm is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
 
     def _phase_a_helper_build_snapshot(self, *, symbol, analysis_time_ms,
                                         bias="bullish", stage="early",
@@ -36922,7 +37319,7 @@ class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
         # Inject fault: delete candidate_trade_plan from the persisted row
         raw.pop("candidate_trade_plan", None)
         self.conn.execute(
-            "UPDATE ga_decisions SET raw_decision_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET raw_decision_json = %s WHERE id = %s",
             (_json.dumps(raw), ga_id),
         )
         self.conn.commit()
@@ -36961,26 +37358,21 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import tempfile
-        from pathlib import Path
-        from plugins.crypto_guard.config import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-
-        self._tmp = Path(tempfile.mkdtemp(prefix="cg_phase_h_content_"))
-        db_path = self._tmp / "content.db"
-        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
-        self.cfg = load_config()
-        initialize_database(self.cfg)
-        self.conn = connect_db(self.cfg.database_path)
-        self.repo = CryptoGuardRepository(self.conn)
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_llm = os.environ.get("CRYPTO_GUARD_LLM_ANALYSIS")
+        os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = "0"
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
-        import shutil
-        self.conn.close()
-        shutil.rmtree(self._tmp, ignore_errors=True)
-        os.environ.pop("CRYPTO_GUARD_DB", None)
+        self._repo_handle.close()
+        if self._old_llm is None:
+            os.environ.pop("CRYPTO_GUARD_LLM_ANALYSIS", None)
+        else:
+            os.environ["CRYPTO_GUARD_LLM_ANALYSIS"] = self._old_llm
+        self.tmp.cleanup()
 
     def _phase_a_helper_build_snapshot(self, *, symbol, analysis_time_ms,
                                         bias="bullish", stage="middle",
@@ -37122,7 +37514,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "  skill_result_refs_json, evidence_json, counter_evidence_json,"
             "  risk_check_json, trade_plan_json, opportunity_watch_json,"
             "  feishu_actions_json, final_summary, raw_decision_json, created_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', ?, CURRENT_TIMESTAMP)",
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}', '[]', '[]', '{}', NULL, NULL, '[]', '', %s, CURRENT_TIMESTAMP)",
             ("BTCUSDT", 1_750_000_000_000, "2026-07-05T19:59:59Z",
              "scheduled", "D", 0.2, "neutral", "unknown", "no_edge",
              _json.dumps(raw, ensure_ascii=False)),
@@ -37148,13 +37540,13 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
             "payload_json, status, started_at, finished_at, error_message) "
             "VALUES ('test_recent', 5, 'test', 'session_recent', '{}', 'failed', "
-            "datetime('now', '-1 hour'), datetime('now', '-1 hour'), 'recent failure')"
+            "NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour', 'recent failure')"
         )
         self.conn.execute(
             "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
             "payload_json, status, started_at, finished_at, error_message) "
             "VALUES ('test_old', 5, 'test', 'session_old', '{}', 'failed', "
-            "datetime('now', '-8 days'), datetime('now', '-8 days'), 'old failure')"
+            "NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days', 'old failure')"
         )
         self.conn.commit()
         recent = self.repo.recent_failed_jobs(limit=10)
@@ -37240,10 +37632,10 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "counter_evidence_json, risk_check_json, "
             "feishu_actions_json, final_summary, raw_decision_json, "
             "batch_id, created_at) "
-            "VALUES (9001, 'BTCUSDT', ?, '2026-07-06T00:00:00Z', "
+            "VALUES (9001, 'BTCUSDT', %s, '2026-07-06T00:00:00Z', "
             "'scheduled_analysis', 'B', 0.65, 'monitor_only', '{}', '[]', "
             "'[]', '{}', '[]', 'summary', '{}', 'r2_p1_3_batch', "
-            "datetime('now', '-1 hour'))",
+            "NOW() - INTERVAL '1 hour')",
             (prior_ms,)
         )
         self.conn.execute(
@@ -37251,9 +37643,9 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "analysis_time_utc, analysis_mode, timeframes, "
             "market_structure_json, trend_clarity_json, "
             "ga_decision_id, state_json, created_at) "
-            "VALUES (9001, 'BTCUSDT', ?, '2026-07-06T00:00:00Z', "
+            "VALUES (9001, 'BTCUSDT', %s, '2026-07-06T00:00:00Z', "
             "'scheduled', '[\"15m\"]', '{}', '{}', "
-            "9001, '{}', datetime('now', '-1 hour'))",
+            "9001, '{}', NOW() - INTERVAL '1 hour')",
             (prior_ms,)
         )
         self.conn.commit()
@@ -37395,7 +37787,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
             "payload_json, status, started_at, finished_at, error_message) "
             "VALUES ('test_crashed_old', 5, 'test', 'session_crashed_old', '{}', "
-            "'failed', datetime('now', '-8 days'), NULL, 'crashed months ago')"
+            "'failed', NOW() - INTERVAL '8 days', NULL, 'crashed months ago')"
         )
         # Insert a job that crashed recently: finished_at=NULL,
         # started_at=1 hour ago. Must be included.
@@ -37403,7 +37795,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
             "payload_json, status, started_at, finished_at, error_message) "
             "VALUES ('test_crashed_recent', 5, 'test', 'session_crashed_recent', '{}', "
-            "'failed', datetime('now', '-1 hour'), NULL, 'crashed recently')"
+            "'failed', NOW() - INTERVAL '1 hour', NULL, 'crashed recently')"
         )
         self.conn.commit()
         recent = self.repo.recent_failed_jobs(limit=10)
@@ -37687,20 +38079,20 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO analysis_batches (batch_id, primary_interval, "
             "analysis_time, status, enabled_symbols_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             (batch_id, "1h", analysis_time, "success",
              _json.dumps(["BTCUSDT"])),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             (batch_id, "BTCUSDT", "completed"),
         )
         # Stale-but-ready snapshot: 1h stale, other 4 TFs fresh.
-        self.conn.execute(
+        snap_id = self.conn.execute(
             "INSERT INTO market_snapshots "
             "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("BTCUSDT", analysis_time, "scheduled", "{}",
              _json.dumps({"health": {
                  "1d": {"ready": True, "last_close_time": fresh_close_1d},
@@ -37709,8 +38101,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                  "15m": {"ready": True, "last_close_time": fresh_close_15m},
                  "5m": {"ready": True, "last_close_time": fresh_close_5m},
              }})),
-        )
-        snap_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         # Insert ga_decisions row referencing the snapshot.
         self.conn.execute(
             "INSERT INTO ga_decisions (symbol, analysis_time, "
@@ -37719,7 +38110,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "counter_evidence_json, risk_check_json, "
             "feishu_actions_json, final_summary, raw_decision_json, batch_id, "
             "snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", analysis_time, "2033-05-18T08:33:20Z", "scheduled",
              "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
              "{}", batch_id, snap_id),
@@ -37738,13 +38129,13 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         # Revert-fail: fresh last_close_time (within 1 interval) for ALL
         # 5 required TFs → no fire.
         self.conn.execute(
-            "DELETE FROM market_snapshots WHERE id = ?", (snap_id,),
+            "DELETE FROM market_snapshots WHERE id = %s", (snap_id,),
         )
         fresh_close_1h_new = analysis_time - 60_000  # 1 minute ago — fresh
-        self.conn.execute(
+        snap_id2 = self.conn.execute(
             "INSERT INTO market_snapshots "
             "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("BTCUSDT", analysis_time, "scheduled", "{}",
              _json.dumps({"health": {
                  "1d": {"ready": True, "last_close_time": fresh_close_1d},
@@ -37753,10 +38144,9 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                  "15m": {"ready": True, "last_close_time": fresh_close_15m},
                  "5m": {"ready": True, "last_close_time": fresh_close_5m},
              }})),
-        )
-        snap_id2 = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
-            "UPDATE ga_decisions SET snapshot_id = ? WHERE batch_id = ?",
+            "UPDATE ga_decisions SET snapshot_id = %s WHERE batch_id = %s",
             (snap_id2, batch_id),
         )
         self.conn.commit()
@@ -37771,10 +38161,10 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
 
         # Fail-closed: missing snapshot recorded as unhealthy.
         self.conn.execute(
-            "DELETE FROM market_snapshots WHERE id = ?", (snap_id2,),
+            "DELETE FROM market_snapshots WHERE id = %s", (snap_id2,),
         )
         self.conn.execute(
-            "UPDATE ga_decisions SET snapshot_id = NULL WHERE batch_id = ?",
+            "UPDATE ga_decisions SET snapshot_id = NULL WHERE batch_id = %s",
             (batch_id,),
         )
         self.conn.commit()
@@ -38059,24 +38449,21 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO analysis_batches (batch_id, primary_interval, "
                 "analysis_time, status, enabled_symbols_json) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s)",
                 (batch_id, "1h", analysis_time, "success",
                  _json.dumps(["BTCUSDT"])),
             )
             self.conn.execute(
                 "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-                "VALUES (?, ?, ?)",
+                "VALUES (%s, %s, %s)",
                 (batch_id, "BTCUSDT", "completed"),
             )
-            self.conn.execute(
+            snap_id = self.conn.execute(
                 "INSERT INTO market_snapshots "
                 "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 ("BTCUSDT", analysis_time, "scheduled", "{}", dq_json),
-            )
-            snap_id = self.conn.execute(
-                "SELECT last_insert_rowid()",
-            ).fetchone()[0]
+            ).fetchone()["id"]
             self.conn.execute(
                 "INSERT INTO ga_decisions (symbol, analysis_time, "
                 "analysis_time_utc, decision_type, signal_grade, confidence, "
@@ -38084,7 +38471,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                 "counter_evidence_json, risk_check_json, "
                 "feishu_actions_json, final_summary, raw_decision_json, "
                 "batch_id, snapshot_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 ("BTCUSDT", analysis_time, "2033-05-18T08:33:20Z", "scheduled",
                  "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
                  "{}", batch_id, snap_id),
@@ -38421,13 +38808,13 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO analysis_batches (batch_id, primary_interval, "
             "analysis_time, status, enabled_symbols_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             (batch_id_a, "1h", analysis_time_a, "success",
              _json.dumps(["BTCUSDT"])),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             (batch_id_a, "BTCUSDT", "completed"),
         )
         # 5m only — healthy but missing 1d/4h/1h/15m.
@@ -38439,13 +38826,12 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                 },
             }
         })
-        self.conn.execute(
+        snap_id_a = self.conn.execute(
             "INSERT INTO market_snapshots "
             "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("BTCUSDT", analysis_time_a, "scheduled", "{}", dq_a),
-        )
-        snap_id_a = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
             "INSERT INTO ga_decisions (symbol, analysis_time, "
             "analysis_time_utc, decision_type, signal_grade, confidence, "
@@ -38453,7 +38839,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "counter_evidence_json, risk_check_json, "
             "feishu_actions_json, final_summary, raw_decision_json, "
             "batch_id, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", analysis_time_a, "2036-07-18T08:33:20Z", "scheduled",
              "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
              "{}", batch_id_a, snap_id_a),
@@ -38490,13 +38876,13 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO analysis_batches (batch_id, primary_interval, "
             "analysis_time, status, enabled_symbols_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             (batch_id_b, "1h", analysis_time_b, "success",
              _json.dumps(["BTCUSDT"])),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             (batch_id_b, "BTCUSDT", "completed"),
         )
         dq_b = _json.dumps({
@@ -38508,13 +38894,12 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                 "5m": {"ready": True, "last_close_time": analysis_time_b - 300_000},
             }
         })
-        self.conn.execute(
+        snap_id_b = self.conn.execute(
             "INSERT INTO market_snapshots "
             "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("BTCUSDT", analysis_time_b, "scheduled", "{}", dq_b),
-        )
-        snap_id_b = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
             "INSERT INTO ga_decisions (symbol, analysis_time, "
             "analysis_time_utc, decision_type, signal_grade, confidence, "
@@ -38522,7 +38907,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "counter_evidence_json, risk_check_json, "
             "feishu_actions_json, final_summary, raw_decision_json, "
             "batch_id, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", analysis_time_b, "2036-07-18T08:33:20Z", "scheduled",
              "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
              "{}", batch_id_b, snap_id_b),
@@ -38570,13 +38955,13 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO analysis_batches (batch_id, primary_interval, "
             "analysis_time, status, enabled_symbols_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s)",
             (batch_id, "15m", analysis_time, "success",
              _json.dumps(["BTCUSDT"])),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             (batch_id, "BTCUSDT", "completed"),
         )
         # All 5 required TFs present; ``1h`` has ``ready=False``.
@@ -38589,13 +38974,12 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                 "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
             }
         })
-        self.conn.execute(
+        snap_id = self.conn.execute(
             "INSERT INTO market_snapshots "
             "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             ("BTCUSDT", analysis_time, "scheduled", "{}", dq),
-        )
-        snap_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        ).fetchone()["id"]
         self.conn.execute(
             "INSERT INTO ga_decisions (symbol, analysis_time, "
             "analysis_time_utc, decision_type, signal_grade, confidence, "
@@ -38603,7 +38987,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             "counter_evidence_json, risk_check_json, "
             "feishu_actions_json, final_summary, raw_decision_json, "
             "batch_id, snapshot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             ("BTCUSDT", analysis_time, "2036-07-18T08:33:20Z", "scheduled",
              "C", 0.3, "no_edge", "{}", "[]", "[]", "{}", "[]", "test",
              "{}", batch_id, snap_id),
@@ -38712,7 +39096,6 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         # Build a minimal config with a custom TF set for primary_interval="15m".
         # Use a 3-TF set that's clearly different from the default 5-TF set.
         custom_tfs = ["1d", "4h", "1h"]  # missing 15m, 5m
-        from pathlib import Path as _Path
         custom_cfg = CryptoGuardConfig(
             trading_mode={},
             symbols={},
@@ -38728,7 +39111,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
                 },
             },
             strategies={},
-            database_path=_Path("dummy"),
+            database_url="dummy",
         )
 
         # Revert-fail (stronger than Case A above): mock ``load_config``
@@ -40110,22 +40493,21 @@ class TestPhaseD07_07RawGradeCaps(unittest.TestCase):
     # on the top-level raw_decision_json (not under timeframe_context,
     # which is schema-restricted to 1d/4h/1h/15m).
     def test_07_07_r6_raw_grade_cap4_low_tf_rebound_only_diagnostic(self) -> None:
-        import tempfile
-        import os as _os
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        # P9 (PG cutover): replace the legacy inline CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + initialize_database + connect_db setup with a per-test isolated
+        # scratch schema on the real PostgreSQL test DB. The diagnostic
+        # _check_raw_grade_exceeds_htf_cap is already PG-native (repo.conn.execute
+        # with %s placeholders + dict_row access + _safe_json), so only the test
+        # setup and the raw-? INSERT needed conversion.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_raw_grade_exceeds_htf_cap,
+            RAW_GRADE_EXCEEDS_HTF_CAP,
+        )
+        handle = make_repo()
+        conn = handle.conn
+        repo = handle.repo
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
-            from plugins.crypto_guard.diagnostics.report_diagnostics import (
-                _check_raw_grade_exceeds_htf_cap,
-                RAW_GRADE_EXCEEDS_HTF_CAP,
-            )
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
             # Insert a ga_decisions row whose raw_decision_json encodes:
             # - raw_signal_grade=S, market_bias=bullish (candidate_side=LONG)
             # - timeframe_context: 1d=bullish, 4h=bearish, 1h=bearish, 15m=bearish
@@ -40153,7 +40535,7 @@ class TestPhaseD07_07RawGradeCaps(unittest.TestCase):
                 "  skill_result_refs_json, evidence_json, counter_evidence_json,"
                 "  risk_check_json, feishu_actions_json, final_summary,"
                 "  raw_decision_json, batch_id"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 ("BTCUSDT", now_ms, "2026-07-08T00:00:00Z", "scheduled_analysis",
                  "S", 0.85, "bullish", "early", "trade_plan_available",
                  "[]", "[]", "[]", '{"ok":true}', "[]", "summary",
@@ -40181,10 +40563,8 @@ class TestPhaseD07_07RawGradeCaps(unittest.TestCase):
                 "R6 evidence gap 1: applied_cap_reasons must contain low_tf_rebound_only_cap",
             )
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            # Return the pooled connection + drop the scratch schema + reset pool.
+            handle.close()
 
     # R6 reviewer evidence gap 3: integration test proving m5_bias reaches
     # raw_decision_json top-level through the full controller -> persistence
@@ -40259,22 +40639,21 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        """Each test gets a fresh in-memory repo with the schema initialized."""
-        import tempfile
-        import os as _os
+        """Each test gets a fresh isolated scratch schema on the real PostgreSQL
+        test DB (P9 PG cutover: replaces the legacy in-memory CRYPTO_GUARD_DB
+        sqlite + initialize_database + connect_db pattern). self.conn is a
+        pooled psycopg.Connection bound to a fresh schema; self.repo wraps it,
+        so repo methods that use ``self.conn.transaction()`` (e.g.
+        finish_analysis_batch) now get a real PG connection."""
         self.tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(self.tmp.name, "crypto_guard.sqlite3")
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        initialize_database()
-        self.conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-        self.repo = CryptoGuardRepository(self.conn)
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
 
     def tearDown(self) -> None:
-        self.conn.close()
-        import os as _os
-        _os.environ.pop("CRYPTO_GUARD_DB", None)
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
         self.tmp.cleanup()
 
     def _seed_running_batch(
@@ -40320,7 +40699,7 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                     "  skill_result_refs_json, evidence_json, counter_evidence_json,"
                     "  risk_check_json, feishu_actions_json, final_summary,"
                     "  raw_decision_json, batch_id"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (sym, analysis_time, "2023-11-14T00:00:00Z", "scheduled_analysis",
                      "A", 0.75, "bullish", "middle", "trade_plan_available",
                      "[]", "[]", "[]",
@@ -40349,13 +40728,13 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
             "INSERT INTO analysis_batches ("
             "  batch_id, primary_interval, analysis_time, status, started_at,"
             "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-            ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
+            ") VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)",
             ("BATCH_GAP_1", "15m", recent_ms, "success",
              '["BTCUSDT","ETHUSDT"]', "[]", "[]"),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             ("BATCH_GAP_1", "BTCUSDT", "completed"),
         )
         self.conn.commit()
@@ -40390,13 +40769,13 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
             "INSERT INTO analysis_batches ("
             "  batch_id, primary_interval, analysis_time, status, started_at,"
             "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-            ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
+            ") VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)",
             ("BATCH_OLD_GAP", "15m", old_ms, "success",
              '["BTCUSDT"]', "[]", "[]"),
         )
         self.conn.execute(
             "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             ("BATCH_OLD_GAP", "BTCUSDT", "completed"),
         )
         self.conn.commit()
@@ -40429,11 +40808,11 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
         # Before finish_analysis_batch: raw columns are empty (default).
         pre = self.conn.execute(
             "SELECT completed_symbols_json, failed_symbols_json "
-            "FROM analysis_batches WHERE batch_id=?",
+            "FROM analysis_batches WHERE batch_id=%s",
             (batch_id,),
         ).fetchone()
         self.assertEqual(
-            pre["completed_symbols_json"], "[]",
+            pre["completed_symbols_json"], [],
             "AC15b setup: completed_symbols_json must be empty before finish_analysis_batch",
         )
 
@@ -40446,12 +40825,11 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
         # After finish: raw columns must be populated from batch_symbol_status.
         post = self.conn.execute(
             "SELECT completed_symbols_json, failed_symbols_json, status, summary_json "
-            "FROM analysis_batches WHERE batch_id=?",
+            "FROM analysis_batches WHERE batch_id=%s",
             (batch_id,),
         ).fetchone()
-        import json
-        completed = json.loads(post["completed_symbols_json"])
-        failed = json.loads(post["failed_symbols_json"])
+        completed = _load_json(post["completed_symbols_json"])
+        failed = _load_json(post["failed_symbols_json"])
         # Symbols are sorted (ORDER BY symbol in the materialization query).
         self.assertEqual(
             completed, ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
@@ -40468,7 +40846,7 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
             "AC15b: status must be written as passed",
         )
         # summary_json must also be preserved.
-        summary = json.loads(post["summary_json"])
+        summary = _load_json(post["summary_json"])
         self.assertEqual(
             summary.get("llm_health", {}).get("breaker_state"), "closed",
             "AC15b: summary_json must be preserved by finish_analysis_batch",
@@ -40636,23 +41014,24 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
     # the diagnostic correctly returns no issue (renderer used a previous
     # complete batch).
     def test_07_07_r6_hourly_report_used_running_batch_diagnostic(self) -> None:
-        import tempfile
-        import os as _os
+        # R6 diagnostic test (P9 PG cutover): replace the legacy inline
+        # CRYPTO_GUARD_DB=<tmp>.sqlite3 + initialize_database + connect_db setup
+        # with a per-test isolated scratch schema on the real PostgreSQL test DB.
+        # The diagnostic _check_hourly_report_used_partial_running_batch is
+        # PG-native (repo.conn with %s + dict_row), so only the test setup and
+        # the raw-? INSERTs need conversion. started_at/created_at are
+        # TIMESTAMPTZ -> pass datetime objects (not ISO strings); payload_json
+        # is JSONB -> keep the "{}" JSON string.
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            _check_hourly_report_used_partial_running_batch,
+            HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
+        )
+        handle = make_repo()
+        conn = handle.conn
+        repo = handle.repo
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
-            from plugins.crypto_guard.diagnostics.report_diagnostics import (
-                _check_hourly_report_used_partial_running_batch,
-                HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
-            )
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
 
             # Case 1: latest batch is running, hourly alert created AFTER
             # running batch started -> must emit warning.
@@ -40662,17 +41041,16 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                 "INSERT INTO analysis_batches ("
                 "  batch_id, primary_interval, analysis_time, status, started_at,"
                 "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 ("BATCH_R6_RUNNING", "15m", 1_700_000_000_000, "running",
-                 running_started.isoformat().replace("+00:00", "Z"),
+                 running_started,
                  '["BTCUSDT"]', "[]", "[]"),
             )
             conn.execute(
                 "INSERT INTO alert_outbox ("
                 "  alert_type, payload_json, status, created_at, retry_count"
-                ") VALUES (?, ?, ?, ?, ?)",
-                ("hourly_summary", "{}", "sent",
-                 alert_created.isoformat().replace("+00:00", "Z"), 0),
+                ") VALUES (%s, %s, %s, %s, %s)",
+                ("hourly_summary", "{}", "sent", alert_created, 0),
             )
             conn.commit()
             issues = _check_hourly_report_used_partial_running_batch(repo)
@@ -40706,17 +41084,16 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                 "INSERT INTO analysis_batches ("
                 "  batch_id, primary_interval, analysis_time, status, started_at,"
                 "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 ("BATCH_R6_RUNNING_2", "15m", 1_700_000_000_000, "running",
-                 earlier_started.isoformat().replace("+00:00", "Z"),
+                 earlier_started,
                  '["BTCUSDT"]', "[]", "[]"),
             )
             conn.execute(
                 "INSERT INTO alert_outbox ("
                 "  alert_type, payload_json, status, created_at, retry_count"
-                ") VALUES (?, ?, ?, ?, ?)",
-                ("hourly_summary", "{}", "sent",
-                 earlier_alert.isoformat().replace("+00:00", "Z"), 0),
+                ") VALUES (%s, %s, %s, %s, %s)",
+                ("hourly_summary", "{}", "sent", earlier_alert, 0),
             )
             conn.commit()
             issues2 = _check_hourly_report_used_partial_running_batch(repo)
@@ -40734,17 +41111,16 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                 "INSERT INTO analysis_batches ("
                 "  batch_id, primary_interval, analysis_time, status, started_at,"
                 "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 ("BATCH_R6_SUCCESS", "15m", 1_700_000_000_000, "success",
-                 _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"),
+                 _dt.now(_tz.utc),
                  '["BTCUSDT"]', '["BTCUSDT"]', "[]"),
             )
             conn.execute(
                 "INSERT INTO alert_outbox ("
                 "  alert_type, payload_json, status, created_at, retry_count"
-                ") VALUES (?, ?, ?, ?, ?)",
-                ("hourly_summary", "{}", "sent",
-                 _dt.now(_tz.utc).isoformat().replace("+00:00", "Z"), 0),
+                ") VALUES (%s, %s, %s, %s, %s)",
+                ("hourly_summary", "{}", "sent", _dt.now(_tz.utc), 0),
             )
             conn.commit()
             issues3 = _check_hourly_report_used_partial_running_batch(repo)
@@ -40754,10 +41130,8 @@ class TestPhaseE07_07HourlyReportAndBatchConsistency(unittest.TestCase):
                 "R6 evidence gap 2 case 3: latest batch success must NOT trigger",
             )
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            # Return the pooled connection + drop the scratch schema + reset pool.
+            handle.close()
 
 
 
@@ -41341,45 +41715,45 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
         2. The renderer surfaces a legacy-audit count line so the operator
            knows schema-fail events were archived (not silently dropped).
         """
-        import tempfile
-        import os as _os
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        # 07-16 PG-native: per-test scratch schema via make_repo() (replaces
+        # the legacy tempfile + CRYPTO_GUARD_DB + initialize_database +
+        # connect_db SQLite dance). The pooled conn is routed at the scratch
+        # schema; the test body already uses %s placeholders.
+        _h = None
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
             from plugins.crypto_guard.notify.hourly_report import render_ga_hourly_summary
 
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
+            _h = make_repo()
+            conn = _h.conn
+            repo = _h.repo
 
             # Legacy schema-fail job 1 day old (within 7-day window).
             legacy_finished = _dt.now(_tz.utc) - _td(days=1)
-            conn.execute(
-                "INSERT INTO agent_jobs ("
-                "  job_type, priority, source, session_id, payload_json,"
-                "  status, error_message, started_at, finished_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("scheduled_market_analysis", 0, "test", "S1", "{}", "failed",
-                 "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
-                 legacy_finished.isoformat().replace("+00:00", "Z"),
-                 legacy_finished.isoformat().replace("+00:00", "Z")),
+            _insert_scheduled_analysis_job_valid(
+                conn,
+                batch_id="15m:legacy_schema_fail",
+                symbol="BTCUSDT",
+                analysis_time_ms=int(legacy_finished.timestamp() * 1000),
+                status="failed",
+                error_message="no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+                started_at=legacy_finished.isoformat().replace("+00:00", "Z"),
+                finished_at=legacy_finished.isoformat().replace("+00:00", "Z"),
+                session_id="S1",
             )
             # Recent actionable failure 1 hour old.
             recent_finished = _dt.now(_tz.utc) - _td(hours=1)
-            conn.execute(
-                "INSERT INTO agent_jobs ("
-                "  job_type, priority, source, session_id, payload_json,"
-                "  status, error_message, started_at, finished_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("scheduled_market_analysis", 0, "test", "S2", "{}", "failed",
-                 "data quality check failed",
-                 recent_finished.isoformat().replace("+00:00", "Z"),
-                 recent_finished.isoformat().replace("+00:00", "Z")),
+            _insert_scheduled_analysis_job_valid(
+                conn,
+                batch_id="15m:recent_data_quality",
+                symbol="ETHUSDT",
+                analysis_time_ms=int(recent_finished.timestamp() * 1000),
+                status="failed",
+                error_message="data quality check failed",
+                started_at=recent_finished.isoformat().replace("+00:00", "Z"),
+                finished_at=recent_finished.isoformat().replace("+00:00", "Z"),
+                session_id="S2",
             )
             conn.commit()
 
@@ -41434,10 +41808,8 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
                 "not 2 (current + archived legacy schema-fail)",
             )
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            if _h is not None:
+                _h.close()
 
     # P2 (07-09 R3): shared helper splits failed_jobs into current vs legacy.
     def test_07_09_split_current_and_legacy_failed_jobs_helper(self) -> None:
@@ -41495,43 +41867,43 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
         must NOT appear in the current failed_jobs risk event section. They
         should be moved to a legacy subsection OR filtered out by age cutoff.
         """
-        import tempfile
-        import os as _os
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        # 07-16 PG-native: per-test scratch schema via make_repo() (replaces
+        # the legacy tempfile + CRYPTO_GUARD_DB + initialize_database +
+        # connect_db SQLite dance). The pooled conn is routed at the scratch
+        # schema; the test body already uses %s placeholders.
+        _h = None
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
+            _h = make_repo()
+            conn = _h.conn
+            repo = _h.repo
 
             # Legacy failure: 10 days old, with the analysis_time_utc signature.
             legacy_finished = _dt.now(_tz.utc) - _td(days=10)
-            conn.execute(
-                "INSERT INTO agent_jobs ("
-                "  job_type, priority, source, session_id, payload_json,"
-                "  status, error_message, started_at, finished_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("scheduled_market_analysis", 0, "test", "S1", "{}", "failed",
-                 "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
-                 legacy_finished.isoformat().replace("+00:00", "Z"),
-                 legacy_finished.isoformat().replace("+00:00", "Z")),
+            _insert_scheduled_analysis_job_valid(
+                conn,
+                batch_id="15m:legacy_analysis_time_utc",
+                symbol="BTCUSDT",
+                analysis_time_ms=int(legacy_finished.timestamp() * 1000),
+                status="failed",
+                error_message="no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
+                started_at=legacy_finished.isoformat().replace("+00:00", "Z"),
+                finished_at=legacy_finished.isoformat().replace("+00:00", "Z"),
+                session_id="S1",
             )
             # Recent failure: 1 hour old, different error.
             recent_finished = _dt.now(_tz.utc) - _td(hours=1)
-            conn.execute(
-                "INSERT INTO agent_jobs ("
-                "  job_type, priority, source, session_id, payload_json,"
-                "  status, error_message, started_at, finished_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("scheduled_market_analysis", 0, "test", "S2", "{}", "failed",
-                 "data quality check failed",
-                 recent_finished.isoformat().replace("+00:00", "Z"),
-                 recent_finished.isoformat().replace("+00:00", "Z")),
+            _insert_scheduled_analysis_job_valid(
+                conn,
+                batch_id="15m:recent_data_quality",
+                symbol="ETHUSDT",
+                analysis_time_ms=int(recent_finished.timestamp() * 1000),
+                status="failed",
+                error_message="data quality check failed",
+                started_at=recent_finished.isoformat().replace("+00:00", "Z"),
+                finished_at=recent_finished.isoformat().replace("+00:00", "Z"),
+                session_id="S2",
             )
             conn.commit()
 
@@ -41549,28 +41921,24 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
                 "AC11: recent 1h failure must appear in recent_failed_jobs",
             )
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            if _h is not None:
+                _h.close()
 
     # AC12: report diagnostics layered (current / warning / legacy_audit)
     def test_07_09_report_diagnostics_layered(self) -> None:
         from plugins.crypto_guard.diagnostics.report_diagnostics import (
             diagnose_report_accuracy,
         )
-        import tempfile
-        import os as _os
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        # 07-16 PG-native: per-test scratch schema via make_repo() (replaces
+        # the legacy tempfile + CRYPTO_GUARD_DB + initialize_database +
+        # connect_db SQLite dance). The pooled conn is routed at the scratch
+        # schema; the test body already uses %s placeholders.
+        _h = None
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
+            _h = make_repo()
+            conn = _h.conn
+            repo = _h.repo
 
             result = diagnose_report_accuracy(repo)
             # AC12: result must include layer-grouped counts in summary.
@@ -41601,10 +41969,8 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
                     self.assertEqual(issue["layer"], "warning",
                                      "AC12: warning severity must map to warning layer")
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            if _h is not None:
+                _h.close()
 
     # AC6 extended: repairable schema alias + repair success does not count
     # toward breaker consecutive/rate.
@@ -41686,37 +42052,41 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
         After fix: ``isinstance(count, dict)`` skips the dict and renders
         the integer codes correctly.
         """
-        import tempfile
-        import os as _os
         from datetime import datetime as _dt, timezone as _tz
-        tmp = tempfile.TemporaryDirectory()
-        _os.environ["CRYPTO_GUARD_DB"] = _os.path.join(tmp.name, "crypto_guard.sqlite3")
-        conn = None
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
+        # 07-16 PG-native: per-test scratch schema via make_repo() (replaces
+        # the legacy tempfile + CRYPTO_GUARD_DB + initialize_database +
+        # connect_db SQLite dance). The pooled conn is routed at the scratch
+        # schema; the test body already uses %s placeholders.
+        _h = None
         try:
-            from plugins.crypto_guard.storage.migrations import initialize_database
-            from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-            from plugins.crypto_guard.storage.sqlite_db import connect_db
             from plugins.crypto_guard.notify.hourly_report import render_hourly_report_text
             from plugins.crypto_guard.diagnostics.report_diagnostics import (
                 diagnose_report_accuracy,
             )
 
-            initialize_database()
-            conn = connect_db(_os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
+            _h = make_repo()
+            conn = _h.conn
+            repo = _h.repo
 
             # Seed a real issue so diagnose_report_accuracy returns
             # total_issues > 0 with the layer_counts shape.
             batch_id = "P0_LAYER"
             analysis_time = 2_000_000_000_000
+            # 07-16 PG adaptation: started_at/finished_at (analysis_batches) and
+            # updated_at (batch_symbol_status) are TIMESTAMPTZ columns -- they
+            # reject a bigint ms literal (DatatypeMismatch). analysis_time stays
+            # BIGINT (pass the int). Convert the ms epoch to a tz-aware datetime
+            # for the timestamptz columns, mirroring production writes.
+            _ts = _dt.fromtimestamp(analysis_time / 1000.0, tz=_tz.utc)
             conn.execute(
                 "INSERT INTO analysis_batches ("
                 "  batch_id, primary_interval, analysis_time, status, started_at, finished_at,"
                 "  enabled_symbols_json, completed_symbols_json, summary_json"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     batch_id, "1h", analysis_time, "success",
-                    analysis_time, analysis_time,
+                    _ts, _ts,
                     json.dumps(["BTCUSDT"]), json.dumps(["BTCUSDT"]),
                     json.dumps({"total_symbols": 1, "completed_symbols": 1}),
                 ),
@@ -41724,8 +42094,8 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             conn.execute(
                 "INSERT INTO batch_symbol_status ("
                 "  batch_id, symbol, status, updated_at"
-                ") VALUES (?, ?, ?, ?)",
-                (batch_id, "BTCUSDT", "completed", analysis_time),
+                ") VALUES (%s, %s, %s, %s)",
+                (batch_id, "BTCUSDT", "completed", _ts),
             )
             conn.commit()
 
@@ -41771,10 +42141,8 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
                 "P0 regression: render_hourly_report_text must surface the diagnostics section",
             )
         finally:
-            if conn is not None:
-                conn.close()
-            _os.environ.pop("CRYPTO_GUARD_DB", None)
-            tmp.cleanup()
+            if _h is not None:
+                _h.close()
 
     # P2 (07-09 R4 reviewer): the broad first signature
     # ``"analysis_time_utc' is a required property"`` would also match a
@@ -42345,14 +42713,10 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
         call must fail this test: the cached breaker would fall back to
         the constructor default of 5, not the patched 7.
         """
-        import os
-        import tempfile
         from unittest.mock import patch
         import plugins.crypto_guard.run_ga_workers as rgw
         from plugins.crypto_guard.config.loader import load_config
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
         # Sanity: production config pins min_rate_samples=5. We do NOT
         # assert on this value in the e2e leg below - we patch load_config
@@ -42372,9 +42736,9 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
         # inspect it. The stub raises to short-circuit before analysis.
         batch_id = "BATCH_R3_P0_WORKER_PATH"
         rgw._batch_breakers.pop(batch_id, None)
-        tmpdir = tempfile.mkdtemp(prefix="cg_r3_p0_")
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        os.environ["CRYPTO_GUARD_DB"] = os.path.join(tmpdir, "crypto_guard.sqlite3")
+        handle = make_repo()
+        conn = handle.conn
+        repo = handle.repo
         captured = {}
 
         class _StubController:
@@ -42418,9 +42782,6 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
             return _Cfg()
 
         try:
-            initialize_database()
-            conn = connect_db(os.environ["CRYPTO_GUARD_DB"])
-            repo = CryptoGuardRepository(conn)
             with patch(
                 "plugins.crypto_guard.run_ga_workers.GAMasterController",
                 _StubController,
@@ -42454,7 +42815,6 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
                             self.assertEqual(
                                 str(exc), "stub_stop_after_breaker_creation"
                             )
-            conn.close()
             snap = captured.get("snapshot")
             self.assertIsNotNone(
                 snap,
@@ -42470,12 +42830,7 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
             )
         finally:
             rgw._batch_breakers.pop(batch_id, None)
-            if old_db is None:
-                os.environ.pop("CRYPTO_GUARD_DB", None)
-            else:
-                os.environ["CRYPTO_GUARD_DB"] = old_db
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            handle.close()
 
     # -- R4: repairable unwrap does not count toward breaker failure rate --
 
@@ -42666,44 +43021,57 @@ class TestPhaseA07_10LLMFairSchedulingRepro(unittest.TestCase):
     def setUp(self) -> None:
         import tempfile as _tempfile
         from pathlib import Path
-        from plugins.crypto_guard.config import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
-        from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-
-        self._tmp = Path(_tempfile.mkdtemp(prefix="cg_07_10_phase_a_"))
-        db_path = self._tmp / "phase_a.db"
-        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
-        self.cfg = load_config()
-        initialize_database(self.cfg)
-        self.conn = connect_db(self.cfg.database_path)
-        self.repo = CryptoGuardRepository(self.conn)
-        # Seed a paper account so risk gates have an account to read.
-        self.conn.execute(
-            "INSERT OR REPLACE INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
-            "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0)"
-        )
-        # Enable all 10 symbols so active_analysis_symbols() returns them in
-        # the same alphabetical order the production scheduler enqueues them.
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
         from plugins.crypto_guard.utils import INTERVAL_MS  # noqa: F401
-        for sym in self._SYMBOLS:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
-                (sym,),
-            )
-        self.conn.commit()
+
+        # P9 (PG cutover): per-test isolated scratch schema on the real
+        # PostgreSQL test DB (replaces the legacy CRYPTO_GUARD_DB=<tmp>.sqlite3
+        # + connect_db + initialize_database pattern). self.conn is a pooled
+        # psycopg.Connection bound to a fresh schema; self.repo wraps it.
+        #
+        # ``self._tmp`` is retained as a throwaway tempdir ONLY so that legacy
+        # mid-test lines of the form ``os.environ["CRYPTO_GUARD_DB"] =
+        # str(self._tmp / "...")`` (inert under PG - production reads
+        # CRYPTO_GUARD_DATABASE_URL, never CRYPTO_GUARD_DB) do not raise
+        # AttributeError. Those env assignments are now no-ops; the per-test
+        # scratch schema already provides isolation. They are left in place
+        # during the P9 class-by-class migration and removed as each class is
+        # fully converted.
+        self._tmp = Path(_tempfile.mkdtemp(prefix="cg_07_10_phase_a_"))
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
+        # Seed a paper account so risk gates have an account to read.
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_accounts(id, account_name, initial_balance, current_balance, equity) "
+                    "VALUES (1, 'test_account', 10000.0, 10000.0, 10000.0) "
+                    "ON CONFLICT (id) DO UPDATE SET account_name=EXCLUDED.account_name, "
+                    "initial_balance=EXCLUDED.initial_balance, current_balance=EXCLUDED.current_balance, "
+                    "equity=EXCLUDED.equity"
+                )
+                # Enable all 10 symbols so active_analysis_symbols() returns them
+                # in the same alphabetical order the production scheduler
+                # enqueues them. ``symbols.enabled`` is BOOLEAN on PG.
+                for sym in self._SYMBOLS:
+                    cur.execute(
+                        "INSERT INTO symbols(symbol, enabled, category) "
+                        "VALUES (%s, TRUE, 'perp') "
+                        "ON CONFLICT (symbol) DO UPDATE SET enabled=EXCLUDED.enabled, "
+                        "category=EXCLUDED.category",
+                        (sym,),
+                    )
         # Reset the module-level batch breaker cache between tests so a prior
         # test's breaker does not leak into this one.
         from plugins.crypto_guard import run_ga_workers
         run_ga_workers._batch_breakers.clear()
 
     def tearDown(self) -> None:
-        import shutil
         from plugins.crypto_guard import run_ga_workers
         run_ga_workers._batch_breakers.clear()
-        self.conn.close()
-        shutil.rmtree(self._tmp, ignore_errors=True)
-        os.environ.pop("CRYPTO_GUARD_DB", None)
+        # Return the pooled connection + drop the scratch schema + reset pool.
+        self._repo_handle.close()
 
     # -- helper: build a schema-valid snapshot for one symbol --
     def _build_snapshot(self, *, symbol: str, analysis_time_ms: int) -> dict:
@@ -44520,12 +44888,18 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 symbol=sym, analysis_time_ms=self._PROD_BATCH_MS,
             )
             prepared.append({"symbol": sym, "snapshot": snapshot})
-        # The connection is autocommit (sqlite_db.py ``isolation_level=None``),
-        # so an explicit BEGIN/COMMIT owns the transaction. Commit any pending
-        # state first so the BEGIN starts a clean transaction.
+        # 07-16 PG-native (psycopg, autocommit=False): a ``with
+        # self.conn.transaction():`` context owns the commit/rollback. Commit
+        # any pending state first so the transaction starts on a clean
+        # connection. (The legacy SQLite helper used ``BEGIN IMMEDIATE`` +
+        # manual ``COMMIT``/``ROLLBACK``; under PG ``BEGIN IMMEDIATE`` is a
+        # syntax error and the pooled conn is already transactional, so a
+        # transaction context is the native equivalent. Nested repo writes
+        # self-wrap ``conn.transaction()`` -> savepoints, so a mid-transaction
+        # exception rolls the whole outer txn back, leaving zero residue -- the
+        # R8-D atomic contract.)
         self.conn.commit()
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
+        with self.conn.transaction():
             self.repo.start_analysis_batch(
                 batch_id=batch_id, primary_interval="15m",
                 analysis_time=self._PROD_BATCH_MS, enabled_symbols=symbols,
@@ -44536,6 +44910,13 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 # seal failure rolls the snapshot row back with the batch -- no
                 # orphan (mirrors the production producer Phase 2).
                 snapshot_id = self.repo.save_market_snapshot(item["snapshot"])
+                # PostgreSQL enforces scheduled-job membership with a
+                # composite FK. Production registers membership before the job
+                # INSERT in the same transaction; the test helper must mirror
+                # that order exactly.
+                self.repo.mark_batch_symbol_completed(
+                    batch_id=batch_id, symbol=sym, status="pending",
+                )
                 self.repo.enqueue_job(
                     "scheduled_market_analysis",
                     1, "cron", self._prod_session_id(sym),
@@ -44547,24 +44928,14 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                         "symbol": sym,
                     },
                 )
-                self.repo.mark_batch_symbol_completed(
-                    batch_id=batch_id, symbol=sym, status="pending",
-                )
             if not seal:
                 # An unsealed/partial batch is intentionally left committed so
                 # the test can mutate the rows itself (inject post-seal
                 # pollution, etc.). This mirrors a producer that builds the
-                # batch row + jobs but never seals.
-                self.conn.execute("COMMIT")
+                # batch row + jobs but never seals. Returning inside the
+                # transaction context commits it.
                 return
             sealed = self.repo.seal_analysis_batch(batch_id)
-            self.conn.execute("COMMIT")
-        except Exception:
-            try:
-                self.conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
         if not sealed:
             raise AssertionError(
                 "_enqueue_batch_jobs seal failed for batch %r -- the exact-set "
@@ -44583,12 +44954,12 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         ``_apply_daily_review_idempotency_migration``).
 
         A prior case leaves rows behind for the SAME production session_id. The
-        tests then key BOTH the seed ``UPDATE ... WHERE session_id=?`` AND the
-        final ``SELECT ... WHERE session_id=?`` by session_id ALONE, so any
+        tests then key BOTH the seed ``UPDATE ... WHERE session_id=%s`` AND the
+        final ``SELECT ... WHERE session_id=%s`` by session_id ALONE, so any
         surviving prior-case row with the same session_id makes the seed UPDATE
         mutate MULTIPLE rows (corrupting the prior row AND the fresh row) and the
         final assertion read a row other than the one this case just processed.
-        Marking survivors 'failed' is NOT enough: ``WHERE session_id=?`` still
+        Marking survivors 'failed' is NOT enough: ``WHERE session_id=%s`` still
         matches the failed row, and ``claim_next_batch`` still groups ALL rows
         of a sealed batch by batch_id (a prior ``failed`` job in a prior batch_id
         would not be re-claimed, but a prior PENDING one would -- and the seed
@@ -45071,14 +45442,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # deterministic observation with the structured terminal reason.
         row = self.conn.execute(
             "SELECT raw_decision_json FROM ga_decisions "
-            "WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            "WHERE symbol=%s ORDER BY id DESC LIMIT 1",
             (failing_symbol,),
         ).fetchone()
         self.assertIsNotNone(
             row, "P0-1: a decision must be persisted for the failing symbol "
             "(deterministic observation retained for audit).",
         )
-        raw = json.loads(row["raw_decision_json"]) if row["raw_decision_json"] else {}
+        _raw_val = row["raw_decision_json"]
+        # 07-16 PG adaptation: ga_decisions.raw_decision_json is JSONB, which
+        # psycopg auto-deserializes to a native dict/list on read-back. Calling
+        # json.loads on an already-deserialized dict raises TypeError. Guard so
+        # the same assertion works whether the column yields a str (SQLite-era
+        # /explicit-text) or a native object (PG JSONB).
+        raw = json.loads(_raw_val) if isinstance(_raw_val, str) else (_raw_val if _raw_val else {})
         self.assertEqual(
             str(raw.get("llm_terminal_reason") or ""), "continuity_unavailable",
             "P0-1: the failing symbol's decision must carry "
@@ -45124,7 +45501,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         """P0 #2 (a): _enqueue_job_redis must NOT push
         scheduled_market_analysis to either Redis queue.
 
-        ``enqueue_job`` already wrote the SQLite row; Redis is only a
+        PostgreSQL owns the durable row; Redis is only a
         wake-up / user-job channel. ``should_use_redis_for_path`` is patched
         True so the guard's early-return is the ONLY thing preventing the
         enqueue. A recording fake ``RedisAdapter`` asserts that neither
@@ -45152,15 +45529,15 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
              patch.object(_radb, "RedisAdapter", _FakeRedis):
             # scheduled_market_analysis at priority 1 (<=2 -> user path) AND
             # priority 5 (>2 -> background path) must BOTH be skipped.
-            self.repo.enqueue_job(
-                "scheduled_market_analysis", 1, "cron", "sess:sma1", {}
+            self.repo._enqueue_job_redis(
+                1, "scheduled_market_analysis", 1, "cron", "sess:sma1", {}
             )
-            self.repo.enqueue_job(
-                "scheduled_market_analysis", 5, "cron", "sess:sma2", {}
+            self.repo._enqueue_job_redis(
+                2, "scheduled_market_analysis", 5, "cron", "sess:sma2", {}
             )
             # A normal background job type still enqueues to Redis.
-            self.repo.enqueue_job(
-                "trade_review", 4, "paper_worker", "sess:tr1", {"trade_id": 7}
+            self.repo._enqueue_job_redis(
+                3, "trade_review", 4, "paper_worker", "sess:tr1", {"trade_id": 7}
             )
         self.assertEqual(
             calls, [("background", "trade_review")],
@@ -45276,13 +45653,13 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         batch_id = self._PROD_BATCH_ID
         symbols = list(self._SYMBOLS)
-        # Enqueue the real batch into SQLite (these are the authority rows).
+        # Enqueue the real batch into PostgreSQL (these are the authority rows).
         self._enqueue_batch_jobs(batch_id, symbols)
-        # Read one of the SQLite job ids so the stale Redis payload can point at
+        # Read one PostgreSQL job id so the stale Redis payload can point at
         # it (mimicking a pre-S2 enqueued item). R7-P0-1: the producer writes
         # the production session_id format (see ``_prod_session_id``).
-        stale_sqlite_id = self.conn.execute(
-            "SELECT id FROM agent_jobs WHERE session_id=? LIMIT 1",
+        stale_db_job_id = self.conn.execute(
+            "SELECT id FROM agent_jobs WHERE session_id=%s LIMIT 1",
             (self._prod_session_id(symbols[0]),),
         ).fetchone()["id"]
 
@@ -45306,8 +45683,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # fake ``_FakeRedis`` returns this dict from ``pop_background_job``).
         stale_redis_payload = {
             "redis_job_id": "stale-redis-1",
-            "sqlite_job_id": stale_sqlite_id,
-            "database_path": str(self._tmp / "phase_a.db"),
+            "db_job_id": stale_db_job_id,
             "job_type": "scheduled_market_analysis",
             "priority": 3,
             "source": "cron",
@@ -45328,7 +45704,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 return None
             def pop_background_job(self):
                 # Simulate a STALE / bypassed producer: a scheduled_market_analysis
-                # payload IS in Redis, pointing at a real SQLite row. The S2
+                # payload IS in Redis, pointing at a real PostgreSQL row. The S2
                 # producer guard should have prevented this, but P1-4 must defend
                 # on the consumer side regardless.
                 return stale_redis_payload
@@ -45360,17 +45736,17 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "when a stale scheduled_market_analysis item was popped from Redis. "
             "call_log=%r" % (call_log,),
         )
-        # (c) the stale Redis item's SQLite row was NOT orphaned in 'running' by
+        # (c) the stale Redis item's PostgreSQL row was NOT orphaned in 'running' by
         # the serial-claim UPDATE -- the batch coordinator claimed it (stamping a
         # claim_token) and finished it per-symbol (S6). The decisive proof that
         # it went through the batch path (not the serial branch) is the
         # claim_token: the serial branch's UPDATE stamps only started_at and NO
         # claim_token, so a token present means the batch coordinator owned it.
         row = self.conn.execute(
-            "SELECT status, claim_token, lease_until FROM agent_jobs WHERE id=?",
-            (stale_sqlite_id,),
+            "SELECT status, claim_token, lease_until FROM agent_jobs WHERE id=%s",
+            (stale_db_job_id,),
         ).fetchone()
-        self.assertIsNotNone(row, "P1-4: the stale item's SQLite row must exist")
+        self.assertIsNotNone(row, "P1-4: the stale item's PostgreSQL row must exist")
         self.assertIn(
             str(row["status"]), {"success", "failed"},
             "P1-4: the row must have been finished by the batch coordinator "
@@ -45385,7 +45761,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "Got claim_token=%r" % (row["claim_token"],),
         )
         dec_row = self.conn.execute(
-            "SELECT 1 FROM ga_decisions WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            "SELECT 1 FROM ga_decisions WHERE symbol=%s ORDER BY id DESC LIMIT 1",
             (symbols[0],),
         ).fetchone()
         self.assertIsNotNone(
@@ -45463,15 +45839,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         them to running + stamps token A; the second UPDATE (status='pending'
         WHERE) now hits zero rows (none left pending) -> returns None. This
         proves the CAS is race-safe: no double-dispatch of the same batch."""
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.tests.pg_fixtures import direct_conn
 
         batch_id = "15m:1783641599000"
         syms = self._SYMBOLS[:3]
         self._enqueue_batch_jobs(batch_id=batch_id, symbols=syms)
 
-        db_path = os.environ["CRYPTO_GUARD_DB"]
-        conn_a = connect_db(db_path)
-        conn_b = connect_db(db_path)
+        # 07-16 PG-native: two INDEPENDENT backend connections routed at the
+        # same scratch schema simulate two workers racing on the same batch
+        # (replaces the legacy two SQLite connect_db calls on the same file).
+        # Each direct_conn is a non-pooled psycopg connection whose .close()
+        # truly closes it, so neither disturbs the pooled self.conn.
+        schema = self._repo_handle.schema
+        conn_a = direct_conn(schema)
+        conn_b = direct_conn(schema)
         try:
             rows_a = self._claim_next_batch_on_conn(conn_a)
             rows_b = self._claim_next_batch_on_conn(conn_b)
@@ -45522,12 +45903,12 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         self.repo.conn.execute(
             "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP, "
             "claim_token='FOREIGN_PRIOR_TOKEN', "
-            "lease_until=datetime('now','+25 minutes') "
+            "lease_until=NOW() + INTERVAL '25 minutes' "
             "WHERE job_type='scheduled_market_analysis' "
-            "AND json_extract(payload_json,'$.batch_id')=? "
+            "AND (payload_json::jsonb ->> 'batch_id')=%s "
             "AND id IN (SELECT id FROM agent_jobs WHERE "
             "job_type='scheduled_market_analysis' "
-            "AND json_extract(payload_json,'$.batch_id')=? ORDER BY id LIMIT 2)",
+            "AND (payload_json::jsonb ->> 'batch_id')=%s ORDER BY id LIMIT 2)",
             (batch_id, batch_id),
         )
         self.repo.conn.commit()
@@ -45570,20 +45951,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         assert rows is not None
         # Row 0: expire the lease (crashed + lease elapsed) -> recoverable.
         self.repo.conn.execute(
-            "UPDATE agent_jobs SET lease_until=datetime('now','-1 minute') "
-            "WHERE id=?",
+            "UPDATE agent_jobs SET lease_until=NOW() - INTERVAL '1 minute' "
+            "WHERE id=%s",
             (rows[0]["id"],),
         )
         # Row 1: valid future lease -> must STAY running.
         self.repo.conn.execute(
-            "UPDATE agent_jobs SET lease_until=datetime('now','+25 minutes') "
-            "WHERE id=?",
+            "UPDATE agent_jobs SET lease_until=NOW() + INTERVAL '25 minutes' "
+            "WHERE id=%s",
             (rows[1]["id"],),
         )
         # Row 2: pre-S3 legacy row (no lease_until, old started_at) -> age-recovered.
         self.repo.conn.execute(
             "UPDATE agent_jobs SET lease_until=NULL, "
-            "started_at=datetime('now','-31 minutes') WHERE id=?",
+            "started_at=NOW() - INTERVAL '31 minutes' WHERE id=%s",
             (rows[2]["id"],),
         )
         self.repo.conn.commit()
@@ -45599,7 +45980,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         statuses = {
             r["id"]: r["status"]
             for r in self.repo.conn.execute(
-                "SELECT id, status FROM agent_jobs WHERE id IN (?,?,?)",
+                "SELECT id, status FROM agent_jobs WHERE id IN (%s,%s,%s)",
                 (rows[0]["id"], rows[1]["id"], rows[2]["id"]),
             ).fetchall()
         }
@@ -46610,14 +46991,27 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # A MagicMock stored on the class does NOT bind ``self`` (it is not a
         # function descriptor), so the spy receives ONLY the keyword args the
         # caller passed. Use ``*args, **kwargs`` and route the real call through
-        # ``self.repo`` (same SQLite file as run_once's repo -- the test set
-        # CRYPTO_GUARD_DB to the same path).
-        _orig_mark = CryptoGuardRepository.mark_batch_symbol_completed
+        # ``self.repo`` (under PG, run_once's repo and ``self.repo`` share the
+        # same pool + per-test scratch schema, so the CAS on ``claim_token``
+        # resolves the same rows).
+        #
+        # 07-16 P9 contract fix: the fair-pool path (``process_fair_batch``,
+        # which ``run_once(background=True)`` drives) persists each symbol via
+        # ``finish_claimed_batch_symbol`` -- NOT ``mark_batch_symbol_completed``
+        # (that is the serial ``process_job`` path only). The original test spied
+        # ``mark_batch_symbol_completed``, which the fair-pool path never calls,
+        # so ``held_during_mark`` stayed empty (false-green risk: the lease-timing
+        # invariant was not actually exercised). The persistence commit point on
+        # the fair-pool path is ``finish_claimed_batch_symbol`` (it is the one
+        # that writes ``batch_symbol_status`` per-symbol, right before the
+        # per-symbol finally releases the lease), so that is the function the spy
+        # must wrap to snapshot the lease state at the persistence moment.
+        _orig_finish = CryptoGuardRepository.finish_claimed_batch_symbol
 
         def _spy_mark(*args, **kwargs):
-            # Snapshot the lease state AT THE MOMENT the persistence mark runs.
+            # Snapshot the lease state AT THE MOMENT the persistence commit runs.
             held_during_mark.append(lease.is_held(symbol=kwargs.get("symbol")))
-            return _orig_mark(self.repo, **kwargs)
+            return _orig_finish(self.repo, **kwargs)
 
         try:
             self._enqueue_batch_jobs(batch_id, [sym])
@@ -46631,20 +47025,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
             with patch.object(_laj, "_call_ga_llm", side_effect=_fake_call):
                 with patch.object(
-                    CryptoGuardRepository, "mark_batch_symbol_completed",
+                    CryptoGuardRepository, "finish_claimed_batch_symbol",
                     side_effect=_spy_mark,
                 ):
                     result = run_ga_workers.run_once(background=True)
             self.assertEqual(result.get("queue"), "fair_pool")
             self.assertTrue(
                 held_during_mark,
-                "S5: mark_batch_symbol_completed must have been called for the "
+                "S5: finish_claimed_batch_symbol must have been called for the "
                 "processed symbol (the batch ran).",
             )
             self.assertTrue(
                 held_during_mark[0],
                 "S5 (P1 #5): the global lease MUST still be held for %s when "
-                "mark_batch_symbol_completed runs -- release happens AFTER "
+                "finish_claimed_batch_symbol runs -- release happens AFTER "
                 "persistence + _post_decision_effects, not in run_fair_batch's "
                 "finally (which runs BEFORE persistence). Got held_during_mark=%r "
                 "(revert-fail: release_lease=True / coordinator-finally release "
@@ -46850,11 +47244,27 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # True)``, which returns None while ``has_pending_user_jobs()``
         # (priority <= 2) is true. Priority 5 clears that gate so the serial
         # worker can actually claim and process the scheduled job.
+        # Production order (mirrors ``_enqueue_batch_jobs``): the parent
+        # ``analysis_batches`` row + ``batch_symbol_status`` membership rows
+        # must exist BEFORE ``enqueue_job`` so the
+        # ``guard_scheduled_analysis_job_membership`` trigger admits each job
+        # (under PG the trigger fires on INSERT into agent_jobs and requires an
+        # unsealed parent). The batch is left UNSEALED - the legacy serial path
+        # claims via ``claim_next_job`` (per-row), not ``claim_next_batch``, so
+        # no ``claim_ready_at`` stamp is needed; sealing before enqueue would
+        # instead make the trigger reject jobs as "already sealed".
+        self.repo.start_analysis_batch(
+            batch_id=batch_id, primary_interval="15m",
+            analysis_time=self._PROD_BATCH_MS, enabled_symbols=symbols,
+        )
         for sym in symbols:
             snapshot = self._build_snapshot(
                 symbol=sym, analysis_time_ms=self._PROD_BATCH_MS,
             )
             snapshot_id = self.repo.save_market_snapshot(snapshot)
+            self.repo.mark_batch_symbol_completed(
+                batch_id=batch_id, symbol=sym, status="pending",
+            )
             self.repo.enqueue_job(
                 job_type="scheduled_market_analysis",
                 priority=5, source="scheduler",
@@ -46864,13 +47274,10 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     "snapshot_id": snapshot_id,
                     "primary_interval": "15m",
                     "batch_id": batch_id,
+                    "symbol": sym,
                     "allow_realtime_signal_alert": False,
                 },
             )
-        self.repo.start_analysis_batch(
-            batch_id=batch_id, primary_interval="15m",
-            analysis_time=self._PROD_BATCH_MS, enabled_symbols=symbols,
-        )
 
         # Build a config whose llm.scheduling.mode is 'legacy_serial' so
         # ``run_once`` skips the fair-pool branch (line ~1722) and ``process_job``
@@ -46889,7 +47296,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
         call_count = {"n": 0}
@@ -46941,7 +47348,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Each persisted decision's §8 envelope must record the disabled path.
         rows = self.conn.execute(
             "SELECT symbol, raw_decision_json FROM ga_decisions "
-            "WHERE batch_id=? ORDER BY symbol",
+            "WHERE batch_id=%s ORDER BY symbol",
             (batch_id,),
         ).fetchall()
         self.assertEqual(
@@ -46950,7 +47357,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "Got %d rows for %d symbols." % (len(rows), len(symbols)),
         )
         for r in rows:
-            raw = json.loads(r["raw_decision_json"] or "{}")
+            _rdj = r["raw_decision_json"]
+            raw = json.loads(_rdj) if isinstance(_rdj, str) else (_rdj or {})
             self.assertEqual(
                 raw.get("llm_status"), "disabled",
                 "S7 (P1 #8): persisted decision for %s must have "
@@ -47009,7 +47417,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         from plugins.crypto_guard.storage.migrations import check_schema_health
 
         row = self.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key=?",
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
             ("llm_fair_scheduling_context_contract_v1",),
         ).fetchone()
         self.assertIsNotNone(
@@ -47031,7 +47439,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The S3 columns must physically exist on agent_jobs.
         cols = {
             r["name"]
-            for r in self.conn.execute("PRAGMA table_info(agent_jobs)").fetchall()
+            for r in self.conn.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'agent_jobs' ORDER BY ordinal_position").fetchall()
         }
         self.assertIn(
             "claim_token", cols,
@@ -47124,7 +47532,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Delete the marker to simulate a DB where initialize_database has not
         # yet written it (the release-gated production state).
         self.conn.execute(
-            "DELETE FROM _migration_state WHERE key=?",
+            "DELETE FROM _migration_state WHERE key=%s",
             ("llm_fair_scheduling_context_contract_v1",),
         )
         self.conn.commit()
@@ -47171,14 +47579,19 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
 
         # Insert a running scheduled_market_analysis row with NO claim_token
-        # and NO lease_until (the pre-S3 / racing-worker defect shape).
-        self.conn.execute(
-            """INSERT INTO agent_jobs(job_type, priority, source, session_id,
-               payload_json, status, started_at)
-               VALUES('scheduled_market_analysis', 5, 'scheduler',
-               'system:scheduled:15m:BTCUSDT:1783641599999',
-               '{"batch_id":"15m:1783641599999","snapshot":{"symbol":"BTCUSDT","analysis_time_utc":1783641599999}}',
-               'running', CURRENT_TIMESTAMP)"""
+        # and NO lease_until (the pre-S3 / racing-worker defect shape). The
+        # schema-valid helper inserts the full membership chain (parent batch
+        # left unsealed so the trigger admits the job) without weakening any
+        # gate; claim_token/lease_until default to absent.
+        _now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _insert_scheduled_analysis_job_valid(
+            self.conn,
+            batch_id="15m:1783641599999",
+            symbol="BTCUSDT",
+            analysis_time_ms=1783641599999,
+            status="running",
+            started_at=_now_iso,
+            session_id="system:scheduled:15m:BTCUSDT:1783641599999",
         )
         self.conn.commit()
 
@@ -47239,7 +47652,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                raw_decision_json, batch_id)
                VALUES('BTCUSDT', 2000, '2026-01-01T00:00:20Z', 'market_analysis',
                'B', 0.5, 'observe', '[]', '[]', '[]', '{}', '[]', 'summary',
-               ?, '15m:2000')""",
+               %s, '15m:2000')""",
             (raw,),
         )
         self.conn.commit()
@@ -47274,20 +47687,24 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Use a post-marker analysis_time so the marker cutoff does NOT demote.
         import time as _time
         post_marker_at = int(_time.time() * 1000)
-        self.conn.execute(
-            """INSERT INTO batch_symbol_status(batch_id, symbol, status, updated_at)
-               VALUES('15m:3000', 'ETHUSDT', 'failed', CURRENT_TIMESTAMP)"""
+        # P9 (PG cutover): ``scheduled_market_analysis`` rows require a valid
+        # membership chain (parent ``analysis_batches`` unsealed +
+        # ``batch_symbol_status`` + non-NULL ``batch_id``/``symbol`` columns,
+        # enforced by the CHECK + composite FK + trigger). Insert the job via
+        # the schema-valid helper with ``status='success'``, then flip the
+        # ``batch_symbol_status`` row to ``'failed'`` to seed the S6 mismatch.
+        _insert_scheduled_analysis_job_valid(
+            self.conn,
+            batch_id="15m:3000",
+            symbol="ETHUSDT",
+            analysis_time_ms=post_marker_at,
+            status="success",
+            session_id="system:scheduled:15m:ETHUSDT:3000",
         )
-        payload = json.dumps({
-            "batch_id": "15m:3000",
-            "snapshot": {"symbol": "ETHUSDT", "analysis_time_utc": post_marker_at},
-        })
         self.conn.execute(
-            """INSERT INTO agent_jobs(job_type, priority, source, session_id,
-               payload_json, status)
-               VALUES('scheduled_market_analysis', 5, 'scheduler',
-               'system:scheduled:15m:ETHUSDT:3000', ?, 'success')""",
-            (payload,),
+            "UPDATE batch_symbol_status SET status=%s, updated_at=CURRENT_TIMESTAMP "
+            "WHERE batch_id=%s AND symbol=%s",
+            ("failed", "15m:3000", "ETHUSDT"),
         )
         self.conn.commit()
 
@@ -47316,10 +47733,22 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
     # ============================================================
 
     def _p1_1_recent_analysis_time_ms(self) -> int:
-        """Post-marker analysis_time (now - 1h in ms) so the marker cutoff
-        does NOT demote the seeded finding (matches the fault-inject helper)."""
+        """Return an analysis time deterministically after the contract marker.
+
+        The old ``now - 1h`` seed was not post-marker at all.  In the first
+        UTC hour of a day it crossed the date boundary, so the marker cutoff
+        correctly demoted the finding to ``legacy_info`` and made this test
+        fail only around UTC midnight.  Anchor the seed to the persisted
+        marker instead of wall-clock arithmetic.
+        """
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
+            ("llm_fair_scheduling_context_contract_v1",),
+        ).fetchone()
+        if row and row["applied_at"] is not None:
+            return int(row["applied_at"].timestamp() * 1000) + 1_000
         import time as _time
-        return int(_time.time() * 1000) - 3_600_000
+        return int(_time.time() * 1000) + 1_000
 
     def _p1_1_insert_batch(self, *, batch_id, enabled, analysis_time=None,
                            status="success", summary=None) -> str:
@@ -47332,7 +47761,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "  batch_id, primary_interval, analysis_time, status, started_at,"
             "  enabled_symbols_json, completed_symbols_json, failed_symbols_json,"
             "  summary_json"
-            ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)",
+            ") VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s)",
             (batch_id, "15m", analysis_time, status,
              json.dumps(list(enabled)),
              json.dumps(list(enabled)),
@@ -47395,7 +47824,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "  skill_result_refs_json, evidence_json, counter_evidence_json,"
             "  risk_check_json, trade_plan_json, opportunity_watch_json,"
             "  feishu_actions_json, final_summary, raw_decision_json, batch_id"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (symbol, analysis_time, iso_str, "scheduled",
              grade, confidence, decision, "neutral", "unknown",
              "{}", "[]", "[]",
@@ -47854,33 +48283,33 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository  # noqa: F401
         c = self.conn.execute
         ga_dec = c(
-            "SELECT COUNT(*) AS n FROM ga_decisions WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM ga_decisions WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         # ga_decisions carries analysis_state_id + snapshot_id FKs; analysis_states
         # / signals are also symbol-keyed. Count rows whose symbol matches.
         an_state = c(
-            "SELECT COUNT(*) AS n FROM analysis_states WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM analysis_states WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         sig = c(
-            "SELECT COUNT(*) AS n FROM signals WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM signals WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         paper_orders = c(
-            "SELECT COUNT(*) AS n FROM paper_orders WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM paper_orders WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         paper_trades = c(
-            "SELECT COUNT(*) AS n FROM paper_trades WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         alerts = c(
-            "SELECT COUNT(*) AS n FROM alert_outbox WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM alert_outbox WHERE symbol=%s",
             (symbol,),
         ).fetchone()["n"]
         bss = c(
-            "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+            "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
             (batch_id, symbol),
         ).fetchone()
         bss_status = str(bss["status"]) if bss else "<absent>"
@@ -48071,7 +48500,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # cleared ownership + an explicit structured audit marker.
         job_row = self.conn.execute(
             "SELECT status, claim_token, lease_until, started_at, error_message, "
-            "scheduled_at FROM agent_jobs WHERE session_id=?",
+            "scheduled_at FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertIsNotNone(job_row, "R3-P0-1: the held symbol's job must exist")
@@ -48111,7 +48540,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "complete (the deferred symbol's batch_symbol_status is pending).",
         )
         batch_row = self.conn.execute(
-            "SELECT status FROM analysis_batches WHERE batch_id=?",
+            "SELECT status FROM analysis_batches WHERE batch_id=%s",
             (batch_id,),
         ).fetchone()
         self.assertIsNotNone(batch_row, "R3-P0-1: the batch row must exist")
@@ -48189,8 +48618,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Simulate the 15s defer window passing: reset the deferred job's
         # scheduled_at to the past so claim_next_batch can reclaim it.
         self.conn.execute(
-            "UPDATE agent_jobs SET scheduled_at=datetime('now','-1 hour') "
-            "WHERE session_id=?",
+            "UPDATE agent_jobs SET scheduled_at=NOW() - INTERVAL '1 hour' "
+            "WHERE session_id=%s",
             (self._prod_session_id(held_sym),),
         )
         self.conn.commit()
@@ -48222,7 +48651,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         # Exactly ONE GA decision for held_sym now (it was 0 after tick 1).
         held_decisions = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM ga_decisions WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM ga_decisions WHERE symbol=%s",
             (held_sym,),
         ).fetchone()["n"]
         self.assertEqual(
@@ -48240,13 +48669,13 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # order; this proves _post_decision_effects ran exactly once without
         # duplication).
         held_orders = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM paper_orders WHERE symbol=?",
+            "SELECT COUNT(*) AS n FROM paper_orders WHERE symbol=%s",
             (held_sym,),
         ).fetchone()["n"]
         self.assertEqual(int(held_orders), 0)
         # The deferred job is now finished (success), NOT left pending/running.
         job_row = self.conn.execute(
-            "SELECT status FROM agent_jobs WHERE session_id=?",
+            "SELECT status FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertEqual(
@@ -48298,7 +48727,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # or moved scheduled_at.
         after = self.conn.execute(
             "SELECT status, claim_token, lease_until, scheduled_at, error_message "
-            "FROM agent_jobs WHERE id=?",
+            "FROM agent_jobs WHERE id=%s",
             (job_id,),
         ).fetchone()
         self.assertEqual(
@@ -48328,7 +48757,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         after_real = self.conn.execute(
             "SELECT status, claim_token, lease_until, started_at, error_message "
-            "FROM agent_jobs WHERE id=?",
+            "FROM agent_jobs WHERE id=%s",
             (job_id,),
         ).fetchone()
         self.assertEqual(str(after_real["status"]), "pending")
@@ -48398,8 +48827,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         _default_cfg = run_ga_workers._resolve_single_flight_defer_config({})
         _seed_count = _default_cfg.max_defers
         self.conn.execute(
-            "UPDATE agent_jobs SET defer_count=?, deferred_at=?, error_message=? "
-            "WHERE session_id=?",
+            "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, error_message=%s "
+            "WHERE session_id=%s",
             (
                 _seed_count,
                 "2020-01-01 00:00:00",  # far past -> absolute window exhausted
@@ -48448,7 +48877,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The held symbol's batch_symbol_status is FAILED (so the batch can
         # complete and the operator sees the exhaustion).
         bss = self.conn.execute(
-            "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+            "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
             (batch_id, held_sym),
         ).fetchone()
         self.assertIsNotNone(bss, "R3-P0-1: the exhausted symbol must register a batch_symbol_status row")
@@ -48459,7 +48888,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         # The job is finished failed with the exhaustion reason.
         job_row = self.conn.execute(
-            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(held_sym),),
         ).fetchone()
         self.assertEqual(str(job_row["status"]), "failed")
@@ -48560,7 +48989,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 symbols=original_cfg.symbols,
                 scheduler=original_cfg.scheduler,
                 strategies=original_cfg.strategies,
-                database_path=original_cfg.database_path,
+                database_url=original_cfg.database_url,
             )
             _defer_cfg = run_ga_workers._resolve_single_flight_defer_config(
                 tm.get("llm", {})
@@ -48590,8 +49019,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
             self._enqueue_batch_jobs(batch_id, symbols)
             # Stamp deferred_at = (now - elapsed_seed) in real wall-clock UTC, the
-            # same ``YYYY-MM-DD HH:MM:SS`` form SQLite ``datetime('now')`` uses, so
-            # ``_parse_sqlite_ts_ms`` parses it and the absolute-window comparison
+            # same ``YYYY-MM-DD HH:MM:SS`` form SQLite ``NOW()`` uses, so
+            # ``_parse_db_ts_ms`` parses it and the absolute-window comparison
             # reads the configured (window - 30s) elapsed. defer_count=3 (far
             # under the R5-P0 dynamic max_defers) AND deferred_at is parseable,
             # so the absolute window is the SOLE authority.
@@ -48600,8 +49029,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 _seed_at_ms / 1000, tz=timezone.utc,
             ).strftime("%Y-%m-%d %H:%M:%S")
             self.conn.execute(
-                "UPDATE agent_jobs SET defer_count=?, deferred_at=?, error_message=? "
-                "WHERE session_id=?",
+                "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, error_message=%s "
+                "WHERE session_id=%s",
                 (
                     3,  # far under the R5-P0 dynamic max_defers
                     _seed_at_str,  # elapsed = window - 30s (short of the bound)
@@ -48663,7 +49092,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # the count on reclaim, the increment would land on 1, not 4.
             job_after = self.conn.execute(
                 "SELECT status, defer_count, deferred_at, error_message "
-                "FROM agent_jobs WHERE session_id=?",
+                "FROM agent_jobs WHERE session_id=%s",
                 (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
@@ -48681,8 +49110,16 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "(NOT finished / failed). Got status=%r." % (pst, job_after["status"]),
             )
             # The first-defer anchor SURVIVES the claim + defer (COALESCE keeps it).
+            # PG timestamptz returns a tz-aware UTC datetime; normalize to the
+            # seed's ``%Y-%m-%d %H:%M:%S`` UTC wall-clock form so the anchor
+            # comparison is by instant, not by the ``str()`` ``+00:00`` suffix.
+            _read_def = job_after["deferred_at"]
+            _read_def_str = (
+                _read_def.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                if _read_def is not None else None
+            )
             self.assertEqual(
-                str(job_after["deferred_at"]), _seed_at_str,
+                _read_def_str, _seed_at_str,
                 "R4-P0-1 (pst=%d): the deferred_at anchor must survive the claim "
                 "+ defer (COALESCE(deferred_at, now)) so the absolute window "
                 "continues to accumulate. Got %r (revert-fail: claim_next_batch "
@@ -48694,7 +49131,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # (4) batch_symbol_status stays pending (NOT failed) + batch NOT
             # complete (the exhausted branch would flip it to failed + complete).
             bss = self.conn.execute(
-                "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+                "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
                 (batch_id, held_sym),
             ).fetchone()
             self.assertTrue(
@@ -48749,7 +49186,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             symbols=original_cfg.symbols,
             scheduler=original_cfg.scheduler,
             strategies=original_cfg.strategies,
-            database_path=original_cfg.database_path,
+            database_url=original_cfg.database_url,
         )
 
     def _r5_p0_run_defer_tick(self, *, mock_cfg, held_sym, symbols, call_log,
@@ -48767,7 +49204,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         in wall-clock terms; without pinning, ~1s of chain execution between seed
         and check would round ``// 1000`` the elapsed time across the window
         boundary and make a "one second short" assertion flaky). The rest of the
-        chain (lease, claim_next_batch via SQLite ``datetime('now')``, etc.) is
+        chain (lease, claim_next_batch via SQLite ``NOW()``, etc.) is
         unaffected because it does not call ``run_ga_workers.utc_ms``."""
         from plugins.crypto_guard import run_ga_workers
         from plugins.crypto_guard.reasoning import llm_agent_judge as _laj
@@ -48983,8 +49420,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 # accumulating absolute window is anchored on the FIRST defer).
                 _now_ts = run_ga_workers.utc_ms()
                 self.conn.execute(
-                    "UPDATE agent_jobs SET scheduled_at=? "
-                    "WHERE session_id=?",
+                    "UPDATE agent_jobs SET scheduled_at=%s "
+                    "WHERE session_id=%s",
                     (datetime.fromtimestamp(_now_ts / 1000, tz=timezone.utc)
                      .strftime("%Y-%m-%d %H:%M:%S"),
                      self._prod_session_id(held_sym)),
@@ -48993,7 +49430,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 # Inspect the job state after this tick's CAS.
                 job_row = self.conn.execute(
                     "SELECT status, defer_count, deferred_at "
-                    "FROM agent_jobs WHERE session_id=?",
+                    "FROM agent_jobs WHERE session_id=%s",
                     (self._prod_session_id(held_sym),),
                 ).fetchone()
                 self.assertEqual(
@@ -49029,8 +49466,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "(the held symbol is still awaiting re-claim)." % pst,
             )
             bss = self.conn.execute(
-                "SELECT status FROM batch_symbol_status WHERE batch_id=? "
-                "AND symbol=?", (batch_id, held_sym),
+                "SELECT status FROM batch_symbol_status WHERE batch_id=%s "
+                "AND symbol=%s", (batch_id, held_sym),
             ).fetchone()
             self.assertTrue(
                 bss is None or str(bss["status"]) == "pending",
@@ -49126,8 +49563,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 _seed_at_ms / 1000, tz=timezone.utc,
             ).strftime("%Y-%m-%d %H:%M:%S")
             self.conn.execute(
-                "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
-                "error_message=? WHERE session_id=?",
+                "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, "
+                "error_message=%s WHERE session_id=%s",
                 (8, _seed_at_str, "single_flight_deferred:8",
                  self._prod_session_id(held_sym)),
             )
@@ -49160,7 +49597,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     pst, batch_result.get("deferred_symbols")),
             )
             job_after = self.conn.execute(
-                "SELECT status, defer_count FROM agent_jobs WHERE session_id=?",
+                "SELECT status, defer_count FROM agent_jobs WHERE session_id=%s",
                 (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
@@ -49248,8 +49685,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 _seed_at_ms / 1000, tz=timezone.utc,
             ).strftime("%Y-%m-%d %H:%M:%S")
             self.conn.execute(
-                "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
-                "error_message=? WHERE session_id=?",
+                "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, "
+                "error_message=%s WHERE session_id=%s",
                 (2, _seed_at_str, "single_flight_deferred:2",
                  self._prod_session_id(held_sym)),
             )
@@ -49274,7 +49711,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_after = self.conn.execute(
                 "SELECT status, defer_count, error_message "
-                "FROM agent_jobs WHERE session_id=?",
+                "FROM agent_jobs WHERE session_id=%s",
                 (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
@@ -49303,8 +49740,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     pst, job_after["error_message"]),
             )
             bss = self.conn.execute(
-                "SELECT status FROM batch_symbol_status WHERE batch_id=? "
-                "AND symbol=?", (batch_id, held_sym),
+                "SELECT status FROM batch_symbol_status WHERE batch_id=%s "
+                "AND symbol=%s", (batch_id, held_sym),
             ).fetchone()
             self.assertIsNotNone(bss)
             self.assertEqual(
@@ -49337,7 +49774,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         We pre-stamp the held symbol's PENDING job with ``defer_count`` AT the
         resolved dynamic ``max_defers`` AND ``deferred_at`` set to a string that
-        ``_parse_sqlite_ts_ms`` CANNOT parse (``'not-a-timestamp'``). The skip
+        ``_parse_db_ts_ms`` CANNOT parse (``'not-a-timestamp'``). The skip
         branch therefore sees ``_deferred_at_known=False`` -> the absolute
         window cannot be evaluated -> the dynamic count backstop is consulted ->
         ``defer_count >= max_defers`` -> terminate. We then run the REAL
@@ -49393,15 +49830,19 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             _seed_count = _cfg.max_defers
 
             self._enqueue_batch_jobs(batch_id, symbols)
-            # Seed defer_count AT the dynamic max_defers + an UNPARSEABLE
-            # deferred_at so _parse_sqlite_ts_ms returns None ->
-            # _deferred_at_known=False -> the absolute window cannot be
+            # Seed defer_count AT the dynamic max_defers + a NULL deferred_at
+            # so the defer logic treats the elapsed time as unknown
+            # (_deferred_at_known=False) -> the absolute window cannot be
             # evaluated -> the dynamic count backstop is the fail-closed
-            # fallback.
+            # fallback. (PG adaptation: the deferred_at column is timestamptz,
+            # which rejects unparseable strings at UPDATE; NULL is the PG-native
+            # "unknown deferred_at" and exercises the same
+            # _deferred_at_known=False count-backstop path the SQLite-era
+            # "not-a-timestamp" value did.)
             self.conn.execute(
-                "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
-                "error_message=? WHERE session_id=?",
-                (_seed_count, "not-a-timestamp",
+                "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, "
+                "error_message=%s WHERE session_id=%s",
+                (_seed_count, None,
                  "single_flight_deferred:%d" % _seed_count,
                  self._prod_session_id(held_sym)),
             )
@@ -49427,7 +49868,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_after = self.conn.execute(
                 "SELECT status, defer_count, error_message "
-                "FROM agent_jobs WHERE session_id=?",
+                "FROM agent_jobs WHERE session_id=%s",
                 (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
@@ -49444,8 +49885,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     pst, job_after["error_message"]),
             )
             bss = self.conn.execute(
-                "SELECT status FROM batch_symbol_status WHERE batch_id=? "
-                "AND symbol=?", (batch_id, held_sym),
+                "SELECT status FROM batch_symbol_status WHERE batch_id=%s "
+                "AND symbol=%s", (batch_id, held_sym),
             ).fetchone()
             self.assertIsNotNone(bss)
             self.assertEqual(
@@ -49537,8 +49978,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 _seed_at_ms / 1000, tz=timezone.utc,
             ).strftime("%Y-%m-%d %H:%M:%S")
             self.conn.execute(
-                "UPDATE agent_jobs SET defer_count=?, deferred_at=?, "
-                "error_message=? WHERE session_id=?",
+                "UPDATE agent_jobs SET defer_count=%s, deferred_at=%s, "
+                "error_message=%s WHERE session_id=%s",
                 (8, _seed_at_str, "single_flight_deferred:8",
                  self._prod_session_id(held_sym)),
             )
@@ -49575,7 +50016,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     pst, batch_result.get("deferred_symbols")),
             )
             job_after = self.conn.execute(
-                "SELECT status, defer_count FROM agent_jobs WHERE session_id=?",
+                "SELECT status, defer_count FROM agent_jobs WHERE session_id=%s",
                 (self._prod_session_id(held_sym),),
             ).fetchone()
             self.assertEqual(
@@ -49597,7 +50038,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # state: ``_absolute_exhausted OR (defer_count >= 8)`` with the
             # FIXED 8 and NO timestamp-gate. The LIVE code does NOT use this;
             # this documents + locks the contract so a revert breaks the test.
-            _seeded_deferred_ms = run_ga_workers._parse_sqlite_ts_ms(
+            _seeded_deferred_ms = run_ga_workers._parse_db_ts_ms(
                 _seed_at_str,
             )
             self.assertIsNotNone(
@@ -49942,7 +50383,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The batch symbol is FAILED + the job finished failed so the batch
         # completes and the operator sees the malformed input.
         bss = self.conn.execute(
-            "SELECT status FROM batch_symbol_status WHERE batch_id=? AND symbol=?",
+            "SELECT status FROM batch_symbol_status WHERE batch_id=%s AND symbol=%s",
             (batch_id, sym),
         ).fetchone()
         self.assertIsNotNone(bss, "R3-P0-1: missing_snapshot must register a batch_symbol_status row")
@@ -49952,7 +50393,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "must be failed. Got %r" % (bss["status"],),
         )
         job_row = self.conn.execute(
-            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(sym),),
         ).fetchone()
         self.assertEqual(str(job_row["status"]), "failed")
@@ -50008,18 +50449,43 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Enqueue the clean jobs (each with a real snapshot/symbol) and SEAL the
         # batch exactly like the real producer.
         self._enqueue_batch_jobs(batch_id, clean_symbols)
-        # Append a MALFORMED job: scheduled_market_analysis with a payload that has
-        # NO symbol (neither snapshot.symbol nor a top-level symbol). It shares the
-        # same batch_id so it is grouped with the clean jobs by claim_next_batch.
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron",
-            session_id=self._prod_session_id("MALFORMED"),
+        # Append a MALFORMED job: scheduled_market_analysis whose snapshot.symbol
+        # is SWAPPED vs the authoritative payload.symbol (a cross-symbol poison
+        # pill). It shares the same batch_id so it is grouped with the clean
+        # jobs by claim_next_batch. Inserted via the malformed-identity helper
+        # (bare INSERT): production ``enqueue_job`` raises ValueError on a
+        # swapped/missing snapshot, so the test must bypass it to plant the
+        # poison pill and exercise the CLAIM-side fail-closed gate.
+        #
+        # The PG membership trigger rejects INSERT into agent_jobs when the
+        # parent batch is SEALED (claim_ready_at IS NOT NULL), and the real
+        # ``seal_analysis_batch`` itself rejects a swapped-snapshot job. To
+        # build a SEALED-but-polluted batch (the scenario this test pins -- the
+        # claim side catches pollution the seal missed / a post-seal insert),
+        # temporarily UNSEAL the batch, insert the malformed job while the
+        # trigger admits it, then hand-stamp the seal columns back (bypassing
+        # ``seal_analysis_batch``'s per-job validation, simulating a batch that
+        # reached claim time polluted despite the seal). The membership row
+        # registers the authoritative ``symbol`` so the composite FK admits the
+        # row; the malformation lives only in the snapshot.
+        self.conn.execute(
+            "UPDATE analysis_batches SET claim_ready_at=NULL, sealed_at=NULL "
+            "WHERE batch_id=%s",
+            (batch_id,),
+        )
+        self.conn.commit()
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol="MALFORMED",
             payload={
-                "snapshot": {},  # no symbol
-                "batch_id": batch_id,
-                "allow_realtime_signal_alert": False,
+                "snapshot": {"symbol": "WRONGUSDT"},  # swapped -> malformed
+                "batch_id": batch_id, "symbol": "MALFORMED",
             },
+            session_id=self._prod_session_id("MALFORMED"),
+        )
+        self.conn.execute(
+            "UPDATE analysis_batches SET sealed_at=CURRENT_TIMESTAMP, "
+            "claim_ready_at=CURRENT_TIMESTAMP WHERE batch_id=%s",
+            (batch_id,),
         )
         self.conn.commit()
 
@@ -50055,7 +50521,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # the batch-claim path.
         malformed_row = self.conn.execute(
             "SELECT status, error_message FROM agent_jobs "
-            "WHERE session_id=?",
+            "WHERE session_id=%s",
             (self._prod_session_id("MALFORMED"),),
         ).fetchone()
         self.assertIsNotNone(malformed_row, "R7-P0-2: the malformed job must exist")
@@ -50089,23 +50555,40 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         """
         batch_id = "15m:all_malformed_%d" % self._PROD_BATCH_MS
         bad_syms = ["BADUSDT0", "BADUSDT1"]
+        # Every job is MALFORMED: a swapped snapshot (snapshot.symbol != the
+        # authoritative payload.symbol). The authoritative symbol SET itself
+        # matches ``enabled_symbols`` so ONLY the identity malformation triggers
+        # the fail-closed (not a set mismatch). Inserted via the malformed-
+        # identity helper (bare INSERT): production ``enqueue_job`` raises
+        # ValueError on a swapped snapshot, and ``seal_analysis_batch`` rejects
+        # a swapped job too, so to build a SEALED all-malformed batch (the
+        # scenario this test pins -- the claim side catches a batch that
+        # reached claim time all-malformed despite the seal) we hand-stamp the
+        # seal columns, bypassing ``seal_analysis_batch``'s per-job validation
+        # (simulating a migrated / hand-built all-malformed batch). The helper
+        # builds the membership chain so the trigger + composite FK admit each
+        # row.
         for sym in bad_syms:
-            self.repo.enqueue_job(
-                job_type="scheduled_market_analysis",
-                priority=1, source="cron",
+            _insert_scheduled_analysis_job_malformed_identity(
+                self.conn, batch_id=batch_id, symbol=sym,
+                payload={
+                    "snapshot": {"symbol": sym + "_SWAPPED"},  # swapped -> malformed
+                    "batch_id": batch_id, "symbol": sym,
+                },
                 session_id=self._prod_session_id(sym),
-                # MALFORMED PAYLOAD: snapshot has no symbol and there is no
-                # top-level symbol -> payload.symbol is missing.
-                payload={"snapshot": {}, "batch_id": batch_id},
-            )
-            self.repo.mark_batch_symbol_completed(
-                batch_id=batch_id, symbol=sym, status="pending",
             )
         self.repo.start_analysis_batch(
             batch_id=batch_id, primary_interval="15m",
             analysis_time=self._PROD_BATCH_MS, enabled_symbols=bad_syms,
         )
-        self.repo.seal_analysis_batch(batch_id)
+        # Hand-stamp the seal so the batch is "sealed" from claim_next_batch's
+        # perspective, simulating a batch that reached claim time all-malformed
+        # despite the seal (the claim-side re-check is the authoritative gate).
+        self.conn.execute(
+            "UPDATE analysis_batches SET sealed_at=CURRENT_TIMESTAMP, "
+            "claim_ready_at=CURRENT_TIMESTAMP WHERE batch_id=%s",
+            (batch_id,),
+        )
         self.conn.commit()
 
         # Every job is malformed: claim_next_batch must FAIL-CLOSE.
@@ -50128,7 +50611,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # The batch is sealed but unclaimable: status stays 'sealed' (NOT
         # 'failed'/'success'/'running') because the worker never ran.
         batch_row = self.conn.execute(
-            "SELECT status FROM analysis_batches WHERE batch_id=?",
+            "SELECT status FROM analysis_batches WHERE batch_id=%s",
             (batch_id,),
         ).fetchone()
         self.assertIsNotNone(batch_row)
@@ -50163,18 +50646,22 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         batch_id = "15m:p1_3_worker_%d" % self._PROD_BATCH_MS
         bad_sym = "BADUSDT0"
+        from datetime import datetime as _dt, timezone as _tz
+        _now_iso = _dt.now(_tz.utc).isoformat().replace("+00:00", "Z")
         # Build a no-symbol job and flip it to running (mimicking a path that
-        # delivered it to the worker outside the batch-claim gate).
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=self._prod_session_id(bad_sym),
-            payload={"snapshot": {}, "batch_id": batch_id},
-        )
-        self.conn.commit()
-        self.conn.execute(
-            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP "
-            "WHERE job_type='scheduled_market_analysis' AND session_id=?",
-            (self._prod_session_id(bad_sym),),
+        # delivered it to the worker outside the batch-claim gate). The malformed
+        # payload (empty snapshot, no snapshot.symbol) would be rejected by
+        # ``enqueue_job``'s ``validate_job_identity`` gate, so plant it via a bare
+        # INSERT that builds the valid membership chain but writes the malformed
+        # payload verbatim -- the realistic shape for a migrated/hand-built batch
+        # that bypassed the Python gate.
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol=bad_sym,
+            payload={"snapshot": {}, "batch_id": batch_id, "symbol": bad_sym},
+            session_id=self._prod_session_id(bad_sym),
+            status="running",
+            claim_token="p1_3_worker_token",
+            started_at=_now_iso,
         )
         self.conn.commit()
         jobs = self.conn.execute(
@@ -50192,7 +50679,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "Got %r" % (result.get("malformed_jobs"),),
         )
         job_row = self.conn.execute(
-            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(bad_sym),),
         ).fetchone()
         self.assertIsNotNone(job_row)
@@ -50240,16 +50727,15 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         sym = "BTCUSDT"
         # A job that carries the authoritative ``payload.symbol`` but a snapshot
         # that is an EMPTY dict (no symbol inside). This is the missing-snapshot
-        # repro: payload.symbol present, snapshot.symbol absent.
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=self._prod_session_id(sym),
+        # repro: payload.symbol present, snapshot.symbol absent. Inserted via the
+        # malformed-identity helper (bare INSERT) because production ``enqueue_job``
+        # raises ValueError on this payload -- the test must reach the SEAL gate,
+        # not short-circuit at enqueue. The row is a realistic shape for a
+        # migrated / hand-built / future-bypass batch that reached the DB.
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol=sym,
             payload={"snapshot": {}, "batch_id": batch_id, "symbol": sym},
-        )
-        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
-        self.repo.start_analysis_batch(
-            batch_id=batch_id, primary_interval="15m",
-            analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
+            session_id=self._prod_session_id(sym),
         )
         self.conn.commit()
         sealed = self.repo.seal_analysis_batch(batch_id)
@@ -50284,15 +50770,17 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         batch_id = "15m:r8a_swapped_%d" % self._PROD_BATCH_MS
         sym = "BTCUSDT"
         # payload.symbol = BTCUSDT but snapshot.symbol = ETHUSDT (swapped).
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=self._prod_session_id(sym),
+        # Inserted via the malformed-identity helper (bare INSERT): production
+        # ``enqueue_job`` raises ValueError on a swapped snapshot, so the test
+        # must bypass it to reach the SEAL gate.
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol=sym,
             payload={
                 "snapshot": {"symbol": "ETHUSDT"},  # swapped!
                 "batch_id": batch_id, "symbol": sym,
             },
+            session_id=self._prod_session_id(sym),
         )
-        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
         self.repo.start_analysis_batch(
             batch_id=batch_id, primary_interval="15m",
             analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
@@ -50326,15 +50814,17 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         """
         batch_id = "15m:r8a_claim_swapped_%d" % self._PROD_BATCH_MS
         sym = "BTCUSDT"
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=self._prod_session_id(sym),
+        # Inserted via the malformed-identity helper (bare INSERT): production
+        # ``enqueue_job`` raises ValueError on a swapped snapshot, so the test
+        # must bypass it to reach the CLAIM gate.
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol=sym,
             payload={
                 "snapshot": {"symbol": "ETHUSDT"},  # swapped
                 "batch_id": batch_id, "symbol": sym,
             },
+            session_id=self._prod_session_id(sym),
         )
-        self.repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym, status="pending")
         self.repo.start_analysis_batch(
             batch_id=batch_id, primary_interval="15m",
             analysis_time=self._PROD_BATCH_MS, enabled_symbols=[sym],
@@ -50345,7 +50835,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # authoritative defense-in-depth gate).
         self.conn.execute(
             "UPDATE analysis_batches SET sealed_at=CURRENT_TIMESTAMP, "
-            "claim_ready_at=CURRENT_TIMESTAMP WHERE batch_id=?",
+            "claim_ready_at=CURRENT_TIMESTAMP WHERE batch_id=%s",
             (batch_id,),
         )
         self.conn.commit()
@@ -50386,19 +50876,23 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         batch_id = "15m:r8a_worker_swapped_%d" % self._PROD_BATCH_MS
         sym = "BTCUSDT"
         # payload.symbol = BTCUSDT, snapshot.symbol = ETHUSDT (swapped).
-        self.repo.enqueue_job(
-            job_type="scheduled_market_analysis",
-            priority=1, source="cron", session_id=self._prod_session_id(sym),
+        # Inserted via the malformed-identity helper (bare INSERT) as a RUNNING
+        # row carrying a shared claim_token: production ``enqueue_job`` raises
+        # ValueError on a swapped snapshot, and ``process_fair_batch`` requires
+        # the batch rows to share one non-empty claim_token (the claim gate
+        # stamps it). This test bypasses BOTH gates to reach the worker's own
+        # malformed-identity check directly (defense-in-depth).
+        from datetime import datetime as _dt, timezone as _tz
+        _now_iso = _dt.now(_tz.utc).isoformat().replace("+00:00", "Z")
+        _insert_scheduled_analysis_job_malformed_identity(
+            self.conn, batch_id=batch_id, symbol=sym,
             payload={
                 "snapshot": {"symbol": "ETHUSDT"},  # swapped
                 "batch_id": batch_id, "symbol": sym,
             },
-        )
-        self.conn.commit()
-        self.conn.execute(
-            "UPDATE agent_jobs SET status='running', started_at=CURRENT_TIMESTAMP "
-            "WHERE job_type='scheduled_market_analysis' AND session_id=?",
-            (self._prod_session_id(sym),),
+            session_id=self._prod_session_id(sym),
+            status="running", started_at=_now_iso,
+            claim_token="r8a_worker_token",
         )
         self.conn.commit()
         jobs = self.conn.execute(
@@ -50415,7 +50909,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "Got %r" % (result.get("malformed_jobs"),),
         )
         job_row = self.conn.execute(
-            "SELECT status, error_message FROM agent_jobs WHERE session_id=?",
+            "SELECT status, error_message FROM agent_jobs WHERE session_id=%s",
             (self._prod_session_id(sym),),
         ).fetchone()
         self.assertIsNotNone(job_row)
@@ -50528,9 +51022,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # for this tick's symbols/analysis_time. Pre-fix one orphan survived
             # per symbol (auto-committed in Phase 1, left behind by ROLLBACK).
             orphan_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 orphan_count, 0,
                 "R8-C (P1-2): a seal failure MUST leave ZERO orphan market_snapshots "
@@ -50539,9 +51033,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             # The batch row must also be gone (no half-built batch).
             batch_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s",
                 (f"15m:{analysis_time}",),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 batch_count, 0,
                 "R8-C: a seal failure must roll the analysis_batches row back too. "
@@ -50550,9 +51044,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # The jobs must be gone too (no orphan jobs).
             job_count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
-                "AND session_id LIKE ?",
+                "AND session_id LIKE %s",
                 (f"system:scheduled:15m:%:{analysis_time}",),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 job_count, 0,
                 "R8-C: a seal failure must roll every scheduled_market_analysis job "
@@ -50566,9 +51060,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # IMMEDIATE (Phase 2, before save_market_snapshot) so they roll back
             # too. Assert ZERO module_analysis_results rows for this tick.
             module_orphan_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 module_orphan_count, 0,
                 "R8 P2-2: a seal failure MUST leave ZERO orphan module_analysis_results "
@@ -50674,7 +51168,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             import json as _json
             sym_set = set(enabled)
             for r in rows:
-                payload = _json.loads(r["payload_json"])
+                _payload_val = r["payload_json"]
+                # 07-16 PG adaptation: agent_jobs.payload_json is JSONB, which
+                # psycopg auto-deserializes to a native dict on read-back; only
+                # json.loads a str (SQLite-era / explicit-text insert).
+                payload = _json.loads(_payload_val) if isinstance(_payload_val, str) else _payload_val
                 sym = payload.get("symbol")
                 self.assertIn(
                     sym, sym_set,
@@ -50690,7 +51188,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
             # The batch row must be sealed (claim_ready_at stamped).
             batch_row = self.conn.execute(
-                "SELECT claim_ready_at, enabled_symbols_json FROM analysis_batches WHERE batch_id=?",
+                "SELECT claim_ready_at, enabled_symbols_json FROM analysis_batches WHERE batch_id=%s",
                 (batch_id,),
             ).fetchone()
             self.assertIsNotNone(batch_row)
@@ -50699,8 +51197,16 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "R8-D: a sealed batch must have claim_ready_at stamped.",
             )
             import json as _json2
+            _enabled_val = batch_row["enabled_symbols_json"]
+            # 07-16 PG adaptation: JSONB columns auto-deserialize to a native
+            # list on read-back; json.loads on an already-deserialized list
+            # raises TypeError. Guard with isinstance (fall back to [] on NULL).
+            _enabled_list = (
+                _json2.loads(_enabled_val) if isinstance(_enabled_val, str)
+                else (_enabled_val or [])
+            )
             self.assertEqual(
-                set(_json2.loads(batch_row["enabled_symbols_json"] or "[]")), set(enabled),
+                set(_enabled_list), set(enabled),
             )
 
             # 07-14 R8 Recommended-1: POSITIVE persistence assertion that the
@@ -50716,9 +51222,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # so the exact expected count is 2 * len(enabled) = 20 for the
             # 10-symbol enabled set. This pins the success-path persist contract.
             module_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 module_count, 2 * len(enabled),
                 "R8 Recommended-1: the deferred module_analysis_results MUST persist "
@@ -50744,7 +51250,10 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     str(c["status"]), "running",
                     "R8-D: every claimed row must be flipped to running. Got %r" % (c["status"],),
                 )
-                cp = _json.loads(c["payload_json"])
+                _cp_val = c["payload_json"]
+                # 07-16 PG adaptation: payload_json is JSONB -> native dict on
+                # read-back (claim_next_batch RETURNING *); guard json.loads.
+                cp = _json.loads(_cp_val) if isinstance(_cp_val, str) else _cp_val
                 claimed_symbols.add(cp.get("symbol"))
             self.assertEqual(
                 claimed_symbols, set(enabled),
@@ -50816,26 +51325,26 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             batch_id = f"15m:{analysis_time}"
             # ZERO residue across every table the producer touched.
             batch_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?", (batch_id,),
-            ).fetchone()[0])
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s", (batch_id,),
+            ).fetchone()["count"])
             job_count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
-                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
-            ).fetchone()[0])
+                "AND (payload_json::jsonb ->> 'batch_id')=%s", (batch_id,),
+            ).fetchone()["count"])
             bss_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=?", (batch_id,),
-            ).fetchone()[0])
+                "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=%s", (batch_id,),
+            ).fetchone()["count"])
             snap_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             # R8 P2-2: the deferred module_analysis_results rows persist inside
             # the BEGIN IMMEDIATE (before save_market_snapshot), so the injected
             # mid-transaction crash must roll them back too -- zero residue.
             module_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(batch_count, 0, "R8-D: no batch row residue. Got %d." % batch_count)
             self.assertEqual(job_count, 0, "R8-D: no job row residue. Got %d." % job_count)
             self.assertEqual(bss_count, 0, "R8-D: no batch_symbol_status residue. Got %d." % bss_count)
@@ -50883,19 +51392,19 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         # ZERO residue across every table the helper wrote.
         batch_count = int(self.conn.execute(
-            "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?", (batch_id,),
-        ).fetchone()[0])
+            "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s", (batch_id,),
+        ).fetchone()["count"])
         job_count = int(self.conn.execute(
             "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
-            "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
-        ).fetchone()[0])
+            "AND (payload_json::jsonb ->> 'batch_id')=%s", (batch_id,),
+        ).fetchone()["count"])
         bss_count = int(self.conn.execute(
-            "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=?", (batch_id,),
-        ).fetchone()[0])
+            "SELECT COUNT(*) FROM batch_symbol_status WHERE batch_id=%s", (batch_id,),
+        ).fetchone()["count"])
         snap_count = int(self.conn.execute(
-            "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+            "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=%s",
             (int(self._PROD_BATCH_MS),),
-        ).fetchone()[0])
+        ).fetchone()["count"])
         self.assertEqual(batch_count, 0, "R8-D helper: no batch residue. Got %d." % batch_count)
         self.assertEqual(job_count, 0, "R8-D helper: no job residue. Got %d." % job_count)
         self.assertEqual(bss_count, 0, "R8-D helper: no bss residue. Got %d." % bss_count)
@@ -51116,6 +51625,38 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         real_conn = self.repo.conn
         straddle_applied = {"done": False}
 
+        class _StraddleCursor:
+            """Proxy cursor for ``_StraddleConn``. ``claim_next_batch`` drives
+            its SELECT/UPDATE via ``with self.conn.cursor() as cur: cur.execute``
+            (NOT ``self.conn.execute``), so without this proxy (a) the real
+            connection's ``cursor()`` is never reached (AttributeError) and (b)
+            the straddle interception in ``_StraddleConn.execute`` never fires
+            for the claim's flip UPDATE...RETURNING (it runs through the real
+            cursor, bypassing the proxy). Route ``execute`` back through
+            ``_StraddleConn.execute`` (which intercepts + delegates to
+            ``real_conn.execute``) and forward fetchone/fetchall to the last
+            returned real cursor."""
+
+            def __init__(self, outer):
+                self._outer = outer
+                self._last = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=()):
+                self._last = self._outer.execute(sql, params)
+                return self._last
+
+            def fetchone(self):
+                return self._last.fetchone() if self._last is not None else None
+
+            def fetchall(self):
+                return self._last.fetchall() if self._last is not None else []
+
         class _StraddleConn:
             """Proxy over the real connection: intercepts the claim's UPDATE to
             backdate started_at, simulating a clock-second boundary straddle
@@ -51140,8 +51681,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                     # transaction (the outer BEGIN IMMEDIATE is still open), so a
                     # commit here would break the claim's own COMMIT below.
                     real_conn.execute(
-                        "UPDATE agent_jobs SET started_at=datetime('now','-5 seconds') "
-                        "WHERE status='running' AND json_extract(payload_json,'$.batch_id')=?",
+                        "UPDATE agent_jobs SET started_at=NOW() - INTERVAL '5 seconds' "
+                        "WHERE status='running' AND (payload_json::jsonb ->> 'batch_id')=%s",
                         (batch_id,),
                     )
                     straddle_applied["done"] = True
@@ -51154,6 +51695,30 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 # to real_conn). No-op so the claim's COMMIT is the single
                 # authority.
                 pass
+
+            def transaction(self):
+                # 07-16 PG adaptation: claim_next_batch wraps its work in
+                # ``with self.conn.transaction():``. Delegate to the real pooled
+                # connection's nested-transaction context manager so the claim's
+                # SELECT...FOR UPDATE / UPDATE...RETURNING run inside a real
+                # psycopg transaction on the underlying conn. The proxy's
+                # ``execute`` still intercepts SQL (and backdates started_at) on
+                # the way through; this only supplies the missing
+                # ``transaction()`` entry point the test double lacked under PG.
+                return real_conn.transaction()
+
+            def cursor(self):
+                # 07-16 PG adaptation: claim_next_batch drives its SELECT/UPDATE
+                # via ``with self.conn.cursor() as cur: cur.execute(...)``. A
+                # bare ``return real_conn.cursor()`` would fix the missing-
+                # cursor AttributeError BUT the claim's flip UPDATE...RETURNING
+                # runs through that real cursor (bypassing this proxy's
+                # ``execute`` interception), so the straddle backdate would
+                # never fire -> ``straddle_applied['done']`` stays False -> the
+                # test is vacuous. Return the cursor proxy above whose
+                # ``execute`` routes back through ``_StraddleConn.execute`` so
+                # the interception fires on the claim's UPDATE...RETURNING.
+                return _StraddleCursor(self)
 
         self.repo.conn = _StraddleConn()
         try:
@@ -51174,14 +51739,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                          "of the batch despite the timestamp straddle; got %d"
                          % len(rows))
         for r in rows:
+            _pj = r["payload_json"]
+            # 07-16 PG adaptation: payload_json is JSONB -> native dict on
+            # read-back (RETURNING *); guard json.loads with isinstance.
+            _pj_d = json.loads(_pj) if isinstance(_pj, str) else _pj
             self.assertEqual(
-                json.loads(r["payload_json"]).get("batch_id"), batch_id,
+                _pj_d.get("batch_id"), batch_id,
                 "every claimed row must belong to the target batch_id",
             )
             self.assertEqual(r["status"], "running")
         for r in rows:
+            _pj = r["payload_json"]
+            _pj_d = json.loads(_pj) if isinstance(_pj, str) else _pj
             self.assertEqual(
-                json.loads(r["payload_json"]).get("batch_id"), batch_id,
+                _pj_d.get("batch_id"), batch_id,
                 "every claimed row must belong to the target batch_id",
             )
             self.assertEqual(r["status"], "running")
@@ -51279,7 +51850,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             log_rows = [
                 dict(r) for r in self.conn.execute(
                     "SELECT id, commit_state FROM skill_execution_logs "
-                    "WHERE analysis_time=? ORDER BY id",
+                    "WHERE analysis_time=%s ORDER BY id",
                     (int(analysis_time),),
                 ).fetchall()
             ]
@@ -51302,11 +51873,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # has no analysis_time column, so we gate by source_id IN (this tick's
             # log ids) -- the deferred feedback would have pointed at these logs.
             log_ids = [r["id"] for r in log_rows]
-            placeholders = ",".join("?" for _ in log_ids)
+            placeholders = ",".join("%s" for _ in log_ids)
             feedback_count = int(self.conn.execute(
                 f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
                 log_ids,
-            ).fetchone()[0]) if log_ids else 0
+            ).fetchone()["count"]) if log_ids else 0
             self.assertEqual(
                 feedback_count, 0,
                 "R8 P2-NEW-1 (point 3): a seal failure MUST leave ZERO new "
@@ -51354,7 +51925,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             log_rows = [
                 dict(r) for r in self.conn.execute(
                     "SELECT id, commit_state FROM skill_execution_logs "
-                    "WHERE analysis_time=? ORDER BY id",
+                    "WHERE analysis_time=%s ORDER BY id",
                     (int(analysis_time),),
                 ).fetchall()
             ]
@@ -51370,11 +51941,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # low-confidence path (price_action conf=0.0 on empty candles) fires
             # _maybe_write_skill_feedback, so the deferred feedback MUST land.
             log_ids = [r["id"] for r in log_rows]
-            placeholders = ",".join("?" for _ in log_ids)
+            placeholders = ",".join("%s" for _ in log_ids)
             feedback_count = int(self.conn.execute(
                 f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
                 log_ids,
-            ).fetchone()[0]) if log_ids else 0
+            ).fetchone()["count"]) if log_ids else 0
             self.assertGreater(
                 feedback_count, 0,
                 "R8 P2-NEW-1 (point 2): a successful seal MUST write the deferred "
@@ -51412,7 +51983,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Flip it to committed (save_skill_execution_log defaults to committed
         # for legacy callers, but pin it explicitly here).
         repo.conn.execute(
-            "UPDATE skill_execution_logs SET commit_state='committed' WHERE id=?",
+            "UPDATE skill_execution_logs SET commit_state='committed' WHERE id=%s",
             (committed_id,),
         )
         # An aborted_unsealed log with a HIGHER id (would win MAX(id) if unguarded).
@@ -51423,7 +51994,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             final_result={"skill": "price_action", "confidence": 0.0}, confidence=0.0,
         )
         repo.conn.execute(
-            "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' WHERE id=?",
+            "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' WHERE id=%s",
             (aborted_id,),
         )
         self.assertGreater(aborted_id, committed_id)
@@ -51474,7 +52045,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         # (2) Backdate the row so the stale threshold fires, then recover.
         repo.conn.execute(
-            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            "UPDATE skill_execution_logs SET created_at=NOW() - INTERVAL '1 hour' WHERE id=%s",
             (prepared_id,),
         )
         summary = recover_stale_prepared_skill_logs(repo.conn, stale_after_seconds=1)
@@ -51485,7 +52056,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         )
         # (3) The recovered 'aborted' log is STILL excluded from learning.
         row = dict(repo.conn.execute(
-            "SELECT commit_state FROM skill_execution_logs WHERE id=?", (prepared_id,),
+            "SELECT commit_state FROM skill_execution_logs WHERE id=%s", (prepared_id,),
         ).fetchone())
         self.assertEqual(row["commit_state"], "aborted")
         refs2 = repo.latest_skill_result_refs("BTCUSDT", analysis_time)
@@ -51578,18 +52149,28 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             commit_state="prepared", batch_id="15m:1783999999996", attempt_id=1,
         )
         self.repo.conn.execute(
-            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            "UPDATE skill_execution_logs SET created_at=NOW() - INTERVAL '1 hour' WHERE id=%s",
             (prepared_id,),
         )
         # Seed a stale running agent_job (pre-S3 legacy: no lease_until, old
         # started_at) so recover_stale_running_jobs WOULD reset it to pending IF
-        # it ran. On the non-owner path it MUST stay ``running``.
+        # it ran. On the non-owner path it MUST stay ``running``. P9 (PG cutover):
+        # the ``scheduled_market_analysis`` membership invariant (CHECK + FK +
+        # trigger) requires a valid parent batch + batch_symbol_status + non-NULL
+        # batch_id/symbol, so insert via the schema-valid helper then backdate
+        # ``started_at`` past the 30-min recovery threshold.
+        _insert_scheduled_analysis_job_valid(
+            self.repo.conn,
+            batch_id="15m:1783999999996",
+            symbol="ETHUSDT",
+            analysis_time_ms=1783999999996,
+            status="running",
+            session_id="r9p0:stale:15m:1783999999996",
+        )
         self.repo.conn.execute(
-            "INSERT INTO agent_jobs(job_type, priority, source, session_id, "
-            "payload_json, status, started_at) "
-            "VALUES ('scheduled_market_analysis', 5, 'test', "
-            "'r9p0:stale:15m:1783999999996', '{}', 'running', "
-            "datetime('now','-31 minutes'))"
+            "UPDATE agent_jobs SET started_at=NOW() - INTERVAL '31 minutes' "
+            "WHERE session_id=%s",
+            ("r9p0:stale:15m:1783999999996",),
         )
         self.repo.conn.commit()
 
@@ -51683,7 +52264,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # 5. The seeded stale prepared log MUST stay ``prepared`` (NOT
             #    terminalized to aborted by the recovery hook).
             row = dict(self.conn.execute(
-                "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                "SELECT commit_state FROM skill_execution_logs WHERE id=%s",
                 (prepared_id,),
             ).fetchone())
             self.assertEqual(
@@ -51694,7 +52275,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # 6. The seeded stale running job MUST stay ``running`` (NOT reset
             #    to pending by the recovery hook).
             job_row = dict(self.conn.execute(
-                "SELECT status FROM agent_jobs WHERE session_id=?",
+                "SELECT status FROM agent_jobs WHERE session_id=%s",
                 ("r9p0:stale:15m:1783999999996",),
             ).fetchone())
             self.assertEqual(
@@ -51755,7 +52336,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             commit_state="prepared", batch_id="15m:1783999999997", attempt_id=1,
         )
         self.repo.conn.execute(
-            "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+            "UPDATE skill_execution_logs SET created_at=NOW() - INTERVAL '1 hour' WHERE id=%s",
             (prepared_id,),
         )
         self.repo.conn.commit()
@@ -51807,7 +52388,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             # The seeded stale prepared log MUST now be terminalized to aborted.
             row = dict(self.conn.execute(
-                "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                "SELECT commit_state FROM skill_execution_logs WHERE id=%s",
                 (prepared_id,),
             ).fetchone())
             self.assertEqual(
@@ -51859,7 +52440,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 commit_state="prepared", batch_id="15m:1783999999996", attempt_id=1,
             )
             self.repo.conn.execute(
-                "UPDATE skill_execution_logs SET created_at=datetime('now','-1 hour') WHERE id=?",
+                "UPDATE skill_execution_logs SET created_at=NOW() - INTERVAL '1 hour' WHERE id=%s",
                 (log_id,),
             )
         self.repo.conn.commit()
@@ -51924,7 +52505,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 # path. The real _run_skill deferred it; this re-introduces the
                 # direct write so a seal failure leaves feedback behind.
                 last_log = int(repo.conn.execute(
-                    "SELECT MAX(id) AS id FROM skill_execution_logs WHERE symbol=? AND analysis_time=?",
+                    "SELECT MAX(id) AS id FROM skill_execution_logs WHERE symbol=%s AND analysis_time=%s",
                     (symbol, int(analysis_time_utc)),
                 ).fetchone()["id"])
                 payload = runner._collect_skill_feedback(
@@ -51965,11 +52546,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "prepared skill logs in Phase 1 (found 0). The direct-write patch "
                 "cannot be evaluated without logs.",
             )
-            placeholders = ",".join("?" for _ in log_ids)
+            placeholders = ",".join("%s" for _ in log_ids)
             feedback_count = int(self.conn.execute(
                 f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
                 log_ids,
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertGreater(
                 feedback_count, 0,
                 "R8 P2-NEW-1 revert-fail anchor: re-introducing the Phase-1 direct "
@@ -52052,9 +52633,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             batch_id = f"15m:{analysis_time}"
             # ZERO analysis_batches row for this batch_id (rolled back).
             batch_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s",
                 (batch_id,),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 batch_count, 0,
                 "R9-P1a: a feedback-write failure MUST roll back the batch -- "
@@ -52062,9 +52643,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             # ZERO market_snapshots rows for this batch (rolled back, no orphan).
             snap_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM market_snapshots WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 snap_count, 0,
                 "R9-P1a: a feedback-write failure MUST roll back snapshots -- "
@@ -52072,9 +52653,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             # ZERO module_analysis_results rows for this batch (rolled back).
             module_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=?",
+                "SELECT COUNT(*) FROM module_analysis_results WHERE analysis_time=%s",
                 (int(analysis_time),),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 module_count, 0,
                 "R9-P1a: a feedback-write failure MUST roll back module rows -- "
@@ -52085,7 +52666,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             log_rows = [
                 dict(r) for r in self.conn.execute(
                     "SELECT id, commit_state FROM skill_execution_logs "
-                    "WHERE analysis_time=? ORDER BY id",
+                    "WHERE analysis_time=%s ORDER BY id",
                     (int(analysis_time),),
                 ).fetchall()
             ]
@@ -52110,11 +52691,11 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # ZERO new skill_feedback_memory rows (the strict write raised before
             # any INSERT committed; the ROLLBACK reverted any partial state).
             log_ids = [r["id"] for r in log_rows]
-            placeholders = ",".join("?" for _ in log_ids)
+            placeholders = ",".join("%s" for _ in log_ids)
             feedback_count = int(self.conn.execute(
                 f"SELECT COUNT(*) FROM skill_feedback_memory WHERE source_id IN ({placeholders})",
                 log_ids,
-            ).fetchone()[0]) if log_ids else 0
+            ).fetchone()["count"]) if log_ids else 0
             self.assertEqual(
                 feedback_count, 0,
                 "R9-P1a: a feedback-write failure MUST leave ZERO new "
@@ -52162,7 +52743,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         two_symbols = ["ADAUSDT", "AVAXUSDT"]
         for sym in two_symbols:
             self.conn.execute(
-                "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+                "INSERT INTO symbols(symbol, enabled, category) VALUES (%s, TRUE, 'perp') ON CONFLICT (symbol) DO UPDATE SET enabled = EXCLUDED.enabled, category = EXCLUDED.category",
                 (sym,),
             )
         self.conn.commit()
@@ -52223,9 +52804,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # No batch/snapshot/job residue (Phase 1 never reached the Phase-2
             # transaction).
             batch_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s",
                 (batch_id,),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 batch_count, 0,
                 "R9-P1b: a Phase-1 exception must leave ZERO batch rows. Got %d."
@@ -52233,8 +52814,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
-                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
-            ).fetchone()[0])
+                "AND (payload_json::jsonb ->> 'batch_id')=%s", (batch_id,),
+            ).fetchone()["count"])
             self.assertEqual(
                 job_count, 0,
                 "R9-P1b: a Phase-1 exception must leave ZERO job rows. Got %d."
@@ -52244,7 +52825,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # terminalized to 'aborted_unsealed' (NOT left 'prepared').
             first_log = self.conn.execute(
                 "SELECT id, commit_state FROM skill_execution_logs "
-                "WHERE symbol=? AND analysis_time=? ORDER BY id",
+                "WHERE symbol=%s AND analysis_time=%s ORDER BY id",
                 (first_symbol, int(analysis_time)),
             ).fetchall()
             self.assertEqual(
@@ -52310,7 +52891,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         self.conn.execute("DELETE FROM symbols")
         solo_symbol = "ADAUSDT"
         self.conn.execute(
-            "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+            "INSERT INTO symbols(symbol, enabled, category) VALUES (%s, TRUE, 'perp') ON CONFLICT (symbol) DO UPDATE SET enabled = EXCLUDED.enabled, category = EXCLUDED.category",
             (solo_symbol,),
         )
         self.conn.commit()
@@ -52357,9 +52938,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # No batch/snapshot/job residue (Phase 1 never reached the Phase-2
             # transaction).
             batch_count = int(self.conn.execute(
-                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=?",
+                "SELECT COUNT(*) FROM analysis_batches WHERE batch_id=%s",
                 (batch_id,),
-            ).fetchone()[0])
+            ).fetchone()["count"])
             self.assertEqual(
                 batch_count, 0,
                 "R10-P1#2: a Phase-1 current-symbol exception must leave ZERO "
@@ -52367,8 +52948,8 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             job_count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM agent_jobs WHERE job_type='scheduled_market_analysis' "
-                "AND json_extract(payload_json,'$.batch_id')=?", (batch_id,),
-            ).fetchone()[0])
+                "AND (payload_json::jsonb ->> 'batch_id')=%s", (batch_id,),
+            ).fetchone()["count"])
             self.assertEqual(
                 job_count, 0,
                 "R10-P1#2: a Phase-1 current-symbol exception must leave ZERO "
@@ -52378,7 +52959,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # terminalized to 'aborted_unsealed' (NOT left 'prepared').
             partial_logs = self.conn.execute(
                 "SELECT id, commit_state FROM skill_execution_logs "
-                "WHERE symbol=? AND analysis_time=? ORDER BY id",
+                "WHERE symbol=%s AND analysis_time=%s ORDER BY id",
                 (solo_symbol, int(analysis_time)),
             ).fetchall()
             self.assertEqual(
@@ -52574,7 +53155,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         self.conn.execute("DELETE FROM symbols")
         single = ["ADAUSDT"]
         self.conn.execute(
-            "INSERT OR REPLACE INTO symbols(symbol, enabled, category) VALUES (?, 1, 'perp')",
+            "INSERT INTO symbols(symbol, enabled, category) VALUES (%s, TRUE, 'perp') ON CONFLICT (symbol) DO UPDATE SET enabled = EXCLUDED.enabled, category = EXCLUDED.category",
             (single[0],),
         )
         self.conn.commit()
@@ -52602,7 +53183,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # race). The Phase-2 CAS-commit will fail on this row.
             repo.conn.execute(
                 "UPDATE skill_execution_logs SET commit_state='aborted_unsealed' "
-                "WHERE id=?",
+                "WHERE id=%s",
                 (log_id,),
             )
             pre_aborted_log_ids.append(int(log_id))
@@ -52645,7 +53226,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             )
             for log_id in pre_aborted_log_ids:
                 row = dict(self.conn.execute(
-                    "SELECT commit_state FROM skill_execution_logs WHERE id=?",
+                    "SELECT commit_state FROM skill_execution_logs WHERE id=%s",
                     (log_id,),
                 ).fetchone())
                 self.assertEqual(
@@ -52701,7 +53282,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         reviewer flagged; it must be atomic on its own.
         """
         import threading
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.tests.pg_fixtures import direct_conn
         from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
 
         batch_id = f"15m:{self._PROD_BATCH_MS}"
@@ -52710,10 +53291,16 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         # Barrier so both threads attempt the allocation at the SAME instant
         # (maximizing the race window the non-atomic MAX+1 read loses).
         barrier = threading.Barrier(2)
+        # 07-16 PG-native: each thread gets its OWN non-pooled backend
+        # connection routed at the scratch schema (replaces the legacy
+        # connect_db(self.cfg.database_path) SQLite file). The row lock on
+        # _analysis_attempt_counter serializes the two allocators -> distinct
+        # attempt_ids.
+        schema = self._repo_handle.schema
 
         def _allocate(tag: str) -> None:
             try:
-                conn = connect_db(self.cfg.database_path)
+                conn = direct_conn(schema)
                 try:
                     barrier.wait()  # release both threads together
                     aid = cron_mod._allocate_attempt_id(conn, batch_id)
@@ -52763,12 +53350,15 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         against an over-broad global counter that would break the per-batch
         monotonic semantics the R9-P2 audit relies on.
         """
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
+        from plugins.crypto_guard.tests.pg_fixtures import direct_conn
         from plugins.crypto_guard.scheduler import cron_scheduler as cron_mod
 
         batch_a = f"15m:{self._PROD_BATCH_MS}"
         batch_b = "15m:1783641600000"  # a different analysis_time -> different batch
-        conn = connect_db(self.cfg.database_path)
+        # 07-16 PG-native: a non-pooled backend connection routed at the
+        # scratch schema (replaces the legacy connect_db(self.cfg.database_path)
+        # SQLite file).
+        conn = direct_conn(self._repo_handle.schema)
         try:
             a1 = int(cron_mod._allocate_attempt_id(conn, batch_a))
             a2 = int(cron_mod._allocate_attempt_id(conn, batch_a))
@@ -52832,7 +53422,9 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         # Sanity: the table EXISTS after initialize_database (the migration ran).
         pre = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='_analysis_attempt_counter'"
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = '_analysis_attempt_counter'"
         ).fetchone()
         self.assertIsNotNone(
             pre,
@@ -52887,18 +53479,12 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import tempfile as _tempfile
-        from pathlib import Path
-        from plugins.crypto_guard.config import load_config
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        from plugins.crypto_guard.storage.migrations import initialize_database
         from plugins.crypto_guard import service_manager as sm
+        from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
-        self._tmp = Path(_tempfile.mkdtemp(prefix="cg_r7p03_"))
-        db_path = self._tmp / "r7p03.db"
-        os.environ["CRYPTO_GUARD_DB"] = str(db_path)
-        self.cfg = load_config()
-        initialize_database(self.cfg)
+        self._repo_handle = make_repo()
+        self.conn = self._repo_handle.conn
+        self.repo = self._repo_handle.repo
         self.sm = sm
         # Reset the in-process lease cache + liveness probe + ownership-lost
         # latch between tests so a prior test's lease / lost-latch does not
@@ -52906,24 +53492,26 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         sm._OWNERSHIP_LEASE = None
         sm._OWNERSHIP_LOST.clear()
         sm.set_pid_liveness_probe(None)
-        self.conn = connect_db(self.cfg.database_path)
 
     def tearDown(self) -> None:
-        import shutil
         sm = self.sm
         sm._OWNERSHIP_LEASE = None
         sm._OWNERSHIP_LOST.clear()
         sm.set_pid_liveness_probe(None)
-        self.conn.close()
-        shutil.rmtree(self._tmp, ignore_errors=True)
-        os.environ.pop("CRYPTO_GUARD_DB", None)
+        self._repo_handle.close()
 
     def _ownership_row(self) -> dict | None:
-        row = self.conn.execute(
-            "SELECT pid, started_at_ms, db_path, release_commit, owner_identity, "
-            "lease_until_ms, owner_token FROM _service_ownership WHERE key=?",
-            (self.sm.OWNERSHIP_LEASE_KEY,),
-        ).fetchone()
+        # Wrap the read in its own transaction so self.conn takes a FRESH
+        # snapshot and observes rows a second-process connection (conn_b /
+        # sm_module_conn) has committed. Without this, an already-open
+        # transaction on self.conn would keep a stale snapshot and miss the
+        # other backend's commit (PG MVCC visibility).
+        with self.conn.transaction():
+            row = self.conn.execute(
+                "SELECT pid, started_at_ms, db_path, release_commit, owner_identity, "
+                "lease_until_ms, owner_token FROM _service_ownership WHERE key=%s",
+                (self.sm.OWNERSHIP_LEASE_KEY,),
+            ).fetchone()
         return None if row is None else dict(row)
 
     def test_r7_p0_3_acquire_is_atomic_only_one_wins_concurrent(self) -> None:
@@ -52962,7 +53550,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         def _acquire(tag: str, conn, pid: int) -> None:
             try:
                 with _patch_getpid(pid):
-                    results[tag] = sm.acquire_service_ownership(conn, str(self.cfg.database_path))
+                    results[tag] = sm.acquire_service_ownership(conn, self._repo_handle.schema)
             except BaseException as exc:  # noqa: BLE001
                 errors[tag] = exc
 
@@ -53006,7 +53594,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
 
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_getpid(30303):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
         row0 = self._ownership_row()
         assert row0 is not None
@@ -53038,7 +53626,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         sm.set_pid_liveness_probe(lambda pid: True)  # both alive
         with _patch_time(future / 1000.0):
             with _patch_getpid(40404):
-                dup = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+                dup = sm.acquire_service_ownership(conn_b, self._repo_handle.schema)
         self.assertFalse(dup.get("acquired"),
                          "R7-P0-3: after heartbeat renewal, a second live process "
                          "must NOT reclaim; got %r (pre-fix it would, because the "
@@ -53062,7 +53650,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         # Owner A acquires.
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_getpid(50505):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
 
         # Time passes beyond the TTL with NO heartbeat. Owner A is now DEAD
@@ -53074,7 +53662,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         conn_b = self.sm_module_conn()
         with _patch_time(expired_now / 1000.0):
             with _patch_getpid(60606):
-                reclaimed = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+                reclaimed = sm.acquire_service_ownership(conn_b, self._repo_handle.schema)
         self.assertTrue(reclaimed.get("acquired"),
                         "R7-P0-3: an expired + dead-owner lease must be reclaimable; "
                         "got %r" % (reclaimed,))
@@ -53087,7 +53675,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         # If the old owner's cached lease is still around and it tries to
         # heartbeat, it must report "lost" (its token no longer matches the row).
         sm._OWNERSHIP_LEASE = {
-            "pid": 50505, "db_path": str(self.cfg.database_path),
+            "pid": 50505, "db_path": self._repo_handle.schema,
             "owner_token": str(row0["owner_token"]), "lease_until_ms": int(row0["lease_until_ms"]),
         }
         with _patch_getpid(50505):
@@ -53106,7 +53694,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         ``key + pid + owner_token``; a token mismatch matches 0 rows -> the
         renewal fails with reason ``lost`` and the live owner's lease row is
         UNCHANGED. Pre-fix (PID-only CAS) the recycled process's heartbeat
-        ``WHERE key=? AND pid=70707`` would match the live owner's row and
+        ``WHERE key=%s AND pid=70707`` would match the live owner's row and
         silently extend a lease it does not own, masquerading as the owner.
 
         We do NOT assert the recycled process cannot ACQUIRE a live owner's
@@ -53121,7 +53709,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         # Owner A acquires with pid 70707 and token T_A; A stays ALIVE.
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_getpid(70707):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
         row0 = self._ownership_row()
         assert row0 is not None
@@ -53135,7 +53723,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         token_b = _secrets.token_hex(16)
         self.assertNotEqual(token_b, token_a)
         sm._OWNERSHIP_LEASE = {
-            "pid": 70707, "db_path": str(self.cfg.database_path),
+            "pid": 70707, "db_path": self._repo_handle.schema,
             "owner_token": token_b, "lease_until_ms": lease0,
         }
         # Its heartbeat CAS must match 0 rows (token mismatch) -> lost. Run
@@ -53163,7 +53751,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         # Positive control: the REAL owner (token_a, pid 70707) heartbeat DOES
         # renew the lease -- the matching pid+token CAS hits the row.
         sm._OWNERSHIP_LEASE = {
-            "pid": 70707, "db_path": str(self.cfg.database_path),
+            "pid": 70707, "db_path": self._repo_handle.schema,
             "owner_token": token_a, "lease_until_ms": lease0,
         }
         later = lease0 + 30 * 1000
@@ -53186,7 +53774,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
 
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_getpid(80808):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
         row0 = self._ownership_row()
         assert row0 is not None
@@ -53197,7 +53785,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         later = lease0 + 30 * 1000
         with _patch_time(later / 1000.0):
             with _patch_getpid(80808):
-                again = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+                again = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertFalse(again.get("acquired"))
         self.assertEqual(again.get("reason"), "already_started")
         row1 = self._ownership_row()
@@ -53226,7 +53814,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         # Owner A acquires; A stays ALIVE.
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_getpid(90909):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
         row0 = self._ownership_row()
         assert row0 is not None
@@ -53239,7 +53827,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         sm.set_pid_liveness_probe(lambda pid: True)
         with _patch_time(expired_now / 1000.0):
             with _patch_getpid(100100):
-                dup = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+                dup = sm.acquire_service_ownership(conn_b, self._repo_handle.schema)
         self.assertFalse(
             dup.get("acquired"),
             "R7-P0-3: a LIVE owner with an EXPIRED lease must NOT be silently "
@@ -53263,9 +53851,14 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
     # ---- helpers ----
 
     def sm_module_conn(self):
-        """A fresh connection to the test DB (simulates a second process)."""
-        from plugins.crypto_guard.storage.sqlite_db import connect_db
-        return connect_db(self.cfg.database_path)
+        """A fresh connection to the test schema (simulates a second process).
+
+        A NON-pooled direct psycopg connection (pg_fixtures.direct_conn) so
+        ``conn_b.close()`` truly closes an independent backend without
+        disturbing the pooled ``self.conn``.
+        """
+        from plugins.crypto_guard.tests.pg_fixtures import direct_conn
+        return direct_conn(self._repo_handle.schema)
 
     # ------------------------------------------------------------------
     # 07-15 R8-E (P1-3): ownership-lost must be FAIL-CLOSED. When the
@@ -53294,7 +53887,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
 
         # Owner A acquires, then B reclaims (expired + dead A).
         with _patch_getpid(110011):
-            got = sm.acquire_service_ownership(self.conn, str(self.cfg.database_path))
+            got = sm.acquire_service_ownership(self.conn, self._repo_handle.schema)
         self.assertTrue(got.get("acquired"))
         row0 = self._ownership_row()
         assert row0 is not None
@@ -53305,13 +53898,13 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         conn_b = self.sm_module_conn()
         with _patch_time(expired_now / 1000.0):
             with _patch_getpid(120012):
-                reclaimed = sm.acquire_service_ownership(conn_b, str(self.cfg.database_path))
+                reclaimed = sm.acquire_service_ownership(conn_b, self._repo_handle.schema)
         self.assertTrue(reclaimed.get("acquired"))
 
         # Restore A's cached lease (as if A is still running with a stale cache)
         # and heartbeat -> must report lost AND set the Event.
         sm._OWNERSHIP_LEASE = {
-            "pid": 110011, "db_path": str(self.cfg.database_path),
+            "pid": 110011, "db_path": self._repo_handle.schema,
             "owner_token": str(row0["owner_token"]),
             "lease_until_ms": int(row0["lease_until_ms"]),
         }
@@ -53421,8 +54014,8 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         owner is also dispatching. The fix is a SECOND ``is_set()`` check
         immediately after the heartbeat block.
 
-        This test exercises the real heartbeat path: ``db_path`` is a real DB
-        so ``connect_db`` + ``_renew_service_ownership_lease`` run, and the
+        This test exercises the real heartbeat path: ``db_path`` is a real schema
+        label so the pooled-conn heartbeat + ``_renew_service_ownership_lease`` run, and the
         probeable renew returns ``lost`` (and sets the Event, as production
         does). The Event is CLEAR on entry -- the only thing that sets it is
         the heartbeat DURING this iteration. Without the post-heartbeat check
@@ -53477,9 +54070,9 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
             sm._renew_service_ownership_lease = _fake_renew_lost  # type: ignore[assignment]
             stack.callback(setattr, sm.time, "sleep", real_sleep)
             sm.time.sleep = _breaking_sleep  # type: ignore[assignment]
-            # Real db_path -> the heartbeat path (connect_db + renew) runs.
+            # Real db_path label -> the heartbeat path (pooled conn + renew) runs.
             try:
-                sm._scheduler_loop(str(self.cfg.database_path))
+                sm._scheduler_loop(self._repo_handle.schema)
             except StopIteration:
                 pass
         # The heartbeat MUST have run (lost path exercised).
@@ -53745,7 +54338,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
         sm._OWNERSHIP_LEASE = None
         sm._OWNERSHIP_LOST.clear()
         # Ensure no prior owner row from setUp / a sibling test.
-        self.conn.execute("DELETE FROM _service_ownership WHERE key=?", (sm.OWNERSHIP_LEASE_KEY,))
+        self.conn.execute("DELETE FROM _service_ownership WHERE key=%s", (sm.OWNERSHIP_LEASE_KEY,))
         self.conn.commit()
         # Ensure autostart is ON (start_all_services early-returns if
         # CRYPTO_GUARD_AUTOSTART is 0/false/no). Save/restore so we don't leak.
@@ -53846,7 +54439,7 @@ class TestR7P0_3ServiceOwnershipLease(unittest.TestCase):
             else:
                 os.environ["CRYPTO_GUARD_AUTOSTART"] = _prev_autostart
             # Clean any lease row this test created.
-            self.conn.execute("DELETE FROM _service_ownership WHERE key=?", (sm.OWNERSHIP_LEASE_KEY,))
+            self.conn.execute("DELETE FROM _service_ownership WHERE key=%s", (sm.OWNERSHIP_LEASE_KEY,))
             self.conn.commit()
 
 
@@ -55726,6 +56319,53 @@ class TestPhaseC07_10FairScheduler(unittest.TestCase):
             "R2-1: session.read_timeout must equal max(15, int(provider_timeout"
             "_seconds))=%d. Got %r" % (expected_read_timeout, captured.read_timeout),
         )
+
+    def test_r2_1c_provider_call_inputs_are_consumed_once(self) -> None:
+        """Provider timeout/process-isolation inputs must not leak to the next call."""
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning import llm_agent_judge
+
+        class _FakeSession:
+            def __init__(self):
+                self.system = None
+                self.read_timeout = 0
+                self.max_retries = 99
+                self.thinking_type = None
+                self.thinking_budget_tokens = None
+                self.max_tokens = None
+                self.temperature = None
+                self.tools = None
+                self.raw_calls = 0
+
+            def raw_ask(self, _msgs):
+                self.raw_calls += 1
+                return ["{}"]
+
+        session = _FakeSession()
+        import llmcore
+
+        llm_agent_judge._llm_call_state.provider_timeout_seconds = 15.0
+        llm_agent_judge._llm_call_state.subprocess_hard_timeout = True
+        try:
+            with patch.object(llmcore, "resolve_session", return_value=session), patch.object(
+                llm_agent_judge,
+                "_run_provider_call_in_subprocess",
+                return_value="{}",
+            ) as subprocess_call:
+                llm_agent_judge._call_ga_llm("first isolated call")
+                self.assertFalse(hasattr(
+                    llm_agent_judge._llm_call_state, "provider_timeout_seconds"
+                ))
+                self.assertFalse(hasattr(
+                    llm_agent_judge._llm_call_state, "subprocess_hard_timeout"
+                ))
+
+                llm_agent_judge._call_ga_llm("next ordinary call")
+
+            self.assertEqual(subprocess_call.call_count, 1)
+            self.assertEqual(session.raw_calls, 1)
+        finally:
+            llm_agent_judge._llm_call_state_reset()
 
     def test_r2_2_barrier_cancels_hung_provider_call(self) -> None:
         """R2-2: when an ``llm_call_fn`` hangs (sleeps longer than the

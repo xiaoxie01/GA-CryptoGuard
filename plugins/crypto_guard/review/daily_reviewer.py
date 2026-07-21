@@ -92,13 +92,11 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
 
     # Idempotency: if report already exists and not forced, return existing
     existing = repo.conn.execute(
-        "SELECT id, summary_json, ga_report, pushed_to_feishu FROM daily_review_reports WHERE review_date=?",
+        "SELECT id, summary_json, ga_report, pushed_to_feishu FROM daily_review_reports WHERE review_date=%s",
         (report_date,),
     ).fetchone()
     if existing and not force:
-        import json
-
-        summary = json.loads(existing["summary_json"] or "{}")
+        summary = _parse_json_field(existing["summary_json"], {})
         return {
             "ok": True,
             "idempotent": True,
@@ -113,10 +111,11 @@ def run_daily_review(repo: CryptoGuardRepository, *, day_utc: str | None = None,
 
     # If force=True and existing report, archive old skill_feedback_memory
     if force and existing:
-        repo.conn.execute(
-            "UPDATE skill_feedback_memory SET status='archived' WHERE source_type='daily_review' AND finding LIKE ?",
-            (f"每日复盘：%{report_date}%",),
-        )
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE skill_feedback_memory SET status='archived' WHERE source_type='daily_review' AND finding LIKE %s",
+                (f"每日复盘：%{report_date}%",),
+            )
 
     # Fix 1: Get ALL closed trades in window (not just unreviewed)
     all_closed = repo.list_closed_trades_for_review(start_utc=start, end_utc=end, only_unreviewed=False)
@@ -504,6 +503,15 @@ def _cleanup_false_review_error_memories(repo: CryptoGuardRepository, review_dat
 
     Only cleans up if the date's loss trades all have valid trade_reviews.
     """
+    # 07-16 PG cutover: an empty ``review_date`` (the parameter default;
+    # production always passes ``report_date``) must short-circuit. The PG cast
+    # ``created_at::date=%s::date`` raises ``InvalidDatetimeFormat`` on the empty
+    # string -- SQLite's ``date('')`` returned NULL and matched no rows, so the
+    # historical behavior with no date scope is "archive nothing". Guard here to
+    # preserve that behavior and avoid the cast error.
+    if not review_date:
+        return 0
+
     loss_items = [item for item in all_review_items if (_item_pnl_r(item) or 0) < -0.05]
 
     # Only cleanup if all loss trades have reviews
@@ -522,19 +530,22 @@ def _cleanup_false_review_error_memories(repo: CryptoGuardRepository, review_dat
     polluted = repo.conn.execute(
         """SELECT id FROM skill_feedback_memory
            WHERE source_type='daily_review'
-             AND (finding LIKE '%review 错误%' OR finding LIKE '%未生成归因%')
+             AND (finding LIKE '%%review 错误%%' OR finding LIKE '%%未生成归因%%')
              AND status != 'archived'
-             AND DATE(created_at) = ?""",
+             AND created_at::date=%s::date""",
         (review_date,),
     ).fetchall()
 
     count = 0
-    for row in polluted:
-        repo.conn.execute(
-            "UPDATE skill_feedback_memory SET status='archived' WHERE id=?",
-            (row["id"],),
-        )
-        count += 1
+    if polluted:
+        ids = [row["id"] for row in polluted]
+        placeholders = ",".join("%s" for _ in ids)
+        with repo.conn.transaction():
+            repo.conn.execute(
+                f"UPDATE skill_feedback_memory SET status='archived' WHERE id IN ({placeholders})",
+                ids,
+            )
+        count = len(ids)
 
     return count
 
@@ -596,7 +607,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
     trigger_ids = [t["id"] for t in related_triggers]
     related_patches = []
     if trigger_ids:
-        placeholders = ",".join("?" * len(trigger_ids))
+        placeholders = ",".join("%s" for _ in trigger_ids)
         patch_rows = repo.conn.execute(
             f"SELECT * FROM strategy_patches WHERE trigger_id IN ({placeholders})",
             trigger_ids,
@@ -607,7 +618,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
     for trade_id in window_trade_ids:
         candidate_version = f"candidate-trade-{trade_id}"
         rows = repo.conn.execute(
-            "SELECT * FROM strategy_patches WHERE candidate_version LIKE ?",
+            "SELECT * FROM strategy_patches WHERE candidate_version LIKE %s",
             (f"%{candidate_version}%",),
         ).fetchall()
         for r in rows:
@@ -635,7 +646,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
                       COUNT(CASE WHEN pnl_r IS NULL OR outcome_source IS NULL OR outcome_source!='real_pnl' THEN 1 END) as pseudo_r_count,
                       AVG(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN pnl_r END) as avg_r
                FROM strategy_evaluations
-               WHERE strategy_name=? AND strategy_version=? AND is_shadow=1""",
+               WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE""",
             (p.get("strategy_name"), p.get("candidate_version")),
         ).fetchone()
         if stats:
@@ -658,7 +669,7 @@ def _evolution_status_for_report(repo: CryptoGuardRepository, window_trades: lis
             if real_count >= 5:
                 win_row = repo.conn.execute(
                     """SELECT COUNT(*) as wins FROM strategy_evaluations
-                       WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
+                       WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
                     (p.get("strategy_name"), p.get("candidate_version")),
                 ).fetchone()
                 if win_row:
@@ -770,8 +781,8 @@ def _strategy_performance_summary(
 
 def _window_display_text(start_utc: str, end_utc: str) -> str:
     """Build UTC+8 window display text for the daily report."""
-    utc_start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
-    utc_end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+    utc_start_dt = datetime.fromisoformat(str(start_utc).replace("Z", "+00:00"))
+    utc_end_dt = datetime.fromisoformat(str(end_utc).replace("Z", "+00:00"))
     beijing_tz = timezone(timedelta(hours=8))
     bj_start = utc_start_dt.astimezone(beijing_tz)
     bj_end = utc_end_dt.astimezone(beijing_tz)

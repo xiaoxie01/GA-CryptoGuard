@@ -191,14 +191,13 @@ def backfill_symbol_interval(
                 "resumed_from_page": 0,
                 "skipped_due_to_lock": True,
             }
-        # P0-7: Commit the lock transaction immediately so the SQLite write
-        # lock is released before network requests begin. Without this, the
-        # uncommitted INSERT holds the write lock for the entire backfill
-        # duration (including network I/O), blocking all other writers.
-        try:
-            repo.conn.commit()
-        except Exception:
-            pass
+        # P0-7 (PG cutover): ``acquire_lock`` self-wraps its own
+        # ``conn.transaction()`` (DELETE-expired + ON CONFLICT INSERT, one
+        # atomic commit on return). The old SQLite bare ``repo.conn.commit()``
+        # here was to release the SQLite write lock before network I/O; under
+        # PG pooled autocommit=False that is both unnecessary (no global write
+        # lock; row lock is per-statement) and harmful (a bare commit could
+        # prematurely commit the caller's outer transaction). So it is removed.
         lock_acquired = True
     except Exception:
         # task_locks not available (e.g. test env without full scheduler) —
@@ -220,11 +219,11 @@ def backfill_symbol_interval(
             try:
                 from plugins.crypto_guard.scheduler.task_locks import release_lock
                 release_lock(repo, lock_name, owner)
-                # P0-7: Commit the release so the lock row is actually deleted.
-                try:
-                    repo.conn.commit()
-                except Exception:
-                    pass
+                # P0-7 (PG cutover): ``release_lock`` self-wraps its own
+                # ``conn.transaction()`` (DELETE commit on return). The old
+                # bare ``repo.conn.commit()`` is removed (see acquire_lock note).
+            except Exception:
+                pass
             except Exception:
                 pass
 
@@ -252,7 +251,7 @@ def _read_backfill_progress(repo: CryptoGuardRepository, symbol: str, interval: 
     """
     try:
         row = repo.conn.execute(
-            "SELECT last_open_time_fetched FROM backfill_progress WHERE symbol=? AND interval=?",
+            "SELECT last_open_time_fetched FROM backfill_progress WHERE symbol=%s AND interval=%s",
             (symbol, interval),
         ).fetchone()
         if row and row["last_open_time_fetched"] is not None:
@@ -276,9 +275,12 @@ def _write_backfill_progress(repo: CryptoGuardRepository, symbol: str, interval:
     propagate to the caller, which can decide whether to abort the backfill.
     """
     repo.conn.execute(
-        "INSERT OR REPLACE INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
-        "VALUES (?, ?, ?, ?)",
-        (symbol, interval, int(last_open_time), int(repo.conn.execute("SELECT CAST(strftime('%s','now') AS INTEGER) * 1000 AS ms").fetchone()["ms"])),
+        "INSERT INTO backfill_progress(symbol, interval, last_open_time_fetched, last_updated_ms) "
+        "VALUES (%s, %s, %s, (EXTRACT(epoch FROM NOW())::bigint * 1000)) "
+        "ON CONFLICT (symbol, interval) DO UPDATE SET "
+        "last_open_time_fetched = EXCLUDED.last_open_time_fetched, "
+        "last_updated_ms = EXCLUDED.last_updated_ms",
+        (symbol, interval, int(last_open_time)),
     )
 
 
@@ -328,7 +330,7 @@ def _verify_resume_progress(
     try:
         row = repo.conn.execute(
             "SELECT 1 FROM candles "
-            "WHERE symbol=? AND interval=? AND is_closed=1 AND open_time=? "
+            "WHERE symbol=%s AND interval=%s AND is_closed=TRUE AND open_time=%s "
             "LIMIT 1",
             (symbol, interval, last_open_time),
         ).fetchone()
@@ -364,8 +366,8 @@ def _verify_resume_progress(
             }
             cur = repo.conn.execute(
                 "SELECT open_time FROM candles "
-                "WHERE symbol=? AND interval=? AND is_closed=1 "
-                "AND open_time >= ? AND open_time <= ?",
+                "WHERE symbol=%s AND interval=%s AND is_closed=TRUE "
+                "AND open_time >= %s AND open_time <= %s",
                 (symbol, interval, window_start_open, last_open_time),
             )
             actual_opens: set[int] = {int(r["open_time"]) for r in cur.fetchall()}
@@ -431,8 +433,8 @@ def _is_gap_actually_filled(
     try:
         cur = repo.conn.execute(
             "SELECT open_time FROM candles "
-            "WHERE symbol=? AND interval=? AND is_closed=1 "
-            "AND open_time >= ? AND open_time <= ?",
+            "WHERE symbol=%s AND interval=%s AND is_closed=TRUE "
+            "AND open_time >= %s AND open_time <= %s",
             (symbol, interval, gap_start, gap_end),
         )
         actual_opens: set[int] = {int(r["open_time"]) for r in cur.fetchall()}
@@ -597,15 +599,15 @@ def _do_backfill(
                 count = repo.upsert_candles(deduped)
                 candles_upserted += count
 
-            # P1-8: write progress in the SAME transaction as candles upsert,
-            # then commit once. Previously upsert_candles + commit ran first,
-            # then _write_backfill_progress did its own INSERT + commit — two
-            # separate transactions. If the process crashed between them,
-            # candles were written but progress was lost (on resume the same
-            # page was re-fetched). Now both writes land in one atomic commit.
+            # P1-8 (PG cutover): write progress in its own ``conn.transaction()``
+            # (locked P5 pattern: every repo write self-wraps conn.transaction()).
+            # ``upsert_candles`` already self-commits via its own
+            # ``conn.transaction()``; a bare ``repo.conn.commit()`` here would
+            # prematurely commit the caller's outer transaction. The progress
+            # write self-commits; ``_write_backfill_progress`` does NOT commit.
             last_open = max(int(c["open_time"]) for c in deduped) if deduped else page_start
-            _write_backfill_progress(repo, symbol, interval, last_open)
-            repo.conn.commit()
+            with repo.conn.transaction():
+                _write_backfill_progress(repo, symbol, interval, last_open)
 
             # Advance page_start to the next candle after the last fetched.
             page_start = last_open + span

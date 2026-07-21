@@ -6,7 +6,7 @@ from typing import Any
 
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.review.evolution_engine import build_candidate_patch
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, _decode_json
 from plugins.crypto_guard.strategy.shadow_testing import promote_shadow_candidate, run_shadow_test
 from plugins.crypto_guard.strategy.version_manager import create_candidate_version_from_patch
 
@@ -197,8 +197,7 @@ def run_self_evolution_cycle(
 
     # Enforce candidate cap after creating new candidate — atomic with save + create + cap
     from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
-    repo.conn.execute("BEGIN")
-    try:
+    with repo.conn.transaction():
         # Check config gate: draft patches stay draft unless auto-promote is allowed
         from plugins.crypto_guard.config.loader import load_config as _load_cfg
         _evo_cfg = _load_cfg().trading_mode.get("evolution", {})
@@ -208,10 +207,6 @@ def run_self_evolution_cycle(
         patch_id = repo.save_strategy_patch_candidate(patch, {"aggregation": aggregation}, status=initial_status)
         candidate = create_candidate_version_from_patch(repo, patch_id, initial_status=initial_status)
         _enforce_candidate_cap(repo, strategy_name, max_candidates=5)
-        repo.conn.commit()
-    except Exception:
-        repo.conn.execute("ROLLBACK")
-        raise
     audit_steps.append({"step": "create_candidate_patch", "patch_id": patch_id, "candidate": candidate})
     audit_steps.append({"step": "ga_llm_candidate_patch", "result": agent_patch})
 
@@ -242,10 +237,11 @@ def run_self_evolution_cycle(
 
     # Save backtest result to strategy_patches
     import json
-    repo.conn.execute(
-        "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
-        (json.dumps(backtest_result, ensure_ascii=False), patch_id),
-    )
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE strategy_patches SET backtest_result_json=%s WHERE id=%s",
+            (json.dumps(backtest_result, ensure_ascii=False), patch_id),
+        )
 
     # If backtest truly fails (not skipped, not gate_disabled, not data_missing),
     # reject the candidate immediately.
@@ -264,17 +260,16 @@ def run_self_evolution_cycle(
             and not no_data)
     )
     if backtest_failed:
-        # Update strategy version status to rejected
-        repo.conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
-            (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, patch["candidate_version"]),
-        )
-        # Update strategy patch status to rejected
-        repo.conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE id=?",
-            (patch_id,),
-        )
-        repo.conn.commit()
+        # Update strategy version and patch status to rejected atomically
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE strategy_name=%s AND version=%s",
+                (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, patch["candidate_version"]),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE id=%s",
+                (patch_id,),
+            )
 
         result = _blocked(
             "backtest_gate_failed",
@@ -287,11 +282,11 @@ def run_self_evolution_cycle(
         return result
 
     # Backtest passed or skipped — transition candidate to shadow_testing
-    repo.conn.execute(
-        "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
-        (strategy_name, patch["candidate_version"]),
-    )
-    repo.conn.commit()
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=%s AND version=%s AND status='candidate'",
+            (strategy_name, patch["candidate_version"]),
+        )
 
     shadow = run_shadow_test(
         repo,

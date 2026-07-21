@@ -49,7 +49,7 @@ def archive_status(root: str | Path = "data/crypto_guard/archive") -> dict[str, 
         "ok": True,
         "implemented": "path_contract_only",
         "root": str(Path(root)),
-        "note": "MVP 使用 SQLite 热数据；DuckDB/Parquet 历史回放接口已预留。",
+        "note": "MVP 使用 PostgreSQL 热数据；DuckDB/Parquet 历史回放接口已预留。",
     }
 
 

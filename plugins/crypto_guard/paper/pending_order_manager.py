@@ -47,42 +47,44 @@ def expire_pending_orders(repo: CryptoGuardRepository) -> dict[str, Any]:
     ).fetchall()
 
     expired: list[dict[str, Any]] = []
-    for order in pending_orders:
-        order = dict(order)
-        expires_at_str = order.get("expires_at")
+    with repo.conn.transaction():
+        for order in pending_orders:
+            order = dict(order)
+            expires_at_str = order.get("expires_at")
 
-        if expires_at_str:
-            # Use stored expires_at
-            try:
-                expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                if now > expires_at:
-                    expires_at_utc8 = expires_at.astimezone(timezone(timedelta(hours=8)))
-                    reason = f"挂单已超过有效期（到期时间：{expires_at_utc8.strftime('%m-%d %H:%M')} UTC+8）"
-                    _expire_order(repo, order, now, reason)
-                    expired.append(order)
-            except (ValueError, TypeError):
-                pass  # Skip malformed expires_at
-        else:
-            # Fallback: compute from created_at + TTL
-            created_at_str = order.get("created_at")
-            if not created_at_str:
-                continue
-            try:
-                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                ttl = ttl_for_entry_type(order.get("order_type"))
-                if now - created_at > ttl:
-                    hours = int(ttl.total_seconds() // 3600)
-                    reason = f"挂单已超过{hours}小时有效期"
-                    _expire_order(repo, order, now, reason)
-                    expired.append(order)
-            except (ValueError, TypeError):
-                continue
+            if expires_at_str:
+                # Use stored expires_at. PG returns TIMESTAMPTZ columns as
+                # ``datetime`` objects (not strings); ``str(...)`` normalizes
+                # both datetime and ISO-string values before fromisoformat.
+                try:
+                    expires_at = datetime.fromisoformat(str(expires_at_str).replace("Z", "+00:00"))
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=timezone.utc)
+                    if now > expires_at:
+                        expires_at_utc8 = expires_at.astimezone(timezone(timedelta(hours=8)))
+                        reason = f"挂单已超过有效期（到期时间：{expires_at_utc8.strftime('%m-%d %H:%M')} UTC+8）"
+                        _expire_order(repo, order, now, reason)
+                        expired.append(order)
+                except (ValueError, TypeError):
+                    pass  # Skip malformed expires_at
+            else:
+                # Fallback: compute from created_at + TTL
+                created_at_str = order.get("created_at")
+                if not created_at_str:
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    ttl = ttl_for_entry_type(order.get("order_type"))
+                    if now - created_at > ttl:
+                        hours = int(ttl.total_seconds() // 3600)
+                        reason = f"挂单已超过{hours}小时有效期"
+                        _expire_order(repo, order, now, reason)
+                        expired.append(order)
+                except (ValueError, TypeError):
+                    continue
 
-    repo.conn.commit()
     result: dict[str, Any] = {"ok": True, "expired_count": len(expired), "expired_orders": expired}
     if expired:
         LOGGER.info("expire_pending_orders result: expired %d orders", len(expired))
@@ -92,7 +94,7 @@ def expire_pending_orders(repo: CryptoGuardRepository) -> dict[str, Any]:
 def _expire_order(repo: CryptoGuardRepository, order: dict[str, Any], now: datetime, reason: str) -> None:
     now_iso = now.isoformat()
     repo.conn.execute(
-        "UPDATE paper_orders SET status='expired', cancelled_at=?, cancel_reason=? WHERE id=?",
+        "UPDATE paper_orders SET status='expired', cancelled_at=%s, cancel_reason=%s WHERE id=%s",
         (now_iso, reason, order["id"]),
     )
     order["cancel_reason"] = reason
@@ -112,65 +114,65 @@ def cancel_conflict_pending_orders(repo: CryptoGuardRepository) -> dict[str, Any
     ).fetchall()
 
     cancelled: list[dict[str, Any]] = []
-    for order in pending_orders:
-        order = dict(order)
-        symbol = order["symbol"]
-        side = str(order["side"] or "").upper()
+    with repo.conn.transaction():
+        for order in pending_orders:
+            order = dict(order)
+            symbol = order["symbol"]
+            side = str(order["side"] or "").upper()
 
-        # Get the latest GA decision for this symbol
-        # R13 P1 defense-in-depth: order by ``analysis_time`` (INTEGER NOT NULL,
-        # schema.sql:148) instead of ``analysis_time_utc`` (TEXT). Although
-        # R13 P0 ensures ``analysis_time_utc`` is always an ISO string (and
-        # ISO strings sort lexicographically the same as chronological
-        # order), the integer column is the canonical chronological key
-        # and is unaffected by any future regression that might re-introduce
-        # mixed integer/ISO-text population. ``id DESC`` as a tiebreaker
-        # for rows inserted within the same millisecond.
-        latest_decision = repo.conn.execute(
-            "SELECT id, market_bias, signal_grade FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
-            (symbol,),
-        ).fetchone()
+            # Get the latest GA decision for this symbol
+            # R13 P1 defense-in-depth: order by ``analysis_time`` (INTEGER NOT NULL,
+            # schema.sql:148) instead of ``analysis_time_utc`` (TEXT). Although
+            # R13 P0 ensures ``analysis_time_utc`` is always an ISO string (and
+            # ISO strings sort lexicographically the same as chronological
+            # order), the integer column is the canonical chronological key
+            # and is unaffected by any future regression that might re-introduce
+            # mixed integer/ISO-text population. ``id DESC`` as a tiebreaker
+            # for rows inserted within the same millisecond.
+            latest_decision = repo.conn.execute(
+                "SELECT id, market_bias, signal_grade FROM ga_decisions WHERE symbol=%s ORDER BY analysis_time DESC, id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
 
-        if not latest_decision:
-            continue
+            if not latest_decision:
+                continue
 
-        bias = str(latest_decision["market_bias"] or "neutral").lower()
-        grade = str(latest_decision["signal_grade"] or "D").upper()
-        ga_decision_id = int(latest_decision["id"])
-        side_cn = {"LONG": "做多", "SHORT": "做空"}.get(side, side)
-        bias_cn = {"bullish": "偏多", "bearish": "偏空", "neutral": "中性", "mixed": "混杂"}.get(bias, bias)
+            bias = str(latest_decision["market_bias"] or "neutral").lower()
+            grade = str(latest_decision["signal_grade"] or "D").upper()
+            ga_decision_id = int(latest_decision["id"])
+            side_cn = {"LONG": "做多", "SHORT": "做空"}.get(side, side)
+            bias_cn = {"bullish": "偏多", "bearish": "偏空", "neutral": "中性", "mixed": "混杂"}.get(bias, bias)
 
-        # Conflict: SHORT pending but bullish with strong grade, or LONG pending but bearish
-        conflict = False
-        if side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"}:
-            conflict = True
-        elif side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"}:
-            conflict = True
+            # Conflict: SHORT pending but bullish with strong grade, or LONG pending but bearish
+            conflict = False
+            if side == "SHORT" and bias == "bullish" and grade in {"S", "A", "B"}:
+                conflict = True
+            elif side == "LONG" and bias == "bearish" and grade in {"S", "A", "B"}:
+                conflict = True
 
-        if conflict:
-            now_iso = now.isoformat()
-            reason = f"方向冲突：{side_cn} vs {bias_cn}（{grade}级）"
-            repo.conn.execute(
-                "UPDATE paper_orders SET status='conflict_cancelled', cancelled_at=?, cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
-                (now_iso, reason, ga_decision_id, order["id"]),
-            )
-            cancelled.append(order)
-            LOGGER.info(
-                "conflict cancelled pending order id=%s symbol=%s side=%s bias=%s grade=%s ga_decision_id=%s",
-                order["id"], symbol, side, bias, grade, ga_decision_id,
-            )
-        elif bias in ("neutral", "mixed"):
-            # Neutral/mixed bias: mark for recheck, don't cancel
-            repo.conn.execute(
-                "UPDATE paper_orders SET status='needs_recheck' WHERE id=? AND status='pending'",
-                (order["id"],),
-            )
-            LOGGER.info(
-                "marked needs_recheck: pending order id=%s symbol=%s side=%s bias=%s",
-                order["id"], symbol, side, bias,
-            )
+            if conflict:
+                now_iso = now.isoformat()
+                reason = f"方向冲突：{side_cn} vs {bias_cn}（{grade}级）"
+                repo.conn.execute(
+                    "UPDATE paper_orders SET status='conflict_cancelled', cancelled_at=%s, cancel_reason=%s, invalidated_by_ga_decision_id=%s WHERE id=%s",
+                    (now_iso, reason, ga_decision_id, order["id"]),
+                )
+                cancelled.append(order)
+                LOGGER.info(
+                    "conflict cancelled pending order id=%s symbol=%s side=%s bias=%s grade=%s ga_decision_id=%s",
+                    order["id"], symbol, side, bias, grade, ga_decision_id,
+                )
+            elif bias in ("neutral", "mixed"):
+                # Neutral/mixed bias: mark for recheck, don't cancel
+                repo.conn.execute(
+                    "UPDATE paper_orders SET status='needs_recheck' WHERE id=%s AND status='pending'",
+                    (order["id"],),
+                )
+                LOGGER.info(
+                    "marked needs_recheck: pending order id=%s symbol=%s side=%s bias=%s",
+                    order["id"], symbol, side, bias,
+                )
 
-    repo.conn.commit()
     result: dict[str, Any] = {"ok": True, "cancelled_count": len(cancelled), "cancelled_orders": cancelled}
     if cancelled:
         LOGGER.info("cancel_conflict_pending_orders result: cancelled %d orders", len(cancelled))
@@ -196,7 +198,7 @@ def cleanup_stale_pending(repo: CryptoGuardRepository, max_age_hours: int = 24) 
         if not created_at_str:
             continue
         try:
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             if created_at < cutoff:
@@ -209,12 +211,12 @@ def cleanup_stale_pending(repo: CryptoGuardRepository, max_age_hours: int = 24) 
 
     now_iso = now.isoformat()
     reason = f"手动清理：挂单滞留超过{max_age_hours}小时"
-    for order in to_expire:
-        repo.conn.execute(
-            "UPDATE paper_orders SET status='expired', cancelled_at=?, cancel_reason=? WHERE id=? AND status='pending'",
-            (now_iso, reason, order["id"]),
-        )
-    repo.conn.commit()
+    with repo.conn.transaction():
+        for order in to_expire:
+            repo.conn.execute(
+                "UPDATE paper_orders SET status='expired', cancelled_at=%s, cancel_reason=%s WHERE id=%s AND status='pending'",
+                (now_iso, reason, order["id"]),
+            )
 
     LOGGER.info("cleanup_stale_pending: cleaned %d orders older than %dh", len(to_expire), max_age_hours)
     return {"ok": True, "cleaned": len(to_expire), "orders": to_expire}
@@ -292,23 +294,22 @@ def force_risk_off_pending_revalidation(repo: CryptoGuardRepository) -> dict[str
     ).fetchall()
 
     converted: list[dict[str, Any]] = []
-    for row in pending_orders:
-        order = dict(row)
-        now_iso = now.isoformat()
-        reason = f"账户风控暂停（{pause_reason}）"
-        repo.conn.execute(
-            "UPDATE paper_orders SET status='risk_off_cancelled', cancelled_at=?, cancel_reason=? WHERE id=?",
-            (now_iso, reason, order["id"]),
-        )
-        # Create opportunity_watch entry so the signal isn't lost
-        _create_watch_from_risk_off(repo, order, reason, now)
-        converted.append(order)
-        LOGGER.info(
-            "risk_off cancelled pending order id=%s symbol=%s side=%s",
-            order["id"], order["symbol"], order["side"],
-        )
-
-    repo.conn.commit()
+    with repo.conn.transaction():
+        for row in pending_orders:
+            order = dict(row)
+            now_iso = now.isoformat()
+            reason = f"账户风控暂停（{pause_reason}）"
+            repo.conn.execute(
+                "UPDATE paper_orders SET status='risk_off_cancelled', cancelled_at=%s, cancel_reason=%s WHERE id=%s",
+                (now_iso, reason, order["id"]),
+            )
+            # Create opportunity_watch entry so the signal isn't lost
+            _create_watch_from_risk_off(repo, order, reason, now)
+            converted.append(order)
+            LOGGER.info(
+                "risk_off cancelled pending order id=%s symbol=%s side=%s",
+                order["id"], order["symbol"], order["side"],
+            )
 
     LOGGER.info("force_risk_off_pending_revalidation: converted %d orders", len(converted))
     return {
@@ -328,7 +329,7 @@ def _create_watch_from_risk_off(repo: CryptoGuardRepository, order: dict[str, An
         repo.conn.execute(
             """
             INSERT INTO opportunity_watches(symbol, direction, ga_decision_id, watch_reason, watch_condition_json, status, created_at, expires_at)
-            VALUES (?, ?, ?, ?, '{}', 'active', ?, ?)
+            VALUES (%s, %s, %s, %s, '{}'::jsonb, 'active', %s, %s)
             """,
             (order.get("symbol", ""), order.get("side", ""), order.get("ga_decision_id"),
              f"账户风控暂停：{reason}", now_iso, expires_iso),

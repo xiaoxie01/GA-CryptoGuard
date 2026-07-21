@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from psycopg.conninfo import conninfo_to_dict
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +22,23 @@ class CryptoGuardConfig:
     symbols: dict[str, Any]
     scheduler: dict[str, Any]
     strategies: dict[str, Any]
-    database_path: Path
+    database_url: str
+
+    @property
+    def database_path(self) -> Path:
+        """DEPRECATED alias kept only while callers migrate to PostgreSQL.
+
+        CryptoGuard now runs on PostgreSQL only (fail-closed; no SQLite
+        fallback). The runtime DSN lives in :attr:`database_url`. A few legacy
+        call sites still reference ``database_path`` (e.g. the Redis-path
+        heuristic); they are migrated in the cutover and this property will be
+        removed. It raises so any unmigrated caller fails loudly rather than
+        silently using a stale SQLite path.
+        """
+        raise RuntimeError(
+            "database_path is removed; CryptoGuard uses PostgreSQL. "
+            "Use config.database_url (DSN) instead."
+        )
 
     @property
     def live_trading_enabled(self) -> bool:
@@ -66,10 +83,100 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def _default_db_path() -> Path:
-    raw = os.environ.get("CRYPTO_GUARD_DB")
+    """DEPRECATED. CryptoGuard is PostgreSQL-only; kept only to surface a clear
+    error for unmigrated callers instead of silently building a SQLite path."""
+    raise RuntimeError(
+        "CryptoGuard no longer uses SQLite. Set CRYPTO_GUARD_DATABASE_URL to a "
+        "PostgreSQL DSN (postgresql://crypto_guard_app:<pw>@host:5432/crypto_guard)."
+    )
+
+
+def resolve_database_url() -> str:
+    """Resolve the PostgreSQL DSN from ``CRYPTO_GUARD_DATABASE_URL``.
+
+    Fail-closed: if the env var is unset/empty, raise ``RuntimeError`` (caught
+    by ``pg_db.resolve_dsn`` and re-raised as ``CryptoGuardDBUnavailable``).
+    There is NO SQLite fallback. The DSN must be a ``postgresql://`` URL; the
+    application password is supplied only via this env var (never committed).
+    """
+    raw = os.environ.get("CRYPTO_GUARD_DATABASE_URL", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "CRYPTO_GUARD_DATABASE_URL is not set; CryptoGuard requires a "
+            "PostgreSQL DSN (postgresql://crypto_guard_app:<pw>@host:5432/"
+            "crypto_guard). No SQLite fallback is available."
+        )
+    if not raw.startswith(("postgresql://", "postgres://")):
+        raise RuntimeError(
+            "CRYPTO_GUARD_DATABASE_URL must be a postgresql:// DSN; got a non-"
+            "PostgreSQL value. CryptoGuard does not fall back to SQLite."
+        )
+    try:
+        identity = conninfo_to_dict(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            "CRYPTO_GUARD_DATABASE_URL is not a valid PostgreSQL DSN"
+        ) from exc
+    user = str(identity.get("user") or "")
+    dbname = str(identity.get("dbname") or "")
+    allowed_identity = (
+        (user == "crypto_guard_app" and dbname == "crypto_guard")
+        or (user == "crypto_guard_test_app" and dbname == "crypto_guard_test")
+    )
+    if not allowed_identity:
+        raise RuntimeError(
+            "CRYPTO_GUARD_DATABASE_URL must use the dedicated "
+            "crypto_guard_app/crypto_guard runtime identity (or the isolated "
+            "crypto_guard_test_app/crypto_guard_test test identity); superuser "
+            "and arbitrary-role DSNs are forbidden"
+        )
+    return raw
+
+
+def _resolve_scoped_postgres_url(
+    env_name: str,
+    *,
+    allowed_identities: set[tuple[str, str]],
+) -> str:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        raise RuntimeError(f"{env_name} is not set")
+    try:
+        identity = conninfo_to_dict(raw)
+    except Exception as exc:
+        raise RuntimeError(f"{env_name} is not a valid PostgreSQL DSN") from exc
+    pair = (str(identity.get("user") or ""), str(identity.get("dbname") or ""))
+    if pair not in allowed_identities:
+        raise RuntimeError(f"{env_name} violates its dedicated-role contract")
+    return raw
+
+
+def resolve_migration_database_url() -> str:
+    """Resolve the explicit DDL-only production migrator identity."""
+    return _resolve_scoped_postgres_url(
+        "CRYPTO_GUARD_MIGRATION_DATABASE_URL",
+        allowed_identities={("crypto_guard_migrator", "crypto_guard")},
+    )
+
+
+def resolve_replay_database_url() -> str:
+    """Resolve the isolated replay database; production runtime DB is forbidden."""
+    raw = os.environ.get("CRYPTO_GUARD_REPLAY_DATABASE_URL", "").strip()
     if raw:
-        return Path(raw).expanduser().resolve()
-    return (PROJECT_ROOT / "data" / "crypto_guard" / "crypto_guard.sqlite3").resolve()
+        return _resolve_scoped_postgres_url(
+            "CRYPTO_GUARD_REPLAY_DATABASE_URL",
+            allowed_identities={("crypto_guard_replay", "crypto_guard_replay")},
+        )
+    # Tests deliberately reuse their disposable role/database and isolate each
+    # replay in a scratch schema. Production app identity never gets this path.
+    runtime = resolve_database_url()
+    identity = conninfo_to_dict(runtime)
+    if (
+        str(identity.get("user") or "") == "crypto_guard_test_app"
+        and str(identity.get("dbname") or "") == "crypto_guard_test"
+    ):
+        return runtime
+    raise RuntimeError("CRYPTO_GUARD_REPLAY_DATABASE_URL is not set")
 
 
 def _default_market_data() -> dict[str, Any]:
@@ -91,12 +198,21 @@ def _default_market_data() -> dict[str, Any]:
 
 def load_config(config_dir: Path | None = None) -> CryptoGuardConfig:
     cfg_dir = config_dir or CONFIG_DIR
+    # Resolve the DSN through ``pg_db.resolve_dsn`` (NOT the raw
+    # ``resolve_database_url``) so a missing/malformed DSN surfaces uniformly as
+    # ``CryptoGuardDBUnavailable`` — the fail-closed contract callers gate on.
+    # ``resolve_database_url`` raises a bare ``RuntimeError``; ``CryptoGuardDBUnavailable``
+    # subclasses ``RuntimeError`` but the reverse is not true, so callers that
+    # ``except CryptoGuardDBUnavailable`` would otherwise miss a missing-DSN at
+    # config-load time. Lazy import avoids a config/loader <-> storage/pg_db cycle.
+    from plugins.crypto_guard.storage import pg_db
+
     config = CryptoGuardConfig(
         trading_mode=_read_yaml(cfg_dir / "trading_mode.yaml"),
         symbols=_read_yaml(cfg_dir / "symbols.yaml"),
         scheduler=_read_yaml(cfg_dir / "scheduler.yaml"),
         strategies=_read_yaml(cfg_dir / "strategies.yaml"),
-        database_path=_default_db_path(),
+        database_url=pg_db.resolve_dsn(),
     )
     if config.live_trading_enabled:
         raise RuntimeError("CryptoGuard 禁止实盘：live_trading_enabled 必须为 false")

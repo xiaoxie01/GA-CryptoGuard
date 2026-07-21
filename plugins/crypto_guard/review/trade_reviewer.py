@@ -8,7 +8,7 @@ from plugins.crypto_guard.reasoning.decision_schema import validate_json
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.review.evolution_engine import build_candidate_patch
 from plugins.crypto_guard.review.loss_classifier import classify_trade
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, _decode_json, _json_dumps_payload
 
 
 def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
@@ -73,9 +73,8 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
 
     patch_id = None
     if review_patch and review.get("evolution_trigger_allowed", True):
-        # Wrap patch + version + cap in explicit BEGIN/COMMIT — all or nothing
-        repo.conn.execute("BEGIN")
-        try:
+        # Wrap patch + version + cap in a single transaction — all or nothing
+        with repo.conn.transaction():
             patch_id = repo.save_strategy_patch_candidate(
                 review_patch, {"trade_id": trade_id, "review_id": review_id},
                 status="candidate",
@@ -90,10 +89,6 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
             # Enforce candidate cap AFTER creation, inside same transaction
             from plugins.crypto_guard.strategy.shadow_testing import _enforce_candidate_cap
             _enforce_candidate_cap(repo, review_patch.get("strategy_name", strategy_name), max_candidates=5)
-            repo.conn.commit()
-        except Exception:
-            repo.conn.execute("ROLLBACK")
-            raise
         # Run backtest gate if patch has score_adjustments
         candidate_patch_data = review_patch.get("patch", {})
         if candidate_patch_data.get("score_adjustments"):
@@ -101,15 +96,15 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
                                          review_patch["candidate_version"], patch_id)
         else:
             # No scoring changes — transition directly to shadow_testing
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
-                (review_patch.get("strategy_name", strategy_name), review_patch["candidate_version"]),
-            )
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='shadow_testing' WHERE id=?",
-                (patch_id,),
-            )
-            repo.conn.commit()
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=%s AND version=%s AND status='candidate'",
+                    (review_patch.get("strategy_name", strategy_name), review_patch["candidate_version"]),
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='shadow_testing' WHERE id=%s",
+                    (patch_id,),
+                )
     repo.update_strategy_memory_from_review(
         strategy_name=strategy_name,
         condition_hash=f"{trade.get('symbol')}:{primary}",
@@ -121,10 +116,10 @@ def review_trade(repo: CryptoGuardRepository, trade_id: int) -> dict[str, Any]:
 
 
 def _load_review_json(row: dict[str, Any]) -> dict[str, Any]:
-    try:
-        return json.loads(row.get("ga_review_json") or "{}")
-    except Exception:
-        return {"trade_id": row.get("trade_id"), "result": row.get("result"), "primary_reason": row.get("primary_reason")}
+    decoded = _decode_json(row.get("ga_review_json"), None)
+    if isinstance(decoded, dict):
+        return decoded
+    return {"trade_id": row.get("trade_id"), "result": row.get("result"), "primary_reason": row.get("primary_reason")}
 
 
 def _trade_metrics(trade: dict[str, Any]) -> dict[str, Any]:
@@ -195,7 +190,7 @@ def _enrich_trade_with_regime_context(repo: CryptoGuardRepository, trade: dict[s
 
     try:
         order = repo.conn.execute(
-            "SELECT ga_decision_id FROM paper_orders WHERE id=?",
+            "SELECT ga_decision_id FROM paper_orders WHERE id=%s",
             (int(order_id),),
         ).fetchone()
     except Exception:
@@ -206,7 +201,7 @@ def _enrich_trade_with_regime_context(repo: CryptoGuardRepository, trade: dict[s
 
     try:
         gd = repo.conn.execute(
-            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=?",
+            "SELECT market_regime_gate_json FROM ga_decisions WHERE id=%s",
             (int(order["ga_decision_id"]),),
         ).fetchone()
     except Exception:
@@ -216,10 +211,10 @@ def _enrich_trade_with_regime_context(repo: CryptoGuardRepository, trade: dict[s
         return trade
 
     try:
-        regime_data = json.loads(gd["market_regime_gate_json"])
+        regime_data = _decode_json(gd["market_regime_gate_json"], {})
         # Extract the regime info from the gate result structure
         # regime_gate has: market_regime (the scoring), adjustments, regime_gate_applied, mode
-        market_regime = regime_data.get("market_regime", {})
+        market_regime = regime_data.get("market_regime", {}) if isinstance(regime_data, dict) else {}
         if market_regime:
             trade = dict(trade)
             trade["market_regime_json"] = market_regime
@@ -230,19 +225,32 @@ def _enrich_trade_with_regime_context(repo: CryptoGuardRepository, trade: dict[s
 
 
 def _snapshot_context(repo: CryptoGuardRepository, trade: dict[str, Any]) -> dict[str, Any]:
+    # Under PG, paper_trades has no signal_id/market_snapshot_id (normalized away).
+    # Resolve the snapshot via the order -> signal chain:
+    # trade.order_id -> paper_orders.signal_id -> signals.market_snapshot_id -> market_snapshots.
     snapshot_id = trade.get("market_snapshot_id")
-    if not snapshot_id and trade.get("signal_id"):
-        signal = repo.get_signal(int(trade["signal_id"]))
-        snapshot_id = (signal or {}).get("market_snapshot_id") or (signal or {}).get("snapshot_id")
+    if not snapshot_id:
+        order_id = trade.get("order_id")
+        if order_id:
+            try:
+                order = repo.conn.execute(
+                    "SELECT signal_id FROM paper_orders WHERE id=%s",
+                    (int(order_id),),
+                ).fetchone()
+            except Exception:
+                order = None
+            signal_id = order["signal_id"] if order else None
+            if signal_id:
+                signal = repo.get_signal(int(signal_id))
+                snapshot_id = (signal or {}).get("market_snapshot_id") or (signal or {}).get("snapshot_id")
     if not snapshot_id:
         return {"available": False, "reason": "trade 未关联 snapshot"}
     row = repo.get_market_snapshot(int(snapshot_id))
     if not row:
         return {"available": False, "snapshot_id": int(snapshot_id), "reason": "snapshot 不存在"}
-    try:
-        snapshot = json.loads(row.get("snapshot_json") or "{}")
-    except Exception as exc:
-        return {"available": False, "snapshot_id": int(snapshot_id), "reason": f"snapshot_json 解析失败: {exc}"}
+    snapshot = _decode_json(row.get("snapshot_json"), {})
+    if not isinstance(snapshot, dict):
+        return {"available": False, "snapshot_id": int(snapshot_id), "reason": "snapshot_json 解析失败"}
     modules = snapshot.get("modules") or {}
     regime = modules.get("market_regime") or {}
     return {
@@ -331,7 +339,7 @@ def _derive_strategy_name_from_trade(repo: CryptoGuardRepository, trade: dict[st
         return None
     try:
         order = repo.conn.execute(
-            "SELECT ga_decision_id FROM paper_orders WHERE id=?",
+            "SELECT ga_decision_id FROM paper_orders WHERE id=%s",
             (int(order_id),),
         ).fetchone()
     except Exception:
@@ -340,7 +348,7 @@ def _derive_strategy_name_from_trade(repo: CryptoGuardRepository, trade: dict[st
         return None
     try:
         gd = repo.conn.execute(
-            "SELECT raw_decision_json FROM ga_decisions WHERE id=?",
+            "SELECT raw_decision_json FROM ga_decisions WHERE id=%s",
             (int(order["ga_decision_id"]),),
         ).fetchone()
     except Exception:
@@ -348,12 +356,14 @@ def _derive_strategy_name_from_trade(repo: CryptoGuardRepository, trade: dict[st
     if not gd or not gd["raw_decision_json"]:
         return None
     try:
-        raw = json.loads(gd["raw_decision_json"])
+        raw = _decode_json(gd["raw_decision_json"], {})
+        if not isinstance(raw, dict):
+            return None
         # Try top-level first, then raw_legacy_decision
         strategy_name = raw.get("strategy_name")
         if not strategy_name:
             legacy = raw.get("raw_legacy_decision") or {}
-            strategy_name = legacy.get("strategy_name")
+            strategy_name = legacy.get("strategy_name") if isinstance(legacy, dict) else None
         return strategy_name
     except (json.JSONDecodeError, TypeError):
         return None
@@ -370,7 +380,6 @@ def _run_backtest_for_candidate(
     Saves backtest_result_json to strategy_patches. If backtest fails,
     rejects the patch and strategy_version immediately.
     """
-    import json
     from plugins.crypto_guard.strategy.shadow_testing import run_backtest_gate
 
     try:
@@ -387,11 +396,6 @@ def _run_backtest_for_candidate(
             "error": str(exc),
         }
 
-    repo.conn.execute(
-        "UPDATE strategy_patches SET backtest_result_json=? WHERE id=?",
-        (json.dumps(backtest_result, ensure_ascii=False), patch_id),
-    )
-
     # Reject on: (ok=false AND passed=false AND NOT skipped) OR (ok=true AND passed=false AND NOT skipped AND NOT gate_disabled)
     skipped = backtest_result.get("skipped", False)
     gate_disabled = backtest_result.get("gate_disabled", False)
@@ -400,23 +404,27 @@ def _run_backtest_for_candidate(
         and not skipped
         and not gate_disabled
     )
-    if backtest_failed:
+    with repo.conn.transaction():
         repo.conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
-            (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, candidate_version),
+            "UPDATE strategy_patches SET backtest_result_json=%s WHERE id=%s",
+            (_json_dumps_payload(backtest_result), patch_id),
         )
-        repo.conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE id=?",
-            (patch_id,),
-        )
-    else:
-        # Backtest passed or skipped — transition candidate to shadow_testing
-        repo.conn.execute(
-            "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=? AND version=? AND status='candidate'",
-            (strategy_name, candidate_version),
-        )
-        repo.conn.execute(
-            "UPDATE strategy_patches SET status='shadow_testing' WHERE id=?",
-            (patch_id,),
-        )
-    repo.conn.commit()
+        if backtest_failed:
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE strategy_name=%s AND version=%s",
+                (f"回测门禁未通过：{backtest_result.get('reason', 'unknown')}", strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE id=%s",
+                (patch_id,),
+            )
+        else:
+            # Backtest passed or skipped — transition candidate to shadow_testing
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='shadow_testing' WHERE strategy_name=%s AND version=%s AND status='candidate'",
+                (strategy_name, candidate_version),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='shadow_testing' WHERE id=%s",
+                (patch_id,),
+            )

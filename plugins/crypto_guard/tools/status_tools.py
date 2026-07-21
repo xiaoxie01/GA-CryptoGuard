@@ -5,22 +5,23 @@ from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import log_path
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.redis_adapter import RedisAdapter
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 
 
 def crypto_system_status() -> dict[str, Any]:
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PG cutover: pooled connection (auto-returned; the queries below are
+    # read-only, so no commit is needed).
+    with pg_db.get_conn() as conn:
         queues = {
             "pending_user": _count(conn, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority <= 2"),
             "pending_background": _count(conn, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority > 2"),
             "running": _count(conn, "SELECT COUNT(*) FROM agent_jobs WHERE status='running'"),
-            "failed_24h": _count(conn, "SELECT COUNT(*) FROM agent_jobs WHERE status='failed' AND datetime(finished_at) >= datetime('now','-1 day')"),
+            "failed_24h": _count(conn, "SELECT COUNT(*) FROM agent_jobs WHERE status='failed' AND finished_at >= NOW() - INTERVAL '1 day'"),
         }
         scheduler = [
             dict(r)
@@ -40,8 +41,8 @@ def crypto_system_status() -> dict[str, Any]:
             ).fetchall()
         ]
         symbols = {
-            "enabled": _count(conn, "SELECT COUNT(*) FROM symbols WHERE enabled=1"),
-            "disabled": _count(conn, "SELECT COUNT(*) FROM symbols WHERE enabled=0"),
+            "enabled": _count(conn, "SELECT COUNT(*) FROM symbols WHERE enabled=TRUE"),
+            "disabled": _count(conn, "SELECT COUNT(*) FROM symbols WHERE enabled=FALSE"),
         }
         paper = {
             "pending": _count(conn, "SELECT COUNT(*) FROM paper_orders WHERE status='pending'"),
@@ -63,8 +64,8 @@ def crypto_system_status() -> dict[str, Any]:
         return {
             "ok": True,
             "service_started": _service_started(),
-            "database_path": str(cfg.database_path),
-            "sqlite": {"status": "ok", "database": str(cfg.database_path)},
+            "database": pg_db.database_identity(),
+            "postgres": {"status": "ok", "identity": pg_db.database_identity()},
             "redis": redis_status,
             "parquet": {"status": "ok" if parquet_run and parquet_run.get("status") == "success" else "degraded", "last_write": (parquet_run or {}).get("created_at"), "path": (parquet_run or {}).get("path")},
             "duckdb": duckdb_status,
@@ -77,8 +78,6 @@ def crypto_system_status() -> dict[str, Any]:
             "recent_scheduler_runs": scheduler,
             "locks": locks,
         }
-    finally:
-        conn.close()
 
 
 def render_system_status_text(status: dict[str, Any]) -> str:
@@ -88,7 +87,7 @@ def render_system_status_text(status: dict[str, Any]) -> str:
         "**CryptoGuard 系统状态**",
         "",
         f"服务：{'已启动' if status.get('service_started') else '未检测到自动服务线程'}",
-        f"数据库：{status.get('database_path')}",
+        f"数据库：{status.get('database')}",
         f"日志：{status.get('log_path')}",
         f"Redis：{(status.get('redis') or {}).get('status', '-')}",
         f"Parquet：{(status.get('parquet') or {}).get('status', '-')} last_write={(status.get('parquet') or {}).get('last_write') or '-'}",
@@ -135,15 +134,14 @@ def render_system_status_text(status: dict[str, Any]) -> str:
 def crypto_list_recent_errors(limit: int = 20) -> dict[str, Any]:
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PG cutover: pooled connection (auto-returned; list_recent_errors is
+    # read-only, so no commit is needed).
+    with pg_db.get_conn() as conn:
         from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
         repo = CryptoGuardRepository(conn)
         errors = repo.list_recent_errors(limit=limit)
         return {"ok": True, "errors": errors, "count": len(errors), "text": render_recent_errors_text(errors)}
-    finally:
-        conn.close()
 
 
 def render_recent_errors_text(errors: list[dict[str, Any]]) -> str:
@@ -162,7 +160,9 @@ def render_recent_errors_text(errors: list[dict[str, Any]]) -> str:
 
 
 def _count(conn: Any, sql: str) -> int:
-    return int(conn.execute(sql).fetchone()[0])
+    # PG cutover: psycopg dict_row factory returns a dict; ``COUNT(*)`` is
+    # exposed as the lowercase ``"count"`` key (not a positional tuple).
+    return int(conn.execute(sql).fetchone()["count"])
 
 
 def _service_started() -> bool:

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, _decode_json
 
 
 def list_strategy_versions(repo: CryptoGuardRepository, strategy_name: str | None = None) -> dict[str, Any]:
@@ -26,7 +25,7 @@ def list_strategy_versions(repo: CryptoGuardRepository, strategy_name: str | Non
 
 
 def create_candidate_version_from_patch(repo: CryptoGuardRepository, patch_id: int, *, initial_status: str = "draft") -> dict[str, Any]:
-    row = repo.conn.execute("SELECT * FROM strategy_patches WHERE id=?", (int(patch_id),)).fetchone()
+    row = repo.conn.execute("SELECT * FROM strategy_patches WHERE id=%s", (int(patch_id),)).fetchone()
     if not row:
         return {"ok": False, "error": "strategy_patch 不存在", "patch_id": patch_id}
     patch = dict(row)
@@ -81,14 +80,8 @@ def _candidate_config(repo: CryptoGuardRepository, patch: dict[str, Any], initia
     active = repo.active_strategy_version(patch["strategy_name"])
     base: dict[str, Any] = {}
     if active:
-        try:
-            base = json.loads(active.get("config_json") or "{}")
-        except Exception:
-            base = {}
-    try:
-        patch_json = json.loads(patch.get("patch_json") or "{}")
-    except Exception:
-        patch_json = {}
+        base = _decode_json(active.get("config_json"), {})
+    patch_json = _decode_json(patch.get("patch_json"), {})
     return {
         **base,
         "strategy_name": patch["strategy_name"],
@@ -100,9 +93,8 @@ def _candidate_config(repo: CryptoGuardRepository, patch: dict[str, Any], initia
 
 
 def _review_id_from_evidence(raw: Any) -> int | None:
-    try:
-        evidence = json.loads(raw or "{}")
-    except Exception:
+    evidence = _decode_json(raw, {})
+    if not isinstance(evidence, dict):
         return None
     value = evidence.get("review_id")
     return int(value) if value is not None else None

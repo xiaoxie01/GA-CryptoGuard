@@ -173,7 +173,7 @@ class PerformanceGate:
 
         # Parse timestamp and check if cooldown period has passed
         try:
-            last_dt = datetime.fromisoformat(last_trade_time.replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(str(last_trade_time).replace("Z", "+00:00"))
             cooldown_until = last_dt + timedelta(hours=cooldown_hours)
             now = datetime.now(cooldown_until.tzinfo) if cooldown_until.tzinfo else datetime.now()
 
@@ -250,11 +250,11 @@ class PerformanceGate:
                     t.pnl_r,
                     t.closed_at
                 FROM paper_trades t
-                WHERE t.symbol = ? AND t.side = ? AND t.closed_at IS NOT NULL
+                WHERE t.symbol = %s AND t.side = %s AND t.closed_at IS NOT NULL
                   AND t.pnl_r IS NOT NULL
                   AND (t.close_reason IS NULL OR t.close_reason != 'duplicate_cleanup')
                 ORDER BY t.closed_at DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (symbol, side, limit),
             ).fetchall()
@@ -284,9 +284,9 @@ class PerformanceGate:
                 JOIN signals s ON s.ga_decision_id = gd.id
                 JOIN paper_orders po ON po.signal_id = s.id
                 JOIN paper_trades t ON t.order_id = po.id AND t.closed_at IS NOT NULL
-                WHERE gd.symbol = ?
-                  AND UPPER(s.direction) = UPPER(?)
-                  AND gd.trend_stage = ?
+                WHERE gd.symbol = %s
+                  AND UPPER(s.direction) = UPPER(%s)
+                  AND gd.trend_stage = %s
                   AND t.pnl_r IS NOT NULL
                   AND (t.close_reason IS NULL OR t.close_reason != 'duplicate_cleanup')
                 """,
@@ -295,9 +295,9 @@ class PerformanceGate:
 
             if row:
                 result = {
-                    "sample_count": row[0] or 0,
-                    "avg_r": row[1] or 0.0,
-                    "win_rate": row[2] or 0.0,
+                    "sample_count": row["sample_count"] or 0,
+                    "avg_r": row["avg_r"] or 0.0,
+                    "win_rate": row["win_rate"] or 0.0,
                 }
             else:
                 result = {"sample_count": 0, "avg_r": 0.0, "win_rate": 0.0}

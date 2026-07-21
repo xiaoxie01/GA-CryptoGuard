@@ -7,7 +7,7 @@ from typing import Any
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, _decode_json
 
 LOGGER = get_logger("crypto_guard.shadow_testing")
 
@@ -33,34 +33,37 @@ def record_shadow_evaluation(
 ) -> dict[str, Any]:
     """候选策略只做影子记录，不推送飞书、不创建模拟盘。"""
 
-    repo.conn.execute(
-        """
-        INSERT INTO strategy_evaluations(
-            symbol, timeframe, analysis_time, strategy_name, strategy_version, score,
-            decision, evidence_json, counter_evidence_json, is_shadow, snapshot_id, pnl_r,
-            ga_decision_id, outcome_source, paper_trade_id, shadow_virtual_trade_id
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            symbol,
-            timeframe,
-            int(analysis_time_utc),
-            strategy_name,
-            strategy_version,
-            float(score),
-            decision,
-            "{}" if evidence is None else __import__("json").dumps(evidence, ensure_ascii=False),
-            "{}" if counter_evidence is None else __import__("json").dumps(counter_evidence, ensure_ascii=False),
-            snapshot_id,
-            pnl_r,
-            ga_decision_id,
-            outcome_source,
-            paper_trade_id,
-            shadow_virtual_trade_id,
-        ),
-    )
-    evaluation_id = int(repo.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+    with repo.conn.transaction():
+        with repo.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategy_evaluations(
+                    symbol, timeframe, analysis_time, strategy_name, strategy_version, score,
+                    decision, evidence_json, counter_evidence_json, is_shadow, snapshot_id, pnl_r,
+                    ga_decision_id, outcome_source, paper_trade_id, shadow_virtual_trade_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    symbol,
+                    timeframe,
+                    int(analysis_time_utc),
+                    strategy_name,
+                    strategy_version,
+                    float(score),
+                    decision,
+                    "{}" if evidence is None else json.dumps(evidence, ensure_ascii=False),
+                    "{}" if counter_evidence is None else json.dumps(counter_evidence, ensure_ascii=False),
+                    snapshot_id,
+                    pnl_r,
+                    ga_decision_id,
+                    outcome_source,
+                    paper_trade_id,
+                    shadow_virtual_trade_id,
+                ),
+            )
+            evaluation_id = int(cur.fetchone()["id"])
     return {"ok": True, "evaluation_id": evaluation_id, "is_shadow": True}
 
 
@@ -223,13 +226,15 @@ def run_shadow_test(
         # Check if candidate has been shadow_testing for 7+ days with zero real_pnl
         # If so, reject instead of keeping in 'running' — unlikely to ever accumulate real samples
         candidate_version_row = repo.conn.execute(
-            "SELECT created_at FROM strategy_versions WHERE strategy_name=? AND version=?",
+            "SELECT created_at FROM strategy_versions WHERE strategy_name=%s AND version=%s",
             (strategy_name, candidate_version),
         ).fetchone()
         is_stale = False
         if candidate_version_row and candidate_version_row["created_at"]:
             try:
-                created = datetime.fromisoformat(candidate_version_row["created_at"])
+                created = candidate_version_row["created_at"]
+                if not isinstance(created, datetime):
+                    created = datetime.fromisoformat(str(created))
                 if created.tzinfo is None:
                     created = created.replace(tzinfo=timezone.utc)
                 if datetime.now(timezone.utc) - created > timedelta(days=7):
@@ -339,14 +344,14 @@ def _paired_real_pnl_samples(
         FROM strategy_evaluations a
         INNER JOIN strategy_evaluations c
             ON a.ga_decision_id = c.ga_decision_id
-        WHERE a.strategy_name = ?
-          AND a.strategy_version = ?
-          AND a.is_shadow = 0
+        WHERE a.strategy_name = %s
+          AND a.strategy_version = %s
+          AND a.is_shadow = FALSE
           AND a.outcome_source = 'real_pnl'
           AND a.pnl_r IS NOT NULL
-          AND c.strategy_name = ?
-          AND c.strategy_version = ?
-          AND c.is_shadow = 1
+          AND c.strategy_name = %s
+          AND c.strategy_version = %s
+          AND c.is_shadow = TRUE
           AND c.outcome_source = 'real_pnl'
           AND c.pnl_r IS NOT NULL
         """,
@@ -378,13 +383,13 @@ def _run_paired_comparison(
         FROM strategy_evaluations a
         INNER JOIN strategy_evaluations c
             ON a.ga_decision_id = c.ga_decision_id
-        WHERE a.strategy_name = ?
-          AND a.strategy_version = ?
-          AND a.is_shadow = 0
+        WHERE a.strategy_name = %s
+          AND a.strategy_version = %s
+          AND a.is_shadow = FALSE
           AND a.outcome_source = 'real_pnl'
-          AND c.strategy_name = ?
-          AND c.strategy_version = ?
-          AND c.is_shadow = 1
+          AND c.strategy_name = %s
+          AND c.strategy_version = %s
+          AND c.is_shadow = TRUE
           AND c.outcome_source = 'real_pnl'
         ORDER BY a.analysis_time ASC
         """,
@@ -447,12 +452,12 @@ def _designate_primary_candidate(repo: CryptoGuardRepository, strategy_name: str
         SELECT sv.version, sv.created_at,
                (SELECT COUNT(*) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
-                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count,
+                  AND se.is_shadow=TRUE AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count,
                (SELECT MAX(se.created_at) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
-                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as last_sample_at
+                  AND se.is_shadow=TRUE AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as last_sample_at
         FROM strategy_versions sv
-        WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
+        WHERE sv.strategy_name=%s AND sv.status IN ('candidate', 'shadow_testing')
         ORDER BY real_pnl_count DESC, sv.created_at ASC
         """,
         (strategy_name,),
@@ -494,9 +499,9 @@ def _enforce_candidate_cap(repo: CryptoGuardRepository, strategy_name: str, max_
         SELECT sv.id, sv.version, sv.created_at, sv.status,
                (SELECT COUNT(*) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
-                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count
+                  AND se.is_shadow=TRUE AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count
         FROM strategy_versions sv
-        WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
+        WHERE sv.strategy_name=%s AND sv.status IN ('candidate', 'shadow_testing')
         ORDER BY real_pnl_count DESC, sv.created_at ASC
         """,
         (strategy_name,),
@@ -509,22 +514,21 @@ def _enforce_candidate_cap(repo: CryptoGuardRepository, strategy_name: str, max_
     excess = list(rows[max_candidates:])
     rejected = 0
     for row in excess:
-        repo.conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-            (f"候选上限 {max_candidates} 已满，自动拒绝旧候选", int(row["id"])),
-        )
-        repo.conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
-            (row["version"],),
-        )
-        repo.conn.execute(
-            "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-            (row["version"],),
-        )
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE id=%s",
+                (f"候选上限 {max_candidates} 已满，自动拒绝旧候选", int(row["id"])),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=%s AND status NOT IN ('rejected','duplicate')",
+                (row["version"],),
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                (row["version"],),
+            )
         rejected += 1
 
-    if rejected:
-        pass  # Caller is responsible for committing the transaction.
     return rejected
 
 
@@ -537,8 +541,6 @@ def _soft_reject_unknown_candidates(repo: CryptoGuardRepository) -> int:
 
     Returns number of candidates soft-rejected.
     """
-    import json
-
     unknown = repo.conn.execute(
         """
         SELECT sv.id, sv.strategy_name, sv.version
@@ -551,29 +553,27 @@ def _soft_reject_unknown_candidates(repo: CryptoGuardRepository) -> int:
     rejected = 0
     for row in unknown:
         patch_row = repo.conn.execute(
-            "SELECT patch_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+            "SELECT patch_json FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s ORDER BY id DESC LIMIT 1",
             (row["strategy_name"], row["version"]),
         ).fetchone()
         if not patch_row:
             continue
-        try:
-            patch = json.loads(patch_row["patch_json"] or "{}")
-        except (json.JSONDecodeError, TypeError):
+        patch = _decode_json(patch_row["patch_json"], {})
+        if not isinstance(patch, dict):
             continue
         loss_pattern = patch.get("patch", patch).get("loss_pattern", "")
         if loss_pattern == "unknown":
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='rejected', change_reason='needs_manual_classification' WHERE id=?",
-                (int(row["id"]),),
-            )
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=? AND candidate_version=?",
-                (row["strategy_name"], row["version"]),
-            )
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='rejected', change_reason='needs_manual_classification' WHERE id=%s",
+                    (int(row["id"]),),
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=%s AND candidate_version=%s",
+                    (row["strategy_name"], row["version"]),
+                )
             rejected += 1
 
-    if rejected:
-        repo.conn.commit()  # commit immediately after soft reject
     return rejected
 
 
@@ -583,11 +583,13 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
     # Throttle: only run every 30 minutes
     last_run = repo.conn.execute(
-        "SELECT MAX(created_at) as last_at FROM shadow_test_results WHERE verdict_runner_run=1"
+        "SELECT MAX(created_at) as last_at FROM shadow_test_results WHERE verdict_runner_run=TRUE"
     ).fetchone()
     if last_run and last_run["last_at"]:
         try:
-            last_time = datetime.fromisoformat(last_run["last_at"])
+            last_time = last_run["last_at"]
+            if not isinstance(last_time, datetime):
+                last_time = datetime.fromisoformat(str(last_time))
             if last_time.tzinfo is None:
                 last_time = last_time.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - last_time < timedelta(minutes=30):
@@ -624,7 +626,8 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
     # Soft-reject historical unknown candidates (patch with loss_pattern='unknown')
     _soft_reject_unknown_candidates(repo)
-    repo.conn.commit()  # commit immediately after soft reject
+    # 07-16 cutover: _soft_reject_unknown_candidates now self-wraps each write;
+    # no bare commit() here (would mis-scope a caller's outer transaction).
 
     # Re-query after soft reject — rejected candidates must not appear in re-queried list
     candidates = repo.conn.execute(
@@ -644,11 +647,11 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
         SELECT sv.id, sv.strategy_name, sv.version, sv.created_at
         FROM strategy_versions sv
         WHERE sv.status = 'shadow_testing'
-          AND sv.created_at < ?
+          AND sv.created_at < %s::timestamptz
           AND (SELECT COUNT(*) FROM strategy_evaluations se
                WHERE se.strategy_name = sv.strategy_name
                  AND se.strategy_version = sv.version
-                 AND se.is_shadow = 1
+                 AND se.is_shadow = TRUE
                  AND se.outcome_source = 'real_pnl'
                  AND se.pnl_r IS NOT NULL) = 0
         """,
@@ -656,24 +659,25 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
     ).fetchall()
 
     for row in stale_zero_real:
-        repo.conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-            ("no_real_samples_7d", int(row["id"])),
-        )
-        repo.conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
-            (row["version"],),
-        )
-        repo.conn.execute(
-            "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-            (row["version"],),
-        )
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE id=%s",
+                ("no_real_samples_7d", int(row["id"])),
+            )
+            repo.conn.execute(
+                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=%s AND status NOT IN ('rejected','duplicate')",
+                (row["version"],),
+            )
+            repo.conn.execute(
+                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                (row["version"],),
+            )
         LOGGER.info(
             "soft_reject_zero_real_pnl: %s/%s has 0 real_pnl samples after 7+ days — rejected",
             row["strategy_name"], row["version"],
         )
     if stale_zero_real:
-        repo.conn.commit()
+        pass  # 07-16 cutover: writes self-wrap in a transaction above.
 
     # Re-query after zero-real-PnL soft reject
     candidates = repo.conn.execute(
@@ -697,7 +701,7 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         # Guard: skip if status was changed to 'rejected' (e.g. by soft reject)
         current_status = repo.conn.execute(
-            "SELECT status FROM strategy_versions WHERE strategy_name=? AND version=?",
+            "SELECT status FROM strategy_versions WHERE strategy_name=%s AND version=%s",
             (strategy_name, candidate_version),
         ).fetchone()
         if not current_status or current_status["status"] == "rejected":
@@ -708,7 +712,7 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         # Check if sample count increased since last verdict
         last_verdict = repo.conn.execute(
-            "SELECT sample_count FROM shadow_test_results WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+            "SELECT sample_count FROM shadow_test_results WHERE strategy_name=%s AND candidate_version=%s ORDER BY id DESC LIMIT 1",
             (strategy_name, candidate_version),
         ).fetchone()
         current_sample_count = len(_strategy_eval_rows(repo, strategy_name, candidate_version, is_shadow=True))
@@ -728,18 +732,19 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         if verdict == "candidate_can_be_promoted_with_manual_confirmation":
             # Promote to review_required
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='review_required' WHERE strategy_name=? AND version=?",
-                (strategy_name, candidate_version),
-            )
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='review_required' WHERE strategy_name=? AND candidate_version=?",
-                (strategy_name, candidate_version),
-            )
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET status='review_required' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-                (candidate_version,),
-            )
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='review_required' WHERE strategy_name=%s AND version=%s",
+                    (strategy_name, candidate_version),
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='review_required' WHERE strategy_name=%s AND candidate_version=%s",
+                    (strategy_name, candidate_version),
+                )
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET status='review_required' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                    (candidate_version,),
+                )
             # Send notification for review_required promotion
             try:
                 repo.enqueue_job(
@@ -763,18 +768,19 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
 
         elif verdict == "reject_candidate":
             # Reject
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE strategy_name=? AND version=?",
-                ("shadow_test_verdict_rejected", strategy_name, candidate_version),
-            )
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=? AND candidate_version=?",
-                (strategy_name, candidate_version),
-            )
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-                (candidate_version,),
-            )
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='rejected', change_reason=%s WHERE strategy_name=%s AND version=%s",
+                    ("shadow_test_verdict_rejected", strategy_name, candidate_version),
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='rejected' WHERE strategy_name=%s AND candidate_version=%s",
+                    (strategy_name, candidate_version),
+                )
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                    (candidate_version,),
+                )
 
             # P1-A: Shadow failure reflection
             _write_failure_reflection(repo, strategy_name, candidate_version, shadow)
@@ -788,13 +794,13 @@ def run_shadow_verdict_runner(repo: CryptoGuardRepository) -> dict[str, Any]:
     # Mark this as a verdict runner run for throttling
     if results:
         try:
-            repo.conn.execute(
-                "INSERT INTO shadow_test_results(strategy_name, candidate_version, sample_count, recommendation, status, verdict_runner_run) VALUES (?, ?, ?, ?, ?, 1)",
-                ("verdict_runner", "system", 0, "verdict_run", "completed"),
-            )
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "INSERT INTO shadow_test_results(strategy_name, candidate_version, sample_count, recommendation, status, verdict_runner_run) VALUES (%s, %s, %s, %s, %s, TRUE)",
+                    ("verdict_runner", "system", 0, "verdict_run", "completed"),
+                )
         except Exception:
             pass
-    repo.conn.commit()
     return {
         "ok": True,
         "processed": len(results),
@@ -1067,15 +1073,13 @@ def _aggregate_stats(
 def _get_candidate_patch(repo: CryptoGuardRepository, strategy_name: str, candidate_version: str) -> dict[str, Any]:
     """Get candidate patch from strategy_patches table."""
     row = repo.conn.execute(
-        "SELECT patch_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+        "SELECT patch_json FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s ORDER BY id DESC LIMIT 1",
         (strategy_name, candidate_version),
     ).fetchone()
     if not row:
         return {}
-    try:
-        return json.loads(row["patch_json"] or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return {}
+    patch = _decode_json(row["patch_json"], {})
+    return patch if isinstance(patch, dict) else {}
 
 
 def _extract_score_adjustment(patch: dict[str, Any]) -> float:
@@ -1133,16 +1137,15 @@ def _has_scoring_changes(patch: dict[str, Any]) -> bool:
 def check_candidate_backtest_status(repo: CryptoGuardRepository, strategy_name: str, candidate_version: str) -> dict[str, Any]:
     """Check if a candidate has passed the backtest gate."""
     row = repo.conn.execute(
-        "SELECT backtest_result_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? AND backtest_result_json IS NOT NULL",
+        "SELECT backtest_result_json FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s AND backtest_result_json IS NOT NULL",
         (strategy_name, candidate_version),
     ).fetchone()
     if not row:
         return {"has_backtest": False}
-    try:
-        backtest = json.loads(row["backtest_result_json"])
-        return {"has_backtest": True, "passed": backtest.get("passed", False), "backtest": backtest}
-    except (json.JSONDecodeError, TypeError):
+    backtest = _decode_json(row["backtest_result_json"], None)
+    if not isinstance(backtest, dict):
         return {"has_backtest": False}
+    return {"has_backtest": True, "passed": backtest.get("passed", False), "backtest": backtest}
 
 
 def _promote_draft_to_candidate(
@@ -1161,21 +1164,22 @@ def _promote_draft_to_candidate(
         return {"ok": False, "error": "draft promotion requires explicit confirmation (confirm=True)"}
 
     row = repo.conn.execute(
-        "SELECT id, status FROM strategy_patches WHERE strategy_name=? AND candidate_version=? AND status='draft'",
+        "SELECT id, status FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s AND status='draft'",
         (strategy_name, candidate_version),
     ).fetchone()
     if not row:
         return {"ok": False, "error": "draft patch not found or not in draft status"}
 
-    repo.conn.execute(
-        "UPDATE strategy_patches SET status='candidate' WHERE id=?",
-        (int(row["id"]),),
-    )
-    repo.conn.execute(
-        "UPDATE strategy_versions SET status='candidate', change_reason='manual_approval_from_draft' WHERE strategy_name=? AND version=? AND status='draft'",
-        (strategy_name, candidate_version),
-    )
-    repo.conn.commit()
+    # 07-16 cutover: wrap both UPDATEs in one transaction (writes self-commit).
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE strategy_patches SET status='candidate' WHERE id=%s",
+            (int(row["id"]),),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='candidate', change_reason='manual_approval_from_draft' WHERE strategy_name=%s AND version=%s AND status='draft'",
+            (strategy_name, candidate_version),
+        )
     return {"ok": True, "strategy_name": strategy_name, "candidate_version": candidate_version, "status": "candidate"}
 
 
@@ -1198,14 +1202,16 @@ def promote_shadow_candidate(
     candidate = repo.get_strategy_version(strategy_name, candidate_version)
     if not candidate or candidate.get("status") not in {"candidate", "shadow_testing", "review_required"}:
         return {"ok": False, "error": "candidate version not found or invalid status"}
-    repo.conn.execute(
-        "UPDATE strategy_versions SET status='deprecated' WHERE strategy_name=? AND status='active'",
-        (strategy_name,),
-    )
-    repo.conn.execute(
-        "UPDATE strategy_versions SET status='active', change_reason=? WHERE strategy_name=? AND version=?",
-        (change_reason, strategy_name, candidate_version),
-    )
+    # 07-16 cutover: wrap both UPDATEs in one transaction (writes self-commit).
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='deprecated' WHERE strategy_name=%s AND status='active'",
+            (strategy_name,),
+        )
+        repo.conn.execute(
+            "UPDATE strategy_versions SET status='active', change_reason=%s WHERE strategy_name=%s AND version=%s",
+            (change_reason, strategy_name, candidate_version),
+        )
     return {"ok": True, "strategy_name": strategy_name, "active_version": candidate_version}
 
 
@@ -1215,10 +1221,10 @@ def _strategy_eval_rows(repo: CryptoGuardRepository, strategy_name: str, version
     rows = repo.conn.execute(
         """
         SELECT * FROM strategy_evaluations
-        WHERE strategy_name=? AND strategy_version=? AND is_shadow=?
+        WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=%s
         ORDER BY analysis_time ASC, id ASC
         """,
-        (strategy_name, version, 1 if is_shadow else 0),
+        (strategy_name, version, bool(is_shadow)),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1257,7 +1263,7 @@ def _write_failure_reflection(
 
     # Get affected symbols from strategy evaluations
     rows = repo.conn.execute(
-        "SELECT DISTINCT symbol FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
+        "SELECT DISTINCT symbol FROM strategy_evaluations WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE",
         (strategy_name, candidate_version),
     ).fetchall()
     affected_symbols = [r["symbol"] for r in rows if r["symbol"]]
@@ -1267,7 +1273,7 @@ def _write_failure_reflection(
     sides_rows = repo.conn.execute(
         """
         SELECT DISTINCT decision FROM strategy_evaluations
-        WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND decision IS NOT NULL
+        WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE AND decision IS NOT NULL
         """,
         (strategy_name, candidate_version),
     ).fetchall()
@@ -1358,7 +1364,7 @@ def _maybe_generate_draft_patch(
 
     # Find original trigger
     patch_row = repo.conn.execute(
-        "SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND strategy_name=?",
+        "SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND strategy_name=%s",
         (candidate_version, strategy_name),
     ).fetchone()
 
@@ -1369,7 +1375,7 @@ def _maybe_generate_draft_patch(
 
     # Count existing drafts for this trigger
     draft_count = repo.conn.execute(
-        "SELECT COUNT(*) as cnt FROM strategy_patches WHERE trigger_id=? AND status='draft'",
+        "SELECT COUNT(*) as cnt FROM strategy_patches WHERE trigger_id=%s AND status='draft'",
         (trigger_id,),
     ).fetchone()
 
@@ -1379,13 +1385,15 @@ def _maybe_generate_draft_patch(
 
     # Check cooldown (24h since last draft)
     last_draft = repo.conn.execute(
-        "SELECT created_at FROM strategy_patches WHERE trigger_id=? AND status='draft' ORDER BY created_at DESC LIMIT 1",
+        "SELECT created_at FROM strategy_patches WHERE trigger_id=%s AND status='draft' ORDER BY created_at DESC LIMIT 1",
         (trigger_id,),
     ).fetchone()
 
     if last_draft and last_draft["created_at"]:
         try:
-            last_time = datetime.fromisoformat(last_draft["created_at"])
+            last_time = last_draft["created_at"]
+            if not isinstance(last_time, datetime):
+                last_time = datetime.fromisoformat(str(last_time))
             if last_time.tzinfo is None:
                 last_time = last_time.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - last_time < timedelta(hours=24):
@@ -1405,20 +1413,22 @@ def _maybe_generate_draft_patch(
 
     # Create new patch entry with status='draft'
     new_version = f"{candidate_version}.draft.{int(datetime.now(timezone.utc).timestamp())}"
-    repo.conn.execute(
-        """
-        INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id, reason)
-        VALUES (?, ?, ?, ?, 'draft', ?, ?)
-        """,
-        (
-            strategy_name,
-            candidate_version,
-            new_version,
-            json.dumps(draft_patch, ensure_ascii=False),
-            trigger_id,
-            f"auto_draft_from_failure_{pattern_type}",
-        ),
-    )
+    # 07-16 cutover: INSERT self-wraps in a transaction (writes self-commit).
+    with repo.conn.transaction():
+        repo.conn.execute(
+            """
+            INSERT INTO strategy_patches(strategy_name, from_version, candidate_version, patch_json, status, trigger_id, reason)
+            VALUES (%s, %s, %s, %s, 'draft', %s, %s)
+            """,
+            (
+                strategy_name,
+                candidate_version,
+                new_version,
+                json.dumps(draft_patch, ensure_ascii=False),
+                trigger_id,
+                f"auto_draft_from_failure_{pattern_type}",
+            ),
+        )
     repo.save_strategy_version(
         strategy_name=strategy_name,
         version=new_version,
@@ -1426,7 +1436,6 @@ def _maybe_generate_draft_patch(
         config=draft_patch,
         change_reason=f"auto_draft_from_failure_{pattern_type}",
     )
-    repo.conn.commit()
 
     LOGGER.info(
         "shadow_failure_reflection: generated draft patch %s for trigger %s",
@@ -1502,8 +1511,8 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             and outcome_source == "real_pnl"
             and ga_decision_id is not None
             and (
-                (is_shadow == 1 and shadow_virtual_trade_id is not None)
-                or (is_shadow == 0 and paper_trade_id is not None)
+                (bool(is_shadow) and shadow_virtual_trade_id is not None)
+                or (not bool(is_shadow) and paper_trade_id is not None)
             )
         ):
             real_pnls.append(float(pnl_r))

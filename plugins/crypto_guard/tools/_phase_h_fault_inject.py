@@ -1,28 +1,49 @@
 """Phase H (07-05) fault injection verifier.
 
 For each of the 7 Phase H diagnostic codes, seed a defective row into a fresh
-temp DB, run diagnose_report_accuracy, and assert the corresponding code is
-reported. Then clean up and report PASS/FAIL for each fault.
+isolated PostgreSQL scratch schema, run diagnose_report_accuracy, and assert
+the corresponding code is reported. Then drop the scratch schema and report
+PASS/FAIL for each fault.
+
+PG cutover: each fault runs against a fresh isolated scratch schema
+(``fault_<uuid>``) on the dedicated ``crypto_guard_test`` DB (app role
+``crypto_guard_test_app``, never the ``postgres`` superuser) - NOT a temp SQLite
+file. The scratch schema carries the full schema + seeds + ALL contract
+markers (including ``llm_fair_scheduling_context_contract_v1``) so the 07-10
+§10 fair-scheduling findings fire at their real severity (NOT demoted).
+Fail-closed: if the scratch connection cannot be opened or seeded the error
+propagates (NO SQLite fallback).
 
 Usage:
-    python plugins/crypto_guard/tools/_phase_h_fault_inject.py
+    python -m plugins.crypto_guard.tools._phase_h_fault_inject
 """
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
-import tempfile
-from pathlib import Path
+import uuid
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
-# Force temp DB before any config import
-TMP_DIR = Path(tempfile.mkdtemp(prefix="cg_phase_h_fault_"))
-DB_PATH = TMP_DIR / "fault.db"
-os.environ["CRYPTO_GUARD_DB"] = str(DB_PATH)
+import psycopg
+from psycopg.rows import dict_row
+
+# Bootstrap the dedicated test DB + app role BEFORE importing config/migrations
+# (which resolve ``CRYPTO_GUARD_DATABASE_URL`` at import/call time). The admin
+# password is read from ``CRYPTO_GUARD_DB_ADMIN_PASSWORD`` (test env only) and
+# is NEVER written to source/YAML/logs/git. The role is least-privilege
+# (NOSUPERUSER); the runtime never connects as the ``postgres`` superuser.
+from plugins.crypto_guard.tests._pg_bootstrap import ensure_bootstrap
+
+_APP_DSN = ensure_bootstrap()
+os.environ["CRYPTO_GUARD_DATABASE_URL"] = _APP_DSN
 
 from plugins.crypto_guard.config import load_config
-from plugins.crypto_guard.storage.sqlite_db import connect_db
-from plugins.crypto_guard.storage.migrations import initialize_database
+from plugins.crypto_guard.storage.migrations import (
+    SCHEMA_PATH,
+    _seed_strategies,
+    _seed_symbols,
+)
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.diagnostics.report_diagnostics import (
     diagnose_report_accuracy,
@@ -53,6 +74,89 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
     LLM_BATCH_DEGRADED_REPORTED_HEALTHY,
     LLM_REPAIR_COUNTED_AS_PROVIDER_CALL,
 )
+
+
+# ---------------------------------------------------------------------------
+# Scratch-schema isolation (mirrors backtest/historical_replay._scratch_replay_repo)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
+    """Write every contract marker into the scratch schema.
+
+    The 07-10 §10 fair-scheduling fault seeds require
+    ``llm_fair_scheduling_context_contract_v1`` to be present or the findings
+    are demoted to ``legacy_info`` (wrong severity). Production's
+    ``initialize_database`` writes all markers after schema+seeds; we replicate
+    the full set here so every fault fires at its real severity. Marker rows
+    land in ``_migration_state`` (created by the schema SQL) inside the scratch
+    schema via ``search_path``.
+    """
+    from plugins.crypto_guard.storage.migrations import (
+        _ensure_btc9_trade_gate_contract_marker,
+        _ensure_hourly_decision_context_continuity_contract_marker,
+        _ensure_hourly_market_semantic_accuracy_contract_marker,
+        _ensure_hourly_report_accuracy_r4_contract_marker,
+        _ensure_llm_fair_scheduling_context_contract_marker,
+        _ensure_market_data_contract_marker,
+        _ensure_profit_protection_cutoff_marker,
+        _ensure_stop_loss_adjustment_dedup_marker,
+    )
+
+    _ensure_profit_protection_cutoff_marker(cur)
+    _ensure_hourly_report_accuracy_r4_contract_marker(cur)
+    _ensure_btc9_trade_gate_contract_marker(cur)
+    _ensure_market_data_contract_marker(cur)
+    _ensure_hourly_market_semantic_accuracy_contract_marker(cur)
+    _ensure_hourly_decision_context_continuity_contract_marker(cur)
+    _ensure_llm_fair_scheduling_context_contract_marker(cur)
+    _ensure_stop_loss_adjustment_dedup_marker(cur)
+
+
+@contextmanager
+def _scratch_fault_repo() -> Iterator[CryptoGuardRepository]:
+    """Yield a repo bound to a fresh isolated scratch schema; drop it on exit.
+
+    A dedicated (non-pooled) ``psycopg.connect`` to the test DSN with
+    ``search_path`` routed to a unique scratch schema so writes never touch the
+    ``public`` schema (and the production pool is never opened). The schema SQL
+    is schema-agnostic (no ``public.`` qualification), so ``CREATE TABLE``
+    lands in ``search_path``. We deliberately do NOT call
+    ``initialize_database`` (which targets the production pool / advisory
+    lock / contract markers) - we apply schema + seeds + markers directly.
+    """
+    schema_name = f"fault_{uuid.uuid4().hex}".lower()
+    conn = psycopg.connect(_APP_DSN, row_factory=dict_row, autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema_name}"')
+        # Commit CREATE SCHEMA + SET search_path as its own transaction so the
+        # schema exists before the DDL is applied into it.
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(f'SET search_path = "{schema_name}", public')
+        # Apply schema + seeds + contract markers as one transaction so a
+        # seed/marker failure drops nothing half-built (we DROP on exit).
+        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        cfg = load_config()
+        with conn.cursor() as cur:
+            cur.execute(schema_sql)
+            _seed_symbols(cur, cfg.symbols)
+            _seed_strategies(cur, cfg.strategies)
+            _ensure_all_contract_markers(cur)
+        conn.commit()
+        yield CryptoGuardRepository(conn)
+    finally:
+        # Drop the scratch schema (autocommit so DROP works outside a txn) and
+        # close the dedicated connection. Swallow only DROP errors so a fault
+        # exception still propagates from the ``yield``.
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+        except Exception:
+            pass
+        conn.close()
 
 
 def _insert_decision(conn, *, raw, decision="monitor_only", grade="D",
@@ -107,45 +211,35 @@ def _insert_decision(conn, *, raw, decision="monitor_only", grade="D",
         "opportunity_watch": None,
     }
     raw_full.update(raw)
-    conn.execute(
-        "INSERT INTO ga_decisions ("
-        "  symbol, analysis_time, analysis_time_utc, decision_type,"
-        "  signal_grade, confidence, decision, market_bias, trend_stage,"
-        "  skill_result_refs_json, evidence_json, counter_evidence_json,"
-        "  risk_check_json, trade_plan_json, opportunity_watch_json,"
-        "  feishu_actions_json, final_summary, raw_decision_json, batch_id"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            symbol, analysis_time, "2033-05-18T08:33:20Z", "scheduled",
-            grade, confidence, decision, "neutral", "unknown",
-            "{}", "[]", "[]",
-            "{}", None, None,
-            "[]", "test", json.dumps(raw_full), batch_id,
-        ),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ga_decisions ("
+            "  symbol, analysis_time, analysis_time_utc, decision_type,"
+            "  signal_grade, confidence, decision, market_bias, trend_stage,"
+            "  skill_result_refs_json, evidence_json, counter_evidence_json,"
+            "  risk_check_json, trade_plan_json, opportunity_watch_json,"
+            "  feishu_actions_json, final_summary, raw_decision_json, batch_id"
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                symbol, analysis_time, "2033-05-18T08:33:20Z", "scheduled",
+                grade, confidence, decision, "neutral", "unknown",
+                "{}", "[]", "[]",
+                "{}", None, None,
+                "[]", "test", json.dumps(raw_full), batch_id,
+            ),
+        )
     conn.commit()
 
 
 def _run_one(name, fn):
-    """Reset DB, run fn to seed fault, run diagnostics, return result dict."""
-    # Fresh DB for isolation
-    if DB_PATH.exists():
-        DB_PATH.unlink()
-    for suffix in ("-wal", "-shm"):
-        side = DB_PATH.with_suffix(DB_PATH.suffix + suffix)
-        if side.exists():
-            side.unlink()
-    cfg = load_config()
-    initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    repo = CryptoGuardRepository(conn)
-    try:
+    """Build a fresh scratch schema, run fn to seed fault, run diagnostics,
+    return result dict. The scratch schema is dropped on exit."""
+    with _scratch_fault_repo() as repo:
+        conn = repo.conn
         fn(conn)
         result = diagnose_report_accuracy(repo)
         codes = [i["type"] for i in result["issues"]]
         return {"name": name, "codes": codes, "issues": result["issues"]}
-    finally:
-        conn.close()
 
 
 def fault_missing_candidate(conn):
@@ -229,49 +323,51 @@ def fault_batch_time_health_mismatch(conn):
     # (5-TF set), and the diagnostic fired ``missing_required_tf`` instead
     # of ``not_ready`` — so the ``not_ready`` branch was never exercised
     # by fault injection.
-    conn.execute(
-        "INSERT INTO analysis_batches (batch_id, primary_interval, "
-        "analysis_time, status, enabled_symbols_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (batch_id, "15m", analysis_time, "success",
-         json.dumps(["BTCUSDT"])),
-    )
-    # Insert a batch_symbol_status row marked completed
-    conn.execute(
-        "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-        "VALUES (?, ?, ?)",
-        (batch_id, "BTCUSDT", "completed"),
-    )
-    # P1-7 (07-05 final review): seed the PRODUCTION shape
-    # ``data_quality.health[tf]`` — market_state_builder persists this
-    # structure (see market_state_builder.py:_data_quality). The previous
-    # fault seeded ``timeframes`` which does not exist in production,
-    # so the diagnostic (which read ``timeframes``) appeared to catch
-    # the fault but actually never fired on real data.
-    # R12 P2-2: seed all 5 required TFs. 1h has ``ready=False`` to
-    # exercise the ``not_ready`` branch of the diagnostic.
-    conn.execute(
-        "INSERT INTO market_snapshots "
-        "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ("BTCUSDT", analysis_time, "scheduled", "{}",
-         json.dumps({"health": {
-             "1d": {"ready": True, "last_close_time": analysis_time - 86_400_000},
-             "4h": {"ready": True, "last_close_time": analysis_time - 14_400_000},
-             "1h": {"ready": False, "last_close_time": 0},
-             "15m": {"ready": True, "last_close_time": analysis_time - 900_000},
-             "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
-         }})),
-    )
-    snap_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (batch_id, "15m", analysis_time, "success",
+             json.dumps(["BTCUSDT"])),
+        )
+        # Insert a batch_symbol_status row marked completed
+        cur.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (%s, %s, %s)",
+            (batch_id, "BTCUSDT", "completed"),
+        )
+        # P1-7 (07-05 final review): seed the PRODUCTION shape
+        # ``data_quality.health[tf]`` — market_state_builder persists this
+        # structure (see market_state_builder.py:_data_quality). The previous
+        # fault seeded ``timeframes`` which does not exist in production,
+        # so the diagnostic (which read ``timeframes``) appeared to catch
+        # the fault but actually never fired on real data.
+        # R12 P2-2: seed all 5 required TFs. 1h has ``ready=False`` to
+        # exercise the ``not_ready`` branch of the diagnostic.
+        cur.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            ("BTCUSDT", analysis_time, "scheduled", "{}",
+             json.dumps({"health": {
+                 "1d": {"ready": True, "last_close_time": analysis_time - 86_400_000},
+                 "4h": {"ready": True, "last_close_time": analysis_time - 14_400_000},
+                 "1h": {"ready": False, "last_close_time": 0},
+                 "15m": {"ready": True, "last_close_time": analysis_time - 900_000},
+                 "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
+             }})),
+        )
+        snap_id = cur.fetchone()["id"]
     # Insert a ga_decisions row referencing the snapshot via snapshot_id
     _insert_decision(conn, raw={
         "batch_id": batch_id,
     }, batch_id=batch_id, decision="no_edge", grade="C")
-    conn.execute(
-        "UPDATE ga_decisions SET snapshot_id = ? WHERE batch_id = ?",
-        (snap_id, batch_id),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE ga_decisions SET snapshot_id = %s WHERE batch_id = %s",
+            (snap_id, batch_id),
+        )
     conn.commit()
 
 
@@ -297,68 +393,76 @@ def fault_batch_time_health_stale_but_ready(conn):
     analysis_time = 2_000_000_000_000
     # 1h interval = 3_600_000 ms. 12h stale = batch_at - 12 * 3_600_000.
     stale_close = analysis_time - 12 * 3_600_000
-    conn.execute(
-        "INSERT INTO analysis_batches (batch_id, primary_interval, "
-        "analysis_time, status, enabled_symbols_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (batch_id, "15m", analysis_time, "success",
-         json.dumps(["BTCUSDT"])),
-    )
-    conn.execute(
-        "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-        "VALUES (?, ?, ?)",
-        (batch_id, "BTCUSDT", "completed"),
-    )
-    # ``ready=True`` (would have passed old check) but last_close is 12h
-    # stale, which must be caught by the R5 stale lower bound.
-    # R12 P2-2: seed all 5 required TFs. Only ``1h`` is stale; the
-    # others are fresh so the only reason the diagnostic fires is the
-    # stale lower bound on ``1h``.
-    conn.execute(
-        "INSERT INTO market_snapshots "
-        "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ("BTCUSDT", analysis_time, "scheduled", "{}",
-         json.dumps({"health": {
-             "1d": {"ready": True, "last_close_time": analysis_time - 86_400_000},
-             "4h": {"ready": True, "last_close_time": analysis_time - 14_400_000},
-             "1h": {"ready": True, "last_close_time": stale_close},
-             "15m": {"ready": True, "last_close_time": analysis_time - 900_000},
-             "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
-         }})),
-    )
-    snap_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches (batch_id, primary_interval, "
+            "analysis_time, status, enabled_symbols_json) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (batch_id, "15m", analysis_time, "success",
+             json.dumps(["BTCUSDT"])),
+        )
+        cur.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (%s, %s, %s)",
+            (batch_id, "BTCUSDT", "completed"),
+        )
+        # ``ready=True`` (would have passed old check) but last_close is 12h
+        # stale, which must be caught by the R5 stale lower bound.
+        # R12 P2-2: seed all 5 required TFs. Only ``1h`` is stale; the
+        # others are fresh so the only reason the diagnostic fires is the
+        # stale lower bound on ``1h``.
+        cur.execute(
+            "INSERT INTO market_snapshots "
+            "(symbol, analysis_time, mode, snapshot_json, data_quality_json) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            ("BTCUSDT", analysis_time, "scheduled", "{}",
+             json.dumps({"health": {
+                 "1d": {"ready": True, "last_close_time": analysis_time - 86_400_000},
+                 "4h": {"ready": True, "last_close_time": analysis_time - 14_400_000},
+                 "1h": {"ready": True, "last_close_time": stale_close},
+                 "15m": {"ready": True, "last_close_time": analysis_time - 900_000},
+                 "5m": {"ready": True, "last_close_time": analysis_time - 300_000},
+             }})),
+        )
+        snap_id = cur.fetchone()["id"]
     _insert_decision(conn, raw={
         "batch_id": batch_id,
     }, batch_id=batch_id, decision="no_edge", grade="C")
-    conn.execute(
-        "UPDATE ga_decisions SET snapshot_id = ? WHERE batch_id = ?",
-        (snap_id, batch_id),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE ga_decisions SET snapshot_id = %s WHERE batch_id = %s",
+            (snap_id, batch_id),
+        )
     conn.commit()
 
 
 def fault_failed_jobs_outside_window(conn):
     """Fault: failed batch older than 7 days — should be legacy_info."""
-    # Use sqlite CURRENT_TIMESTAMP (UTC now). Set started_at to 8 days ago.
-    conn.execute(
-        "INSERT INTO analysis_batches ("
-        "  batch_id, primary_interval, analysis_time, status, started_at,"
-        "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-        ") VALUES (?, ?, ?, ?, datetime('now', '-8 days'), ?, ?, ?)",
-        ("BATCH_OLD", "1h", 2_000_000_000_000, "failed",
-         json.dumps(["BTCUSDT"]), json.dumps([]), json.dumps(["BTCUSDT"])),
-    )
+    # Set started_at to 8 days ago. PG: ``NOW() - INTERVAL '8 days'``.
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+            ") VALUES (%s, %s, %s, %s, (NOW() - INTERVAL '8 days'), %s, %s, %s)",
+            ("BATCH_OLD", "1h", 2_000_000_000_000, "failed",
+             json.dumps(["BTCUSDT"]), json.dumps([]), json.dumps(["BTCUSDT"])),
+        )
     conn.commit()
 
 
 # ── Phase I (07-07): LLM retry + hourly accuracy repair fault seeds ──────────
 
 def _recent_analysis_time_ms() -> int:
-    """Return a recent analysis_time (now - 1h in ms) so 24h-lookback
-    diagnostics see the seeded row."""
+    """Return a current-contract analysis time visible to 24h diagnostics.
+
+    Use a one-second forward guard rather than ``now - 1h``.  The latter can
+    fall before a freshly-created contract marker (and crosses the UTC date
+    boundary during the first UTC hour), incorrectly demoting positive fault
+    seeds to historical ``legacy_info``.
+    """
     import time as _time
-    return int(_time.time() * 1000) - 3_600_000
+    return int(_time.time() * 1000) + 1_000
 
 
 def fault_llm_config_error_http_422(conn):
@@ -408,14 +512,15 @@ def fault_llm_circuit_breaker_open(conn):
             "total_retries": 3,
         },
     }
-    conn.execute(
-        "INSERT INTO analysis_batches ("
-        "  batch_id, primary_interval, analysis_time, status, started_at,"
-        "  summary_json"
-        ") VALUES (?, ?, ?, ?, datetime('now'), ?)",
-        ("BATCH_BREAKER_OPEN", "1h", at_ms, "failed",
-         json.dumps(summary)),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  summary_json"
+            ") VALUES (%s, %s, %s, %s, NOW(), %s)",
+            ("BATCH_BREAKER_OPEN", "1h", at_ms, "failed",
+             json.dumps(summary)),
+        )
     conn.commit()
 
 
@@ -506,23 +611,24 @@ def fault_success_batch_missing_completed_symbols(conn):
     ``batch_symbol_status`` to prove the column is stale.
     """
     at_ms = _recent_analysis_time_ms()
-    conn.execute(
-        "INSERT INTO analysis_batches ("
-        "  batch_id, primary_interval, analysis_time, status, started_at,"
-        "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
-        ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)",
-        ("BATCH_EMPTY_COMPLETED", "1h", at_ms, "success",
-         json.dumps(["BTCUSDT", "ETHUSDT"]),
-         json.dumps([]),  # ← raw column empty — the defect
-         json.dumps([])),
-    )
-    # Plant a live completed entry to prove the column is stale (not
-    # legitimately empty).
-    conn.execute(
-        "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
-        "VALUES (?, ?, ?)",
-        ("BATCH_EMPTY_COMPLETED", "BTCUSDT", "completed"),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  enabled_symbols_json, completed_symbols_json, failed_symbols_json"
+            ") VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)",
+            ("BATCH_EMPTY_COMPLETED", "1h", at_ms, "success",
+             json.dumps(["BTCUSDT", "ETHUSDT"]),
+             json.dumps([]),  # ← raw column empty — the defect
+             json.dumps([])),
+        )
+        # Plant a live completed entry to prove the column is stale (not
+        # legitimately empty).
+        cur.execute(
+            "INSERT INTO batch_symbol_status (batch_id, symbol, status) "
+            "VALUES (%s, %s, %s)",
+            ("BATCH_EMPTY_COMPLETED", "BTCUSDT", "completed"),
+        )
     conn.commit()
 
 
@@ -535,30 +641,31 @@ def fault_hourly_report_used_partial_running_batch(conn):
     violates the contract.
     """
     at_ms = _recent_analysis_time_ms()
-    conn.execute(
-        "INSERT INTO analysis_batches ("
-        "  batch_id, primary_interval, analysis_time, status, started_at"
-        ") VALUES (?, ?, ?, ?, datetime('now'))",
-        ("BATCH_RUNNING", "1h", at_ms, "running"),
-    )
-    # Plant a recent hourly_summary alert (within last hour).
-    conn.execute(
-        "INSERT INTO alert_outbox ("
-        "  alert_type, symbol, priority, payload_json, status, created_at"
-        ") VALUES (?, ?, ?, ?, ?, datetime('now'))",
-        ("hourly_summary", None, 5,
-         json.dumps({"fallback_text": "hourly report test"}), "sent"),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at"
+            ") VALUES (%s, %s, %s, %s, NOW())",
+            ("BATCH_RUNNING", "1h", at_ms, "running"),
+        )
+        # Plant a recent hourly_summary alert (within last hour).
+        cur.execute(
+            "INSERT INTO alert_outbox ("
+            "  alert_type, symbol, priority, payload_json, status, created_at"
+            ") VALUES (%s, %s, %s, %s, %s, NOW())",
+            ("hourly_summary", None, 5,
+             json.dumps({"fallback_text": "hourly report test"}), "sent"),
+        )
     conn.commit()
 
 
 # ── 07-10 P1-1 (design §10): eight Phase F fair-scheduling fault seeds ───────
 #
-# Each seed plants the EXACT production defect into a fresh DB (whose
-# ``initialize_database`` writes the ``llm_fair_scheduling_context_contract_v1``
-# marker, so findings fire at their real severity - NOT demoted). Each has a
-# paired negative control proving the check does NOT fire on the healthy
-# shape (so a future widening cannot silently green it).
+# Each seed plants the EXACT production defect into a fresh scratch schema
+# (whose init writes the ``llm_fair_scheduling_context_contract_v1`` marker,
+# so findings fire at their real severity - NOT demoted). Each has a paired
+# negative control proving the check does NOT fire on the healthy shape (so
+# a future widening cannot silently green it).
 #
 # Batch-row helper: the batch-level checks (coverage / starvation / mismatch /
 # degraded) read ``analysis_batches`` rows. ``enabled_symbols_json`` is the
@@ -573,18 +680,19 @@ def _insert_batch(conn, *, batch_id, enabled, analysis_time=None,
     summary_json). Returns ``batch_id`` for chaining."""
     if analysis_time is None:
         analysis_time = _recent_analysis_time_ms()
-    conn.execute(
-        "INSERT INTO analysis_batches ("
-        "  batch_id, primary_interval, analysis_time, status, started_at,"
-        "  enabled_symbols_json, completed_symbols_json, failed_symbols_json,"
-        "  summary_json"
-        ") VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)",
-        (batch_id, "15m", analysis_time, status,
-         json.dumps(list(enabled)),
-         json.dumps(list(enabled)),
-         json.dumps([]),
-         json.dumps(summary) if summary is not None else None),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO analysis_batches ("
+            "  batch_id, primary_interval, analysis_time, status, started_at,"
+            "  enabled_symbols_json, completed_symbols_json, failed_symbols_json,"
+            "  summary_json"
+            ") VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s)",
+            (batch_id, "15m", analysis_time, status,
+             json.dumps(list(enabled)),
+             json.dumps(list(enabled)),
+             json.dumps([]),
+             json.dumps(summary) if summary is not None else None),
+        )
     return batch_id
 
 
@@ -1061,7 +1169,7 @@ def main():
     print("=" * 70)
     print("Phase H (07-05) Fault Injection Verification")
     print("=" * 70)
-    print(f"Temp DB: {DB_PATH}")
+    print(f"Test DB DSN: {_APP_DSN.split('@')[-1] if '@' in _APP_DSN else _APP_DSN}")
     print()
 
     faults = [

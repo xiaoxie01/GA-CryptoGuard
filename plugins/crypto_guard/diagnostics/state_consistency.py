@@ -13,6 +13,7 @@ Detects:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -21,6 +22,54 @@ from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 
 LOGGER = get_logger("crypto_guard.state_diagnostics")
 
+
+def _diagnostic_query_failure(
+    repo: CryptoGuardRepository,
+    check_name: str,
+    exc: BaseException,
+) -> list[dict[str, Any]]:
+    try:
+        repo.conn.rollback()
+    except Exception:
+        pass
+    return [{
+        "type": "diagnostic_query_failed",
+        "severity": "error",
+        "details": {"check": check_name, "error_type": type(exc).__name__},
+        "suggested_action": "Restore PostgreSQL query health; this check failed closed.",
+    }]
+
+
+def _run_check(
+    repo: CryptoGuardRepository,
+    check: Any,
+) -> list[dict[str, Any]]:
+    """Run one diagnostic in isolation and fail closed on query errors."""
+    try:
+        result = check(repo)
+        return result if isinstance(result, list) else []
+    except Exception as exc:
+        LOGGER.exception("state consistency check failed: %s", check.__name__)
+        return _diagnostic_query_failure(repo, check.__name__, exc)
+
+
+def _safe_json(raw: Any, default: Any) -> Any:
+    """Decode a JSON column value, PG-JSONB-aware.
+
+    PostgreSQL JSONB columns come back from psycopg as already-decoded
+    dict/list (NOT str). ``json.loads`` on a dict/list raises TypeError and,
+    inside the per-row ``except ...: continue`` blocks here, would silently
+    skip every row -> every JSONB-backed check would report zero issues (false
+    green). Only parse a str; pass dict/list through.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
 
 
 def _profit_protection_cutoff(repo: CryptoGuardRepository) -> str | None:
@@ -39,8 +88,8 @@ def _profit_protection_cutoff(repo: CryptoGuardRepository) -> str | None:
         ).fetchone()
         if row and row["applied_at"]:
             return str(row["applied_at"])
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError("profit-protection marker query failed") from exc
     return None
 
 
@@ -59,8 +108,8 @@ def _btc9_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
         ).fetchone()
         if row and row["applied_at"]:
             return str(row["applied_at"])
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError("BTC#9 marker query failed") from exc
     return None
 
 
@@ -82,13 +131,13 @@ def _llm_fair_scheduling_contract_cutoff(repo: CryptoGuardRepository) -> str | N
     try:
         row = repo.conn.execute(
             "SELECT applied_at FROM _migration_state "
-            "WHERE key = ? LIMIT 1",
+            "WHERE key = %s LIMIT 1",
             (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
         ).fetchone()
         if row and row["applied_at"]:
             return str(row["applied_at"])
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError("LLM fair-scheduling marker query failed") from exc
     return None
 
 
@@ -103,62 +152,57 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         }
     """
     issues: list[dict[str, Any]] = []
-
-    issues.extend(_check_orphan_patches(repo))
-    issues.extend(_check_status_mismatches(repo))
-    issues.extend(_check_stale_shadows(repo))
-    issues.extend(_check_draft_limbo(repo))
-    issues.extend(_check_duplicate_patches(repo))
-    issues.extend(_check_duplicate_open_trades(repo))
-    issues.extend(_check_candidate_queue_overflow(repo))
-    issues.extend(_check_stalled_candidate(repo))
-    issues.extend(_check_no_real_pnl_progress(repo))
-    issues.extend(_check_strategy_name_mismatch(repo))
-    issues.extend(_check_zero_quantity_virtual_trades(repo))
-    issues.extend(_check_zero_risk_virtual_trades(repo))
-    issues.extend(_check_three_table_status_mismatch(repo))
-    issues.extend(_check_closed_vt_missing_real_pnl_eval(repo))
-    issues.extend(_check_ambiguous_vt_missing_ambiguous_eval(repo))
-    issues.extend(_check_ambiguous_eval_not_real_pnl(repo))
-    issues.extend(_check_duplicate_vt_per_candidate_decision(repo))
-    issues.extend(_check_closed_vt_still_processed(repo))
-    issues.extend(_check_cursor_regression(repo))
-    issues.extend(_check_illegal_status_transitions(repo))
-    issues.extend(_check_active_eval_missing_ga_decision_id(repo))
-    issues.extend(_check_paper_order_missing_active_eval(repo))
-    issues.extend(_check_closed_trade_missing_active_real_pnl(repo))
-    issues.extend(_check_shadow_candidate_legacy_only_samples(repo))
-    issues.extend(_check_financial_action_missing_mark_price(repo))
-    issues.extend(_check_financial_action_stale_price(repo))
-    issues.extend(_check_paper_notification_missing_event_time(repo))
-    # Section 九: Schema health is an integral part of state consistency
-    issues.extend(_check_schema_health_as_issues(repo))
-    # BTC#9 fix: 6 类新诊断
-    issues.extend(_check_btc9_contract_marker_missing(repo))
-    issues.extend(_check_fallback_llm_failed_created_paper_order(repo))
-    issues.extend(_check_missing_entry_confirmation_paper_order(repo))
-    issues.extend(_check_htf_support_reason_inconsistent(repo))
-    issues.extend(_check_chop_regime_boosted(repo))
-    issues.extend(_check_fill_without_ga_revalidation(repo))
-    issues.extend(_check_invalid_condition_equals_stop_loss(repo))
-    # R7: 10 market-data-contract diagnostic checks
-    issues.extend(_check_market_data_insufficient_contiguous_samples(repo))
-    issues.extend(_check_market_data_gap_detected(repo))
-    issues.extend(_check_market_data_stale_last_candle(repo))
-    issues.extend(_check_market_data_future_candle(repo))
-    issues.extend(_check_market_data_duplicate_open_time(repo))
-    issues.extend(_check_analysis_created_with_unready_market_data(repo))
-    issues.extend(_check_executable_decision_with_unready_market_data(repo))
-    issues.extend(_check_paper_order_created_with_unready_market_data(repo))
-    issues.extend(_check_report_claims_complete_for_gapped_data(repo))
-    issues.extend(_check_deterministic_direction_from_failed_llm(repo))
-    # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract checks.
-    # The marker-missing check runs first so a missing contract is explicitly
-    # surfaced even when the ownership / continuity / per-job checks would
-    # otherwise pass (or skip). These verify the S1-S6 production-chain
-    # postconditions survive in persisted state.
-    issues.extend(_check_llm_fair_scheduling_contract_marker_missing(repo))
-    issues.extend(_check_batch_claim_ownership_integrity(repo))
+    checks = (
+        _check_orphan_patches,
+        _check_status_mismatches,
+        _check_stale_shadows,
+        _check_draft_limbo,
+        _check_duplicate_patches,
+        _check_duplicate_open_trades,
+        _check_candidate_queue_overflow,
+        _check_stalled_candidate,
+        _check_no_real_pnl_progress,
+        _check_strategy_name_mismatch,
+        _check_zero_quantity_virtual_trades,
+        _check_zero_risk_virtual_trades,
+        _check_three_table_status_mismatch,
+        _check_closed_vt_missing_real_pnl_eval,
+        _check_ambiguous_vt_missing_ambiguous_eval,
+        _check_ambiguous_eval_not_real_pnl,
+        _check_duplicate_vt_per_candidate_decision,
+        _check_closed_vt_still_processed,
+        _check_cursor_regression,
+        _check_illegal_status_transitions,
+        _check_active_eval_missing_ga_decision_id,
+        _check_paper_order_missing_active_eval,
+        _check_closed_trade_missing_active_real_pnl,
+        _check_shadow_candidate_legacy_only_samples,
+        _check_financial_action_missing_mark_price,
+        _check_financial_action_stale_price,
+        _check_paper_notification_missing_event_time,
+        _check_schema_health_as_issues,
+        _check_btc9_contract_marker_missing,
+        _check_fallback_llm_failed_created_paper_order,
+        _check_missing_entry_confirmation_paper_order,
+        _check_htf_support_reason_inconsistent,
+        _check_chop_regime_boosted,
+        _check_fill_without_ga_revalidation,
+        _check_invalid_condition_equals_stop_loss,
+        _check_market_data_insufficient_contiguous_samples,
+        _check_market_data_gap_detected,
+        _check_market_data_stale_last_candle,
+        _check_market_data_future_candle,
+        _check_market_data_duplicate_open_time,
+        _check_analysis_created_with_unready_market_data,
+        _check_executable_decision_with_unready_market_data,
+        _check_paper_order_created_with_unready_market_data,
+        _check_report_claims_complete_for_gapped_data,
+        _check_deterministic_direction_from_failed_llm,
+        _check_llm_fair_scheduling_contract_marker_missing,
+        _check_batch_claim_ownership_integrity,
+    )
+    for check in checks:
+        issues.extend(_run_check(repo, check))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -335,7 +379,7 @@ def _check_duplicate_patches(repo: CryptoGuardRepository) -> list[dict[str, Any]
     duplicates = repo.conn.execute(
         """
         SELECT strategy_name, candidate_version, COUNT(*) as count,
-               GROUP_CONCAT(id) as patch_ids, GROUP_CONCAT(status) as statuses
+               STRING_AGG(id::text, ',') as patch_ids, STRING_AGG(status::text, ',') as statuses
         FROM strategy_patches
         WHERE status NOT IN ('duplicate', 'rejected', 'deprecated')
         GROUP BY strategy_name, candidate_version
@@ -377,19 +421,19 @@ def _check_stale_shadows(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
             continue
 
         try:
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
 
             if created_at < stale_threshold:
                 # Check if there are new samples since last update
                 latest_eval = repo.conn.execute(
-                    "SELECT MAX(created_at) as latest FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1",
+                    "SELECT MAX(created_at) as latest FROM strategy_evaluations WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE",
                     (row["strategy_name"], row["version"]),
                 ).fetchone()
 
                 latest_eval_at = latest_eval["latest"] if latest_eval else None
-                if not latest_eval_at or datetime.fromisoformat(latest_eval_at.replace("Z", "+00:00")).replace(tzinfo=timezone.utc) < stale_threshold:
+                if not latest_eval_at or datetime.fromisoformat(str(latest_eval_at).replace("Z", "+00:00")).replace(tzinfo=timezone.utc) < stale_threshold:
                     issues.append({
                         "type": "stale_shadow",
                         "severity": "warning",
@@ -423,7 +467,7 @@ def _check_draft_limbo(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
             continue
 
         try:
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
 
@@ -452,11 +496,11 @@ def _check_duplicate_open_trades(repo: CryptoGuardRepository) -> list[dict[str, 
 
     duplicates = repo.conn.execute(
         """
-        SELECT order_id, symbol, COUNT(*) as open_count,
-               GROUP_CONCAT(id) as trade_ids,
-               GROUP_CONCAT(entry_price) as entry_prices,
-               GROUP_CONCAT(quantity) as quantities,
-               GROUP_CONCAT(created_at) as created_ats
+        SELECT order_id, MAX(symbol) as symbol, COUNT(*) as open_count,
+               STRING_AGG(id::text, ',') as trade_ids,
+               STRING_AGG(entry_price::text, ',') as entry_prices,
+               STRING_AGG(quantity::text, ',') as quantities,
+               STRING_AGG(created_at::text, ',') as created_ats
         FROM paper_trades
         WHERE closed_at IS NULL
         GROUP BY order_id
@@ -489,7 +533,7 @@ def _check_candidate_queue_overflow(repo: CryptoGuardRepository) -> list[dict[st
 
     overflow = repo.conn.execute(
         """
-        SELECT strategy_name, COUNT(*) as cnt, GROUP_CONCAT(version) as versions
+        SELECT strategy_name, COUNT(*) as cnt, STRING_AGG(version::text, ',') as versions
         FROM strategy_versions
         WHERE status = 'shadow_testing'
         GROUP BY strategy_name
@@ -531,7 +575,7 @@ def _check_stalled_candidate(repo: CryptoGuardRepository) -> list[dict[str, Any]
         if not created_at_str:
             continue
         try:
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             if created_at < threshold:
@@ -563,7 +607,7 @@ def _check_no_real_pnl_progress(repo: CryptoGuardRepository) -> list[dict[str, A
         SELECT sv.strategy_name, sv.version, sv.created_at,
                (SELECT MAX(se.created_at) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
-                  AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as last_real_pnl_at
+                  AND se.is_shadow=TRUE AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as last_real_pnl_at
         FROM strategy_versions sv
         WHERE sv.status = 'shadow_testing'
         """
@@ -575,7 +619,7 @@ def _check_no_real_pnl_progress(repo: CryptoGuardRepository) -> list[dict[str, A
             created_at_str = row["created_at"]
             if created_at_str:
                 try:
-                    created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                    created_at = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
                     if created_at.tzinfo is None:
                         created_at = created_at.replace(tzinfo=timezone.utc)
                     if created_at < threshold:
@@ -595,7 +639,7 @@ def _check_no_real_pnl_progress(repo: CryptoGuardRepository) -> list[dict[str, A
             continue
 
         try:
-            last_dt = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(str(last_at).replace("Z", "+00:00"))
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
             if last_dt < threshold:
@@ -819,7 +863,7 @@ def _check_closed_vt_missing_real_pnl_eval(repo: CryptoGuardRepository) -> list[
               SELECT 1 FROM strategy_evaluations se
               WHERE se.shadow_virtual_trade_id = svt.id
                 AND se.outcome_source = 'real_pnl'
-                AND se.is_shadow = 1
+                AND se.is_shadow = TRUE
                 AND se.pnl_r IS NOT NULL
           )
         """
@@ -848,7 +892,7 @@ def _check_closed_vt_missing_real_pnl_eval(repo: CryptoGuardRepository) -> list[
                svt.symbol, svt.strategy_name, svt.candidate_version
         FROM shadow_virtual_trades svt
         JOIN strategy_evaluations se ON se.shadow_virtual_trade_id = svt.id
-            AND se.outcome_source = 'real_pnl' AND se.is_shadow = 1
+            AND se.outcome_source = 'real_pnl' AND se.is_shadow = TRUE
         WHERE svt.status = 'closed'
           AND svt.pnl_r IS NOT NULL
           AND (
@@ -865,7 +909,7 @@ def _check_closed_vt_missing_real_pnl_eval(repo: CryptoGuardRepository) -> list[
                svt.symbol, svt.strategy_name, svt.candidate_version
         FROM shadow_virtual_trades svt
         JOIN strategy_evaluations se ON se.shadow_virtual_trade_id = svt.id
-            AND se.outcome_source = 'real_pnl' AND se.is_shadow = 1
+            AND se.outcome_source = 'real_pnl' AND se.is_shadow = TRUE
         WHERE svt.status = 'closed'
           AND svt.pnl_r IS NULL
         """
@@ -921,7 +965,7 @@ def _check_ambiguous_vt_missing_ambiguous_eval(repo: CryptoGuardRepository) -> l
           ON se.strategy_name = svt.strategy_name
          AND se.strategy_version = svt.candidate_version
          AND se.ga_decision_id = svt.ga_decision_id
-         AND se.is_shadow = 1
+         AND se.is_shadow = TRUE
         WHERE svt.status = 'closed'
           AND svt.close_reason IN ('ambiguous_path', 'activation_ambiguous_path')
         """
@@ -977,7 +1021,7 @@ def _check_ambiguous_eval_not_real_pnl(repo: CryptoGuardRepository) -> list[dict
         JOIN shadow_virtual_trades svt
           ON se.shadow_virtual_trade_id = svt.id
         WHERE se.outcome_source = 'ambiguous_path'
-          AND se.is_shadow = 1
+          AND se.is_shadow = TRUE
         """
     ).fetchall()
 
@@ -1008,13 +1052,13 @@ def _check_duplicate_vt_per_candidate_decision(repo: CryptoGuardRepository) -> l
     rows = repo.conn.execute(
         """
         SELECT strategy_name, candidate_version, ga_decision_id, COUNT(*) AS cnt,
-               GROUP_CONCAT(id) AS vt_ids,
-               GROUP_CONCAT(status) AS statuses
+               STRING_AGG(id::text, ',') AS vt_ids,
+               STRING_AGG(status::text, ',') AS statuses
         FROM shadow_virtual_trades
         WHERE ga_decision_id IS NOT NULL
           AND COALESCE(status, '') != 'duplicate'
         GROUP BY strategy_name, candidate_version, ga_decision_id
-        HAVING cnt > 1
+        HAVING COUNT(*) > 1
         """
     ).fetchall()
 
@@ -1085,7 +1129,7 @@ def _check_cursor_regression(repo: CryptoGuardRepository) -> list[dict[str, Any]
         FROM shadow_virtual_trades
         WHERE last_processed_candle_time IS NOT NULL
           AND created_at IS NOT NULL
-          AND last_processed_candle_time < created_at
+          AND to_timestamp(last_processed_candle_time / 1000.0) < created_at
         """
     ).fetchall()
 
@@ -1140,7 +1184,7 @@ def _check_illegal_status_transitions(repo: CryptoGuardRepository) -> list[dict[
 
 
 def _check_active_eval_missing_ga_decision_id(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    """Check: active evaluations (is_shadow=0) with NULL ga_decision_id.
+    """Check: active evaluations (is_shadow=FALSE) with NULL ga_decision_id.
 
     Excludes legacy/duplicate/invalidated outcome_sources — those are pre-backfill
     artifacts that will never receive real_pnl. Only flags evaluations that were
@@ -1154,7 +1198,7 @@ def _check_active_eval_missing_ga_decision_id(repo: CryptoGuardRepository) -> li
         """
         SELECT COUNT(*) AS cnt, MIN(created_at) AS earliest, MAX(created_at) AS latest
         FROM strategy_evaluations
-        WHERE is_shadow=0
+        WHERE is_shadow=FALSE
           AND ga_decision_id IS NULL
           AND (outcome_source IS NULL OR outcome_source='pending_outcome')
         """
@@ -1181,7 +1225,7 @@ def _check_active_eval_missing_ga_decision_id(repo: CryptoGuardRepository) -> li
         """
         SELECT COUNT(*) AS cnt
         FROM strategy_evaluations
-        WHERE is_shadow=0
+        WHERE is_shadow=FALSE
           AND ga_decision_id IS NULL
           AND outcome_source IN ('legacy_fuzzy', 'duplicate', 'invalidated')
         """
@@ -1218,7 +1262,7 @@ def _check_paper_order_missing_active_eval(repo: CryptoGuardRepository) -> list[
           AND po.status IN ('open', 'pending', 'needs_recheck')
           AND NOT EXISTS (
               SELECT 1 FROM strategy_evaluations se
-              WHERE se.ga_decision_id=po.ga_decision_id AND se.is_shadow=0
+              WHERE se.ga_decision_id=po.ga_decision_id AND se.is_shadow=FALSE
           )
         LIMIT 50
         """
@@ -1262,7 +1306,7 @@ def _check_closed_trade_missing_active_real_pnl(repo: CryptoGuardRepository) -> 
           AND NOT EXISTS (
               SELECT 1 FROM strategy_evaluations se
               WHERE se.ga_decision_id=po.ga_decision_id
-                AND se.is_shadow=0
+                AND se.is_shadow=FALSE
                 AND se.outcome_source='real_pnl'
                 AND se.paper_trade_id=pt.id
           )
@@ -1307,20 +1351,20 @@ def _check_shadow_candidate_legacy_only_samples(repo: CryptoGuardRepository) -> 
                (SELECT COUNT(*) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name
                   AND se.strategy_version=sv.version
-                  AND se.is_shadow=1) AS total_evals,
+                  AND se.is_shadow=TRUE) AS total_evals,
                (SELECT COUNT(*) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name
                   AND se.strategy_version=sv.version
-                  AND se.is_shadow=1
+                  AND se.is_shadow=TRUE
                   AND se.outcome_source IN ('real_pnl', 'executed_virtual_trade')) AS real_samples,
                (SELECT COUNT(*) FROM strategy_evaluations se
                 WHERE se.strategy_name=sv.strategy_name
                   AND se.strategy_version=sv.version
-                  AND se.is_shadow=1
+                  AND se.is_shadow=TRUE
                   AND se.outcome_source IN ('legacy_fuzzy', 'duplicate', 'invalidated')) AS legacy_samples
         FROM strategy_versions sv
         WHERE sv.status IN ('candidate', 'shadow_testing')
-          AND sv.created_at < ?
+          AND sv.created_at < %s
         ORDER BY sv.created_at DESC
         """,
         (cutoff,),
@@ -1374,10 +1418,10 @@ def _check_financial_action_missing_mark_price(repo: CryptoGuardRepository) -> l
         """
         SELECT id, position_id, event_type, event_json, created_at
         FROM paper_trade_logs
-        WHERE event_type IN (?, ?, ?, ?)
-          AND created_at >= ?
+        WHERE event_type IN (%s, %s, %s, %s)
+          AND created_at >= %s
           AND (event_json IS NULL
-               OR json_extract(event_json, '$.mark_price') IS NULL)
+               OR event_json ->> 'mark_price' IS NULL)
         ORDER BY created_at DESC
         LIMIT 200
         """,
@@ -1421,11 +1465,11 @@ def _check_financial_action_stale_price(repo: CryptoGuardRepository) -> list[dic
         """
         SELECT id, position_id, event_type, event_json, created_at
         FROM paper_trade_logs
-        WHERE event_type IN (?, ?, ?, ?)
-          AND created_at >= ?
+        WHERE event_type IN (%s, %s, %s, %s)
+          AND created_at >= %s
           AND event_json IS NOT NULL
-          AND json_extract(event_json, '$.mark_price') IS NOT NULL
-          AND json_extract(event_json, '$.price_as_of') IS NOT NULL
+          AND event_json ->> 'mark_price' IS NOT NULL
+          AND event_json ->> 'price_as_of' IS NOT NULL
         ORDER BY created_at DESC
         LIMIT 200
         """,
@@ -1435,7 +1479,7 @@ def _check_financial_action_stale_price(repo: CryptoGuardRepository) -> list[dic
     for row in rows:
         try:
             import json
-            event = json.loads(row["event_json"])
+            event = _safe_json(row["event_json"], {})
             price_as_of = event.get("price_as_of")
             created_at = row["created_at"]
 
@@ -1501,11 +1545,11 @@ def _check_paper_notification_missing_event_time(repo: CryptoGuardRepository) ->
         """
         SELECT id, alert_type, payload_json, created_at
         FROM alert_outbox
-        WHERE alert_type IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        WHERE alert_type IN (%s, %s, %s, %s, %s, %s, %s, %s, %s)
           AND status = 'sent'
-          AND created_at >= ?
+          AND created_at >= %s
           AND (payload_json IS NULL
-               OR json_extract(payload_json, '$.event_time') IS NULL)
+               OR payload_json ->> 'event_time' IS NULL)
         ORDER BY created_at DESC
         LIMIT 200
         """,
@@ -1518,7 +1562,7 @@ def _check_paper_notification_missing_event_time(repo: CryptoGuardRepository) ->
         if payload_json:
             try:
                 import json
-                payload = json.loads(payload_json)
+                payload = _safe_json(payload_json, {})
                 fallback = payload.get("fallback_text", "")
                 if fallback and utc8_pattern.search(str(fallback)):
                     continue  # UTC+8 time found in fallback text, not missing
@@ -1571,20 +1615,8 @@ def _check_btc9_contract_marker_missing(repo: CryptoGuardRepository) -> list[dic
                     "marker 缺失时所有 BTC#9 诊断被跳过，可能导致假绿。"
                 ),
             })
-    except Exception:
-        # _migration_state table itself may not exist
-        issues.append({
-            "type": "btc9_contract_marker_missing",
-            "severity": "error",
-            "details": {
-                "marker_key": "btc9_trade_gate_contract_v1",
-                "issue": "migration_state_table_missing",
-            },
-            "suggested_action": (
-                "_migration_state 表不存在或查询失败。"
-                "运行 initialize_database() 创建表并写入 BTC#9 marker。"
-            ),
-        })
+    except Exception as exc:
+        return _diagnostic_query_failure(repo, "btc9_contract_marker", exc)
     return issues
 
 
@@ -1609,7 +1641,7 @@ def _check_fallback_llm_failed_created_paper_order(repo: CryptoGuardRepository) 
         JOIN ga_decisions gd ON po.ga_decision_id = gd.id
         WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
                                 'expired', 'risk_off_cancelled', 'cancelled')
-          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
         """,
         (cutoff,),
     ).fetchone()
@@ -1623,7 +1655,7 @@ def _check_fallback_llm_failed_created_paper_order(repo: CryptoGuardRepository) 
         JOIN ga_decisions gd ON po.ga_decision_id = gd.id
         WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
                                 'expired', 'risk_off_cancelled', 'cancelled')
-          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
         ORDER BY po.id DESC
         LIMIT 500
         """,
@@ -1631,7 +1663,7 @@ def _check_fallback_llm_failed_created_paper_order(repo: CryptoGuardRepository) 
     ).fetchall()
     for row in rows:
         try:
-            raw = json.loads(row["raw_decision_json"] or "{}")
+            raw = _safe_json(row["raw_decision_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         llm_status = str(raw.get("llm_status") or "ok").lower()
@@ -1705,7 +1737,7 @@ def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -
         JOIN ga_decisions gd ON po.ga_decision_id = gd.id
         WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
                                 'expired', 'risk_off_cancelled', 'cancelled')
-          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
         """,
         (cutoff,),
     ).fetchone()
@@ -1720,7 +1752,7 @@ def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -
         JOIN ga_decisions gd ON po.ga_decision_id = gd.id
         WHERE po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
                                 'expired', 'risk_off_cancelled', 'cancelled')
-          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
         ORDER BY po.id DESC
         LIMIT 500
         """,
@@ -1730,7 +1762,7 @@ def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -
     for row in rows:
         plan_json = row["trade_plan_json"] or "{}"
         try:
-            plan = json.loads(plan_json)
+            plan = _safe_json(plan_json, {})
         except (json.JSONDecodeError, TypeError):
             continue
         ec = plan.get("entry_trigger_confirmation")
@@ -1746,7 +1778,7 @@ def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -
             try:
                 mod_rows = repo.conn.execute(
                     "SELECT module, result_json FROM module_analysis_results "
-                    "WHERE snapshot_id=?",
+                    "WHERE snapshot_id=%s",
                     (int(snapshot_id),),
                 ).fetchall()
                 if mod_rows:
@@ -1754,7 +1786,7 @@ def _check_missing_entry_confirmation_paper_order(repo: CryptoGuardRepository) -
                     for mr in mod_rows:
                         mod_key = mr["module"]
                         try:
-                            module_analysis_results[mod_key] = json.loads(mr["result_json"] or "{}")
+                            module_analysis_results[mod_key] = _safe_json(mr["result_json"], {})
                         except (json.JSONDecodeError, TypeError):
                             module_analysis_results[mod_key] = {}
                 else:
@@ -1846,7 +1878,7 @@ def _check_htf_support_reason_inconsistent(repo: CryptoGuardRepository) -> list[
         SELECT id, symbol, risk_check_json, analysis_time_utc
         FROM ga_decisions
         WHERE risk_check_json IS NOT NULL
-          AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND analysis_time_utc::timestamptz >= %s::timestamptz
         ORDER BY id DESC
         LIMIT 500
         """,
@@ -1854,7 +1886,7 @@ def _check_htf_support_reason_inconsistent(repo: CryptoGuardRepository) -> list[
     ).fetchall()
     for row in rows:
         try:
-            risk_check = json.loads(row["risk_check_json"] or "{}")
+            risk_check = _safe_json(row["risk_check_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         htf = (risk_check.get("metrics") or {}).get("htf_support") or {}
@@ -1896,7 +1928,7 @@ def _check_chop_regime_boosted(repo: CryptoGuardRepository) -> list[dict[str, An
         SELECT id, symbol, market_regime_gate_json, analysis_time_utc
         FROM ga_decisions
         WHERE market_regime_gate_json IS NOT NULL
-          AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND analysis_time_utc::timestamptz >= %s::timestamptz
         ORDER BY id DESC
         LIMIT 500
         """,
@@ -1908,7 +1940,7 @@ def _check_chop_regime_boosted(repo: CryptoGuardRepository) -> list[dict[str, An
         raw = row["market_regime_gate_json"] or "{}"
         # Safely parse JSON; default to {} on any failure or non-dict result
         try:
-            regime_gate = json.loads(raw)
+            regime_gate = _safe_json(raw, {})
         except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(regime_gate, dict):
@@ -1948,7 +1980,7 @@ def _check_fill_without_ga_revalidation(repo: CryptoGuardRepository) -> list[dic
         FROM paper_orders po
         WHERE po.fill_method = 'limit_range_touch'
           AND po.filled_at IS NOT NULL
-          AND datetime(replace(replace(po.filled_at, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND po.filled_at::timestamptz >= %s::timestamptz
         ORDER BY po.id DESC
         LIMIT 200
         """,
@@ -1958,7 +1990,7 @@ def _check_fill_without_ga_revalidation(repo: CryptoGuardRepository) -> list[dic
         filled_at_norm = str(row["filled_at"]).replace("T", " ").replace("Z", "")
         ga = repo.conn.execute(
             "SELECT id, market_bias, signal_grade FROM ga_decisions "
-            "WHERE symbol=? AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) <= datetime(?) "
+            "WHERE symbol=%s AND analysis_time_utc::timestamptz <= %s::timestamptz "
             "ORDER BY analysis_time DESC LIMIT 1",
             (row["symbol"], filled_at_norm),
         ).fetchone()
@@ -2007,7 +2039,7 @@ def _check_invalid_condition_equals_stop_loss(repo: CryptoGuardRepository) -> li
         FROM paper_orders po
         JOIN ga_decisions gd ON po.ga_decision_id = gd.id
         WHERE gd.trade_plan_json IS NOT NULL
-          AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+          AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
         ORDER BY po.id DESC
         LIMIT 500
         """,
@@ -2015,7 +2047,7 @@ def _check_invalid_condition_equals_stop_loss(repo: CryptoGuardRepository) -> li
     ).fetchall()
     for row in rows:
         try:
-            plan = json.loads(row["trade_plan_json"] or "{}")
+            plan = _safe_json(row["trade_plan_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         stop = plan.get("stop_loss")
@@ -2071,8 +2103,12 @@ def _market_data_contract_cutoff(repo: CryptoGuardRepository) -> str | None:
         ).fetchone()
         if row and row["applied_at"]:
             return str(row["applied_at"])
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            repo.conn.rollback()
+        except Exception:
+            pass
+        raise RuntimeError("market-data contract marker query failed") from exc
     return None
 
 
@@ -2100,7 +2136,7 @@ def _check_market_data_insufficient_contiguous_samples(repo: CryptoGuardReposito
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE gd.snapshot_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
             ORDER BY gd.id DESC
             LIMIT 500
             """,
@@ -2108,10 +2144,10 @@ def _check_market_data_insufficient_contiguous_samples(repo: CryptoGuardReposito
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_market_data_insufficient_contiguous_samples query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "market_data_insufficient_contiguous_samples", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         health = dq.get("health") or {}
@@ -2178,7 +2214,7 @@ def _check_market_data_gap_detected(repo: CryptoGuardRepository) -> list[dict[st
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE gd.snapshot_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
             ORDER BY gd.id DESC
             LIMIT 500
             """,
@@ -2186,10 +2222,10 @@ def _check_market_data_gap_detected(repo: CryptoGuardRepository) -> list[dict[st
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_market_data_gap_detected query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "market_data_gap_detected", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         health = dq.get("health") or {}
@@ -2256,7 +2292,7 @@ def _check_market_data_stale_last_candle(repo: CryptoGuardRepository) -> list[di
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE gd.snapshot_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
             ORDER BY gd.id DESC
             LIMIT 500
             """,
@@ -2264,10 +2300,10 @@ def _check_market_data_stale_last_candle(repo: CryptoGuardRepository) -> list[di
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_market_data_stale_last_candle query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "market_data_stale_last_candle", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         health = dq.get("health") or {}
@@ -2335,7 +2371,7 @@ def _check_market_data_future_candle(repo: CryptoGuardRepository) -> list[dict[s
             """
             SELECT symbol, interval, open_time, close_time, is_closed
             FROM candles
-            WHERE is_closed = 1 AND close_time > ?
+            WHERE is_closed = TRUE AND close_time > %s
             ORDER BY close_time DESC
             LIMIT 200
             """,
@@ -2343,7 +2379,7 @@ def _check_market_data_future_candle(repo: CryptoGuardRepository) -> list[dict[s
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_market_data_future_candle query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "market_data_future_candle", exc)
     for row in rows:
         issues.append({
             "type": "market_data_future_candle",
@@ -2402,7 +2438,7 @@ def _check_market_data_duplicate_open_time(repo: CryptoGuardRepository) -> list[
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_market_data_duplicate_open_time query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "market_data_duplicate_open_time", exc)
     for row in rows:
         issues.append({
             "type": "market_data_duplicate_open_time",
@@ -2460,7 +2496,7 @@ def _check_analysis_created_with_unready_market_data(repo: CryptoGuardRepository
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE gd.snapshot_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
             ORDER BY gd.id DESC
             LIMIT 500
             """,
@@ -2468,10 +2504,10 @@ def _check_analysis_created_with_unready_market_data(repo: CryptoGuardRepository
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_analysis_created_with_unready_market_data query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "analysis_created_with_unready_market_data", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         status = str(dq.get("status") or "complete").lower()
@@ -2480,8 +2516,17 @@ def _check_analysis_created_with_unready_market_data(repo: CryptoGuardRepository
         # P1-10: Determine if this is a real violation (has trade plan) or
         # expected degraded behavior (monitor_only, no trade plan).
         decision = str(row["decision"] or "")
-        trade_plan_raw = row["trade_plan_json"] or ""
-        has_trade_plan = bool(trade_plan_raw and trade_plan_raw.strip() not in ("", "{}", "null"))
+        # P9 PG cutover: trade_plan_json is a JSONB column -> psycopg returns a
+        # decoded dict/list/None (NOT a str), so the legacy ``.strip()`` string
+        # check crashes. Normalize via the PG-JSONB-aware ``_safe_json`` and
+        # treat empty container / None / "null" as "no trade plan".
+        tp = _safe_json(row["trade_plan_json"], None)
+        if isinstance(tp, (dict, list)):
+            has_trade_plan = bool(tp)
+        elif tp is None:
+            has_trade_plan = False
+        else:
+            has_trade_plan = str(tp).strip() not in ("", "{}", "null")
         is_real_violation = has_trade_plan or decision in {"trade_plan_available", "create_paper_order"}
         severity = "error" if is_real_violation else "warning"
         issues.append({
@@ -2539,7 +2584,7 @@ def _check_executable_decision_with_unready_market_data(repo: CryptoGuardReposit
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE gd.snapshot_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
               AND (gd.decision = 'trade_plan_available' OR gd.trade_plan_json IS NOT NULL)
             ORDER BY gd.id DESC
             LIMIT 500
@@ -2548,10 +2593,10 @@ def _check_executable_decision_with_unready_market_data(repo: CryptoGuardReposit
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_executable_decision_with_unready_market_data query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "executable_decision_with_unready_market_data", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         status = str(dq.get("status") or "complete").lower()
@@ -2616,7 +2661,7 @@ def _check_paper_order_created_with_unready_market_data(repo: CryptoGuardReposit
             LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
             WHERE po.ga_decision_id IS NOT NULL
               AND ms.data_quality_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
               AND po.status NOT IN ('revalidator_cancelled', 'watch_cancelled',
                                     'expired', 'risk_off_cancelled', 'cancelled')
             ORDER BY po.id DESC
@@ -2626,10 +2671,10 @@ def _check_paper_order_created_with_unready_market_data(repo: CryptoGuardReposit
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_paper_order_created_with_unready_market_data query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "paper_order_created_with_unready_market_data", exc)
     for row in rows:
         try:
-            dq = json.loads(row["data_quality_json"] or "{}")
+            dq = _safe_json(row["data_quality_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         status = str(dq.get("status") or "complete").lower()
@@ -2692,7 +2737,7 @@ def _check_report_claims_complete_for_gapped_data(repo: CryptoGuardRepository) -
             FROM alert_outbox
             WHERE alert_type = 'hourly_summary'
               AND status = 'sent'
-              AND created_at >= ?
+              AND created_at >= %s
             ORDER BY id DESC
             LIMIT 50
             """,
@@ -2700,10 +2745,10 @@ def _check_report_claims_complete_for_gapped_data(repo: CryptoGuardRepository) -
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_report_claims_complete_for_gapped_data alert_outbox query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "report_claims_complete_for_gapped_data", exc)
     for row in rows:
         try:
-            payload = json.loads(row["payload_json"] or "{}")
+            payload = _safe_json(row["payload_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         mdq = payload.get("market_data_quality")
@@ -2731,8 +2776,8 @@ def _check_report_claims_complete_for_gapped_data(repo: CryptoGuardRepository) -
                 LEFT JOIN market_snapshots ms ON ms.id = gd.snapshot_id
                 WHERE gd.snapshot_id IS NOT NULL
                   AND ms.data_quality_json IS NOT NULL
-                  AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
-                  AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) <= datetime(?)
+                  AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
+                  AND gd.analysis_time_utc::timestamptz <= %s::timestamptz
                 ORDER BY gd.id DESC
                 LIMIT 50
                 """,
@@ -2744,7 +2789,7 @@ def _check_report_claims_complete_for_gapped_data(repo: CryptoGuardRepository) -
         found_gap = False
         for gd_row in gapped:
             try:
-                dq = json.loads(gd_row["data_quality_json"] or "{}")
+                dq = _safe_json(gd_row["data_quality_json"], {})
             except (json.JSONDecodeError, TypeError):
                 continue
             health = dq.get("health") or {}
@@ -2805,7 +2850,7 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
                    gd.raw_decision_json
             FROM ga_decisions gd
             WHERE gd.raw_decision_json IS NOT NULL
-              AND datetime(replace(replace(gd.analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
             ORDER BY gd.id DESC
             LIMIT 500
             """,
@@ -2813,10 +2858,10 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
         ).fetchall()
     except Exception as exc:
         LOGGER.warning("_check_deterministic_direction_from_failed_llm query failed: %s", exc)
-        return issues
+        return _diagnostic_query_failure(repo, "deterministic_direction_from_failed_llm", exc)
     for row in rows:
         try:
-            raw = json.loads(row["raw_decision_json"] or "{}")
+            raw = _safe_json(row["raw_decision_json"], {})
         except (json.JSONDecodeError, TypeError):
             continue
         llm_status = str(raw.get("llm_status") or "ok").lower()
@@ -2919,11 +2964,13 @@ def _check_llm_fair_scheduling_contract_marker_missing(repo: CryptoGuardReposito
     issues: list[dict[str, Any]] = []
     try:
         row = repo.conn.execute(
-            "SELECT applied_at FROM _migration_state WHERE key = ? LIMIT 1",
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
             (LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY,),
         ).fetchone()
-    except Exception:
-        row = None
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "llm_fair_scheduling_contract_marker", exc,
+        )
     if not row or not row["applied_at"]:
         issues.append({
             "type": "llm_fair_scheduling_contract_marker_missing",
@@ -2976,7 +3023,7 @@ def _check_batch_claim_ownership_integrity(repo: CryptoGuardRepository) -> list[
         FROM agent_jobs
         WHERE job_type = 'scheduled_market_analysis'
           AND status = 'running'
-          AND datetime(started_at) >= datetime(?)
+          AND started_at >= %s::timestamptz
         ORDER BY id DESC
         LIMIT 500
         """,
@@ -2994,7 +3041,7 @@ def _check_batch_claim_ownership_integrity(repo: CryptoGuardRepository) -> list[
             # Compare lease_until against now. SQLite datetime('now') is UTC.
             try:
                 expired_row = repo.conn.execute(
-                    "SELECT (datetime(?) <= datetime('now')) AS expired",
+                    "SELECT (%s::timestamptz <= NOW()) AS expired",
                     (str(lease),),
                 ).fetchone()
                 if expired_row and int(expired_row["expired"]):

@@ -419,7 +419,7 @@ def _previous_trend_stage(repo: CryptoGuardRepository, symbol: str, analysis_tim
     row = repo.conn.execute(
         """
         SELECT result_json FROM module_analysis_results
-        WHERE symbol=? AND module='trend_stage_fusion' AND analysis_time < ?
+        WHERE symbol=%s AND module='trend_stage_fusion' AND analysis_time < %s
         ORDER BY analysis_time DESC
         LIMIT 1
         """,
@@ -430,6 +430,8 @@ def _previous_trend_stage(repo: CryptoGuardRepository, symbol: str, analysis_tim
     import json
 
     try:
-        return json.loads(row["result_json"]).get("trend_stage")
+        raw = row["result_json"]
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+        return data.get("trend_stage")
     except Exception:
         return None

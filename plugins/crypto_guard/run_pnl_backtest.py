@@ -17,14 +17,15 @@ from typing import Any
 from plugins.crypto_guard.backtest.historical_replay import (
     _classify_market_regime,
     _normalize_replay_candle,
+    _scratch_replay_repo,
     _simulate_trade,
 )
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 from plugins.crypto_guard.reasoning.market_state_builder import build_market_state_snapshot
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 
 POSITION_SIZE_USDT = 10.0  # 每笔交易 10U
 COOLDOWN_CANDLES = 8  # 开仓后冷却 8 根 K 线 (15m × 8 = 2小时)
@@ -53,9 +54,6 @@ def run_single_symbol_backtest(
     position_size: float = POSITION_SIZE_USDT,
 ) -> dict[str, Any]:
     """Run backtest for a single symbol with real P&L calculation."""
-    from tempfile import TemporaryDirectory
-    from pathlib import Path
-
     if end_time is None:
         end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
     if start_time is None:
@@ -77,97 +75,87 @@ def run_single_symbol_backtest(
     if len(rows) < warmup:
         return {"ok": False, "error": f"Only {len(rows)} candles, need {warmup}+"}
 
-    print(f"  Replaying {len(rows)} candles ({rows[0]['close_time']} → {rows[-1]['close_time']})")
+    print(f"  Replaying {len(rows)} candles ({rows[0]['close_time']} -> {rows[-1]['close_time']})")
 
     signals: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     cooldown_until = 0  # index until which we skip trade signals
 
-    with TemporaryDirectory() as tmp:
-        replay_db = Path(tmp) / "replay.sqlite3"
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        os.environ["CRYPTO_GUARD_DB"] = str(replay_db)
-        cfg = load_config()
-        initialize_database(cfg)
-        if old_db is not None:
-            os.environ["CRYPTO_GUARD_DB"] = old_db
-        else:
-            os.environ.pop("CRYPTO_GUARD_DB", None)
+    # PG cutover: replay against an isolated scratch schema on a dedicated
+    # (non-pooled) connection - NOT a temp SQLite file (the old path no longer
+    # exists under the PG-only runtime). See ``_scratch_replay_repo`` in
+    # ``backtest/historical_replay.py``. Writes land only in the scratch schema;
+    # the caller's production repo is untouched by the replay loop itself.
+    with _scratch_replay_repo() as replay_repo:
+        for idx, candle in enumerate(rows):
+            replay_repo.upsert_candles([candle])
+            if idx + 1 < warmup:
+                continue
 
-        replay_conn = connect_db(replay_db)
-        try:
-            replay_repo = CryptoGuardRepository(replay_conn)
-            for idx, candle in enumerate(rows):
-                replay_repo.upsert_candles([candle])
-                if idx + 1 < warmup:
-                    continue
+            analysis_time = int(candle["close_time"])
+            regime = _classify_market_regime(rows[: idx + 1])
 
-                analysis_time = int(candle["close_time"])
-                regime = _classify_market_regime(rows[: idx + 1])
+            snapshot = build_market_state_snapshot(
+                replay_repo,
+                symbol=symbol,
+                analysis_time_utc=analysis_time,
+                mode="shadow_test",
+                timeframes=[interval],
+            )
+            decision = run_ga_sop_decision(snapshot)
 
-                snapshot = build_market_state_snapshot(
-                    replay_repo,
-                    symbol=symbol,
-                    analysis_time_utc=analysis_time,
-                    mode="shadow_test",
-                    timeframes=[interval],
-                )
-                decision = run_ga_sop_decision(snapshot)
+            signal = {
+                "analysis_time_utc": analysis_time,
+                "close": candle["close"],
+                "decision": decision["decision"],
+                "signal_grade": decision["signal_grade"],
+                "confidence": decision["confidence"],
+                "market_bias": decision.get("market_bias"),
+                "market_regime": regime,
+            }
 
-                signal = {
-                    "analysis_time_utc": analysis_time,
-                    "close": candle["close"],
-                    "decision": decision["decision"],
+            # Simulate trade if trade plan exists and not in cooldown
+            trade_plan = decision.get("trade_plan")
+            if trade_plan and decision["decision"] == "trade_plan_available" and idx >= cooldown_until:
+                subsequent = rows[idx + 1: idx + 51]
+                sim = _simulate_trade(trade_plan, subsequent)
+                # Set cooldown: skip next N candles after opening a trade
+                cooldown_until = idx + 1 + COOLDOWN_CANDLES
+                signal["trade_simulation"] = sim
+                signal["pnl_r"] = sim["pnl_r"]
+                signal["trade_outcome"] = sim["outcome"]
+
+                # Calculate actual P&L in USDT
+                entry = trade_plan.get("entry_price", 0)
+                sl = trade_plan.get("stop_loss", 0)
+                risk_per_unit = abs(entry - sl)
+                risk_pct = trade_plan.get("risk_percent", 0.5) / 100.0
+                risk_usdt = position_size * risk_pct  # e.g. 10U * 0.5% = 0.05U
+                pnl_usdt = sim["pnl_r"] * risk_usdt
+
+                trade_record = {
+                    "index": idx,
+                    "time": analysis_time,
+                    "side": trade_plan.get("side"),
+                    "entry_price": entry,
+                    "stop_loss": sl,
+                    "exit_price": sim.get("exit_price"),
                     "signal_grade": decision["signal_grade"],
                     "confidence": decision["confidence"],
-                    "market_bias": decision.get("market_bias"),
                     "market_regime": regime,
+                    "outcome": sim["outcome"],
+                    "pnl_r": sim["pnl_r"],
+                    "risk_usdt": round(risk_usdt, 6),
+                    "pnl_usdt": round(pnl_usdt, 6),
+                    "holding_candles": sim.get("holding_candles", 0),
                 }
+                trades.append(trade_record)
+            else:
+                signal["trade_simulation"] = None
+                signal["pnl_r"] = None
+                signal["trade_outcome"] = None
 
-                # Simulate trade if trade plan exists and not in cooldown
-                trade_plan = decision.get("trade_plan")
-                if trade_plan and decision["decision"] == "trade_plan_available" and idx >= cooldown_until:
-                    subsequent = rows[idx + 1: idx + 51]
-                    sim = _simulate_trade(trade_plan, subsequent)
-                    # Set cooldown: skip next N candles after opening a trade
-                    cooldown_until = idx + 1 + COOLDOWN_CANDLES
-                    signal["trade_simulation"] = sim
-                    signal["pnl_r"] = sim["pnl_r"]
-                    signal["trade_outcome"] = sim["outcome"]
-
-                    # Calculate actual P&L in USDT
-                    entry = trade_plan.get("entry_price", 0)
-                    sl = trade_plan.get("stop_loss", 0)
-                    risk_per_unit = abs(entry - sl)
-                    risk_pct = trade_plan.get("risk_percent", 0.5) / 100.0
-                    risk_usdt = position_size * risk_pct  # e.g. 10U * 0.5% = 0.05U
-                    pnl_usdt = sim["pnl_r"] * risk_usdt
-
-                    trade_record = {
-                        "index": idx,
-                        "time": analysis_time,
-                        "side": trade_plan.get("side"),
-                        "entry_price": entry,
-                        "stop_loss": sl,
-                        "exit_price": sim.get("exit_price"),
-                        "signal_grade": decision["signal_grade"],
-                        "confidence": decision["confidence"],
-                        "market_regime": regime,
-                        "outcome": sim["outcome"],
-                        "pnl_r": sim["pnl_r"],
-                        "risk_usdt": round(risk_usdt, 6),
-                        "pnl_usdt": round(pnl_usdt, 6),
-                        "holding_candles": sim.get("holding_candles", 0),
-                    }
-                    trades.append(trade_record)
-                else:
-                    signal["trade_simulation"] = None
-                    signal["pnl_r"] = None
-                    signal["trade_outcome"] = None
-
-                signals.append(signal)
-        finally:
-            replay_conn.close()
+            signals.append(signal)
 
     # Aggregate P&L
     total_pnl = sum(t["pnl_usdt"] for t in trades)
@@ -326,9 +314,9 @@ def main() -> None:
 
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-
-    try:
+    # PG cutover: pooled connection (auto-returned; every repo write self-wraps
+    # ``conn.transaction()``).
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
 
         end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -377,9 +365,6 @@ def main() -> None:
             Path(args.export).parent.mkdir(parents=True, exist_ok=True)
             Path(args.export).write_text(json.dumps(export_data, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"Exported to {args.export}")
-
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

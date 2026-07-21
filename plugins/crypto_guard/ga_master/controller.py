@@ -70,12 +70,15 @@ def _find_shadow_candidates(repo: CryptoGuardRepository, strategy_name: str) -> 
 def _load_candidate_patch(repo: CryptoGuardRepository, strategy_name: str, candidate_version: str) -> dict[str, Any]:
     """Load candidate patch from strategy_patches."""
     row = repo.conn.execute(
-        "SELECT patch_json FROM strategy_patches WHERE strategy_name=? AND candidate_version=? ORDER BY id DESC LIMIT 1",
+        "SELECT patch_json FROM strategy_patches WHERE strategy_name=%s AND candidate_version=%s ORDER BY id DESC LIMIT 1",
         (strategy_name, candidate_version),
     ).fetchone()
     if row and row["patch_json"]:
         try:
-            return json.loads(row["patch_json"])
+            patch = row["patch_json"]
+            if isinstance(patch, str):
+                patch = json.loads(patch)
+            return patch
         except Exception:
             pass
     return {}

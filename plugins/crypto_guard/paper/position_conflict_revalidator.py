@@ -79,7 +79,7 @@ def run_position_conflict_revalidation(
         # Get GA decision for this symbol — prefer the passed ga_decision_id
         if ga_decision_id is not None:
             latest_decision_row = repo.conn.execute(
-                "SELECT * FROM ga_decisions WHERE id=? AND symbol=?",
+                "SELECT * FROM ga_decisions WHERE id=%s AND symbol=%s",
                 (ga_decision_id, trade_symbol),
             ).fetchone()
         else:
@@ -91,7 +91,7 @@ def run_position_conflict_revalidation(
             # same reason as ``pending_order_manager.py:122`` — canonical
             # chronological key, immune to ``analysis_time_utc`` regressions.
             latest_decision_row = repo.conn.execute(
-                "SELECT * FROM ga_decisions WHERE symbol=? ORDER BY analysis_time DESC, id DESC LIMIT 1",
+                "SELECT * FROM ga_decisions WHERE symbol=%s ORDER BY analysis_time DESC, id DESC LIMIT 1",
                 (trade_symbol,),
             ).fetchone()
 
@@ -376,7 +376,7 @@ def _count_consecutive_reverse_confirmations(
     # analysis_time DESC`` change above.
     rows = repo.conn.execute(
         """SELECT market_bias, signal_grade, risk_check_json, trade_plan_json FROM ga_decisions
-           WHERE symbol=? AND datetime(replace(replace(analysis_time_utc, 'T', ' '), 'Z', '')) >= datetime(?)
+           WHERE symbol=%s AND analysis_time_utc::timestamptz >= %s::timestamptz
            ORDER BY analysis_time DESC, id DESC""",
         (trade_symbol, created_at_iso),
     ).fetchall()
@@ -606,7 +606,7 @@ def _evaluate_profit_protection_inline(
         return None
 
     order = repo.conn.execute(
-        "SELECT * FROM paper_orders WHERE id=?",
+        "SELECT * FROM paper_orders WHERE id=%s",
         (int(order_id),),
     ).fetchone()
     if not order or order["status"] != "open":
@@ -682,7 +682,7 @@ def _execute_early_exit(
 
     # Dedupe: don't close already closed trades
     existing = repo.conn.execute(
-        "SELECT id, close_reason FROM paper_trades WHERE id=? AND closed_at IS NOT NULL",
+        "SELECT id, close_reason FROM paper_trades WHERE id=%s AND closed_at IS NOT NULL",
         (trade_id,),
     ).fetchone()
     if existing:
@@ -708,7 +708,7 @@ def _execute_early_exit(
     order_row = None
     if order_id:
         order_row = repo.conn.execute(
-            "SELECT filled_at, order_type, fill_method FROM paper_orders WHERE id=?",
+            "SELECT filled_at, order_type, fill_method FROM paper_orders WHERE id=%s",
             (int(order_id),),
         ).fetchone()
 
@@ -778,10 +778,11 @@ def _execute_early_exit(
     # Update paper_orders using proper repository method
     if order_id:
         repo.update_paper_order_status(int(order_id), "closed", closed_at=now)
-        repo.conn.execute(
-            "UPDATE paper_orders SET cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=?",
-            (f"conflict_exit: GA#{ga_decision_id} direction conflict", ga_decision_id, int(order_id)),
-        )
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE paper_orders SET cancel_reason=%s, invalidated_by_ga_decision_id=%s WHERE id=%s",
+                (f"conflict_exit: GA#{ga_decision_id} direction conflict", ga_decision_id, int(order_id)),
+            )
 
     # Update paper_positions to closed using proper repository method
     account = repo.ensure_paper_account()
@@ -857,7 +858,7 @@ def _execute_early_exit(
         "side": pos_side,
         "entry_price": entry_price,
         "stop_loss": stop_loss,
-        "take_profits": json.loads(trade.get("take_profit_json") or "[]") if trade.get("take_profit_json") else [],
+        "take_profits": trade.get("take_profit_json") or [],
         "filled_at": (order_row["filled_at"] if order_row and order_row["filled_at"] else trade.get("created_at")),
         "closed_at": now,
         "event_time": now,
@@ -879,8 +880,6 @@ def _execute_early_exit(
         f"system:paper:conflict_exit:{trade_id}:{ga_decision_id}",
         alert_payload,
     )
-
-    repo.conn.commit()
 
     LOGGER.info(
         "conflict_exit: trade_id=%s symbol=%s side=%s exit_price=%s pnl_r=%.2f ga=%s",
@@ -973,6 +972,23 @@ def _execute_stop_tighten(
 
         mfe_r = _compute_mfe_r_for_trade(trade, current_price)
 
+        # PG greenfield: ``created_at`` is a TIMESTAMPTZ column, so under the
+        # psycopg dict_row factory ``trade["created_at"]`` is a ``datetime``
+        # object (SQLite returned an ISO string). A raw datetime stored in
+        # ``enriched_meta`` flows into ``log_paper_trade_event`` -> ``json.dumps``
+        # and raises ``TypeError: Object of type datetime is not JSON serializable``
+        # *before* the INSERT executes (so the error is invisible to cursor
+        # tracing and swallowed by the update-stop-loss ``except Exception``
+        # path), which made the stop tighten silently no-op. Normalize to an
+        # ISO string for the audit payload - ``holding_minutes`` computation
+        # above already proved ``open_time`` parses cleanly when non-None.
+        if isinstance(open_time, datetime):
+            open_time_iso = open_time.isoformat()
+        elif open_time:
+            open_time_iso = str(open_time)
+        else:
+            open_time_iso = None
+
         # Build enriched price_meta with audit details for the atomic log
         enriched_meta = dict(price_meta) if price_meta else {}
         enriched_meta.update({
@@ -980,7 +996,7 @@ def _execute_stop_tighten(
             "trigger": "position_conflict",
             "dedupe_key": dedupe_key,
             "audit": {
-                "open_time": open_time,
+                "open_time": open_time_iso,
                 "action_time": datetime.now(tz_utc).isoformat(),
                 "holding_minutes": holding_minutes,
                 "current_r": round(current_r, 4) if current_r is not None else None,
@@ -1008,7 +1024,6 @@ def _execute_stop_tighten(
                 "status": "duplicate",
                 "reason": "Concurrent writer changed stop_loss first",
             }
-        repo.conn.commit()
 
         # Enqueue paper_event_alert so notifications carry quote metadata
         alert_payload = {
@@ -1122,7 +1137,6 @@ def _execute_recheck_mark(
             "reason": reason or "方向冲突但未满足提前退出或收紧止损条件，进入复核",
         },
     )
-    repo.conn.commit()
 
     LOGGER.info(
         "needs_position_recheck: trade_id=%s symbol=%s side=%s grade=%s r=%.2f ga=%s reason=%s",
@@ -1153,7 +1167,7 @@ def _execute_recheck_mark(
 def _was_action_executed(repo: CryptoGuardRepository, dedupe_key: str) -> bool:
     """Check if an action was already executed by its dedupe key."""
     row = repo.conn.execute(
-        "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
+        "SELECT id FROM paper_trade_logs WHERE event_json ->> 'dedupe_key'=%s LIMIT 1",
         (dedupe_key,),
     ).fetchone()
     return row is not None

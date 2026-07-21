@@ -2186,4 +2186,49 @@ Test coverage: 21 targeted tests across `TestPhaseB07_07LLMRetryAndBreaker` (9),
 
 ---
 
-**Last updated**: 2026-07-08 (07-07 LLM retry + hourly analysis accuracy repair - Section 40 added for LLM error taxonomy, bounded retry + wall-clock budget, batch circuit breaker, plan state model, raw grade caps, prompt strategy, hourly report wording, batch completion consistency, and diagnostics; 07-05 hourly decision context continuity - Sections 39.1-39.8 added for multi-TF feature pack, analysis continuity, plan lifecycle separation, LLM fallback, batch-pinned health, recent-failed-jobs window, marker/cutoff, and report UX)
+## 41. PostgreSQL Greenfield Persistence Contract (07-16)
+
+### 41.1 Engine And Runtime Identity
+
+CryptoGuard is PostgreSQL-only. Runtime accepts only
+`crypto_guard_app@crypto_guard`; tests accept only
+`crypto_guard_test_app@crypto_guard_test`. The DSN comes from
+`CRYPTO_GUARD_DATABASE_URL`, is never emitted verbatim, and has no SQLite
+fallback or dual-write path.
+
+### 41.2 Transaction Boundary
+
+`pg_db.get_conn()` commits a clean pending transaction on scope exit and rolls
+back exceptional/aborted work before returning the connection to the pool.
+Repository writes use `conn.transaction()`; nested use is a savepoint and the
+outer unit remains owned by the caller. PostgreSQL statement failures must not
+be swallowed without rollback.
+
+### 41.3 Schema And Initialization
+
+`schema_postgres.sql` is the greenfield source for all 46 tables.
+`initialize_database()` uses a transaction-scoped advisory lock and atomically
+applies DDL, seeds, health checks, and contract markers. Healthy re-entry skips
+DDL and remains idempotent. `check_schema_health()` resolves
+`current_schema()` and verifies every required table plus contract columns,
+indexes, and constraints.
+
+### 41.4 Claims And Ownership
+
+Job and batch claims use PostgreSQL row locks and `FOR UPDATE SKIP LOCKED`.
+Batch claim re-validates the authoritative payload symbol exact set and stamps
+one claim token/lease in the same transaction. Service ownership and attempt
+allocation remain CAS/atomic operations.
+
+### 41.5 Test Isolation And Delivery
+
+Every real-PG test uses a unique scratch schema; tests never drop shared
+`public`. Concurrency tests use independent backends in the same scratch
+schema. Production cutover remains a separately authorized release: archive
+SQLite, create the dedicated role/database, initialize the empty PostgreSQL
+database, run Schema/State/Report diagnostics, restart, and observe three full
+batches.
+
+---
+
+**Last updated**: 2026-07-19 (Section 41 added for the PostgreSQL greenfield cutover; Section 40 covers LLM retry and hourly analysis accuracy; Sections 39.1-39.8 cover decision-context continuity.)

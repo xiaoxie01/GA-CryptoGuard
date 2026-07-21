@@ -1208,7 +1208,14 @@ def _run_single_llm_attempt(
     error_str: str | None = None
     stage: str | None = None
     try:
-        raw = _call_ga_llm(prompt)
+        try:
+            raw = _call_ga_llm(prompt)
+        finally:
+            # Tests and alternate providers may replace _call_ga_llm entirely,
+            # bypassing its normal one-shot input consumption. Always clear
+            # call-control inputs at the owning attempt boundary so a later
+            # call on the same worker thread cannot inherit hard isolation.
+            _llm_call_input_state_reset()
         candidate = _parse_json_object(raw)
     except json.JSONDecodeError as exc:
         # 07-13 R6-D (P0-3.5 / §7.9): a truncated response (the provider hit
@@ -1958,6 +1965,13 @@ def _llm_call_state_reset() -> None:
         "subprocess_hard_timeout",
         "stop_reason",
     ):
+        if hasattr(_llm_call_state, attr):
+            delattr(_llm_call_state, attr)
+
+
+def _llm_call_input_state_reset() -> None:
+    """Clear one-shot provider-call controls without erasing output metadata."""
+    for attr in ("provider_timeout_seconds", "subprocess_hard_timeout"):
         if hasattr(_llm_call_state, attr):
             delattr(_llm_call_state, attr)
 
@@ -2896,25 +2910,20 @@ def _call_ga_llm(prompt: str) -> str:
     # adapter / ``_run_single_llm_attempt`` stash the per-symbol deadline's
     # provider timeout INTO that same thread-local BEFORE calling
     # ``_call_ga_llm`` — so a naive reset here wipes it and the session never
-    # receives ``read_timeout`` / ``max_retries=0``. Capture the timeout BEFORE
-    # the reset and re-stash it after, so the R2 session-config block below can
-    # apply it. (Legacy callers without a stashed timeout keep None → 60s floor
-    # + default retries, unchanged.)
+    # receives ``read_timeout`` / ``max_retries=0``. Consume the timeout into a
+    # local BEFORE the reset and use that local below. Do not re-stash it: these
+    # are one-call inputs, and retaining either input leaks process isolation
+    # into the next call on the same worker thread. Legacy callers without a
+    # stashed timeout keep None (60s floor + default retries).
     _provider_timeout_seconds = getattr(
         _llm_call_state, "provider_timeout_seconds", None,
     )
     # 07-10 S4 (P0 #3): the fair adapter stashes a process-isolation flag
-    # alongside the provider timeout. Preserve it across the reset the same
-    # way as ``provider_timeout_seconds`` so the subprocess hard-timeout block
-    # below can act on it.
-    _subprocess_hard_timeout = getattr(
+    # alongside the provider timeout. Consume it into a local in the same way.
+    _subprocess_hard_timeout = bool(getattr(
         _llm_call_state, "subprocess_hard_timeout", False,
-    )
+    ))
     _llm_call_state_reset()
-    if _provider_timeout_seconds is not None:
-        _llm_call_state.provider_timeout_seconds = _provider_timeout_seconds
-    if _subprocess_hard_timeout:
-        _llm_call_state.subprocess_hard_timeout = True
     gen = _resolve_generation_config()
     session = llmcore.resolve_session(cfg_name)
     session.system = SYSTEM_PROMPT
@@ -3006,9 +3015,7 @@ def _call_ga_llm(prompt: str) -> str:
     # callers). The fair adapter stashes the per-symbol deadline's provider
     # timeout (``PerSymbolDeadline.provider_timeout_ms()/1000``) before the
     # call.
-    provider_timeout_seconds = getattr(
-        _llm_call_state, "provider_timeout_seconds", None,
-    )
+    provider_timeout_seconds = _provider_timeout_seconds
     if provider_timeout_seconds is not None:
         try:
             session.read_timeout = max(15, int(provider_timeout_seconds))
@@ -3039,9 +3046,6 @@ def _call_ga_llm(prompt: str) -> str:
     # deterministic rollback target and every test that patches
     # ``_call_ga_llm`` (which REPLACES this whole function, so the subprocess
     # block never runs) are unaffected.
-    _subprocess_hard_timeout = bool(getattr(
-        _llm_call_state, "subprocess_hard_timeout", False,
-    ))
     # Measure wall-clock latency of the provider call (network + gateway +
     # model). Stash into the thread-local for the retry wrapper. Use
     # ``time.perf_counter`` (monotonic) — NOT wall-clock ``time.time`` — so

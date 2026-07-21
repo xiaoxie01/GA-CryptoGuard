@@ -21,13 +21,40 @@ from plugins.crypto_guard.storage.repository import CryptoGuardRepository, utc_i
 from plugins.crypto_guard.utils import utc_ms
 
 
+class _ConflictCancelRaceLost(Exception):
+    """Sentinel raised to roll back the conflict-cancel savepoint when the
+    CAS UPDATE matched zero rows (another worker won the race).
+
+    psycopg3 ``with conn.transaction():`` rolls the savepoint back when the
+    ``with`` block exits via this exception, reverting the no-op UPDATE
+    without disturbing the caller's outer transaction.
+    """
+
+
+def _safe_json(raw: Any, default: Any = None) -> Any:
+    """JSONB-aware decode: psycopg3 returns JSONB columns as already-decoded
+    Python dict/list, so ``json.loads(dict)`` raises TypeError. Pass dict/list
+    through; only ``json.loads`` a str/bytes. Returns ``default`` for None/empty.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+    return default
+
+
 def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) -> dict[str, Any]:
     signal = repo.get_signal(signal_id)
     if not signal:
         return {"ok": False, "error": "signal 不存在", "signal_id": signal_id}
     if not signal.get("trade_plan_json"):
         return {"ok": False, "error": "该 signal 没有完整 trade_plan，不能加入模拟盘", "signal_id": signal_id}
-    trade_plan = json.loads(signal["trade_plan_json"])
+    trade_plan = _safe_json(signal["trade_plan_json"], {})
     required = ["side", "entry_type", "stop_loss", "take_profits", "risk_percent", "invalid_condition", "reason"]
     missing = [k for k in required if k not in trade_plan or trade_plan[k] in (None, [], "")]
     if missing:
@@ -84,8 +111,9 @@ def create_paper_order_from_signal(repo: CryptoGuardRepository, signal_id: int) 
     if signal.get("market_snapshot_id"):
         row = repo.get_market_snapshot(int(signal["market_snapshot_id"]))
         if row:
-            snapshot = json.loads(row.get("snapshot_json") or "{}")
-    decision = json.loads(signal.get("ga_decision_json") or "{}") if signal.get("ga_decision_json") else {"confidence": signal.get("confidence"), "trade_plan": trade_plan, "has_trade_plan": True}
+            snapshot = _safe_json(row.get("snapshot_json"), {})
+    _gd = signal.get("ga_decision_json")
+    decision = _safe_json(_gd, {}) if _gd else {"confidence": signal.get("confidence"), "trade_plan": trade_plan, "has_trade_plan": True}
     decision["trade_plan"] = trade_plan
     decision["has_trade_plan"] = True
     risk = validate_trade_plan(decision, snapshot or {})
@@ -283,7 +311,7 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
     if ga_decision.get("snapshot_id"):
         row = repo.get_market_snapshot(int(ga_decision["snapshot_id"]))
         if row:
-            snapshot = json.loads(row.get("snapshot_json") or "{}")
+            snapshot = _safe_json(row.get("snapshot_json"), {})
     risk = validate_trade_plan(raw, snapshot)
     if not risk["ok"]:
         return {
@@ -387,7 +415,7 @@ def create_paper_order_from_ga_decision(repo: CryptoGuardRepository, ga_decision
         "market_snapshot_id": ga_decision.get("snapshot_id"),
         "ga_decision_json": json.dumps(raw, ensure_ascii=False),
     }
-    signal_row = repo.conn.execute("SELECT id FROM signals WHERE ga_decision_id=? ORDER BY id DESC LIMIT 1", (int(ga_decision_id),)).fetchone()
+    signal_row = repo.conn.execute("SELECT id FROM signals WHERE ga_decision_id=%s ORDER BY id DESC LIMIT 1", (int(ga_decision_id),)).fetchone()
     signal_id = int(signal_row["id"]) if signal_row else None
 
     order_id, created = repo.create_paper_order(
@@ -406,7 +434,7 @@ def _ensure_ga_decision_for_legacy_signal(repo: CryptoGuardRepository, signal: d
     # so subsequent reads of ga_decision_json can satisfy the strict-positive-int contract.
     _legacy_analysis_time: Any = None
     try:
-        _orig_decision = json.loads(signal.get("ga_decision_json") or "{}") if signal.get("ga_decision_json") else {}
+        _orig_decision = _safe_json(signal.get("ga_decision_json"), {}) if signal.get("ga_decision_json") else {}
         if isinstance(_orig_decision, dict):
             _legacy_analysis_time = _orig_decision.get("analysis_time_utc")
     except (json.JSONDecodeError, TypeError):
@@ -440,11 +468,16 @@ def _ensure_ga_decision_for_legacy_signal(repo: CryptoGuardRepository, signal: d
     )
     ga_decision_id = repo.create_ga_decision(ga_decision)
     legacy["ga_decision_id"] = ga_decision_id
-    repo.conn.execute(
-        "UPDATE signals SET ga_decision_id=?, ga_decision_json=? WHERE id=?",
-        (ga_decision_id, json.dumps(legacy, ensure_ascii=False), int(signal["id"])),
-    )
-    repo.conn.commit()
+    # 07-16 cutover: ``?`` -> ``%s`` (psycopg3); the JSONB ``ga_decision_json``
+    # accepts a JSON string via the ``%s`` param (PG auto-casts str->jsonb). The
+    # bare ``conn.commit()`` was replaced by ``conn.transaction()`` so the write
+    # is a self-contained BEGIN/COMMIT on the pooled (autocommit=False) conn and
+    # cannot mis-scope a caller's outer transaction.
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE signals SET ga_decision_id=%s, ga_decision_json=%s WHERE id=%s",
+            (ga_decision_id, json.dumps(legacy, ensure_ascii=False), int(signal["id"])),
+        )
     return int(ga_decision_id)
 
 
@@ -638,7 +671,7 @@ def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str
         try:
             dedupe_key = f"ga_recheck_unavailable:{order['id']}:{event_time or 0}"
             existing = repo.conn.execute(
-                "SELECT id FROM paper_trade_logs WHERE json_extract(event_json, '$.dedupe_key')=? LIMIT 1",
+                "SELECT id FROM paper_trade_logs WHERE event_json ->> 'dedupe_key' = %s LIMIT 1",
                 (dedupe_key,),
             ).fetchone()
             if existing:
@@ -690,7 +723,7 @@ def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str
         try:
             if order_ga_id:
                 order_ga_row = repo.conn.execute(
-                    "SELECT analysis_time FROM ga_decisions WHERE id=?", (int(order_ga_id),)
+                    "SELECT analysis_time FROM ga_decisions WHERE id=%s", (int(order_ga_id),)
                 ).fetchone()
                 if order_ga_row and order_ga_row["analysis_time"]:
                     baseline_time = int(order_ga_row["analysis_time"])
@@ -717,7 +750,7 @@ def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str
         try:
             if latest_ga.get("id"):
                 latest_row = repo.conn.execute(
-                    "SELECT analysis_time FROM ga_decisions WHERE id=?", (int(latest_ga["id"]),)
+                    "SELECT analysis_time FROM ga_decisions WHERE id=%s", (int(latest_ga["id"]),)
                 ).fetchone()
                 if latest_row and latest_row["analysis_time"]:
                     latest_ga_analysis_time = int(latest_row["analysis_time"])
@@ -746,51 +779,54 @@ def _revalidate_pending_before_fill(repo: CryptoGuardRepository, order: dict[str
                 else:
                     cancel_ts_iso = utc_iso()
                 reason = f"fill 前复核：方向冲突 {side} vs GA#{latest_ga['id']} bias={bias} grade={grade}"
-                # Section 六: SAVEPOINT/CAS — update first, then audit log on success
-                repo.conn.execute("SAVEPOINT btc9_conflict_cancel")
+                # Section 六: SAVEPOINT/CAS - update first, then audit log on success.
+                # psycopg3: ``with conn.transaction():`` opens a SAVEPOINT when nested
+                # in an outer transaction (matches the prior SQLite SAVEPOINT scope) and
+                # rolls it back automatically on exception, so the race-lost UPDATE
+                # and the audit-log write both revert without disturbing the caller's
+                # outer transaction.
+                conflict_dedupe_key = f"conflict_cancel:{order['id']}:{latest_ga['id']}"
                 try:
-                    cur = repo.conn.execute(
-                        "UPDATE paper_orders SET status='revalidator_cancelled', cancelled_at=?, cancel_reason=?, invalidated_by_ga_decision_id=? WHERE id=? AND status IN ('pending', 'needs_recheck')",
-                        (cancel_ts_iso, reason, latest_ga["id"], order["id"]),
-                    )
-                    if cur.rowcount == 0:
-                        # Race lost — another worker already changed the order
-                        repo.conn.execute("ROLLBACK TO SAVEPOINT btc9_conflict_cancel")
-                        repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
-                        return {"proceed": False, "skip_reason": "cancel_race_lost", "ga_decision_id": latest_ga["id"]}
-                    # C3: Audit log — position_id=None for pending orders (no trade yet).
-                    # event_json enriched with order_id / original_ga_decision_id /
-                    # invalidated_by_ga_decision_id / order_side / latest_bias /
-                    # latest_grade / event_time / dedupe_key for full traceability.
-                    conflict_dedupe_key = f"conflict_cancel:{order['id']}:{latest_ga['id']}"
-                    repo.log_paper_trade_event(
-                        position_id=None,
-                        event_type="pending_order_invalidated_by_new_ga_decision",
-                        symbol=symbol,
-                        side=side,
-                        price=0.0,
-                        quantity=order.get("quantity"),
-                        pnl=0.0,
-                        pnl_pct=0.0,
-                        reason=reason,
-                        event={
-                            "order_id": order["id"],
-                            "original_ga_decision_id": order.get("ga_decision_id"),
-                            "invalidated_by_ga_decision_id": latest_ga["id"],
-                            "order_side": side,
-                            "latest_bias": bias,
-                            "latest_grade": grade,
-                            "event_time": event_time,
-                            "reason": reason,
-                            "dedupe_key": conflict_dedupe_key,
-                        },
-                        event_time=event_time if (event_time is not None and int(event_time) > 0) else None,
-                    )
-                    repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
-                    repo.conn.commit()
+                    with repo.conn.transaction():
+                        cur = repo.conn.execute(
+                            "UPDATE paper_orders SET status='revalidator_cancelled', cancelled_at=%s, cancel_reason=%s, invalidated_by_ga_decision_id=%s WHERE id=%s AND status IN ('pending', 'needs_recheck')",
+                            (cancel_ts_iso, reason, latest_ga["id"], order["id"]),
+                        )
+                        if cur.rowcount == 0:
+                            # Race lost - another worker already changed the order.
+                            # Raise to roll back this savepoint (reverts the no-op
+                            # UPDATE) without touching the caller's outer transaction.
+                            raise _ConflictCancelRaceLost()
+                        # C3: Audit log - position_id=None for pending orders (no trade yet).
+                        # event_json enriched with order_id / original_ga_decision_id /
+                        # invalidated_by_ga_decision_id / order_side / latest_bias /
+                        # latest_grade / event_time / dedupe_key for full traceability.
+                        repo.log_paper_trade_event(
+                            position_id=None,
+                            event_type="pending_order_invalidated_by_new_ga_decision",
+                            symbol=symbol,
+                            side=side,
+                            price=0.0,
+                            quantity=order.get("quantity"),
+                            pnl=0.0,
+                            pnl_pct=0.0,
+                            reason=reason,
+                            event={
+                                "order_id": order["id"],
+                                "original_ga_decision_id": order.get("ga_decision_id"),
+                                "invalidated_by_ga_decision_id": latest_ga["id"],
+                                "order_side": side,
+                                "latest_bias": bias,
+                                "latest_grade": grade,
+                                "event_time": event_time,
+                                "reason": reason,
+                                "dedupe_key": conflict_dedupe_key,
+                            },
+                            event_time=event_time if (event_time is not None and int(event_time) > 0) else None,
+                        )
+                except _ConflictCancelRaceLost:
+                    return {"proceed": False, "skip_reason": "cancel_race_lost", "ga_decision_id": latest_ga["id"]}
                 except Exception:
-                    repo.conn.execute("ROLLBACK TO SAVEPOINT btc9_conflict_cancel")
-                    repo.conn.execute("RELEASE SAVEPOINT btc9_conflict_cancel")
                     _log_ga_recheck_unavailable("exception during conflict cancel", latest_ga)
                     return {"proceed": False, "skip_reason": "ga_recheck_unavailable"}
                 return {"proceed": False, "skip_reason": "ga_conflict_cancelled", "ga_decision_id": latest_ga["id"]}
@@ -988,7 +1024,7 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
             "fill_method": fill_method,
             "side": order.get("side"),
             "stop_loss": order.get("stop_loss"),
-            "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "take_profits": _safe_json(order.get("take_profit_json"), []) if order.get("take_profit_json") else [],
             "filled_at": fill_ts_iso,
             "event_time": fill_event_time,
             "quantity": order.get("quantity"),
@@ -1099,7 +1135,7 @@ def close_trade_if_needed(repo: CryptoGuardRepository, order: dict[str, Any], tr
             "side": order.get("side"),
             "entry_price": order.get("entry_price"),
             "stop_loss": order.get("stop_loss"),
-            "take_profits": json.loads(order.get("take_profit_json") or "[]") if order.get("take_profit_json") else [],
+            "take_profits": _safe_json(order.get("take_profit_json"), []) if order.get("take_profit_json") else [],
             "filled_at": order.get("filled_at"),
             "closed_at": close_ts_iso,
             "event_time": close_ts_iso,
@@ -1193,8 +1229,8 @@ def _create_opportunity_watch_from_gate(
             """
             INSERT INTO opportunity_watches
             (symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id, expires_at, dedupe_key)
-            VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
-            ON CONFLICT(dedupe_key) DO UPDATE SET
+            VALUES (%s, %s, %s, %s, 'active', %s, %s, %s)
+            ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
                 watch_condition_json = excluded.watch_condition_json,
                 expires_at = excluded.expires_at,
                 watch_reason = excluded.watch_reason,
@@ -1205,7 +1241,7 @@ def _create_opportunity_watch_from_gate(
         # No commit here — caller owns the transaction
         # Return the ID of the upserted row
         row = repo.conn.execute(
-            "SELECT id FROM opportunity_watches WHERE dedupe_key = ?", (dedupe_key,)
+            "SELECT id FROM opportunity_watches WHERE dedupe_key = %s", (dedupe_key,)
         ).fetchone()
         return int(row["id"]) if row else None
     except Exception:
@@ -1225,7 +1261,7 @@ def _save_gate_result_to_ga_decision(
     """Save account feedback gate result to GA decision."""
     try:
         repo.conn.execute(
-            "UPDATE ga_decisions SET account_feedback_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET account_feedback_gate_json = %s WHERE id = %s",
             (json.dumps(gate_result, ensure_ascii=False), ga_decision_id),
         )
     except Exception as exc:
@@ -1276,7 +1312,7 @@ def _save_regime_gate_to_ga_decision(
     """Save market regime gate result to GA decision for audit trail."""
     try:
         repo.conn.execute(
-            "UPDATE ga_decisions SET market_regime_gate_json = ? WHERE id = ?",
+            "UPDATE ga_decisions SET market_regime_gate_json = %s WHERE id = %s",
             (json.dumps(regime_gate, ensure_ascii=False), ga_decision_id),
         )
     except Exception as exc:
@@ -1448,7 +1484,7 @@ def _resolve_analysis_time(
     if ga_decision_id:
         try:
             row = repo.conn.execute(
-                "SELECT analysis_time FROM ga_decisions WHERE id=?",
+                "SELECT analysis_time FROM ga_decisions WHERE id=%s",
                 (int(ga_decision_id),),
             ).fetchone()
             if row and row["analysis_time"]:

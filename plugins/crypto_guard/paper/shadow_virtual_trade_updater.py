@@ -19,12 +19,19 @@ DEFAULT_GAP_CATCHUP_LIMIT = 500         # max candles to fetch for gap catch-up
 MAX_PAGINATION_PAGES = 10               # safety cap: max pages to fetch per trade per update
 
 
-def _iso_to_unix_ms(iso_str: str | None) -> int | None:
-    """Convert ISO datetime string to unix milliseconds. Returns None on failure."""
+def _iso_to_unix_ms(iso_str: str | datetime | None) -> int | None:
+    """Convert ISO datetime string or datetime to unix milliseconds. Returns None on failure.
+
+    Under PostgreSQL, TIMESTAMPTZ columns (opened_at / created_at) are decoded
+    as timezone-aware ``datetime`` objects, not ISO strings, so a ``datetime``
+    input must be accepted directly (the SQLite era stored these as TEXT).
+    """
     if not iso_str:
         return None
     try:
-        if isinstance(iso_str, str):
+        if isinstance(iso_str, datetime):
+            dt = iso_str
+        elif isinstance(iso_str, str):
             dt = datetime.fromisoformat(iso_str)
         else:
             return None
@@ -206,8 +213,8 @@ def activate_pending_entry(
                     new_risk = risk_usdt
                     # Update entry_price, quantity, and initial_risk_usdt inline
                     repo.conn.execute(
-                        "UPDATE shadow_virtual_trades SET entry_price=?, quantity=?, initial_risk_usdt=?"
-                        " WHERE id=?",
+                        "UPDATE shadow_virtual_trades SET entry_price=%s, quantity=%s, initial_risk_usdt=%s"
+                        " WHERE id=%s",
                         (fill_price, new_quantity, new_risk, trade_id),
                     )
                     LOGGER.info(
@@ -368,7 +375,7 @@ def _process_candle_for_trade(
             # P1-3: Same-candle SL/TP after activation — conservative rule
             # Re-read trade as open and check if this candle also hits SL/TP
             activated_trade = dict(repo.conn.execute(
-                "SELECT * FROM shadow_virtual_trades WHERE id=?", (trade_id,)
+                "SELECT * FROM shadow_virtual_trades WHERE id=%s", (trade_id,)
             ).fetchone() or trade)
             if str(activated_trade.get("status")) == "open":
                 sl_tp_reason, sl_tp_price = check_sl_tp(activated_trade, candle)
@@ -447,11 +454,11 @@ def _persist_cursor(repo: CryptoGuardRepository, trade_id: int, candle: dict[str
     open_time = candle.get("open_time")
     if open_time is not None:
         next_candle_time = int(open_time) + 60000
-        repo.conn.execute(
-            "UPDATE shadow_virtual_trades SET last_processed_candle_time=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (next_candle_time, trade_id),
-        )
-        repo.conn.commit()
+        with repo.conn.transaction():
+            repo.conn.execute(
+                "UPDATE shadow_virtual_trades SET last_processed_candle_time=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+                (next_candle_time, trade_id),
+            )
 
 
 # ── main entry point ──────────────────────────────────────────────────────
@@ -626,7 +633,7 @@ def update_shadow_virtual_trades(
 
                     # Re-read trade status after processing (may have changed)
                     trade = dict(repo.conn.execute(
-                        "SELECT * FROM shadow_virtual_trades WHERE id=?", (trade_id,)
+                        "SELECT * FROM shadow_virtual_trades WHERE id=%s", (trade_id,)
                     ).fetchone() or trade)
 
                     # Stop processing if trade is no longer open/pending
@@ -636,7 +643,7 @@ def update_shadow_virtual_trades(
 
                 # Re-read trade status after processing this page
                 trade = dict(repo.conn.execute(
-                    "SELECT * FROM shadow_virtual_trades WHERE id=?", (trade_id,)
+                    "SELECT * FROM shadow_virtual_trades WHERE id=%s", (trade_id,)
                 ).fetchone() or trade)
                 new_status = str(trade.get("status", ""))
                 if new_status not in ("open", "pending_entry"):

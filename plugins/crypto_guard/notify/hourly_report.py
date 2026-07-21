@@ -165,7 +165,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
         # structured unrecoverable error instead of returning a green-looking
         # ``batch_incomplete_requeued``. The operator sees the collision.
         _succ_row = repo.conn.execute(
-            "SELECT status FROM agent_jobs WHERE id=?", (int(successor_id),),
+            "SELECT status FROM agent_jobs WHERE id=%s", (int(successor_id),),
         ).fetchone()
         if _succ_row is not None and _succ_row["status"] == "running":
             LOGGER.error(
@@ -630,18 +630,21 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     )
 
     if risk_state:
-        risk_status = []
-        if risk_state.get("risk_off"):
-            risk_status.append("risk_off")
-        if risk_state.get("hard_risk_off"):
-            risk_status.append("hard_risk_off")
-        if risk_state.get("daily_loss_pause"):
-            risk_status.append("daily_loss_pause")
-        if risk_status:
-            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
-            lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+        if risk_state.get("error"):
+            lines.append("- 风险状态：**不可用（故障关闭）**")
         else:
-            lines.append("- 风险状态：正常")
+            risk_status = []
+            if risk_state.get("risk_off"):
+                risk_status.append("risk_off")
+            if risk_state.get("hard_risk_off"):
+                risk_status.append("hard_risk_off")
+            if risk_state.get("daily_loss_pause"):
+                risk_status.append("daily_loss_pause")
+            if risk_status:
+                dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+                lines.append(f"- 风险状态：**{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+            else:
+                lines.append("- 风险状态：正常")
 
     lines.extend(["", "**二、模拟盘摘要**"])
     if equity:
@@ -686,6 +689,8 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
             lines.append(f"- 发现问题 {total} 个")
         else:
             lines.append("- 全部正常，未发现状态不一致")
+    elif state_consistency and state_consistency.get("error"):
+        lines.extend(["", "**状态一致性诊断**", "- 不可用（查询失败）"])
 
     # Report accuracy diagnostics
     if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
@@ -905,29 +910,32 @@ def render_ga_hourly_summary(
         f"- 调度正常 · 等待任务 {queue_counts.get('pending_user', 0) + queue_counts.get('pending_background', 0)} 个"
         f" · 正在执行 {queue_counts.get('running', 0)} 个"
         f" · 最近失败 {len(_current_failed_jobs)} 个",
-        "- 行情数据：Binance U本位合约公共行情 · SQLite",
+        "- 行情数据：Binance U本位合约公共行情 · PostgreSQL",
     ])
 
     # P2-B: Add risk_off state
     if risk_state:
-        risk_status = []
-        if risk_state.get("risk_off"):
-            risk_status.append("risk_off")
-        if risk_state.get("hard_risk_off"):
-            risk_status.append("hard_risk_off")
-        if risk_state.get("daily_loss_pause"):
-            risk_status.append("daily_loss_pause")
-        if risk_status:
-            # P2-14: drawdown display as non-negative amplitude
-            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
-            labels = {
-                "risk_off": "风险收缩",
-                "hard_risk_off": "暂停开仓",
-                "daily_loss_pause": "当日亏损暂停",
-            }
-            lines.append(f"- 风险状态：**{'、'.join(labels.get(x, x) for x in risk_status)}**（回撤 {dd_pct:.1f}%）")
+        if risk_state.get("error"):
+            lines.append("- 风险状态：不可用（故障关闭）")
         else:
-            lines.append("- 风险状态：正常")
+            risk_status = []
+            if risk_state.get("risk_off"):
+                risk_status.append("risk_off")
+            if risk_state.get("hard_risk_off"):
+                risk_status.append("hard_risk_off")
+            if risk_state.get("daily_loss_pause"):
+                risk_status.append("daily_loss_pause")
+            if risk_status:
+                # P2-14: drawdown display as non-negative amplitude
+                dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+                labels = {
+                    "risk_off": "风险收缩",
+                    "hard_risk_off": "暂停开仓",
+                    "daily_loss_pause": "当日亏损暂停",
+                }
+                lines.append(f"- 风险状态：**{'、'.join(labels.get(x, x) for x in risk_status)}**（回撤 {dd_pct:.1f}%）")
+            else:
+                lines.append("- 风险状态：正常")
 
     # P0-5: Market data quality section — surface degraded state in GA path.
     # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
@@ -970,7 +978,7 @@ def render_ga_hourly_summary(
             f" · 回撤 {dd_display:.2f}%"
             + ("（账号权益低于初始）" if dd_value < 0 else "（未回撤）" if dd_value >= 0 else "")
         )
-        analytics_source = "DuckDB 时序统计" if (duckdb_stats or {}).get("ok") else "SQLite 实时统计"
+        analytics_source = "DuckDB 时序统计" if (duckdb_stats or {}).get("ok") else "PostgreSQL 实时统计"
         lines.append(f"- 决策来源：GA 决策 · 统计来源：{analytics_source}")
     else:
         lines.append("- 暂无净值快照")
@@ -1099,6 +1107,8 @@ def render_ga_hourly_summary(
                 lines.append(f"- 发现问题 {total} 个（非关键）")
         else:
             lines.extend(["", "**状态一致性诊断**", "- 全部正常，未发现状态不一致"])
+    elif state_consistency and state_consistency.get("error"):
+        lines.extend(["", "**状态一致性诊断**", "- 不可用（查询失败）"])
 
     # P2-B: Add top failure patterns
     if feedback_patterns and not feedback_patterns.get("error"):
@@ -1273,7 +1283,16 @@ def _fetch_risk_state(repo: CryptoGuardRepository) -> dict[str, Any]:
             "effective_risk_percent": result.get("effective_risk_percent", 1.0),
         }
     except Exception as exc:
-        return {"risk_off": False, "error": str(exc)}
+        try:
+            repo.conn.rollback()
+        except Exception:
+            pass
+        return {
+            "available": False,
+            "risk_off": None,
+            "hard_risk_off": True,
+            "error": f"risk query unavailable ({type(exc).__name__})",
+        }
 
 
 def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
@@ -1283,11 +1302,11 @@ def _fetch_shadow_data_quality(repo: CryptoGuardRepository) -> dict[str, Any]:
         # pnl_r = 0 is real data (breakeven), only NULL is pseudo
         real_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND outcome_source='real_pnl' AND pnl_r IS NOT NULL
+            WHERE is_shadow = TRUE AND outcome_source='real_pnl' AND pnl_r IS NOT NULL
         """)
         pseudo_count = _count(repo, """
             SELECT COUNT(*) FROM strategy_evaluations
-            WHERE is_shadow = 1 AND (outcome_source != 'real_pnl' OR outcome_source IS NULL)
+            WHERE is_shadow = TRUE AND (outcome_source != 'real_pnl' OR outcome_source IS NULL)
         """)
         total = real_count + pseudo_count
         return {
@@ -1390,26 +1409,51 @@ def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Run state consistency diagnostics for the hourly report."""
     try:
         result = diagnose_state_consistency(repo)
-        return {
+        out = {
             "ok": result["ok"],
             "summary": result["summary"],
             "total_issues": result["total_issues"],
             "issues": result["issues"],
         }
+        query_failures = [
+            issue for issue in out["issues"]
+            if issue.get("type") == "diagnostic_query_failed"
+        ]
+        if query_failures:
+            out["ok"] = False
+            out["error"] = (
+                f"state consistency unavailable "
+                f"({len(query_failures)} diagnostic queries failed)"
+            )
+        return out
     except Exception as exc:
-        return {"error": str(exc), "ok": True, "summary": {}, "total_issues": 0, "issues": []}
+        try:
+            repo.conn.rollback()
+        except Exception:
+            pass
+        issue = {
+            "type": "diagnostic_query_failed",
+            "severity": "error",
+            "message": f"state consistency unavailable ({type(exc).__name__})",
+        }
+        return {
+            "error": issue["message"], "ok": False, "summary": {},
+            "total_issues": 1, "issues": [issue],
+        }
 
 
 def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch top 3 failure patterns this week from skill_feedback_memory."""
     try:
-        # Get feedback from last 7 days - use datetime() wrapper for consistent comparison
+        # Get feedback from last 7 days - created_at is a TIMESTAMPTZ column; PG
+        # casts the ISO-8601 parameter to timestamptz for the comparison (no
+        # datetime() wrapper needed, which was SQLite-specific).
         week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
         rows = repo.conn.execute(
             """
             SELECT pattern_type, COUNT(*) as count
             FROM skill_feedback_memory
-            WHERE datetime(created_at) >= datetime(?)
+            WHERE created_at >= %s
               AND pattern_type IS NOT NULL AND pattern_type != ''
               AND status='candidate'
             GROUP BY pattern_type
@@ -1426,7 +1470,7 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
             """
             SELECT skill_name, COUNT(*) as count
             FROM skill_feedback_memory
-            WHERE datetime(created_at) >= datetime(?)
+            WHERE created_at >= %s
               AND status='candidate'
             GROUP BY skill_name
             ORDER BY count DESC
@@ -1447,7 +1491,8 @@ def _fetch_feedback_patterns(repo: CryptoGuardRepository) -> dict[str, Any]:
 def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Fetch LONG vs SHORT performance breakdown."""
     try:
-        # Get last 30 days performance - use datetime() wrapper for consistent comparison
+        # Get last 30 days performance - closed_at is a TIMESTAMPTZ column; PG
+        # casts the ISO-8601 parameter to timestamptz for the comparison.
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
 
         long_stats = repo.conn.execute(
@@ -1457,7 +1502,7 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
                    SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
             FROM paper_trades
-            WHERE side = 'LONG' AND datetime(closed_at) >= datetime(?) AND pnl_r IS NOT NULL
+            WHERE side = 'LONG' AND closed_at >= %s AND pnl_r IS NOT NULL
             """,
             (thirty_days_ago,),
         ).fetchone()
@@ -1469,7 +1514,7 @@ def _fetch_long_short_performance(repo: CryptoGuardRepository) -> dict[str, Any]
                    SUM(CASE WHEN pnl_r > 0.05 THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN pnl_r < -0.05 THEN 1 ELSE 0 END) as losses
             FROM paper_trades
-            WHERE side = 'SHORT' AND datetime(closed_at) >= datetime(?) AND pnl_r IS NOT NULL
+            WHERE side = 'SHORT' AND closed_at >= %s AND pnl_r IS NOT NULL
             """,
             (thirty_days_ago,),
         ).fetchone()
@@ -1504,7 +1549,7 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
             """
             SELECT account_feedback_gate_json
             FROM ga_decisions
-            WHERE datetime(created_at) >= datetime(?) AND account_feedback_gate_json IS NOT NULL
+            WHERE created_at >= %s AND account_feedback_gate_json IS NOT NULL
             """,
             (day_ago,),
         ).fetchall()
@@ -1532,7 +1577,10 @@ def _fetch_account_feedback_gate_stats(repo: CryptoGuardRepository) -> dict[str,
 
         for row in rows:
             try:
-                gate = json.loads(row["account_feedback_gate_json"])
+                gate = _safe_json(row["account_feedback_gate_json"], None)
+                if gate is None:
+                    invalid_json_count += 1
+                    continue
             except (json.JSONDecodeError, TypeError):
                 invalid_json_count += 1
                 continue
@@ -1621,7 +1669,7 @@ def _fetch_market_regime_gate_stats(repo: CryptoGuardRepository, hours: int = 24
             """
             SELECT market_regime_gate_json
             FROM ga_decisions
-            WHERE datetime(created_at) >= datetime(?) AND market_regime_gate_json IS NOT NULL
+            WHERE created_at >= %s AND market_regime_gate_json IS NOT NULL
             """,
             (day_ago,),
         ).fetchall()
@@ -1640,7 +1688,9 @@ def _fetch_market_regime_gate_stats(repo: CryptoGuardRepository, hours: int = 24
 
         for row in rows:
             try:
-                gate = json.loads(row["market_regime_gate_json"])
+                gate = _safe_json(row["market_regime_gate_json"], None)
+                if gate is None:
+                    continue
             except (json.JSONDecodeError, TypeError):
                 continue
 
@@ -1761,19 +1811,22 @@ def render_hourly_report_text(
 
     # P2-B: Add risk_off state
     if risk_state:
-        risk_status = []
-        if risk_state.get("risk_off"):
-            risk_status.append("risk_off")
-        if risk_state.get("hard_risk_off"):
-            risk_status.append("hard_risk_off")
-        if risk_state.get("daily_loss_pause"):
-            risk_status.append("daily_loss_pause")
-        if risk_status:
-            # P2-14: drawdown display as non-negative amplitude
-            dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
-            lines.append(f"- **风险状态：{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+        if risk_state.get("error"):
+            lines.append("- **风险状态：不可用（故障关闭）**")
         else:
-            lines.append("- 风险状态：正常")
+            risk_status = []
+            if risk_state.get("risk_off"):
+                risk_status.append("risk_off")
+            if risk_state.get("hard_risk_off"):
+                risk_status.append("hard_risk_off")
+            if risk_state.get("daily_loss_pause"):
+                risk_status.append("daily_loss_pause")
+            if risk_status:
+                # P2-14: drawdown display as non-negative amplitude
+                dd_pct = abs(float(risk_state.get('drawdown_pct', 0)))
+                lines.append(f"- **风险状态：{', '.join(risk_status)}**（回撤 {dd_pct:.1f}%）")
+            else:
+                lines.append("- 风险状态：正常")
 
     if agent_brief and agent_brief.get("summary"):
         lines.extend(["**GA/LLM 巡航摘要：**", str(agent_brief["summary"]), ""])
@@ -1908,6 +1961,8 @@ def render_hourly_report_text(
                     lines.append(f"  - {' | '.join(parts)}")
         else:
             lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])
+    elif state_consistency and state_consistency.get("error"):
+        lines.extend(["", "**状态一致性诊断：**", "- 不可用（查询失败）"])
 
     # R6: Market data quality section
     # P2-4 R3: Distinguish "health check crashed" (fail_closed=True) from
@@ -2040,7 +2095,11 @@ def render_hourly_report_text(
 
 
 def _count(repo: CryptoGuardRepository, sql: str) -> int:
-    return int(repo.conn.execute(sql).fetchone()[0])
+    # ``repo.conn`` is a pooled psycopg Connection with dict_row rows. PG names
+    # a bare ``COUNT(*)`` column ``count``; read it by name (tuple-style ``[0]``
+    # would raise on a dict_row). The row is never None for an aggregate COUNT.
+    row = repo.conn.execute(sql).fetchone()
+    return int(row["count"])
 
 
 def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2518,8 +2577,8 @@ def _distribution_source_label(source_raw: str, duckdb_stats: dict[str, Any] | N
     if source_raw == "duckdb" and (duckdb_stats or {}).get("ok"):
         return "DuckDB 时序"
     if source_raw in {"in_memory_fallback", "sqlite_fallback"}:
-        return "SQLite 实时等级统计（DuckDB 未启用）"
-    return str(source_raw or "SQLite 实时等级统计（DuckDB 未启用）")
+        return "PostgreSQL 实时等级统计（DuckDB 未启用）"
+    return str(source_raw or "PostgreSQL 实时等级统计（DuckDB 未启用）")
 
 
 def _decision_text(value: Any) -> str:
@@ -3477,6 +3536,11 @@ def _dedupe(items: list[str]) -> list[str]:
 def _safe_json(raw: Any, default: Any) -> Any:
     if raw is None:
         return default
+    # PostgreSQL JSONB columns come back from psycopg as already-decoded
+    # dict/list (NOT str). json.loads on a dict/list raises TypeError and would
+    # silently fall back to ``default`` -> DATA LOSS. Only parse a str.
+    if isinstance(raw, (dict, list)):
+        return raw
     try:
         return json.loads(raw)
     except Exception:

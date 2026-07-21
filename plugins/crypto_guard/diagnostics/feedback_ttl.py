@@ -7,6 +7,18 @@ Protection:
 - Recent 30 days: full weight in context builder
 - 30-90 days: decayed weight (0.5x)
 - >90 days: archived, excluded from context unless referenced
+
+PostgreSQL notes (07-16 greenfield cutover):
+- ``created_at`` is a TIMESTAMPTZ column; PG casts ISO-8601 params directly, so
+  no SQLite ``datetime()`` wrapper is used (it is invalid PG syntax and would
+  raise on every TTL UPDATE). The cutoff params are ISO-8601 ``...Z`` strings.
+- The protected-id exclusion uses a PG array ``id = ANY(%s::bigint[])``. psycopg3
+  adapts the Python ``list[int]`` to a PG array; ``json_each(?)`` (SQLite JSON
+  table function) has no PG equivalent as written. An empty list means nothing
+  is protected (``= ANY('{}'::bigint[])`` is always FALSE).
+- The three UPDATEs run inside ONE ``with repo.conn.transaction():`` so the TTL
+  transition is atomic; the old bare ``repo.conn.commit()`` was removed (on a
+  pooled autocommit=False conn it would mis-scope against a caller's outer txn).
 """
 
 from __future__ import annotations
@@ -55,41 +67,45 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
     # Count current state
     current_counts = _count_feedback_by_status(repo)
 
-    # Transition fresh → decayed (30-90 days, not protected)
-    fresh_to_decayed = repo.conn.execute(
-        """
-        UPDATE skill_feedback_memory
-        SET status = 'decayed', updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'fresh' AND datetime(created_at) < datetime(?) AND datetime(created_at) >= datetime(?)
-        AND id NOT IN (SELECT value FROM json_each(?))
-        """,
-        (fresh_cutoff, decayed_cutoff, json.dumps(protected_ids)),
-    ).rowcount
+    # Atomic TTL transition: the three UPDATEs run inside ONE transaction so a
+    # failure mid-way cannot leave feedback partially transitioned. The pooled
+    # connection is autocommit=False (implicit txn); a bare ``commit()`` would
+    # mis-scope against any caller's outer transaction, so the single
+    # ``with repo.conn.transaction():`` BEGIN/COMMIT is the correct PG boundary.
+    with repo.conn.transaction():
+        # Transition fresh → decayed (30-90 days, not protected)
+        fresh_to_decayed = repo.conn.execute(
+            """
+            UPDATE skill_feedback_memory
+            SET status = 'decayed', updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'fresh' AND created_at < %s AND created_at >= %s
+            AND NOT (id = ANY(%s::bigint[]))
+            """,
+            (fresh_cutoff, decayed_cutoff, protected_ids),
+        ).rowcount
 
-    # Transition decayed → archived (>90 days, not protected)
-    decayed_to_archived = repo.conn.execute(
-        """
-        UPDATE skill_feedback_memory
-        SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'decayed' AND datetime(created_at) < datetime(?)
-        AND id NOT IN (SELECT value FROM json_each(?))
-        """,
-        (decayed_cutoff, json.dumps(protected_ids)),
-    ).rowcount
+        # Transition decayed → archived (>90 days, not protected)
+        decayed_to_archived = repo.conn.execute(
+            """
+            UPDATE skill_feedback_memory
+            SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'decayed' AND created_at < %s
+            AND NOT (id = ANY(%s::bigint[]))
+            """,
+            (decayed_cutoff, protected_ids),
+        ).rowcount
 
-    # Also archive entries still in 'candidate' or 'active' status that are >90 days old
-    # (entries that were never transitioned)
-    stale_to_archived = repo.conn.execute(
-        """
-        UPDATE skill_feedback_memory
-        SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-        WHERE status IN ('candidate', 'active') AND datetime(created_at) < datetime(?)
-        AND id NOT IN (SELECT value FROM json_each(?))
-        """,
-        (decayed_cutoff, json.dumps(protected_ids)),
-    ).rowcount
-
-    repo.conn.commit()
+        # Also archive entries still in 'candidate' or 'active' status that are >90 days old
+        # (entries that were never transitioned)
+        stale_to_archived = repo.conn.execute(
+            """
+            UPDATE skill_feedback_memory
+            SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('candidate', 'active') AND created_at < %s
+            AND NOT (id = ANY(%s::bigint[]))
+            """,
+            (decayed_cutoff, protected_ids),
+        ).rowcount
 
     # Count new state
     new_counts = _count_feedback_by_status(repo)
@@ -141,7 +157,7 @@ def get_feedback_with_ttl_weight(
         FROM skill_feedback_memory
         WHERE 1=1 {status_filter}
         ORDER BY created_at DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (limit,),
     ).fetchall()
@@ -165,7 +181,10 @@ def _get_protected_feedback_ids(repo: CryptoGuardRepository) -> list[int]:
 
     protected_ids: set[int] = set()
     for patch in active_patches:
-        # Parse both evidence_json and patch_json
+        # Parse both evidence_json and patch_json. On PG the JSONB columns are
+        # already decoded by psycopg3 (dict/list), not str; the isinstance guard
+        # keeps the legacy str path working too. ``json.loads(dict)`` would raise
+        # TypeError, so the str-only branch is essential.
         for json_field in ("evidence_json", "patch_json"):
             json_str = patch[json_field]
             if not json_str:

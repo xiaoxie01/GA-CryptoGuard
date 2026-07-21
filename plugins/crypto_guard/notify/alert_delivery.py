@@ -54,7 +54,11 @@ def send_markdown_alert(
     quiet = (feishu_cfg.get("quiet_period") or {})
     quiet_minutes = int(quiet.get("normal_duplicate_alert_minutes", 5))
     never = set(quiet.get("never_silence") or DEFAULT_NEVER_SILENCE)
-    use_redis = should_use_redis_for_path(load_config().database_path)
+    # 07-16 cutover: Redis eligibility no longer depends on the (removed) SQLite
+    # file path. PostgreSQL is a single shared durable DB, so Redis is always
+    # eligible unless explicitly disabled via env (``should_use_redis_for_path(None)``
+    # encodes the production case -- matches feishu_integration.py / run_ga_workers.py).
+    use_redis = should_use_redis_for_path(None)
     redis = RedisAdapter() if use_redis else None
     if alert_type not in never and redis and redis.is_quiet(symbol or "-", alert_type):
         return {"ok": True, "sent": False, "silenced": True}
@@ -111,7 +115,12 @@ def process_alert_outbox(repo: CryptoGuardRepository, send_message: Callable[...
     processed = sent = failed = 0
     for row in repo.claim_pending_alerts(limit=limit):
         processed += 1
-        payload = json.loads(row["payload_json"])
+        # 07-16 cutover: ``payload_json`` is a JSONB column, so psycopg3 returns
+        # it as an already-decoded dict (NOT str). ``json.loads(dict)`` raises
+        # TypeError -> ``_deliver_alert`` never runs -> every alert silently
+        # fails to send. Pass dict/list through; only parse str.
+        raw_payload = row["payload_json"]
+        payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload or "{}")
         result = _deliver_alert(repo, int(row["id"]), payload, send_message)
         if result.get("sent"):
             sent += 1

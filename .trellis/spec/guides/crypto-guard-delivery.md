@@ -60,7 +60,10 @@ Production mutation is a separate, user-confirmed phase:
 
 1. Stop all writers.
 2. Create a timestamped backup outside the live database path.
-3. Record byte size, SHA256 and `PRAGMA integrity_check`.
+3. Archive the old SQLite file read-only and record its byte size and SHA256.
+   For PostgreSQL, create and verify a `pg_dump`/`pg_restore --list` artifact;
+   use PostgreSQL-native catalog/health checks (and `pg_amcheck` when enabled),
+   never `PRAGMA integrity_check`.
 4. Record key-table row counts.
 5. Apply the reviewed migration/repair exactly once.
 6. Re-run integrity, schema, state and report diagnostics.
@@ -69,7 +72,10 @@ Production mutation is a separate, user-confirmed phase:
 
 Use `/trellis:crypto-guard-release`. Do not start `fsapp.py` or `hub.pyw` merely because tests passed.
 
-For an isolated reproduction, set `CRYPTO_GUARD_DB` to a temporary path outside project production-data directories and append `# crypto-guard-non-production-db:<same-path>` to the command. This exemption never applies to service control, destructive Git, or databases under project data directories.
+For an isolated reproduction, use the dedicated `crypto_guard_test_app` /
+`crypto_guard_test` identity and a unique scratch schema. Never point tests at
+the production `crypto_guard` database. This exemption never applies to service
+control, destructive Git, or the production PostgreSQL database.
 
 ## Spec Marketplace Decision
 

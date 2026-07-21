@@ -85,9 +85,10 @@ def assess_health(
 
     try:
         # 1. Total closed count for (symbol, interval) with close_time <= analysis_time.
+        # PG placeholders (%s) + boolean is_closed=TRUE (NOT SQLite ? + is_closed=1).
         total_row = repo.conn.execute(
             "SELECT COUNT(*) AS c FROM candles "
-            "WHERE symbol=? AND interval=? AND is_closed=1 AND close_time <= ?",
+            "WHERE symbol=%s AND interval=%s AND is_closed=TRUE AND close_time <= %s",
             (symbol, interval, at_ms),
         ).fetchone()
         total_closed_count = int(total_row["c"]) if total_row else 0
@@ -101,8 +102,8 @@ def assess_health(
         query_limit = int(required_count) + _QUERY_SLACK
         rows = repo.conn.execute(
             "SELECT open_time, close_time, is_closed FROM candles "
-            "WHERE symbol=? AND interval=? AND is_closed=1 AND close_time <= ? "
-            "ORDER BY open_time DESC LIMIT ?",
+            "WHERE symbol=%s AND interval=%s AND is_closed=TRUE AND close_time <= %s "
+            "ORDER BY open_time DESC LIMIT %s",
             (symbol, interval, at_ms, query_limit),
         ).fetchall()
 
@@ -125,8 +126,8 @@ def assess_health(
         #    historical data, not a violation.
         future_check = repo.conn.execute(
             "SELECT COUNT(*) AS c FROM candles "
-            "WHERE symbol=? AND interval=? AND is_closed=1 "
-            "AND open_time <= ? AND close_time > ?",
+            "WHERE symbol=%s AND interval=%s AND is_closed=TRUE "
+            "AND open_time <= %s AND close_time > %s",
             (symbol, interval, at_ms, at_ms),
         ).fetchone()
         has_future_candle = int(future_check["c"]) > 0 if future_check else False
@@ -136,11 +137,13 @@ def assess_health(
                                    total_closed_count=total_closed_count)
 
         # 4. Check for duplicate open_time (shouldn't happen due to UNIQUE, but check).
+        #    PG (unlike SQLite) does NOT allow a SELECT-list alias (``cnt``) in
+        #    HAVING; reference the aggregate ``COUNT(*)`` directly.
         dup_row = repo.conn.execute(
             "SELECT COUNT(*) AS c FROM ("
-            "  SELECT open_time, COUNT(*) AS cnt FROM candles "
-            "  WHERE symbol=? AND interval=? AND is_closed=1 AND close_time <= ? "
-            "  GROUP BY open_time HAVING cnt > 1"
+            "  SELECT open_time FROM candles "
+            "  WHERE symbol=%s AND interval=%s AND is_closed=TRUE AND close_time <= %s "
+            "  GROUP BY open_time HAVING COUNT(*) > 1"
             ")",
             (symbol, interval, at_ms),
         ).fetchone()

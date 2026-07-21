@@ -20,7 +20,7 @@ def fetch_and_upsert_closed_klines(
     lookback: int,
     required_count: int | None = None,
 ) -> dict[str, Any]:
-    """Fetch closed klines from Binance and upsert into SQLite.
+    """Fetch closed klines from Binance and upsert into PostgreSQL.
 
     When ``required_count`` is provided (R2), after the incremental fetch the
     function calls ``compute_missing_ranges`` and ``backfill_symbol_interval``

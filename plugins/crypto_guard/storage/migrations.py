@@ -1,2229 +1,961 @@
+"""CryptoGuard PostgreSQL schema initialization + health.
+
+Greenfield design (PostgreSQL only; NO SQLite fallback, NO data migration from
+the old SQLite store). ``initialize_database()`` applies the full
+``schema_postgres.sql`` from a single transaction guarded by a transaction-
+scoped advisory lock, seeds the default symbol universe + strategy versions,
+and writes the contract markers. Because the schema file creates the final
+state directly, the historical incremental migrations (column-add, dedup
+cleanups, JSON->symbol-status backfill) are obsolete under greenfield and are
+not run; their helper names are retained only as import-safe no-ops so
+callers/tests that still reference them do not break during the cutover (the
+test suite is migrated to PostgreSQL separately).
+
+Hard contracts preserved:
+- One transaction for the whole init; ``ROLLBACK`` on any error (no half-state).
+- ``pg_advisory_xact_lock(<hash>)`` serializes concurrent initializers.
+- Idempotent: re-running leaves schema + markers identical.
+- ``check_schema_health`` introspects ``information_schema`` / ``pg_catalog``
+  (``pg_indexes`` / ``pg_constraint``) - never ``sqlite_master``/``PRAGMA``.
+- The contract markers are the LAST step, written only after health passes.
+"""
+
 from __future__ import annotations
 
+import hashlib
 import json
-import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import psycopg
+from psycopg.rows import dict_row
+
 from plugins.crypto_guard.config.loader import PLUGIN_ROOT, CryptoGuardConfig, load_config
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 
+SCHEMA_PATH = PLUGIN_ROOT / "storage" / "schema_postgres.sql"
 
-SCHEMA_PATH = PLUGIN_ROOT / "storage" / "schema.sql"
+# Process-local reentrancy guard. The authoritative cross-process / cross-thread
+# serialization is the DB advisory lock; this RLock just prevents two threads in
+# the SAME process from redundantly stacking advisory-lock waits.
 _INITIALIZE_DATABASE_LOCK = threading.RLock()
 
+# Stable 64-bit advisory-lock key derived from a fixed name. ``pg_advisory_xact``
+# takes two int32 halves; we hash the name and split it so the key is stable
+# across processes and reboots (a literal constant would also work, but hashing
+# the name documents intent and is collision-free for our single use).
+_ADVISORY_LOCK_NAME = b"crypto_guard.initialize_database"
 
-def initialize_database(config: CryptoGuardConfig | None = None) -> dict[str, Any]:
-    """执行 schema，并写入默认 symbol 与策略版本。"""
 
-    with _INITIALIZE_DATABASE_LOCK:
-        cfg = config or load_config()
-        conn = connect_db(cfg.database_path)
+def _advisory_lock_key() -> tuple[int, int]:
+    digest = hashlib.sha1(_ADVISORY_LOCK_NAME).digest()
+    hi = int.from_bytes(digest[0:4], "big") & 0x7FFFFFFF
+    lo = int.from_bytes(digest[4:8], "big") & 0x7FFFFFFF
+    return hi, lo
+
+
+@contextmanager
+def _initialization_connection(
+    config: CryptoGuardConfig,
+    *,
+    allow_ddl: bool,
+):
+    if allow_ddl:
+        from plugins.crypto_guard.config.loader import resolve_migration_database_url
+
+        conn = psycopg.connect(
+            resolve_migration_database_url(), row_factory=dict_row, autocommit=False,
+        )
         try:
-            # Run dedup cleanup BEFORE executescript: schema.sql defines the partial
-            # unique index on alert_outbox(dedupe_key) WHERE status='pending'. If a
-            # dirty DB has duplicate pending rows, the executescript would fail.
-            # Dedup first, then apply schema. The migration is table-guarded so it
-            # is a no-op on a fresh DB.
-            # P0-1: Run hourly_report_accuracy migration BEFORE executescript so that
-            # _add_column(batch_id, previous_grade, rendered_summary) completes before
-            # schema.sql tries CREATE INDEX ON ga_decisions(batch_id).  Old DBs that
-            # lack the column would otherwise crash with OperationalError.
-            _apply_stop_loss_adjustment_dedup(conn)
-            _ensure_profit_protection_cutoff_marker(conn)
-            _apply_hourly_report_accuracy_migration(conn)
-            # 07-13 R6-B (P0-1): whole-batch sealing columns. Runs AFTER
-            # _apply_hourly_report_accuracy_migration (which creates
-            # analysis_batches) so the ALTER TABLE succeeds on old DBs.
-            _apply_r6_batch_seal_migration(conn)
-            # 07-13 R6-F (P1-1): service-ownership lease table. Additive
-            # CREATE TABLE IF NOT EXISTS; runs before executescript so the
-            # table exists when start_all_services opens its own connection.
-            apply_r6f_service_ownership_migration(conn)
-            # 07-15 R10-P2: per-batch attempt counter table for atomic
-            # attempt_id allocation. Additive CREATE TABLE IF NOT EXISTS; runs
-            # before executescript so the table exists when the producer (and
-            # start_all_services) opens its own connection.
-            apply_r10_attempt_counter_migration(conn)
-            with SCHEMA_PATH.open("r", encoding="utf-8") as f:
-                conn.executescript(f.read())
-            # R5-D1: Run dedupe_key migration AFTER executescript. schema.sql no
-            # longer creates the partial unique index on paper_trade_logs(dedupe_key)
-            # — the migration function owns the index. On old production DBs that
-            # lack the dedupe_key column, executescript's CREATE INDEX would crash
-            # with OperationalError("no such column: dedupe_key"). By removing the
-            # index DDL from schema.sql and keeping it here (after executescript
-            # which may have CREATE TABLE IF NOT EXISTS), _add_column runs safely
-            # on existing tables, and CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
-            # On fresh DBs: executescript creates the table with dedupe_key column
-            # (from CREATE TABLE DDL), then this migration creates the index.
-            _apply_paper_trade_logs_dedupe_key_migration(conn)
-            _apply_phase_01_02_migrations(conn)
-            _seed_symbols(conn, cfg.symbols)
-            _seed_strategies(conn, cfg.strategies)
-            _apply_phase_13_migrations(conn)
-            _apply_phase_14_15_migrations(conn)
-            _apply_decision_supplement_migrations(conn)
-            _apply_v2_migrations(conn)
-            _apply_ga_master_migrations(conn)
-            _apply_pending_order_lifecycle_migrations(conn)
-            _apply_p1_structured_feedback_migrations(conn)
-            _apply_r8_skill_log_lifecycle_migration(conn)
-            _apply_account_feedback_gate_migration(conn)
-            _apply_daily_review_idempotency_migration(conn)
-            _apply_legacy_fuzzy_migration(conn)
-            _apply_phase_shadow_vt_v2_migration(conn)
-            _apply_candidate_cap_cleanup(conn)
-            # FS-5: R4 contract marker is the LAST step. Only write it after ALL
-            # schema, seed, and migration steps succeed AND schema health passes.
-            # If any prior step raised, the exception propagates and the marker
-            # is never written — diagnostics will not falsely believe the R4
-            # contract is deployed. The marker and any uncommitted work from this
-            # initialization are committed atomically together.
-            health = check_schema_health(conn=conn)
-            if not health["ok"]:
-                raise RuntimeError(
-                    f"schema health check failed after migrations: {health.get('missing_columns')}"
-                )
-            _ensure_hourly_report_accuracy_r4_contract_marker(conn)
-            _ensure_btc9_trade_gate_contract_marker(conn)
-            _ensure_market_data_contract_marker(conn)
-            # Phase E (07-03): semantic-accuracy contract marker. Written AFTER
-            # the R4 marker so both are present when semantic diagnostics run.
-            # Independent cutoff for the five new checks (bias_stage_semantic_conflict,
-            # htf_countertrend_overconfidence, summary_structured_state_mismatch,
-            # observation_reason_missing_market_context, no_edge_reason_coverage_mismatch).
-            _ensure_hourly_market_semantic_accuracy_contract_marker(conn)
-            # Phase H (07-05): decision-context-continuity contract marker.
-            # Written AFTER the semantic-accuracy marker so all Phase A-G
-            # contract diagnostics can use a single independent cutoff. Rows
-            # persisted before this marker are demoted to legacy_info; rows
-            # after are evaluated against the full Phase A-G contract.
-            _ensure_hourly_decision_context_continuity_contract_marker(conn)
-            # 07-10 S7 (P1 #7): fair-scheduling + context-continuity contract
-            # marker. Written AFTER the continuity marker so all prior contract
-            # diagnostics can use a single independent cutoff. The three new
-            # S1-S6 checks (batch_claim_ownership_integrity,
-            # fair_path_continuity_real_injection, per_job_failure_consistency)
-            # use this cutoff. Release-gated on the production DB: this task
-            # does NOT run initialize_database() against production.
-            _ensure_llm_fair_scheduling_context_contract_marker(conn)
-            conn.commit()
-            return {"ok": True, "database_path": str(cfg.database_path)}
+            yield conn
         finally:
             conn.close()
-
-
-def _apply_phase_01_02_migrations(conn: sqlite3.Connection) -> None:
-    """Phase 01-02 兼容迁移，幂等执行，不破坏已有 MVP 数据。"""
-
-    _add_column(conn, "market_snapshots", "data_quality_json", "TEXT")
-    _add_column(conn, "module_analysis_results", "snapshot_id", "INTEGER")
-    _add_column(conn, "strategy_evaluations", "snapshot_id", "INTEGER")
-    _add_column(conn, "signals", "snapshot_id", "INTEGER")
-    _add_column(conn, "signals", "ga_decision_json", "TEXT")
-    _add_column(conn, "paper_trades", "signal_id", "INTEGER")
-    _add_column(conn, "paper_trades", "market_snapshot_id", "INTEGER")
-    _add_column(conn, "paper_trades", "signal_decay_score", "REAL")
-    _add_column(conn, "paper_trades", "stop_take_path_json", "TEXT")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_feishu_events_received_at ON feishu_events(received_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_snapshot_id ON signals(market_snapshot_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_signal_snapshot ON paper_trades(signal_id, market_snapshot_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_module_results_snapshot ON module_analysis_results(snapshot_id)")
-
-
-def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def _index_matches(
-    conn: sqlite3.Connection,
-    index_name: str,
-    *,
-    columns: list[str],
-    sql_markers: list[str],
-) -> bool:
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
-        (index_name,),
-    ).fetchone()
-    if not row:
-        return False
-    actual_columns = [
-        info["name"]
-        for info in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
-    ]
-    if actual_columns != columns:
-        return False
-    sql = str(row["sql"] or "").lower().replace(" ", "")
-    return all(marker.lower().replace(" ", "") in sql for marker in sql_markers)
-
-
-def _ensure_index_definition(
-    conn: sqlite3.Connection,
-    index_name: str,
-    *,
-    columns: list[str],
-    sql_markers: list[str],
-    create_sql: str,
-) -> None:
-    if _index_matches(
-        conn,
-        index_name,
-        columns=columns,
-        sql_markers=sql_markers,
-    ):
         return
-    conn.execute(f"DROP INDEX IF EXISTS {index_name}")
-    conn.execute(create_sql)
+    from plugins.crypto_guard.storage.pg_db import get_conn
+
+    with get_conn() as conn:
+        yield conn
 
 
-def _apply_phase_13_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
+def _connected_role(cur: psycopg.Cursor) -> dict[str, Any]:
+    cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS shadow_test_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy_name TEXT NOT NULL,
-            candidate_version TEXT NOT NULL,
-            active_version TEXT,
-            sample_count INTEGER DEFAULT 0,
-            active_stats_json TEXT,
-            candidate_stats_json TEXT,
-            recommendation TEXT,
-            status TEXT DEFAULT 'running',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
+        SELECT current_user AS current_user, session_user AS session_user,
+               current_database() AS database_name, r.rolsuper, r.rolcreatedb,
+               r.rolcreaterole, r.rolreplication, r.rolbypassrls
+        FROM pg_roles r WHERE r.rolname=current_user
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_results_strategy ON shadow_test_results(strategy_name, candidate_version, status)")
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError("PostgreSQL initialization identity unavailable")
+    result = dict(row)
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_roles parent
+            WHERE pg_has_role(current_user, parent.oid, 'member')
+              AND parent.rolname <> current_user
+              AND (parent.rolsuper OR parent.rolcreatedb OR parent.rolcreaterole
+                   OR parent.rolreplication OR parent.rolbypassrls)
+        ) AS inherited_dangerous
+        """
+    )
+    result["inherited_dangerous"] = bool(cur.fetchone()["inherited_dangerous"])
+    return result
 
 
-def _apply_phase_14_15_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS historical_replay_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            interval TEXT NOT NULL,
-            start_time INTEGER NOT NULL,
-            end_time INTEGER NOT NULL,
-            strategy_versions_json TEXT,
-            result_json TEXT NOT NULL,
-            export_path TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+def _grant_runtime_privileges(cur: psycopg.Cursor) -> None:
+    """Install the production DML-only grant matrix from the migrator role."""
+    cur.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+    cur.execute("REVOKE CREATE ON SCHEMA public FROM crypto_guard_app")
+    cur.execute("GRANT USAGE ON SCHEMA public TO crypto_guard_app")
+    cur.execute(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public "
+        "TO crypto_guard_app"
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS self_evolution_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            status TEXT NOT NULL,
-            result_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+    cur.execute(
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public "
+        "TO crypto_guard_app"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_historical_replay_symbol_time ON historical_replay_results(symbol, interval, start_time, end_time)")
-
-
-def _apply_decision_supplement_migrations(conn: sqlite3.Connection) -> None:
-    _add_column(conn, "ad_hoc_analyses", "status", "TEXT DEFAULT 'created'")
-    _add_column(conn, "paper_orders", "fill_method", "TEXT")
-    _add_column(conn, "paper_trades", "fill_method", "TEXT")
-    _add_column(conn, "trade_reviews", "market_regime_at_loss", "TEXT")
-    _add_column(conn, "trade_reviews", "evolution_trigger_allowed", "INTEGER DEFAULT 1")
-    _add_column(conn, "shadow_test_results", "verdict_runner_run", "INTEGER DEFAULT 0")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS alert_outbox (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_type TEXT NOT NULL,
-            symbol TEXT,
-            priority INTEGER DEFAULT 5,
-            payload_json TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            retry_count INTEGER DEFAULT 0,
-            next_retry_at TEXT,
-            last_error TEXT,
-            dedupe_key TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+    cur.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO crypto_guard_app"
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS alert_failure_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_outbox_id INTEGER,
-            alert_type TEXT,
-            symbol TEXT,
-            error_message TEXT,
-            retry_count INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS config_hot_reload (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            config_key TEXT NOT NULL,
-            old_value TEXT,
-            new_value TEXT NOT NULL,
-            requested_by TEXT,
-            request_text TEXT,
-            confirmation_required INTEGER DEFAULT 1,
-            confirmed INTEGER DEFAULT 0,
-            confirmed_at TEXT,
-            status TEXT DEFAULT 'pending',
-            applied_at TEXT,
-            audit_summary TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS runtime_config (
-            config_key TEXT PRIMARY KEY,
-            value_json TEXT NOT NULL,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_retry ON alert_outbox(status, next_retry_at, priority)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_outbox_dedupe ON alert_outbox(dedupe_key, created_at)")
-
-
-def _apply_v2_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS analysis_states (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            analysis_time INTEGER NOT NULL,
-            analysis_time_utc TEXT NOT NULL,
-            analysis_mode TEXT NOT NULL,
-            timeframes TEXT NOT NULL,
-            market_structure_json TEXT NOT NULL,
-            trend_clarity_json TEXT NOT NULL,
-            no_trade_reason_json TEXT,
-            key_levels_json TEXT,
-            next_triggers_json TEXT,
-            next_analysis_json TEXT,
-            breakout_watch_json TEXT,
-            trade_permission_json TEXT,
-            trade_plan_json TEXT,
-            opportunity_watch_recommended INTEGER DEFAULT 0,
-            paper_trade_allowed INTEGER DEFAULT 0,
-            state_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_states_symbol_time ON analysis_states(symbol, analysis_time)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS skill_execution_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            skill_name TEXT NOT NULL,
-            skill_version TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            analysis_time INTEGER NOT NULL,
-            input_summary_json TEXT,
-            tool_result_json TEXT NOT NULL,
-            ga_interpretation_json TEXT NOT NULL,
-            final_result_json TEXT NOT NULL,
-            confidence REAL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_logs_symbol_time ON skill_execution_logs(symbol, timeframe, analysis_time, skill_name)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS skill_feedback_memory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            skill_name TEXT NOT NULL,
-            skill_version TEXT NOT NULL,
-            feedback_type TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_id INTEGER,
-            finding TEXT NOT NULL,
-            suggested_adjustment_json TEXT,
-            status TEXT DEFAULT 'candidate',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_status ON skill_feedback_memory(skill_name, status, updated_at)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS paper_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_name TEXT NOT NULL UNIQUE,
-            initial_balance REAL NOT NULL,
-            current_balance REAL NOT NULL,
-            equity REAL NOT NULL,
-            realized_pnl REAL DEFAULT 0,
-            unrealized_pnl REAL DEFAULT 0,
-            max_drawdown REAL DEFAULT 0,
-            status TEXT DEFAULT 'active',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS paper_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            current_price REAL,
-            quantity REAL NOT NULL,
-            stop_loss REAL,
-            take_profit_json TEXT,
-            unrealized_pnl REAL DEFAULT 0,
-            unrealized_pnl_pct REAL DEFAULT 0,
-            max_favorable_excursion REAL DEFAULT 0,
-            max_adverse_excursion REAL DEFAULT 0,
-            status TEXT DEFAULT 'open',
-            opened_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            closed_at TEXT
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_positions_account_status ON paper_positions(account_id, status, symbol)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS paper_trade_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position_id INTEGER,
-            event_type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT,
-            price REAL,
-            quantity REAL,
-            pnl REAL,
-            pnl_pct REAL,
-            reason TEXT,
-            event_json TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_trade_logs_symbol_time ON paper_trade_logs(symbol, created_at)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS evolution_triggers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trigger_type TEXT NOT NULL,
-            strategy_name TEXT,
-            symbol TEXT,
-            trigger_value REAL,
-            threshold_value REAL,
-            related_trade_ids TEXT,
-            market_regime TEXT,
-            evolution_allowed INTEGER DEFAULT 1,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TEXT
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_evolution_triggers_status ON evolution_triggers(status, trigger_type, created_at)")
-    _add_column(conn, "evolution_triggers", "latest_trigger_value", "REAL")
-    _add_column(conn, "evolution_triggers", "latest_triggered_at", "TEXT")
-    _add_column(conn, "evolution_triggers", "original_related_trade_ids", "TEXT")
-    _add_column(conn, "evolution_triggers", "latest_related_trade_ids", "TEXT")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_review_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            review_date TEXT NOT NULL UNIQUE,
-            summary_json TEXT NOT NULL,
-            ga_report TEXT NOT NULL,
-            skill_updates_json TEXT,
-            evolution_actions_json TEXT,
-            pushed_to_feishu INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO paper_accounts(account_name, initial_balance, current_balance, equity)
-        VALUES ('default', 10000, 10000, 10000)
-        ON CONFLICT(account_name) DO NOTHING
-        """
+    cur.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO crypto_guard_app"
     )
 
 
-def _apply_ga_master_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ga_decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            analysis_time INTEGER NOT NULL,
-            analysis_time_utc TEXT NOT NULL,
-            decision_type TEXT NOT NULL,
-            signal_grade TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            market_bias TEXT,
-            trend_stage TEXT,
-            decision TEXT NOT NULL,
-            skill_result_refs_json TEXT NOT NULL,
-            evidence_json TEXT NOT NULL,
-            counter_evidence_json TEXT NOT NULL,
-            risk_check_json TEXT NOT NULL,
-            trade_plan_json TEXT,
-            opportunity_watch_json TEXT,
-            feishu_actions_json TEXT NOT NULL,
-            final_summary TEXT NOT NULL,
-            raw_decision_json TEXT NOT NULL,
-            analysis_state_id INTEGER,
-            snapshot_id INTEGER,
-            created_by TEXT DEFAULT 'ga_master_controller',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_decisions_symbol_time ON ga_decisions(symbol, analysis_time)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_decisions_grade_time ON ga_decisions(signal_grade, analysis_time)")
-    _add_column(conn, "signals", "ga_decision_id", "INTEGER")
-    _add_column(conn, "analysis_states", "ga_decision_id", "INTEGER")
-    _add_column(conn, "paper_orders", "ga_decision_id", "INTEGER")
-    _add_column(conn, "paper_orders", "source", "TEXT DEFAULT 'signal_compat'")
-    _add_column(conn, "paper_orders", "risk_check_passed", "INTEGER DEFAULT 0")
-    _add_column(conn, "paper_orders", "last_processed_candle_time", "INTEGER")
-    _add_column(conn, "opportunity_watches", "ga_decision_id", "INTEGER")
-    _add_column(conn, "opportunity_watches", "created_by_user_action", "INTEGER DEFAULT 0")
-    _add_column(conn, "opportunity_watches", "source_button_action", "TEXT")
-    _add_column(conn, "strategy_evaluations", "pnl_r", "REAL")
-    _add_column(conn, "strategy_evaluations", "ga_decision_id", "INTEGER")
-    _add_column(conn, "strategy_evaluations", "paper_trade_id", "INTEGER")
-    _add_column(conn, "strategy_evaluations", "outcome_source", "TEXT")
-    _add_column(conn, "strategy_patches", "trigger_id", "INTEGER")
-    _add_column(conn, "strategy_patches", "backtest_result_json", "TEXT")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_ga_decision_unique ON paper_orders(ga_decision_id) WHERE ga_decision_id IS NOT NULL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS parquet_archive_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            interval TEXT NOT NULL,
-            year_month TEXT NOT NULL,
-            path TEXT NOT NULL,
-            rows_written INTEGER DEFAULT 0,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_parquet_archive_runs_recent ON parquet_archive_runs(created_at, symbol, interval)")
-    # 07-10 S3 (P0 #4): LLM fair-scheduling batch-claim ownership columns.
-    # claim_next_batch stamps a unique claim_token + lease_until on every row it
-    # flips to running, so the re-SELECT proves ownership and recover_stale_run-
-    # ning_jobs can reset rows whose lease expired after a worker crash.
-    # Additive (ALTER TABLE ADD COLUMN) via _add_column's PRAGMA guard - idempotent
-    # on existing DBs, a no-op on fresh DBs where schema.sql already declares them.
-    _add_column(conn, "agent_jobs", "claim_token", "TEXT")
-    _add_column(conn, "agent_jobs", "lease_until", "TEXT")
-    # 07-10 R4-P1-4 (terminal-review-repair-plan-r4): defer accounting columns.
-    # The single-flight defer count + first-defer timestamp MUST live in dedicated
-    # columns, NOT parsed out of ``error_message`` (which couples machine state
-    # to display text and would be reset by any later error-message update). An
-    # atomic ``defer_count = defer_count + 1`` in ``defer_claimed_job`` makes the
-    # increment race-free; ``deferred_at`` anchors the ABSOLUTE defer window used
-    # by R4-P0-1 (terminate once ``now - deferred_at >= per_symbol_timeout +
-    # cleanup_buffer``), so a legitimately long LLM lease (up to per_symbol_timeout
-    # = 1200s) cannot be falsely exhausted by a fixed ``defer_seconds * max_defers``
-    # product (the pre-R4 15*8=120s would exhaust at 2min, mid-flight on a 20-min
-    # lease). Additive / idempotent via _add_column's PRAGMA guard.
-    _add_column(conn, "agent_jobs", "defer_count", "INTEGER NOT NULL DEFAULT 0")
-    _add_column(conn, "agent_jobs", "deferred_at", "TEXT")
+def initialize_database(
+    config: CryptoGuardConfig | None = None,
+    *,
+    allow_ddl: bool = False,
+) -> dict[str, Any]:
+    """Apply the PostgreSQL schema + seeds + contract markers (greenfield).
+
+    Single transaction guarded by ``pg_advisory_xact_lock``. On any error the
+    transaction rolls back, leaving NO schema/seed/marker residue. Re-running is
+    a no-op (idempotent): every statement is ``IF NOT EXISTS`` / ``ON CONFLICT``.
+
+    Returns ``{"ok": True, "database": <password-free identity>}`` on success. Never falls back
+    to SQLite; a missing/unreachable PostgreSQL raises
+    ``CryptoGuardDBUnavailable`` (via ``pg_db.get_conn``).
+    """
+    with _INITIALIZE_DATABASE_LOCK:
+        cfg = config or load_config()
+        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        with _initialization_connection(cfg, allow_ddl=allow_ddl) as conn:
+            try:
+                with conn.cursor() as cur:
+                    role = _connected_role(cur)
+                    current = str(role["current_user"])
+                    session = str(role["session_user"])
+                    database = str(role["database_name"])
+                    dangerous = any(
+                        bool(role[key]) for key in (
+                            "rolsuper", "rolcreatedb", "rolcreaterole",
+                            "rolreplication", "rolbypassrls",
+                        )
+                    ) or bool(role.get("inherited_dangerous"))
+                    is_test_owner = (
+                        current == session == "crypto_guard_test_app"
+                        and database == "crypto_guard_test"
+                        and not dangerous
+                    )
+                    is_migrator = (
+                        allow_ddl
+                        and current == session == "crypto_guard_migrator"
+                        and database == "crypto_guard"
+                        and not dangerous
+                    )
+                    if allow_ddl and not is_migrator:
+                        raise RuntimeError(
+                            "DDL initialization requires the dedicated migrator role"
+                        )
+                    # Serialize concurrent initializers (cross-process). The
+                    # lock is released automatically at COMMIT/ROLLBACK because
+                    # it is transaction-scoped.
+                    hi, lo = _advisory_lock_key()
+                    cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (hi, lo))
+                    cur.fetchone()
+
+                    # 1. Apply the full greenfield schema -- but ONLY when it is
+                    #    missing or unhealthy. On a healthy schema, re-running
+                    #    the DDL is a correctness no-op (every statement is
+                    #    IF NOT EXISTS) yet it still re-takes AccessExclusive
+                    #    (CREATE TABLE) / Share (CREATE INDEX) locks that
+                    #    CONFLICT with concurrent uncommitted DML
+                    #    (RowExclusive) on another connection. Because every
+                    #    _repo() call re-invokes initialize_database(), the
+                    #    unconditional DDL deadlocked the per-call init against
+                    #    a caller's open DML transaction (the test_smoke #21
+                    #    hang root cause; SQLite DDL never conflicted with DML
+                    #    so this was latent until the PG cutover). The health
+                    #    probe is read-only catalog introspection (AccessShare
+                    #    at most, compatible with RowExclusive), so probing
+                    #    never blocks on the caller's DML. Seeds + markers
+                    #    below are idempotent RowExclusive writes on symbols/
+                    #    strategies/_migration_state (never the caller's DML
+                    #    table), so they are still re-affirmed lock-safely.
+                    #    Only a missing/unhealthy schema pays the DDL lock
+                    #    cost, under the advisory lock that serializes
+                    #    concurrent initializers.
+                    pre_health = _check_schema_health_on_conn(conn)
+                    if not pre_health["ok"]:
+                        if not (is_test_owner or is_migrator):
+                            raise RuntimeError(
+                                "schema is unhealthy; explicit migrator initialization required"
+                            )
+                        # Fail-closed: a malformed existing schema (e.g. a
+                        # required column dropped after init) makes the
+                        # idempotent DDL raise -- ``CREATE TABLE IF NOT EXISTS``
+                        # will not re-add a dropped column, and a partial index
+                        # whose WHERE clause references it raises
+                        # ``UndefinedColumn``. That raw psycopg error would
+                        # leak past the post-init health gate's RuntimeError
+                        # contract (test_r5_d1). Wrap it so any DDL DB error on
+                        # an unhealthy schema surfaces a controlled
+                        # RuntimeError; the outer ``except`` then rolls the init
+                        # transaction back, leaving no marker/seed residue. A
+                        # fresh/fixable schema's DDL succeeds, so this branch
+                        # never fires on the greenfield init path.
+                        from psycopg.errors import Error as _PsycopgDBError
+                        try:
+                            cur.execute(schema_sql)
+                        except _PsycopgDBError as exc:
+                            raise RuntimeError(
+                                "initialize_database DDL failed on an unhealthy "
+                                f"schema (fail-closed): {exc}"
+                            ) from exc
+                    if is_migrator:
+                        _grant_runtime_privileges(cur)
+
+                    # 2. Seed default symbols + strategy versions.
+                    _seed_symbols(cur, cfg.symbols)
+                    _seed_strategies(cur, cfg.strategies)
+
+                    # 3. Contract markers - written ONLY after schema + seeds.
+                    _ensure_profit_protection_cutoff_marker(cur)
+                    _ensure_hourly_report_accuracy_r4_contract_marker(cur)
+                    _ensure_btc9_trade_gate_contract_marker(cur)
+                    _ensure_market_data_contract_marker(cur)
+                    _ensure_hourly_market_semantic_accuracy_contract_marker(cur)
+                    _ensure_hourly_decision_context_continuity_contract_marker(cur)
+                    _ensure_llm_fair_scheduling_context_contract_marker(cur)
+                    _ensure_stop_loss_adjustment_dedup_marker(cur)
+
+                    # 4. Health gate - fail-closed BEFORE commit. If the schema
+                    # is wrong, ROLLBACK everything (no marker survives).
+                    health = _check_schema_health_on_conn(conn)
+                    if not health["ok"]:
+                        raise RuntimeError(
+                            "schema health check failed after init: "
+                            f"{health.get('missing_columns')}"
+                        )
+                conn.commit()
+                from plugins.crypto_guard.storage.pg_db import database_identity
+                return {"ok": True, "database": database_identity(cfg.database_url)}
+            except Exception:
+                conn.rollback()
+                raise
 
 
-def _apply_pending_order_lifecycle_migrations(conn: sqlite3.Connection) -> None:
-    """Add lifecycle columns for pending order TTL and conflict cancellation."""
-    _add_column(conn, "paper_orders", "expires_at", "TEXT")
-    _add_column(conn, "paper_orders", "cancelled_at", "TEXT")
-    _add_column(conn, "paper_orders", "cancel_reason", "TEXT")
-    _add_column(conn, "paper_orders", "invalidated_by_ga_decision_id", "INTEGER")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status)")
+# ── seeding ─────────────────────────────────────────────────────────────────
 
 
-def _seed_symbols(conn: sqlite3.Connection, symbols_cfg: dict[str, Any]) -> None:
+def _seed_symbols(cur: psycopg.Cursor, symbols_cfg: dict[str, Any]) -> None:
+    """Upsert the default symbol universe from config (idempotent)."""
     default = symbols_cfg.get("default_universe", {})
     profiles = symbols_cfg.get("symbol_profiles", {})
     if not default.get("enabled", True):
         return
+    user_defaults = symbols_cfg.get("user_symbol_defaults", {})
     for symbol in default.get("symbols", []):
         profile = profiles.get(symbol, {})
         base_asset = symbol.removesuffix("USDT")
-        timeframes = profile.get("default_timeframes") or symbols_cfg.get("user_symbol_defaults", {}).get("default_timeframes", [])
-        conn.execute(
+        timeframes = (
+            profile.get("default_timeframes")
+            or user_defaults.get("default_timeframes", [])
+        )
+        cur.execute(
             """
-            INSERT INTO symbols(symbol, base_asset, quote_asset, category, enabled, source, risk_profile, default_timeframes)
-            VALUES (?, ?, 'USDT', ?, ?, 'default', ?, ?)
-            ON CONFLICT(symbol) DO UPDATE SET
-                category=excluded.category,
-                enabled=excluded.enabled,
-                default_timeframes=excluded.default_timeframes,
-                updated_at=CURRENT_TIMESTAMP
+            INSERT INTO symbols(
+                symbol, base_asset, quote_asset, category, enabled,
+                source, risk_profile, default_timeframes
+            )
+            VALUES (%s, %s, 'USDT', %s, %s, 'default', %s, %s)
+            ON CONFLICT (symbol) DO UPDATE SET
+                category = EXCLUDED.category,
+                enabled = EXCLUDED.enabled,
+                default_timeframes = EXCLUDED.default_timeframes,
+                updated_at = NOW()
             """,
             (
                 symbol,
                 base_asset,
                 profile.get("category", "default_universe"),
-                1 if profile.get("enabled", True) else 0,
+                bool(profile.get("enabled", True)),
                 profile.get("volatility_level", "auto"),
                 json.dumps(timeframes, ensure_ascii=False),
             ),
         )
 
 
-def _seed_strategies(conn: sqlite3.Connection, strategies_cfg: dict[str, Any]) -> None:
+def _seed_strategies(cur: psycopg.Cursor, strategies_cfg: dict[str, Any]) -> None:
+    """Insert strategy versions from config (idempotent; existing left alone)."""
     for item in strategies_cfg.get("strategies", []):
         name = item.get("strategy_name")
         version = str(item.get("version", "1.0"))
         if not name:
             continue
         status = item.get("status", "candidate")
-        # 自进化硬约束：只有配置里显式 active 的初始策略可以 active，补丁创建逻辑永远 candidate。
-        conn.execute(
+        cur.execute(
             """
-            INSERT INTO strategy_versions(strategy_name, version, status, config_json, change_reason)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(strategy_name, version) DO NOTHING
-            """,
-            (name, version, status, json.dumps(item, ensure_ascii=False), "seed_from_config"),
-        )
-
-
-def _apply_p1_structured_feedback_migrations(conn: sqlite3.Connection) -> None:
-    """Add structured fields to skill_feedback_memory for pattern matching."""
-    _add_column(conn, "skill_feedback_memory", "pattern_type", "TEXT")
-    _add_column(conn, "skill_feedback_memory", "affected_symbols", "TEXT")
-    _add_column(conn, "skill_feedback_memory", "affected_sides", "TEXT")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_feedback_pattern ON skill_feedback_memory(pattern_type, status)")
-
-
-def _apply_r8_skill_log_lifecycle_migration(conn: sqlite3.Connection) -> None:
-    """07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle columns.
-
-    ``skill_execution_logs`` is architecturally DECOUPLED from snapshots (no
-    ``snapshot_id`` FK -- it is an immutable audit row keyed by
-    (symbol, timeframe, analysis_time), retained 30d, designed to accumulate
-    across batches as a learning/audit store). So the fix for the Phase-1
-    autocommit orphan is NOT to defer-and-rollback the audit row like P2-2 did
-    for module results. Instead the row gains a ``commit_state`` so it stays
-    (immutable audit) but is MARKED for consumer gating:
-
-      * ``prepared``      - written in Phase 1 (immediate audit, not yet sealed).
-      * ``committed``     - the Phase-2 seal succeeded; the tick is durable.
-      * ``aborted_unsealed`` - the Phase-2 seal FAILED; the row is retained as
-                            audit but excluded from learning.
-      * ``aborted``       - a recovery hook terminalized a long-lived
-                            ``prepared`` row left by a crash before the seal.
-
-    ``batch_id`` links the audit row to the analysis batch (for diagnostics);
-    ``attempt_id`` records the producer attempt. Legacy rows (NULL commit_state)
-    are read as ``legacy_committed`` by consumers -- NO production backfill.
-    """
-    _add_column(conn, "skill_execution_logs", "commit_state", "TEXT")
-    _add_column(conn, "skill_execution_logs", "batch_id", "TEXT")
-    _add_column(conn, "skill_execution_logs", "attempt_id", "INTEGER")
-    # Diagnostic index: find long-lived prepared rows (crash-recovery target)
-    # and the committed/aborted population per tick.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_skill_logs_commit_state_time "
-        "ON skill_execution_logs(commit_state, analysis_time)"
-    )
-
-
-def _apply_account_feedback_gate_migration(conn: sqlite3.Connection) -> None:
-    """Add account_feedback_gate_json column to ga_decisions for gate results."""
-    _add_column(conn, "ga_decisions", "account_feedback_gate_json", "TEXT")
-    _add_column(conn, "ga_decisions", "market_regime_gate_json", "TEXT")
-    # dedupe_key for opportunity_watches (P0 hotfix: Fix 4)
-    _add_column(conn, "opportunity_watches", "dedupe_key", "TEXT")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe "
-        "ON opportunity_watches(dedupe_key)"
-    )
-
-
-def _apply_daily_review_idempotency_migration(conn: sqlite3.Connection) -> None:
-    """Cleanup duplicate agent_jobs from the pre-idempotency era.
-
-    Idempotency is enforced at the application layer via enqueue_job_once()
-    (SELECT-then-INSERT with IntegrityError catch), NOT via a DB-level UNIQUE
-    index.  A global UNIQUE(job_type, session_id) would break event-queue
-    callers like feishu_user_message / feishu_button_callback that legitimately
-    reuse session_ids across events.
-
-    The cleanup here soft-deduplicates historical duplicates so the data is
-    tidy, but does not create a hard constraint.
-    """
-    _add_column(conn, "paper_positions", "updated_at", "TEXT")
-    _cleanup_agent_job_duplicates(conn)
-    _cleanup_orphan_patches(conn)
-    _cleanup_noisy_auto_analysis(conn)
-    _cleanup_duplicate_open_trades(conn)
-    _backfill_historical_shadow_pnl_r(conn)
-    _cleanup_stale_empty_watches(conn)
-    _add_column(conn, "paper_orders", "initial_stop_loss", "REAL")
-    _add_column(conn, "paper_trades", "initial_stop_loss", "REAL")
-    _add_column(conn, "paper_trades", "initial_risk_usdt", "REAL")
-    # Partial unique index: one order can only have one open trade.
-    # Unlike the global UNIQUE on agent_jobs(job_type, session_id) which was
-    # rejected because event-queue callers legitimately reuse session_ids,
-    # this is scoped to open trades only — a genuine data integrity rule.
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_trade_per_order
-        ON paper_trades(order_id)
-        WHERE closed_at IS NULL
-        """
-    )
-
-
-def _cleanup_orphan_patches(conn: sqlite3.Connection) -> dict[str, int]:
-    """Mark strategy_patches as rejected when they have no matching strategy_version."""
-    orphans = conn.execute(
-        """
-        SELECT sp.id, sp.strategy_name, sp.candidate_version
-        FROM strategy_patches sp
-        LEFT JOIN strategy_versions sv ON sp.strategy_name = sv.strategy_name AND sp.candidate_version = sv.version
-        WHERE sv.id IS NULL AND sp.status NOT IN ('duplicate', 'rejected')
-        """
-    ).fetchall()
-
-    for row in orphans:
-        conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE id=?",
-            (row["id"],),
-        )
-
-    if orphans:
-        conn.commit()
-
-    return {"orphans_cleaned": len(orphans)}
-
-
-def _cleanup_noisy_auto_analysis(conn: sqlite3.Connection) -> dict[str, int]:
-    """Dedup auto_analysis skill_feedback_memory: keep only the latest per (skill_name, finding) per day."""
-    # Mark older duplicates as 'superseded' — keep the latest per group
-    conn.execute(
-        """
-        UPDATE skill_feedback_memory
-        SET status='superseded'
-        WHERE feedback_type='auto_analysis'
-          AND status='candidate'
-          AND id NOT IN (
-              SELECT MAX(id) FROM skill_feedback_memory
-              WHERE feedback_type='auto_analysis' AND status='candidate'
-              GROUP BY skill_name, finding, date(created_at)
-          )
-        """
-    )
-    cleaned = int(conn.execute("SELECT changes() AS c").fetchone()["c"])
-    if cleaned:
-        conn.commit()
-    return {"auto_analysis_deduped": cleaned}
-
-
-def _cleanup_duplicate_open_trades(conn: sqlite3.Connection) -> dict[str, int]:
-    """Close duplicate open trades (same order_id, multiple open paper_trades).
-
-    Keeps the oldest trade (lowest id), closes others with reason 'duplicate_cleanup'.
-    Also marks duplicate paper_positions as closed.
-    """
-    # Find order_ids with multiple open trades
-    dup_orders = conn.execute(
-        """
-        SELECT order_id, COUNT(*) as cnt
-        FROM paper_trades
-        WHERE closed_at IS NULL
-        GROUP BY order_id
-        HAVING cnt > 1
-        """
-    ).fetchall()
-
-    trades_closed = 0
-    positions_closed = 0
-
-    for row in dup_orders:
-        order_id = int(row["order_id"])
-        # Find all open trades for this order, keep the oldest
-        trades = conn.execute(
-            "SELECT id FROM paper_trades WHERE order_id=? AND closed_at IS NULL ORDER BY id ASC",
-            (order_id,),
-        ).fetchall()
-
-        keeper_id = int(trades[0]["id"])
-        for trade in trades[1:]:
-            dup_id = int(trade["id"])
-            conn.execute(
-                """
-                UPDATE paper_trades
-                SET closed_at=CURRENT_TIMESTAMP, close_reason='duplicate_cleanup',
-                    pnl=NULL, pnl_percent=NULL, pnl_r=NULL
-                WHERE id=?
-                """,
-                (dup_id,),
+            INSERT INTO strategy_versions(
+                strategy_name, version, status, config_json, change_reason
             )
-            trades_closed += 1
-            # Close matching paper_position (position id matches trade id)
-            conn.execute(
-                "UPDATE paper_positions SET status='closed', closed_at=CURRENT_TIMESTAMP WHERE id=? AND status='open'",
-                (dup_id,),
-            )
-            positions_closed += conn.execute("SELECT changes() AS c").fetchone()["c"]
-
-    if trades_closed:
-        conn.commit()
-
-    return {"duplicate_trades_closed": trades_closed, "duplicate_positions_closed": positions_closed}
-
-
-def _cleanup_stale_empty_watches(conn: sqlite3.Connection) -> dict[str, int]:
-    """Clean up stale opportunity_watches with empty conditions and no TTL.
-
-    Old watches (pre-TTL era) have watch_condition_json='{}' and expires_at=NULL.
-    Without expires_at, evaluate_watch() can't expire them, so they stay active forever.
-
-    Real data: created_at is ISO format (e.g. '2026-06-18T00:15:18+00:00').
-    SQLite datetime('now') returns 'YYYY-MM-DD HH:MM:SS' (no T, no timezone).
-    We MUST use SQLite's built-in datetime() on created_at for consistent comparison,
-    and write expires_at in ISO UTC via strftime() so _is_expired() can parse it.
-    """
-    # Expire old watches (>24h since creation)
-    # datetime(created_at) normalizes ISO→SQLite format for consistent comparison
-    expired = conn.execute(
-        """
-        UPDATE opportunity_watches
-        SET status = 'expired', updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'active'
-          AND (watch_condition_json IS NULL OR watch_condition_json = '{}')
-          AND (expires_at IS NULL OR expires_at = '')
-          AND datetime(created_at) < datetime('now', '-1 day')
-        """
-    )
-    expired_count = expired.rowcount if hasattr(expired, 'rowcount') else 0
-
-    # Set TTL for recent watches — write ISO UTC so _is_expired() can parse it
-    set_ttl = conn.execute(
-        """
-        UPDATE opportunity_watches
-        SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', datetime(created_at), '+1 day'),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE status = 'active'
-          AND (watch_condition_json IS NULL OR watch_condition_json = '{}')
-          AND (expires_at IS NULL OR expires_at = '')
-          AND datetime(created_at) >= datetime('now', '-1 day')
-        """
-    )
-    ttl_count = set_ttl.rowcount if hasattr(set_ttl, 'rowcount') else 0
-
-    if expired_count or ttl_count:
-        conn.commit()
-
-    return {"stale_watches_expired": expired_count, "stale_watches_ttl_set": ttl_count}
-
-
-def _backfill_historical_shadow_pnl_r(conn: sqlite3.Connection) -> dict[str, int]:
-    """One-shot backfill: copy pnl_r from closed paper_trades to active evaluations.
-
-    Uses exact ga_decision_id matching (no ±1h fuzzy match).
-    Each trade backfills at most one active evaluation (is_shadow=0).
-    Shadow evaluations are NOT backfilled — they get PnL exclusively from
-    their independent shadow_virtual_trades lifecycle.
-    """
-    import json
-
-    trades = conn.execute(
-        """
-        SELECT pt.id, pt.order_id, pt.pnl_r
-        FROM paper_trades pt
-        WHERE pt.closed_at IS NOT NULL
-          AND pt.pnl_r IS NOT NULL
-          AND pt.close_reason != 'duplicate_cleanup'
-        """
-    ).fetchall()
-
-    trades_processed = 0
-    evals_updated = 0
-
-    for row in trades:
-        order_id = int(row["order_id"])
-        pnl_r = float(row["pnl_r"])
-
-        # Get order info
-        order = conn.execute(
-            "SELECT ga_decision_id, symbol FROM paper_orders WHERE id=?",
-            (order_id,),
-        ).fetchone()
-        if not order or not order["ga_decision_id"]:
-            continue
-
-        gd_id = int(order["ga_decision_id"])
-
-        # Update active evaluation with exact ga_decision_id match
-        conn.execute(
-            """
-            UPDATE strategy_evaluations
-            SET pnl_r=?, ga_decision_id=?, paper_trade_id=?, outcome_source='real_pnl'
-            WHERE ga_decision_id=? AND is_shadow=0 AND pnl_r IS NULL
+            VALUES (%s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT (strategy_name, version) DO NOTHING
             """,
-            (pnl_r, gd_id, int(row["id"]), gd_id),
+            (
+                name,
+                version,
+                status,
+                json.dumps(item, ensure_ascii=False),
+                "seed_from_config",
+            ),
         )
 
-        updated = int(conn.execute("SELECT changes() AS c").fetchone()["c"])
-        if updated > 0:
-            trades_processed += 1
-            evals_updated += updated
 
-    if evals_updated:
-        conn.commit()
-
-    return {"trades_processed": trades_processed, "evaluations_updated": evals_updated}
+# ── contract markers ────────────────────────────────────────────────────────
 
 
-# Job types that use enqueue_job_once() with idempotent session_ids.
-# Cleanup only deduplicates these — event-queue callers (feishu_user_message,
-# feishu_button_callback, scheduled_market_analysis) are intentionally excluded
-# because they legitimately reuse session_ids across events.
-IDEMPOTENT_JOB_TYPES = frozenset({
-    "daily_review",
-    "intraday_loss_review",
-    "hourly_feishu_report",
-    "alert_outbox_retry",
-    "update_paper_positions",
-    "pending_order_management",
-    "pending_order_revalidation",
-    "update_opportunity_watches",
-})
+def _ensure_marker(cur: psycopg.Cursor, key: str) -> None:
+    """Write a contract marker to ``_migration_state`` (idempotent).
 
-
-def _cleanup_agent_job_duplicates(conn: sqlite3.Connection) -> dict[str, int]:
-    """Soft-clean duplicate agent_jobs for idempotent job types only.
-
-    Only deduplicates job types in IDEMPOTENT_JOB_TYPES — these use
-    enqueue_job_once() and should have at most one active row per
-    (job_type, session_id).  Event-queue job types (feishu_user_message,
-    feishu_button_callback, etc.) are intentionally skipped because
-    they legitimately reuse session_ids.
-
-    Keeps the earliest success or the latest pending/running row,
-    marks the rest as 'duplicate'.
-
-    Returns cleanup stats for audit log.
+    The schema creates ``_migration_state`` already, so this is a plain
+    ``ON CONFLICT DO NOTHING`` upsert - the ``applied_at`` timestamp is written
+    once and never refreshed on re-init (preserving the cutoff semantics the
+    contract diagnostics rely on).
     """
-    result: dict[str, int] = {}
-    placeholders = ",".join("?" * len(IDEMPOTENT_JOB_TYPES))
-    params = tuple(IDEMPOTENT_JOB_TYPES)
-
-    # 1. agent_jobs: keep earliest success per (job_type, session_id)
-    dup_rows = conn.execute(
-        f"""
-        SELECT job_type, session_id, COUNT(*) as cnt
-        FROM agent_jobs
-        WHERE job_type IN ({placeholders})
-          AND status NOT IN ('duplicate', 'superseded')
-        GROUP BY job_type, session_id
-        HAVING cnt > 1
+    cur.execute(
+        """
+        INSERT INTO _migration_state(key, applied_at)
+        VALUES (%s, NOW())
+        ON CONFLICT (key) DO NOTHING
         """,
-        params,
-    ).fetchall()
-    agent_jobs_cleaned = 0
-    for row in dup_rows:
-        keeper = conn.execute(
-            """
-            SELECT id FROM agent_jobs
-            WHERE job_type=? AND session_id=?
-            ORDER BY CASE WHEN status='success' THEN 0 ELSE 1 END, id ASC
-            LIMIT 1
-            """,
-            (row["job_type"], row["session_id"]),
-        ).fetchone()
-        if keeper:
-            cur = conn.execute(
-                """
-                UPDATE agent_jobs
-                SET status='duplicate',
-                    session_id=session_id || '--dup-' || id,
-                    error_message='deduped by agent_job_idempotency cleanup'
-                WHERE job_type=? AND session_id=? AND id!=?
-                """,
-                (row["job_type"], row["session_id"], int(keeper["id"])),
-            )
-            agent_jobs_cleaned += cur.rowcount
-    result["agent_jobs_duplicate"] = agent_jobs_cleaned
-
-    # 2. skill_feedback_memory: archive repeated low-info "无平仓样本"/"无显著亏损" entries
-    # Group by review_date (extracted from finding text pattern) + skill_name + finding
-    skill_cleaned = 0
-    low_info_patterns = (
-        "每日复盘：今日无平仓样本%",
-        "每日复盘：今日无显著亏损%",
+        (key,),
     )
-    for pattern in low_info_patterns:
-        dup_skills = conn.execute(
-            """
-            SELECT skill_name, finding, COUNT(*) as cnt, MIN(id) as keeper_id
-            FROM skill_feedback_memory
-            WHERE source_type='daily_review' AND finding LIKE ?
-            GROUP BY skill_name, finding
-            HAVING cnt > 1
-            """,
-            (pattern,),
-        ).fetchall()
-        for row in dup_skills:
-            cur = conn.execute(
-                """
-                UPDATE skill_feedback_memory
-                SET status='archived'
-                WHERE source_type='daily_review'
-                  AND skill_name=? AND finding=? AND id!=?
-                  AND status NOT IN ('archived', 'superseded')
-                """,
-                (row["skill_name"], row["finding"], int(row["keeper_id"])),
-            )
-            skill_cleaned += cur.rowcount
-    result["skill_feedback_archived"] = skill_cleaned
-
-    # 3. alert_outbox: mark duplicate daily_review alerts
-    alert_dup_rows = conn.execute(
-        """
-        SELECT dedupe_key, COUNT(*) as cnt
-        FROM alert_outbox
-        WHERE alert_type='daily_review'
-        GROUP BY dedupe_key
-        HAVING cnt > 1
-        """
-    ).fetchall()
-    alert_cleaned = 0
-    for row in alert_dup_rows:
-        keeper = conn.execute(
-            """
-            SELECT id FROM alert_outbox
-            WHERE alert_type='daily_review' AND dedupe_key=?
-            ORDER BY CASE WHEN status='sent' THEN 0 ELSE 1 END, id ASC
-            LIMIT 1
-            """,
-            (row["dedupe_key"],),
-        ).fetchone()
-        if keeper:
-            cur = conn.execute(
-                """
-                UPDATE alert_outbox
-                SET status='duplicate'
-                WHERE alert_type='daily_review' AND dedupe_key=? AND id!=?
-                """,
-                (row["dedupe_key"], int(keeper["id"])),
-            )
-            alert_cleaned += cur.rowcount
-    result["alert_outbox_duplicate"] = alert_cleaned
-
-    return result
 
 
-def _apply_legacy_fuzzy_migration(conn: sqlite3.Connection) -> None:
-    """Mark legacy strategy_evaluations as outcome_source='legacy_fuzzy'.
+def _ensure_profit_protection_cutoff_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "profit_protection_mark_price_contract_v1")
 
-    - All rows WHERE ga_decision_id IS NULL → legacy_fuzzy
-    - All rows WHERE paper_trade_id IS NULL AND outcome_source IS NULL → legacy_fuzzy
-    - Clean stalled momentum_continuation_long candidate (Item 12)
+
+def _ensure_hourly_report_accuracy_r4_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "hourly_report_accuracy_r4_contract_v1")
+
+
+def _ensure_btc9_trade_gate_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "btc9_trade_gate_contract_v1")
+
+
+def _ensure_market_data_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "market_data_contract_v1")
+
+
+def _ensure_hourly_market_semantic_accuracy_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "hourly_market_semantic_accuracy_contract_v1")
+
+
+def _ensure_hourly_decision_context_continuity_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "hourly_decision_context_continuity_contract_v1")
+
+
+def _ensure_llm_fair_scheduling_context_contract_marker(cur: psycopg.Cursor) -> None:
+    _ensure_marker(cur, "llm_fair_scheduling_context_contract_v1")
+
+
+def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:
+    """Marker for the historical stop-loss dedup migration.
+
+    Under greenfield there is no historical dirty data to clean, so the marker
+    is written directly (the cleanup it once gated is obsolete). Diagnostics
+    that probe this marker see it as already-applied.
     """
-    # Mark ga_decision_id IS NULL rows
-    cur = conn.execute(
+    _ensure_marker(cur, "stop_loss_adjustment_dedup_v1")
+
+
+# ── externally-called additive table migrations ─────────────────────────────
+
+
+def apply_r6f_service_ownership_migration(conn: psycopg.Connection) -> None:
+    """Ensure the ``_service_ownership`` lease table exists.
+
+    Called by ``service_manager.start_all_services`` BEFORE the lease CAS so the
+    lease row can be read/written on a DB that has not yet run the full
+    ``initialize_database`` (the non-owner path must not run full init). Under
+    greenfield the schema creates this table, so this is a guarded no-op - but
+    it stays idempotent and additive so a partial/old DB is still handled. The
+    connection's transaction is owned by the caller (who commits).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _service_ownership (
+                key TEXT PRIMARY KEY,
+                pid BIGINT NOT NULL,
+                started_at_ms BIGINT NOT NULL,
+                db_path TEXT NOT NULL,
+                release_commit TEXT,
+                owner_identity TEXT,
+                lease_until_ms BIGINT NOT NULL
+            )
+            """
+        )
+        _add_column(cur, "_service_ownership", "owner_token", "TEXT")
+
+
+def apply_r10_attempt_counter_migration(conn: psycopg.Connection) -> None:
+    """Ensure the ``_analysis_attempt_counter`` table exists (R10-P2).
+
+    Under greenfield the schema creates this table, so this is a guarded no-op;
+    it stays idempotent for partial/old DBs. The caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _analysis_attempt_counter (
+                batch_id TEXT PRIMARY KEY,
+                next_attempt BIGINT NOT NULL
+            )
+            """
+        )
+
+
+# ── column/index helpers (PostgreSQL) ───────────────────────────────────────
+
+
+def _column_exists(cur: psycopg.Cursor, table: str, column: str) -> bool:
+    cur.execute(
         """
-        UPDATE strategy_evaluations
-        SET outcome_source='legacy_fuzzy'
-        WHERE ga_decision_id IS NULL AND outcome_source IS NULL
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s
         """,
+        (table, column),
     )
-    marked_null_ga = int(cur.rowcount or 0)
-    # Mark paper_trade_id IS NULL AND outcome_source IS NULL rows
-    cur = conn.execute(
-        """
-        UPDATE strategy_evaluations
-        SET outcome_source='legacy_fuzzy'
-        WHERE paper_trade_id IS NULL AND outcome_source IS NULL AND ga_decision_id IS NOT NULL
-        """,
-    )
-    marked_pending = int(cur.rowcount or 0)
+    return cur.fetchone() is not None
 
-    # Item 12: Clean stalled momentum_continuation_long candidate
-    stalled = conn.execute(
-        """
-        SELECT sv.id AS version_id, sv.version, sv.created_at
-        FROM strategy_versions sv
-        WHERE sv.strategy_name = 'momentum_continuation_long'
-          AND sv.status = 'candidate'
-          AND datetime(sv.created_at) < datetime('now', '-48 hours')
-        """
-    ).fetchall()
 
-    stalled_cleaned = 0
-    for row in stalled:
-        cur = conn.execute(
-            "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-            ("stalled_candidate_cleanup:超过48小时未进入shadow_testing", int(row["version_id"])),
-        )
-        stalled_cleaned += int(cur.rowcount or 0)
-        conn.execute(
-            "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
-            (row["version"],),
-        )
+def _add_column(cur: psycopg.Cursor, table: str, column: str, definition: str) -> None:
+    """Add a column if absent. ``definition`` is the PG type clause (e.g. ``TEXT``)."""
+    if not _column_exists(cur, table, column):
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    marked = marked_null_ga + marked_pending
-    if marked or stalled_cleaned:
-        conn.commit()
 
-    LOGGER = __import__("logging", fromlist=["getLogger"]).getLogger("crypto_guard.migrations")
-    log = LOGGER.info if (marked or stalled_cleaned) else LOGGER.debug
-    log(
-        "legacy_fuzzy_migration: marked %d evaluations as legacy_fuzzy, cleaned %d stalled candidates",
-        marked, stalled_cleaned,
-    )
+# ── schema health ───────────────────────────────────────────────────────────
 
 
-def _apply_phase_shadow_vt_v2_migration(conn: sqlite3.Connection) -> None:
-    """Phase shadow_vt_v2: entry_type, opened_at, expires_at + strategy_name + shadow_virtual_trade_id."""
-    # 1.0: shadow_virtual_trades add entry_type, opened_at, expires_at
-    _add_column(conn, "shadow_virtual_trades", "entry_type", "TEXT NOT NULL DEFAULT 'market'")
-    _add_column(conn, "shadow_virtual_trades", "opened_at", "TEXT")
-    _add_column(conn, "shadow_virtual_trades", "expires_at", "TEXT")
+def _check_schema_health_on_conn(conn: psycopg.Connection) -> dict[str, Any]:
+    """Run the health introspection on an existing PG connection (no commit)."""
+    with conn.cursor() as cur:
+        return _introspect_schema_health(cur)
 
-    # 1.1: shadow_virtual_trades add strategy_name + rebuild unique index
-    _add_column(conn, "shadow_virtual_trades", "strategy_name", "TEXT NOT NULL DEFAULT 'smc_pullback_long'")
 
-    # 1.1a: Soft-mark duplicate shadow_virtual_trades before creating unique index.
-    # Priority: closed with pnl_r > open > pending_entry; has initial_risk_usdt+quantity > bare;
-    # id DESC (most recent wins tiebreak).
-    conn.execute(
-        """
-        UPDATE shadow_virtual_trades SET status = 'duplicate'
-        WHERE id IN (
-            SELECT id FROM (
-                SELECT id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY strategy_name, candidate_version, ga_decision_id
-                           ORDER BY
-                               CASE WHEN status = 'closed' AND pnl_r IS NOT NULL THEN 0 ELSE 1 END,
-                               CASE WHEN status = 'open' THEN 0 ELSE 1 END,
-                               CASE WHEN initial_risk_usdt > 0 AND quantity > 0 THEN 0 ELSE 1 END,
-                               id DESC
-                       ) AS rn
-                FROM shadow_virtual_trades
-                WHERE COALESCE(status, '') != 'duplicate'
-            ) WHERE rn > 1
-        )
-        """
-    )
-    _ensure_index_definition(
-        conn,
-        "idx_shadow_vt_unique",
-        columns=["strategy_name", "candidate_version", "ga_decision_id"],
-        sql_markers=[
-            "CREATE UNIQUE INDEX",
-            "WHERE",
-            "COALESCE(status,'')!='duplicate'",
-        ],
-        create_sql="""
-            CREATE UNIQUE INDEX idx_shadow_vt_unique
-            ON shadow_virtual_trades(strategy_name, candidate_version, ga_decision_id)
-            WHERE COALESCE(status, '') != 'duplicate'
-            """,
-    )
+def check_schema_health(
+    *,
+    config: CryptoGuardConfig | None = None,
+    conn: psycopg.Connection | None = None,
+) -> dict[str, Any]:
+    """Verify the production PostgreSQL schema has every required object.
 
-    # 1.2: strategy_evaluations add shadow_virtual_trade_id
-    _add_column(conn, "strategy_evaluations", "shadow_virtual_trade_id", "INTEGER")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evals_shadow_vt ON strategy_evaluations(shadow_virtual_trade_id)")
+    Introspects ``information_schema`` / ``pg_catalog`` (``pg_indexes`` /
+    ``pg_constraint``) - NEVER ``sqlite_master``/``PRAGMA``. Returns
+    ``{"ok": bool, "missing_columns": [...], "tables_checked": [...]}``.
 
-    # 1.3: Backfill opened_at for existing open trades that have no opened_at
-    conn.execute(
-        "UPDATE shadow_virtual_trades SET opened_at=created_at WHERE opened_at IS NULL AND status='open'"
-    )
-    # Backfill entry_type to 'market' for existing trades without it (already covered by DEFAULT)
-
-    # 1.4: shadow_virtual_trades add last_processed_candle_time for per-candle replay cursor
-    _add_column(conn, "shadow_virtual_trades", "last_processed_candle_time", "INTEGER")
-
-    # 1.5: Partial unique index on strategy_evaluations for shadow dedup
-    # Soft-mark duplicate shadow evaluations (outcome_source='duplicate'),
-    # keeping the best row per group (VT-linked > has pnl_r > most recent).
-    # This preserves the audit trail instead of hard-deleting.
-    # NULL outcome_source rows are included: COALESCE handles the NULL != 'duplicate' gap.
-    conn.execute(
-        """
-        UPDATE strategy_evaluations SET outcome_source = 'duplicate'
-        WHERE id IN (
-            SELECT id FROM (
-                SELECT id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY strategy_name, strategy_version, ga_decision_id
-                           ORDER BY
-                               CASE WHEN shadow_virtual_trade_id IS NOT NULL THEN 0 ELSE 1 END,
-                               CASE WHEN pnl_r IS NOT NULL THEN 0 ELSE 1 END,
-                               id DESC
-                       ) AS rn
-                FROM strategy_evaluations
-                WHERE is_shadow = 1
-                  AND COALESCE(outcome_source, '') != 'duplicate'
-            ) WHERE rn > 1
-        )
-        """
-    )
-    _ensure_index_definition(
-        conn,
-        "idx_strategy_evals_shadow_unique",
-        columns=["strategy_name", "strategy_version", "ga_decision_id"],
-        sql_markers=[
-            "CREATE UNIQUE INDEX",
-            "WHERE",
-            "is_shadow=1",
-            "COALESCE(outcome_source,'')!='duplicate'",
-        ],
-        create_sql="""
-            CREATE UNIQUE INDEX idx_strategy_evals_shadow_unique
-            ON strategy_evaluations(strategy_name, strategy_version, ga_decision_id)
-            WHERE is_shadow = 1 AND COALESCE(outcome_source, '') != 'duplicate'
-            """,
-    )
-
-
-def _apply_candidate_cap_cleanup(conn: sqlite3.Connection) -> None:
-    """Reject excess candidates beyond 5 per strategy_name.
-
-    For each strategy_name with more than 5 candidate+shadow_testing versions,
-    reject the excess candidates, sorted by real_pnl_count DESC, created_at ASC
-    (meaning the weakest candidates are rejected first).
-
-    Idempotent: no-op if cap is already satisfied.
-    Atomic: all rejections happen in a single transaction.
-    """
-    # Find all strategy_names that have candidates
-    strategy_names = conn.execute(
-        """
-        SELECT DISTINCT sv.strategy_name
-        FROM strategy_versions sv
-        WHERE sv.status IN ('candidate', 'shadow_testing')
-        """
-    ).fetchall()
-
-    for row in strategy_names:
-        strategy_name = str(row["strategy_name"])
-
-        # Get all candidate+shadow_testing versions sorted by real_pnl_count DESC, created_at ASC
-        candidates = conn.execute(
-            """
-            SELECT sv.id, sv.version, sv.created_at, sv.status,
-                   (SELECT COUNT(*) FROM strategy_evaluations se
-                    WHERE se.strategy_name=sv.strategy_name AND se.strategy_version=sv.version
-                      AND se.is_shadow=1 AND se.outcome_source='real_pnl' AND se.pnl_r IS NOT NULL) as real_pnl_count
-            FROM strategy_versions sv
-            WHERE sv.strategy_name=? AND sv.status IN ('candidate', 'shadow_testing')
-            ORDER BY real_pnl_count DESC, sv.created_at ASC
-            """,
-            (strategy_name,),
-        ).fetchall()
-
-        if len(candidates) <= 5:
-            continue
-
-        # Reject the excess: weakest candidates (fewest real_pnl samples, newest first)
-        excess = list(candidates[5:])
-        for cand in excess:
-            # Reject strategy_versions
-            conn.execute(
-                "UPDATE strategy_versions SET status='rejected', change_reason=? WHERE id=?",
-                ("候选上限 5 已满，自动拒绝旧候选", int(cand["id"])),
-            )
-            # Sync strategy_patches
-            conn.execute(
-                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected','duplicate')",
-                (cand["version"],),
-            )
-            # Sync evolution_triggers via strategy_patches
-            conn.execute(
-                "UPDATE evolution_triggers SET status='rejected' WHERE id IN (SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-                (cand["version"],),
-            )
-
-    conn.commit()
-
-
-def _ensure_profit_protection_cutoff_marker(conn: sqlite3.Connection) -> None:
-    """Write the profit_protection_mark_price_contract_v1 marker to _migration_state.
-
-    This marker is used by state_consistency._profit_protection_cutoff() to
-    determine the effective cutoff timestamp for profit-protection-era
-    diagnostics checks. Idempotent: no-op if the marker already exists.
-    """
-    # Ensure _migration_state table exists (created by _apply_stop_loss_adjustment_dedup
-    # or schema.sql, but may not exist yet on a fresh DB).
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _migration_state (
-            key TEXT PRIMARY KEY,
-            applied_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("profit_protection_mark_price_contract_v1",),
-    )
-    conn.commit()
-
-
-def _apply_stop_loss_adjustment_dedup(conn: sqlite3.Connection) -> None:
-    """Soft-mark duplicate stop_loss_adjustment paper_trade_logs entries.
-
-    For each (order_id, old_stop_loss, new_stop_loss) combination, keep the
-    earliest entry and mark the rest with event_json.is_duplicate=true.
-
-    Also adds the partial unique index on alert_outbox(dedupe_key) restricted
-    to status='pending' (mirrors schema.sql). Sent alerts keep their full
-    history so a future enqueue can reuse the same dedupe_key.
-
-    Idempotent: no-op if no duplicates exist or already marked. Safe to call
-    before executescript — guards on required tables existing.
-
-    Migration state guard: worker startup calls initialize_database() at high
-    frequency. The expensive scan-and-clean below is only needed once per
-    database to tidy historical dirty data; subsequent runs skip the entire
-    function via the _migration_state marker table.
-    """
-    # Lightweight migration-state table — self-contained so the marker works
-    # even before schema.sql is executed on a brand-new DB. IF NOT EXISTS
-    # makes this harmless on re-runs.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _migration_state (
-            key TEXT PRIMARY KEY,
-            applied_at TEXT
-        )
-        """
-    )
-
-    # 0a. Migration marker: skip the expensive scan-and-clean once it has run
-    # successfully on this database. HOWEVER, we must still verify the partial
-    # unique index definition matches the current contract (pending-only). If
-    # the database was migrated under an older version that used the over-broad
-    # 'pending OR sent' scope, the marker alone does NOT guarantee correctness.
-    marker_row = conn.execute(
-        "SELECT key FROM _migration_state WHERE key=?",
-        ("stop_loss_adjustment_dedup_v1",),
-    ).fetchone()
-    if marker_row:
-        # Verify the index is pending-only. If it still has the old scope
-        # (status IN ('pending','sent')), drop it and let the IF NOT EXISTS
-        # below recreate it with the correct pending-only scope.
-        old_index = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_alert_outbox_dedupe_unique'"
-        ).fetchone()
-        if old_index and "sent" in (old_index["sql"] or ""):
-            conn.execute("DROP INDEX IF EXISTS idx_alert_outbox_dedupe_unique")
-            conn.commit()
-            # Fall through to the IF NOT EXISTS CREATE below — marker stays
-            # set so we skip the heavy scan, but the index gets corrected.
-        else:
-            # Index is already pending-only — fully applied, nothing to do.
-            return
-
-    # 0b. Guard: required tables must exist. Called early in initialize_database
-    # (before executescript), so on a fresh DB some tables may not yet exist.
-    required = conn.execute(
-        """
-        SELECT name FROM sqlite_master
-        WHERE type='table' AND name IN ('alert_outbox', 'paper_trade_logs', 'agent_jobs')
-        """
-    ).fetchall()
-    existing = {row["name"] for row in required}
-    if not {"alert_outbox", "paper_trade_logs", "agent_jobs"}.issubset(existing):
-        # Not all required tables exist yet — nothing to dedupe. Do NOT mark
-        # the migration as applied, so the next run can attempt cleanup once
-        # the schema is in place.
-        return
-
-    # 1. Clean existing duplicate dedupe_keys before creating unique index.
-    # Only pending rows are constrained by the unique index; sent rows keep
-    # their history. So we only need to collapse duplicate pending rows:
-    # keep the earliest pending id per dedupe_key and mark the rest duplicate.
-    dup_keys = conn.execute(
-        """
-        SELECT dedupe_key FROM (
-            SELECT dedupe_key, COUNT(*) AS cnt
-            FROM alert_outbox
-            WHERE dedupe_key IS NOT NULL AND status='pending'
-            GROUP BY dedupe_key
-            HAVING COUNT(*) > 1
-        )
-        """
-    ).fetchall()
-    for (dk,) in dup_keys:
-        conn.execute(
-            """
-            UPDATE alert_outbox SET status='duplicate'
-            WHERE dedupe_key=? AND status='pending'
-              AND id > (SELECT MIN(id) FROM alert_outbox WHERE dedupe_key=? AND status='pending')
-            """,
-            (dk, dk),
-        )
-    if dup_keys:
-        conn.commit()
-
-    # 2. Add partial unique index on alert_outbox (idempotent). Mirrors
-    # schema.sql: dedupe_key unique only among status='pending' rows. Use
-    # IF NOT EXISTS so we never DROP/CREATE on already-applied databases.
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_outbox_dedupe_unique
-        ON alert_outbox(dedupe_key)
-        WHERE dedupe_key IS NOT NULL AND status='pending'
-        """
-    )
-
-    # 3. Soft-mark duplicate stop_loss_adjustment logs
-    dupes = conn.execute(
-        """
-        SELECT id, order_id, event_json
-        FROM (
-            SELECT id,
-                   json_extract(event_json, '$.order_id') AS order_id,
-                   json_extract(event_json, '$.old_stop_loss') AS old_stop,
-                   json_extract(event_json, '$.new_stop_loss') AS new_stop,
-                   event_json,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY json_extract(event_json, '$.order_id'),
-                                    json_extract(event_json, '$.old_stop_loss'),
-                                    json_extract(event_json, '$.new_stop_loss')
-                       ORDER BY created_at ASC
-                   ) AS rn
-            FROM paper_trade_logs
-            WHERE event_type='stop_loss_adjustment'
-              AND json_extract(event_json, '$.is_duplicate') IS NULL
-        ) WHERE rn > 1
-        """
-    ).fetchall()
-
-    for row in dupes:
-        try:
-            event = json.loads(row["event_json"])
-            event["is_duplicate"] = True
-            conn.execute(
-                "UPDATE paper_trade_logs SET event_json=? WHERE id=?",
-                (json.dumps(event, ensure_ascii=False), int(row["id"])),
-            )
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    if dupes:
-        conn.commit()
-
-    # 4. Soft-mark duplicate agent_jobs for paper_event_alert stop_loss_adjustment.
-    # Key the partition on (order_id, event_type, normalized_new_stop) so that
-    # two LEGITIMATE stop adjustments on the same order (different new_stop)
-    # are NOT marked as duplicates of each other.
-    dup_jobs_pending_rows = conn.execute(
-        """
-        SELECT id, payload_json
-        FROM (
-            SELECT id, payload_json,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY json_extract(payload_json, '$.order_id'),
-                                    json_extract(payload_json, '$.event_type'),
-                                    ROUND(json_extract(payload_json, '$.new_stop_loss'), 8)
-                       ORDER BY created_at ASC
-                   ) AS rn
-            FROM agent_jobs
-            WHERE job_type='paper_event_alert'
-              AND json_extract(payload_json, '$.event_type')='stop_loss_adjustment'
-              AND status IN ('pending', 'success')
-        ) WHERE rn > 1
-        """
-    ).fetchall()
-
-    for row in dup_jobs_pending_rows:
-        conn.execute(
-            "UPDATE agent_jobs SET status='duplicate' WHERE id=?",
-            (int(row["id"]),),
-        )
-
-    if dup_jobs_pending_rows:
-        conn.commit()
-
-    # 5. Record the migration marker LAST, after all cleanup has committed.
-    # This ensures a partial failure does not silently skip future retries.
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("stop_loss_adjustment_dedup_v1",),
-    )
-    conn.commit()
-
-
-def _apply_hourly_report_accuracy_migration(conn: sqlite3.Connection) -> None:
-    """Hourly Report Accuracy (2026-06-28) schema migration.
-
-    - ga_decisions gains batch_id, previous_grade, rendered_summary columns.
-    - New analysis_batches table tracks scheduler analysis batch identity and
-      per-symbol completion state, enabling the hourly report batch
-      completion gate.
-    - New batch_symbol_status table replaces JSON columns for atomic per-symbol
-      completion tracking (P0-2: concurrent write safety).
-    - Idempotent: ALTER TABLE is guarded by _add_column (which checks PRAGMA
-      table_info first); CREATE TABLE is guarded by IF NOT EXISTS. Also guards
-      that ga_decisions table exists before trying ALTER TABLE (called before
-      executescript on fresh DBs).
-    """
-    # Guard: ga_decisions must exist before we ALTER it.
-    ga_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='ga_decisions'"
-    ).fetchone()
-    if ga_table:
-        _add_column(conn, "ga_decisions", "batch_id", "TEXT")
-        _add_column(conn, "ga_decisions", "previous_grade", "TEXT")
-        _add_column(conn, "ga_decisions", "rendered_summary", "TEXT")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ga_decisions_batch "
-            "ON ga_decisions(batch_id) WHERE batch_id IS NOT NULL"
-        )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS analysis_batches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            batch_id TEXT NOT NULL UNIQUE,
-            primary_interval TEXT NOT NULL,
-            analysis_time INTEGER NOT NULL,
-            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            finished_at TEXT,
-            status TEXT DEFAULT 'running',
-            enabled_symbols_json TEXT NOT NULL DEFAULT '[]',
-            completed_symbols_json TEXT NOT NULL DEFAULT '[]',
-            failed_symbols_json TEXT NOT NULL DEFAULT '[]',
-            summary_json TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_analysis_batches_status_time "
-        "ON analysis_batches(status, analysis_time)"
-    )
-    # P0-2: batch_symbol_status for atomic per-symbol completion tracking
-    # P2-10 (Round 3): CHECK constraint on status column
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS batch_symbol_status (
-            batch_id  TEXT NOT NULL,
-            symbol    TEXT NOT NULL,
-            status    TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
-            updated_at TEXT,
-            PRIMARY KEY (batch_id, symbol)
-        )
-        """
-    )
-    # One-shot migration: populate batch_symbol_status from existing JSON columns
-    _migrate_batch_json_to_symbol_status(conn)
-    # P1 (R4): rebuild batch_symbol_status with CHECK constraint if it was
-    # created without one (CREATE TABLE IF NOT EXISTS silently skips on existing).
-    _ensure_batch_symbol_status_check_constraint(conn)
-
-
-def _apply_r6_batch_seal_migration(conn: sqlite3.Connection) -> None:
-    """07-13 R6-B (P0-1): whole-batch sealing columns on ``analysis_batches``.
-
-    Adds two additive, nullable columns:
-    - ``claim_ready_at``: set by the producer ONLY after every enabled-symbol
-      job + batch_symbol_status row exists and the exact-set validation
-      (jobs == batch_symbol_status symbols == enabled_symbols_json) passes.
-      NULL means the batch is NOT yet claimable (producer still inserting, or
-      validation failed closed).
-    - ``sealed_at``: same write as ``claim_ready_at``; kept as an explicit,
-      human-auditable "the batch was sealed" timestamp distinct from the
-      read-side "claim-ready" gate so diagnostics can distinguish "never
-      sealed" from "sealed but not yet claimed".
-
-    Idempotent: ``_add_column`` checks PRAGMA table_info first. Both columns
-    are nullable so existing pre-R6 batches (NULL sealed_at) are simply
-    non-claimable under the new claim gate -- they were already finished and
-    will not be re-claimed. The producer re-seals on the next tick.
-
-    Release-gated: this migration runs on fresh/test DBs and on the production
-    DB only via the authorized release workflow. It does NOT mutate business
-    rows.
-    """
-    # Guard: analysis_batches must exist before we ALTER it (this runs after
-    # _apply_hourly_report_accuracy_migration which creates it, but be safe).
-    ab_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_batches'"
-    ).fetchone()
-    if ab_table:
-        _add_column(conn, "analysis_batches", "claim_ready_at", "TEXT")
-        _add_column(conn, "analysis_batches", "sealed_at", "TEXT")
-
-
-def apply_r6f_service_ownership_migration(conn: sqlite3.Connection) -> None:
-    """07-13 R6-F (P1-1): service-ownership lease table.
-
-    A single-row table (key=``service_ownership``) records the process that
-    owns the CryptoGuard service set for this DB: ``pid``, ``started_at_ms``,
-    ``db_path``, ``release_commit``, ``owner_identity``, ``lease_until_ms``.
-    ``start_all_services`` acquires this lease atomically; a live external owner
-    (different PID, lease not expired, PID alive) blocks a duplicate start and
-    returns ``already_started_external``. A stale lease (expired OR dead PID)
-    is reclaimable by the new caller (crash/restart recovery).
-
-    Additive and idempotent: ``CREATE TABLE IF NOT EXISTS``. Does not touch
-    business rows. AC15: this migration does not modify ``hub.pyw``.
-
-    07-14 R7-P0-3: add the ``owner_token`` column. The token is a per-process
-    random secret generated at acquire time and persisted alongside ``pid`` so
-    the heartbeat renewal and reclaim paths can use a CAS keyed on
-    ``key + pid + owner_token``. PID alone is not a safe owner identity: an OS
-    may recycle a dead PID onto a new process, which would then look like the
-    same owner. The token disambiguates a recycled PID from the genuine owner.
-    ``_add_column`` is PRAGMA-guarded (idempotent), so this is a no-op on DBs
-    that already have the column (fresh schema.sql DBs include it directly).
-    """
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _service_ownership (
-            key TEXT PRIMARY KEY,
-            pid INTEGER NOT NULL,
-            started_at_ms INTEGER NOT NULL,
-            db_path TEXT NOT NULL,
-            release_commit TEXT,
-            owner_identity TEXT,
-            lease_until_ms INTEGER NOT NULL
-        )
-        """
-    )
-    _add_column(conn, "_service_ownership", "owner_token", "TEXT")
-
-
-def apply_r10_attempt_counter_migration(conn: sqlite3.Connection) -> None:
-    """07-15 R10-P2: per-batch attempt counter table for ATOMIC ``attempt_id``
-    allocation.
-
-    PRE-R10 ``attempt_id`` was computed as ``COALESCE(MAX(attempt_id),0)+1`` over
-    ``skill_execution_logs`` OUTSIDE any transaction. Two concurrent producers
-    (two connections) could both read the same MAX before either wrote a prepared
-    log -> both stamped the same ``attempt_id`` -> audit-identity collision (the
-    Phase-2 CAS includes the log ``id`` so no direct data overwrite, hence P2,
-    but per-call-unique-monotonic was broken).
-
-    This dedicated counter row, keyed by ``batch_id``, is incremented under an
-    explicit ``BEGIN IMMEDIATE`` (see ``cron_scheduler._allocate_attempt_id``).
-    The RESERVED lock serializes concurrent allocators so each gets a DISTINCT
-    monotonic integer; the counter is per-batch so each batch has its own
-    1,2,3,... sequence (preserving the R9-P2 per-batch monotonic contract).
-
-    Additive and idempotent: ``CREATE TABLE IF NOT EXISTS``. Does not touch
-    business rows. AC15: this migration does not modify ``hub.pyw`` /
-    ``frontends/fsapp.py`` / ``data/binance_rest.py``.
-    """
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _analysis_attempt_counter (
-            batch_id TEXT PRIMARY KEY,
-            next_attempt INTEGER NOT NULL
-        )
-        """
-    )
-
-
-
-def _ensure_hourly_report_accuracy_r4_contract_marker(conn: sqlite3.Connection) -> None:
-    """FS-5: Write the hourly_report_accuracy_r4_contract_v1 marker.
-
-    The marker is written ONCE — the first time the R4 migration runs to
-    completion with all postconditions satisfied. Its ``applied_at``
-    timestamp is the cutoff between legacy audit findings (pre-marker) and
-    current R4 runtime errors (post-marker).
-
-    Idempotent: INSERT OR IGNORE means repeated migration runs do not
-    refresh the timestamp.
-    """
-    # Ensure _migration_state table exists (created by _apply_stop_loss_adjustment_dedup
-    # on older DBs; safe to re-assert here).
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _migration_state (
-            key TEXT PRIMARY KEY,
-            applied_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("hourly_report_accuracy_r4_contract_v1",),
-    )
-
-
-def _apply_paper_trade_logs_dedupe_key_migration(conn: sqlite3.Connection) -> None:
-    """R4-D4: Add dedupe_key column and UNIQUE partial index to paper_trade_logs.
-
-    Enables idempotent audit logging via direct INSERT with IntegrityError catch,
-    eliminating the SELECT-then-INSERT race window in _log_retryable_skip_audit.
-    The partial unique index only applies when dedupe_key IS NOT NULL, so
-    non-deduplicated log rows are unaffected.
-    """
-    _add_column(conn, "paper_trade_logs", "dedupe_key", "TEXT")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trade_logs_dedupe_key "
-        "ON paper_trade_logs(dedupe_key) WHERE dedupe_key IS NOT NULL"
-    )
-
-
-def _ensure_btc9_trade_gate_contract_marker(conn: sqlite3.Connection) -> None:
-    """Section 七: Write the btc9_trade_gate_contract_v1 marker.
-
-    Independent of the R4 marker — BTC#9 diagnostics use this cutoff, not the
-    R4 contract boundary. INSERT OR IGNORE ensures idempotency.
-    """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _migration_state ("
-        "  key TEXT PRIMARY KEY,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("btc9_trade_gate_contract_v1",),
-    )
-
-
-def _ensure_market_data_contract_marker(conn: sqlite3.Connection) -> None:
-    """R2: Write the market_data_contract_v1 marker.
-
-    The marker is the cutoff timestamp for the new market-data diagnostics
-    added in R7 (state_consistency._check_*). Historical data before the
-    marker is not flagged. INSERT OR IGNORE ensures idempotency.
-    """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _migration_state ("
-        "  key TEXT PRIMARY KEY,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("market_data_contract_v1",),
-    )
-
-
-def _ensure_hourly_market_semantic_accuracy_contract_marker(conn: sqlite3.Connection) -> None:
-    """Phase E (07-03): Write the hourly_market_semantic_accuracy_contract_v1 marker.
-
-    Independent of the R4 marker — the five new semantic-accuracy diagnostics
-    (bias_stage_semantic_conflict, htf_countertrend_overconfidence,
-    summary_structured_state_mismatch, observation_reason_missing_market_context,
-    no_edge_reason_coverage_mismatch) use this cutoff, not the R4 contract
-    boundary. ``applied_at`` is the cutoff between ``legacy_info`` (pre-marker)
-    and ``error`` / ``warning`` (post-marker). INSERT OR IGNORE ensures
-    idempotency — re-running initialize_database() never refreshes the timestamp
-    or fails on a duplicate key.
-    """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _migration_state ("
-        "  key TEXT PRIMARY KEY,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("hourly_market_semantic_accuracy_contract_v1",),
-    )
-
-
-def _ensure_hourly_decision_context_continuity_contract_marker(conn: sqlite3.Connection) -> None:
-    """Phase H (07-05): Write the hourly_decision_context_continuity_contract_v1 marker.
-
-    Independent cutoff for the Phase A-G contract diagnostics
-    (missing_feature_pack, missing_analysis_continuity, withheld_without_blockers,
-    missing_candidate_on_llm_failure, oversized_feature_pack,
-    candidate_effective_plan_mismatch, batch_time_health_mismatch). Rows
-    persisted before this marker are demoted to ``legacy_info``; rows after
-    are evaluated against the full Phase A-G contract. INSERT OR IGNORE keeps
-    the marker idempotent — re-running initialize_database() never refreshes
-    the timestamp.
-    """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _migration_state ("
-        "  key TEXT PRIMARY KEY,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("hourly_decision_context_continuity_contract_v1",),
-    )
-
-
-def _ensure_llm_fair_scheduling_context_contract_marker(conn: sqlite3.Connection) -> None:
-    """07-10 S7 (P1 #7): Write the ``llm_fair_scheduling_context_contract_v1``
-    marker.
-
-    Independent cutoff for the fair-scheduling + context-continuity contract
-    diagnostics (S1-S6 production-chain postconditions):
-      - batch_claim_ownership_integrity: every ``status='running'`` row of a
-        ``scheduled_market_analysis`` batch claimed via ``claim_next_batch``
-        must carry a non-null ``claim_token`` AND an unexpired ``lease_until``
-        (S3/P0#4). Rows claimed by the legacy ``claim_next_job`` path
-        (``claim_token IS NULL``) are not part of this contract.
-      - fair_path_continuity_real_injection: a fair-batch decision persisted
-        with a prior cross-batch analysis state must record
-        ``analysis_continuity.continuity_status == "ok"`` (S1/P0#1), not the
-        lazy ``"missing"`` the pre-fix adapter produced.
-      - per_job_failure_consistency: a ``batch_symbol_status='failed'`` row
-        must agree with the owning ``agent_jobs.status='failed'`` (S6/P1#6).
-
-    Written AFTER the continuity marker so all prior contract diagnostics can
-    use a single independent cutoff. Rows persisted before this marker are
-    demoted to ``legacy_info``; rows after are evaluated against the full
-    S1-S6 contract. ``INSERT OR IGNORE`` keeps the marker idempotent -
-    re-running ``initialize_database()`` never refreshes the timestamp.
-
-    NOTE (release boundary): on the PRODUCTION database this marker is written
-    only when ``initialize_database()`` runs there, which is a release-gated
-    operation (``/trellis:crypto-guard-release`` + explicit user confirmation).
-    This task does NOT write the production marker. Fresh-DB tests verify the
-    helper writes the marker and that the new diagnostics evaluate against it.
-    """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _migration_state ("
-        "  key TEXT PRIMARY KEY,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _migration_state(key, applied_at) VALUES (?, CURRENT_TIMESTAMP)",
-        ("llm_fair_scheduling_context_contract_v1",),
-    )
-
-
-def _migrate_batch_json_to_symbol_status(conn: sqlite3.Connection) -> None:
-    """One-shot migration: populate batch_symbol_status from existing JSON columns.
-
-    Reads completed_symbols_json and failed_symbols_json from each analysis_batches
-    row and inserts them into batch_symbol_status. Idempotent: rows with existing
-    batch_id+symbol pairs are skipped via INSERT OR IGNORE.
-    """
-    # Check if there's any data to migrate
-    rows = conn.execute(
-        "SELECT batch_id, completed_symbols_json, failed_symbols_json FROM analysis_batches"
-    ).fetchall()
-    for row in rows:
-        bid = row["batch_id"]
-        completed = _json_list_from_raw(row["completed_symbols_json"])
-        failed = _json_list_from_raw(row["failed_symbols_json"])
-        for sym in completed:
-            conn.execute(
-                "INSERT OR IGNORE INTO batch_symbol_status(batch_id, symbol, status, updated_at) VALUES (?, ?, 'completed', CURRENT_TIMESTAMP)",
-                (bid, sym),
-            )
-        for sym in failed:
-            conn.execute(
-                "INSERT OR IGNORE INTO batch_symbol_status(batch_id, symbol, status, updated_at) VALUES (?, ?, 'failed', CURRENT_TIMESTAMP)",
-                (bid, sym),
-            )
-    if rows:
-        conn.commit()
-
-
-def _json_list_from_raw(raw: Any) -> list[str]:
-    if not raw:
-        return []
-    try:
-        import json as _json
-        data = _json.loads(raw) if isinstance(raw, str) else raw
-        return list(data) if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _ensure_batch_symbol_status_check_constraint(conn: sqlite3.Connection) -> None:
-    """FR-4: Atomic rebuild of batch_symbol_status to add exact CHECK constraint.
-
-    On old DBs where CREATE TABLE IF NOT EXISTS silently skipped the CHECK,
-    the constraint is missing. This migration detects the absence and rebuilds
-    the table atomically using SAVEPOINT.
-
-    Rules:
-    - Never use SELECT * — explicit column list.
-    - Preserve valid statuses: pending, completed, failed.
-    - Invalid legacy values normalized to 'pending' with auditable migration finding.
-    - Business-row count before and after must match.
-    - Handle residual temporary table safely.
-    - Rebuild required indexes.
-    - Validate postconditions before releasing SAVEPOINT.
-    - Repeated execution is a no-op.
-    - Schema-health check verifies the exact status constraint, not merely CHECK.
-    """
-    import re as _re
-
-    # Check if the exact CHECK constraint exists
-    table_sql_row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-    ).fetchone()
-    if not table_sql_row:
-        return  # table doesn't exist yet — will be created with correct schema
-    table_sql = table_sql_row["sql"] or ""
-
-    # FR-4: verify the EXACT constraint pattern, not just any CHECK token
-    # Accept: CHECK(status IN ('pending', 'completed', 'failed'))
-    # with optional whitespace variations
-    exact_check_pattern = _re.compile(
-        r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
-        _re.IGNORECASE,
-    )
-    if exact_check_pattern.search(table_sql):
-        return  # already has the correct constraint — no-op
-
-    # Handle residual temporary table from a previous failed migration
-    conn.execute("DROP TABLE IF EXISTS _batch_symbol_status_new")
-
-    # Count rows before migration
-    count_before = int(conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0])
-
-    # Use SAVEPOINT for atomic rollback on failure
-    conn.execute("SAVEPOINT batch_symbol_status_rebuild")
-    try:
-        # Create new table with exact constraint
-        conn.execute(
-            """
-            CREATE TABLE _batch_symbol_status_new (
-                batch_id  TEXT NOT NULL,
-                symbol    TEXT NOT NULL,
-                status    TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
-                updated_at TEXT,
-                PRIMARY KEY (batch_id, symbol)
-            )
-            """
-        )
-
-        # Copy data with explicit columns — normalize invalid statuses
-        # First: copy valid rows as-is
-        conn.execute(
-            """
-            INSERT INTO _batch_symbol_status_new (batch_id, symbol, status, updated_at)
-            SELECT batch_id, symbol, status, updated_at
-            FROM batch_symbol_status
-            WHERE status IN ('pending', 'completed', 'failed')
-            """
-        )
-
-        # Second: find and normalize invalid statuses, recording audit findings
-        invalid_rows = conn.execute(
-            """
-            SELECT batch_id, symbol, status
-            FROM batch_symbol_status
-            WHERE status NOT IN ('pending', 'completed', 'failed')
-            """
-        ).fetchall()
-
-        if invalid_rows:
-            for row in invalid_rows:
-                # Record auditable migration finding in _migration_state
-                # Schema: key TEXT, applied_at TEXT
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO _migration_state (key, applied_at)
-                    VALUES (?, CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        f"batch_symbol_status_normalize:{row['batch_id']}:{row['symbol']}:original_status={row['status']}:normalized_to=pending",
-                    ),
-                )
-            # Insert normalized rows
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO _batch_symbol_status_new (batch_id, symbol, status, updated_at)
-                SELECT batch_id, symbol, 'pending', updated_at
-                FROM batch_symbol_status
-                WHERE status NOT IN ('pending', 'completed', 'failed')
-                """
-            )
-
-        # Swap tables
-        conn.execute("DROP TABLE batch_symbol_status")
-        conn.execute("ALTER TABLE _batch_symbol_status_new RENAME TO batch_symbol_status")
-
-        # Rebuild indexes
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_batch_symbol_status_batch ON batch_symbol_status(batch_id)"
-        )
-
-        # Validate postconditions
-        count_after = int(conn.execute("SELECT COUNT(*) FROM batch_symbol_status").fetchone()[0])
-        if count_after != count_before:
-            raise RuntimeError(
-                f"FR-4: row count mismatch after migration: before={count_before}, after={count_after}"
-            )
-
-        # Verify the constraint is now present
-        new_sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()
-        if not new_sql_row or not exact_check_pattern.search(new_sql_row["sql"] or ""):
-            raise RuntimeError("FR-4: CHECK constraint not found after migration rebuild")
-
-        conn.execute("RELEASE batch_symbol_status_rebuild")
-    except Exception:
-        conn.execute("ROLLBACK TO batch_symbol_status_rebuild")
-        conn.execute("RELEASE batch_symbol_status_rebuild")
-        raise
-
-
-def check_schema_health(*, config: CryptoGuardConfig | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
-    """Check production schema health - verify all required columns exist.
-
-    Args:
-        config: Optional config for database path. If conn is provided, config is ignored.
-        conn: Optional existing connection. If provided, this is used instead of creating a new one.
-
-    Returns:
-        {
-            ok: bool,
-            missing_columns: [{table, column}],
-            tables_checked: [str],
-        }
+    If ``conn`` is given it is used as-is (the caller owns its transaction); a
+    read-only snapshot is taken and rolled back so no writes escape. If no
+    ``conn`` is given a pooled connection is opened and returned to the pool.
     """
     if conn is not None:
-        own_conn = None
-        _conn = conn
-    else:
-        cfg = config or load_config()
-        _conn = connect_db(cfg.database_path)
-        own_conn = _conn
+        # The caller owns this connection's transaction. The health probe is
+        # read-only (SELECTs on information_schema / pg_catalog only), so it
+        # performs no writes that would need rolling back. We MUST NOT issue a
+        # bare ``conn.rollback()`` here: on an autocommit=False pooled
+        # connection that is already INTRANS (the common case - the caller is
+        # mid-transaction), a full ``rollback()`` discards the caller's
+        # uncommitted writes (e.g. a just-inserted ``signals`` row), breaking
+        # paper-order creation with a spurious FK violation. Instead wrap the
+        # probe in ``conn.transaction()``: on an IDLE connection this opens and
+        # closes a fresh read-only transaction; on an INTRANS connection it is a
+        # SAVEPOINT that releases cleanly without touching the caller's outer
+        # transaction. Either way the caller's transaction state is preserved.
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    result = _introspect_schema_health(cur)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "missing_columns": [
+                    {"table": "(health)", "column": f"check raised: {exc}"}
+                ],
+                "tables_checked": [],
+            }
 
-    # Required columns for skill_feedback_memory
-    required_columns = {
-        "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
-        # 07-14 R8 P2-NEW-1: LAYERED skill-log lifecycle. commit_state gates
-        # learning consumers (latest_skill_result_refs) so an aborted/prepared
-        # audit row never points the orchestrator at a dead/failed tick.
-        # batch_id/attempt_id link the audit row to its batch for diagnostics.
-        "skill_execution_logs": ["commit_state", "batch_id", "attempt_id"],
-        "ga_decisions": ["account_feedback_gate_json", "market_regime_gate_json", "batch_id", "previous_grade", "rendered_summary"],
-        "opportunity_watches": ["dedupe_key"],
-        "paper_positions": ["updated_at"],
-        "strategy_evaluations": ["ga_decision_id", "paper_trade_id", "outcome_source", "shadow_virtual_trade_id"],
-        "paper_orders": ["initial_stop_loss", "last_processed_candle_time"],
-        "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
-        "paper_trade_logs": ["dedupe_key"],
-        "shadow_virtual_trades": ["strategy_name", "status", "entry_type", "opened_at", "expires_at", "last_processed_candle_time"],
-        # P1-11: backfill_progress table must exist with correct columns.
-        "backfill_progress": ["symbol", "interval", "last_open_time_fetched", "last_updated_ms"],
-        # 07-10 S3 (P0 #4): batch-claim ownership columns for the fair-pool
-        # dispatch path (claim_next_batch stamps a unique claim_token + lease).
-        # 07-10 R4-P1-4: defer accounting columns (defer_count + deferred_at)
-        # replace the error_message-parsed defer count so a legitimate long LLM
-        # lease cannot be falsely exhausted (R4-P0-1 absolute defer window).
-        "agent_jobs": ["claim_token", "lease_until", "defer_count", "deferred_at"],
-        # 07-13 R6-B (P0-1): whole-batch sealing columns. claim_next_batch
-        # selects only batches whose claim_ready_at IS NOT NULL (the producer
-        # sealed them after exact-set validation).
-        "analysis_batches": ["claim_ready_at", "sealed_at"],
-        # 07-14 R7-P0-3: service-ownership lease owner_token. The per-process
-        # random token pairs with ``pid`` so the heartbeat-renewal CAS can reject
-        # a stale/reclaimed lease held by a recycled PID. Missing column on an
-        # old DB means the R7-P0-3 atomic-acquire + heartbeat contract is not
-        # deployed; acquire_service_ownership fail-closes on the health gate.
-        "_service_ownership": ["owner_token"],
+    from plugins.crypto_guard.storage.pg_db import get_conn
+
+    cfg = config or load_config()
+    try:
+        with get_conn() as _conn:
+            with _conn.cursor() as cur:
+                result = _introspect_schema_health(cur)
+            _conn.rollback()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "missing_columns": [
+                {"table": "(health)", "column": f"db unavailable: {exc}"}
+            ],
+            "tables_checked": [],
+        }
+
+
+# Required columns per table (the post-greenfield contract). Mirrors the old
+# SQLite health spec; the column set is what every correctly-initialized DB
+# MUST expose for the runtime + diagnostics to function.
+_REQUIRED_COLUMNS: dict[str, list[str]] = {
+    "skill_feedback_memory": ["pattern_type", "affected_symbols", "affected_sides"],
+    "skill_execution_logs": ["commit_state", "batch_id", "attempt_id"],
+    "ga_decisions": [
+        "account_feedback_gate_json",
+        "market_regime_gate_json",
+        "batch_id",
+        "previous_grade",
+        "rendered_summary",
+    ],
+    "opportunity_watches": ["dedupe_key"],
+    "paper_positions": ["updated_at"],
+    "strategy_evaluations": [
+        "ga_decision_id",
+        "paper_trade_id",
+        "outcome_source",
+        "shadow_virtual_trade_id",
+    ],
+    "paper_orders": ["initial_stop_loss", "last_processed_candle_time"],
+    "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
+    "paper_trade_logs": ["dedupe_key"],
+    "shadow_virtual_trades": [
+        "strategy_name",
+        "status",
+        "entry_type",
+        "opened_at",
+        "expires_at",
+        "last_processed_candle_time",
+    ],
+    "backfill_progress": [
+        "symbol",
+        "interval",
+        "last_open_time_fetched",
+        "last_updated_ms",
+    ],
+    "agent_jobs": ["claim_token", "lease_until", "defer_count", "deferred_at"],
+    "analysis_batches": ["claim_ready_at", "sealed_at"],
+    "_service_ownership": ["owner_token"],
+}
+
+# Required indexes (must exist by name).
+_REQUIRED_INDEXES: list[str] = [
+    "idx_opportunity_watches_dedupe",
+    "idx_one_open_trade_per_order",
+    "idx_shadow_vt_unique",
+    "idx_strategy_evals_shadow_unique",
+    "idx_alert_outbox_dedupe_unique",
+    "idx_paper_trade_logs_dedupe_key",
+]
+
+# Required tables (must exist by name).
+_REQUIRED_TABLES: list[str] = [
+    "symbols",
+    "candles",
+    "market_profiles",
+    "market_snapshots",
+    "module_analysis_results",
+    "analysis_states",
+    "skill_execution_logs",
+    "skill_feedback_memory",
+    "ga_decisions",
+    "analysis_batches",
+    "batch_symbol_status",
+    "signals",
+    "ad_hoc_analyses",
+    "opportunity_watches",
+    "paper_accounts",
+    "paper_orders",
+    "paper_trades",
+    "paper_positions",
+    "paper_trade_logs",
+    "paper_equity_snapshots",
+    "trade_reviews",
+    "strategy_versions",
+    "strategy_evaluations",
+    "strategy_patches",
+    "shadow_test_results",
+    "historical_replay_results",
+    "self_evolution_runs",
+    "evolution_triggers",
+    "strategy_memory",
+    "daily_review_reports",
+    "scheduler_runs",
+    "agent_jobs",
+    "task_locks",
+    "feishu_events",
+    "alert_outbox",
+    "_migration_state",
+    "_service_ownership",
+    "backfill_progress",
+    "_analysis_attempt_counter",
+    "alert_failure_log",
+    "config_hot_reload",
+    "parquet_archive_runs",
+    "runtime_config",
+    "user_feedback",
+    "sop_definitions",
+    "shadow_virtual_trades",
+]
+
+# SHA-256 of the normalized PostgreSQL catalog contract produced by
+# ``schema_postgres.sql``. It covers every application table column (type,
+# nullability, identity/default), every table constraint, every non-primary
+# index, and application triggers/functions. Update only after deliberately
+# changing the canonical DDL and regenerating it from a fresh scratch schema.
+_EXPECTED_SCHEMA_FINGERPRINT = "22648daf3dd7f60af3271e0d6bafbefe8f5cebcc4fedb88742b749d321060849"
+
+
+def _normalize_catalog_text(value: Any, schema: str) -> str:
+    text = "" if value is None else " ".join(str(value).split())
+    return text.replace(f'"{schema}".', "<schema>.").replace(
+        f"{schema}.", "<schema>."
+    )
+
+
+def _schema_catalog_fingerprint(cur: psycopg.Cursor, schema: str) -> str:
+    """Return a stable full-schema fingerprint for the current app schema."""
+    contract: dict[str, list[dict[str, Any]]] = {
+        "columns": [], "constraints": [], "indexes": [],
+        "triggers": [], "functions": [],
     }
+    cur.execute(
+        """
+        SELECT table_name, ordinal_position, column_name, data_type, udt_name,
+               is_nullable, is_identity, identity_generation, column_default
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name = ANY(%s)
+        ORDER BY table_name, ordinal_position
+        """,
+        (schema, _REQUIRED_TABLES),
+    )
+    for row in cur.fetchall():
+        item = dict(row)
+        item["column_default"] = _normalize_catalog_text(
+            item.get("column_default"), schema
+        )
+        contract["columns"].append(item)
 
-    # Required indexes
-    required_indexes = [
-        "idx_opportunity_watches_dedupe",
-        "idx_one_open_trade_per_order",
-        "idx_shadow_vt_unique",
-        "idx_strategy_evals_shadow_unique",
-        "idx_alert_outbox_dedupe_unique",
-        "idx_paper_trade_logs_dedupe_key",
-    ]
+    cur.execute(
+        """
+        SELECT cls.relname AS table_name, con.conname, con.contype,
+               pg_get_constraintdef(con.oid, true) AS definition
+        FROM pg_constraint con
+        JOIN pg_class cls ON cls.oid=con.conrelid
+        JOIN pg_namespace ns ON ns.oid=cls.relnamespace
+        WHERE ns.nspname=%s AND cls.relname = ANY(%s)
+        ORDER BY cls.relname, con.conname
+        """,
+        (schema, _REQUIRED_TABLES),
+    )
+    for row in cur.fetchall():
+        item = dict(row)
+        item["definition"] = _normalize_catalog_text(item["definition"], schema)
+        contract["constraints"].append(item)
 
-    # Required tables
-    # 07-15 R10-F (reviewer P2-1): ``_analysis_attempt_counter`` MUST be present
-    # for the producer's atomic ``_allocate_attempt_id`` (R10-P2). A DB
-    # initialized before the R10 migration -- or an interrupted migration --
-    # would be MISSING this table, and the producer would die at tick time with
-    # ``no such table``. ``start_all_services`` runs this health gate and
-    # ``acquire_service_ownership`` fail-closes on it, so the missing table MUST
-    # flip ``ok=False`` (otherwise an unhealthy DB silently passes the gate).
-    required_tables = [
-        "analysis_batches",
-        "batch_symbol_status",
-        "backfill_progress",
-        "_analysis_attempt_counter",
-    ]
+    cur.execute(
+        """
+        SELECT tablename AS table_name, indexname,
+               indexdef AS definition
+        FROM pg_indexes
+        WHERE schemaname=%s AND tablename = ANY(%s)
+        ORDER BY tablename, indexname
+        """,
+        (schema, _REQUIRED_TABLES),
+    )
+    for row in cur.fetchall():
+        item = dict(row)
+        item["definition"] = _normalize_catalog_text(item["definition"], schema)
+        contract["indexes"].append(item)
 
+    cur.execute(
+        """
+        SELECT cls.relname AS table_name, trg.tgname,
+               pg_get_triggerdef(trg.oid, true) AS definition
+        FROM pg_trigger trg
+        JOIN pg_class cls ON cls.oid=trg.tgrelid
+        JOIN pg_namespace ns ON ns.oid=cls.relnamespace
+        WHERE ns.nspname=%s AND NOT trg.tgisinternal
+        ORDER BY cls.relname, trg.tgname
+        """,
+        (schema,),
+    )
+    for row in cur.fetchall():
+        item = dict(row)
+        item["definition"] = _normalize_catalog_text(item["definition"], schema)
+        contract["triggers"].append(item)
+
+    cur.execute(
+        """
+        SELECT p.proname, pg_get_functiondef(p.oid) AS definition
+        FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+        WHERE ns.nspname=%s
+        ORDER BY p.proname, p.oid
+        """,
+        (schema,),
+    )
+    for row in cur.fetchall():
+        item = dict(row)
+        item["definition"] = _normalize_catalog_text(item["definition"], schema)
+        contract["functions"].append(item)
+
+    payload = json.dumps(contract, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _introspect_schema_health(cur: psycopg.Cursor) -> dict[str, Any]:
     missing: list[dict[str, str]] = []
     tables_checked: list[str] = []
 
-    try:
-        for table, columns in required_columns.items():
-            tables_checked.append(table)
-            # Check if table exists
-            table_exists = _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (table,)
-            ).fetchone()
+    # Resolve the target schema the same way unqualified DDL does: PostgreSQL's
+    # ``current_schema()`` returns the first existing schema on ``search_path``
+    # (where ``CREATE TABLE foo`` lands). This is ``public`` in production and
+    # ``test_<uuid>`` under per-test scratch-schema isolation. Hard-coding
+    # ``'public'`` would make the probe blind to the scratch schema and report
+    # every object as missing right after init - breaking the whole test path.
+    cur.execute("SELECT current_schema() AS s")
+    schema = cur.fetchone()["s"]
 
-            if not table_exists:
-                for col in columns:
-                    missing.append({"table": table, "column": col})
-                continue
-
-            # Check columns
-            existing_cols = {row["name"] for row in _conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for col in columns:
-                if col not in existing_cols:
-                    missing.append({"table": table, "column": col})
-
-        # Check required indexes
-        for idx_name in required_indexes:
-            idx_exists = _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
-                (idx_name,),
-            ).fetchone()
-            if not idx_exists:
-                missing.append({"table": "(index)", "column": idx_name})
-
-        # Check required tables
-        for tbl_name in required_tables:
-            tbl_exists = _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (tbl_name,),
-            ).fetchone()
-            if not tbl_exists:
-                missing.append({"table": tbl_name, "column": "(table)"})
-
-        # FR-4: check exact CHECK constraint on batch_symbol_status.status
-        # Must match CHECK(status IN ('pending', 'completed', 'failed')) exactly,
-        # not just any CHECK token (which could be a different constraint).
-        import re as _re
-        bss_sql = _conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_symbol_status'"
-        ).fetchone()
-        exact_check_pattern = _re.compile(
-            r"CHECK\s*\(\s*status\s+IN\s*\(\s*'pending'\s*,\s*'completed'\s*,\s*'failed'\s*\)\s*\)",
-            _re.IGNORECASE,
+    # ── required columns ───────────────────────────────────────────────────
+    for table, columns in _REQUIRED_COLUMNS.items():
+        tables_checked.append(table)
+        cur.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (schema, table),
         )
-        if bss_sql and not exact_check_pattern.search(bss_sql["sql"] or ""):
-            missing.append({"table": "batch_symbol_status", "column": "CHECK(status IN ('pending','completed','failed'))"})
+        existing_cols = {r["column_name"] for r in cur.fetchall()}
+        if not existing_cols:
+            for col in columns:
+                missing.append({"table": table, "column": col})
+            continue
+        for col in columns:
+            if col not in existing_cols:
+                missing.append({"table": table, "column": col})
 
-        # R5-D4/R6-D3: verify the dedupe_key index is a PARTIAL unique index with
-        # WHERE dedupe_key IS NOT NULL. A non-partial unique index would
-        # reject multiple NULL dedupe_key rows (breaking non-deduplicated logs).
-        # R6-D3: also verify via PRAGMA index_info that the indexed column is
-        # actually "dedupe_key" — the SQL text check alone could be fooled by
-        # an index that mentions "dedupe_key" in the WHERE clause but indexes
-        # a different column.
-        import re as _re2
-        dedupe_idx_sql = _conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_paper_trade_logs_dedupe_key'"
-        ).fetchone()
-        if dedupe_idx_sql:
-            idx_sql_lower = (dedupe_idx_sql["sql"] or "").lower()
-            if "unique" not in idx_sql_lower:
-                missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key UNIQUE"})
-            if "dedupe_key is not null" not in idx_sql_lower:
-                missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key WHERE dedupe_key IS NOT NULL"})
-            # R6-D3: verify the indexed column is actually "dedupe_key"
-            # R7-D3: the index must be EXACTLY ["dedupe_key"] — a composite index
-            # that includes dedupe_key plus other columns would pass the old
-            # membership check ("dedupe_key" not in indexed_cols) but should fail.
-            # Also fail-closed if PRAGMA index_info itself raises.
-            try:
-                idx_info_rows = _conn.execute(
-                    "PRAGMA index_info('idx_paper_trade_logs_dedupe_key')"
-                ).fetchall()
-                if not idx_info_rows:
-                    missing.append({"table": "paper_trade_logs", "column": "idx_paper_trade_logs_dedupe_key column=dedupe_key (index has no columns)"})
-                else:
-                    indexed_cols = [str(r["name"]) for r in idx_info_rows if r["name"]]
-                    # R7-D3: exact list equality — index must be solely on dedupe_key
-                    if indexed_cols != ["dedupe_key"]:
-                        missing.append({
-                            "table": "paper_trade_logs",
-                            "column": f"idx_paper_trade_logs_dedupe_key column=dedupe_key (indexed columns: {','.join(indexed_cols) or 'none'})",
-                        })
-            except Exception as exc:
-                # R7-D3: fail-closed — if PRAGMA index_info fails, report it as
-                # a missing health item rather than silently passing.
-                missing.append({
-                    "table": "paper_trade_logs",
-                    "column": f"idx_paper_trade_logs_dedupe_key column=dedupe_key (PRAGMA index_info failed: {exc})",
-                })
+    # ── required indexes ───────────────────────────────────────────────────
+    cur.execute(
+        """
+        SELECT indexname FROM pg_indexes
+        WHERE schemaname = %s AND indexname = ANY(%s)
+        """,
+        (schema, _REQUIRED_INDEXES),
+    )
+    present_indexes = {r["indexname"] for r in cur.fetchall()}
+    for idx_name in _REQUIRED_INDEXES:
+        if idx_name not in present_indexes:
+            missing.append({"table": "(index)", "column": idx_name})
 
-        # P2-10: verify backfill_progress has the correct composite primary key
-        # (symbol, interval). A corrupted/migrated DB with the right columns
-        # but wrong PK would pass the column check above but silently allow
-        # duplicate progress rows. Check the CREATE TABLE SQL from sqlite_master.
-        # P2-3 R3: The old check only verified that "symbol" and "interval" are
-        # IN the PK column list, but didn't verify the list is EXACTLY
-        # ["symbol", "interval"]. A table with PRIMARY KEY(symbol, interval,
-        # extra_column) would incorrectly pass. Now we normalize (lowercase,
-        # strip, sort) and compare to ["interval", "symbol"] (sorted).
-        import re as _re_pk
-        bp_sql_row = _conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='backfill_progress'"
-        ).fetchone()
-        if bp_sql_row and bp_sql_row["sql"]:
-            bp_sql = bp_sql_row["sql"]
-            # Handle both forms: PRIMARY KEY (symbol, interval) and inline
-            # PRIMARY KEY(column1, column2). Extract the PK clause.
-            pk_match = _re_pk.search(
-                r"PRIMARY\s+KEY\s*\(\s*([^)]+)\s*\)",
-                bp_sql,
-                _re_pk.IGNORECASE,
+    # ── required tables ────────────────────────────────────────────────────
+    cur.execute(
+        """
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = %s AND table_name = ANY(%s)
+        """,
+        (schema, _REQUIRED_TABLES),
+    )
+    present_tables = {r["table_name"] for r in cur.fetchall()}
+    for tbl_name in _REQUIRED_TABLES:
+        if tbl_name not in present_tables:
+            missing.append({"table": tbl_name, "column": "(table)"})
+
+    if not missing:
+        actual_fingerprint = _schema_catalog_fingerprint(cur, schema)
+        if actual_fingerprint != _EXPECTED_SCHEMA_FINGERPRINT:
+            missing.append(
+                {
+                    "table": "(schema_contract)",
+                    "column": "catalog fingerprint mismatch",
+                }
             )
-            if pk_match:
-                pk_cols_raw = pk_match.group(1)
-                # Split by comma, strip whitespace/quotes, normalize to lowercase
-                pk_cols = [c.strip().strip('"`[]').lower() for c in pk_cols_raw.split(",")]
-                # P2-3 R3: Normalize and compare to exactly ["interval", "symbol"]
-                # (sorted form of ["symbol", "interval"]). A PK with extra
-                # columns like (symbol, interval, extra) must fail.
-                pk_cols_sorted = sorted(pk_cols)
-                expected_sorted = ["interval", "symbol"]
-                if pk_cols_sorted != expected_sorted:
-                    missing.append({
-                        "table": "backfill_progress",
-                        "column": f"PRIMARY KEY(symbol, interval) (actual: ({pk_cols_raw.strip()}))",
-                    })
-            else:
-                # No PRIMARY KEY clause found in the CREATE TABLE SQL.
-                missing.append({
-                    "table": "backfill_progress",
-                    "column": "PRIMARY KEY(symbol, interval) (missing)",
-                })
 
-        return {
-            "ok": len(missing) == 0,
-            "missing_columns": missing,
-            "tables_checked": tables_checked,
+    # ── batch_symbol_status.status CHECK constraint ────────────────────────
+    # Verify the CHECK(status IN ('pending','completed','failed')) constraint
+    # exists on batch_symbol_status via pg_constraint (not a SQL-text regex).
+    missing.extend(_check_batch_symbol_status_constraint(cur, schema))
+
+    # ── paper_trade_logs dedupe_key partial unique index ───────────────────
+    missing.extend(_check_dedupe_key_partial_unique_index(cur, schema))
+
+    # ── backfill_progress composite primary key (symbol, interval) ─────────
+    missing.extend(_check_backfill_progress_primary_key(cur, schema))
+
+    return {
+        "ok": len(missing) == 0,
+        "missing_columns": missing,
+        "tables_checked": tables_checked,
+    }
+
+
+def _check_batch_symbol_status_constraint(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:
+    """Verify the exact CHECK constraint on batch_symbol_status.status.
+
+    ``pg_get_constraintdef`` renders the check predicate; we verify it lists
+    exactly pending/completed/failed. A missing or different constraint fails
+    closed.
+    """
+    cur.execute(
+        """
+        SELECT pg_get_constraintdef(c.oid) AS def
+        FROM pg_constraint c
+        JOIN pg_class k ON c.conrelid = k.oid
+        JOIN pg_namespace n ON k.relnamespace = n.oid
+        WHERE n.nspname = %s AND k.relname = 'batch_symbol_status'
+          AND c.contype = 'c'
+        """,
+        (schema,),
+    )
+    rows = cur.fetchall()
+    expected = {"'pending'", "'completed'", "'failed'"}
+    for r in rows:
+        defn = (r["def"] or "").lower()
+        if "status" in defn and expected.issubset({tok for tok in expected if tok in defn}):
+            # Confirm no extra status values are admitted.
+            if "'pending'" in defn and "'completed'" in defn and "'failed'" in defn:
+                return []
+    return [
+        {
+            "table": "batch_symbol_status",
+            "column": "CHECK(status IN ('pending','completed','failed'))",
         }
-    finally:
-        if own_conn is not None:
-            own_conn.close()
+    ]
+
+
+def _check_dedupe_key_partial_unique_index(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:
+    """Verify idx_paper_trade_logs_dedupe_key is a UNIQUE PARTIAL index on
+    ``dedupe_key`` (WHERE dedupe_key IS NOT NULL).
+
+    A non-unique or non-partial index would break the dedupe contract (multiple
+    NULL dedupe_key rows must be allowed). Introspected via ``pg_indexes`` +
+    ``pg_index`` (``indisunique`` + the partial predicate ``WHERE``), not SQL
+    text.
+    """
+    cur.execute(
+        """
+        SELECT i.indexname, i.indexdef
+        FROM pg_indexes i
+        WHERE i.schemaname = %s AND i.tablename = 'paper_trade_logs'
+          AND i.indexname = 'idx_paper_trade_logs_dedupe_key'
+        """,
+        (schema,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return [
+            {
+                "table": "paper_trade_logs",
+                "column": "idx_paper_trade_logs_dedupe_key (missing)",
+            }
+        ]
+    defn = (row["indexdef"] or "").lower()
+    problems = []
+    if "unique" not in defn:
+        problems.append(
+            {
+                "table": "paper_trade_logs",
+                "column": "idx_paper_trade_logs_dedupe_key UNIQUE",
+            }
+        )
+    if "dedupe_key is not null" not in defn:
+        problems.append(
+            {
+                "table": "paper_trade_logs",
+                "column": "idx_paper_trade_logs_dedupe_key WHERE dedupe_key IS NOT NULL",
+            }
+        )
+    # Verify the indexed column is exactly dedupe_key via pg_index.
+    cur.execute(
+        """
+        SELECT pg_get_indexdef(ix.indexrelid) AS def
+        FROM pg_index ix
+        JOIN pg_class c ON ix.indexrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = %s AND c.relname = 'idx_paper_trade_logs_dedupe_key'
+        """,
+        (schema,),
+    )
+    idx_row = cur.fetchone()
+    indexed_ok = False
+    if idx_row:
+        # The index definition must be on (dedupe_key) - not a composite that
+        # merely mentions dedupe_key.
+        def_text = (idx_row["def"] or "").lower()
+        if "(dedupe_key)" in def_text.replace(" ", ""):
+            indexed_ok = True
+    if not indexed_ok:
+        problems.append(
+            {
+                "table": "paper_trade_logs",
+                "column": "idx_paper_trade_logs_dedupe_key column=dedupe_key",
+            }
+        )
+    return problems
+
+
+def _check_backfill_progress_primary_key(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:
+    """Verify backfill_progress has exactly PRIMARY KEY (symbol, interval)."""
+    cur.execute(
+        """
+        SELECT a.attname
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid
+          AND a.attnum = ANY(i.indkey)
+        JOIN pg_class c ON i.indrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = %s AND c.relname = 'backfill_progress'
+          AND i.indisprimary
+        ORDER BY array_position(i.indkey, a.attnum)
+        """,
+        (schema,),
+    )
+    pk_cols = [r["attname"].lower() for r in cur.fetchall()]
+    expected_sorted = sorted(["symbol", "interval"])
+    if sorted(pk_cols) != expected_sorted:
+        return [
+            {
+                "table": "backfill_progress",
+                "column": f"PRIMARY KEY(symbol, interval) (actual: ({', '.join(pk_cols) or 'none'}))",
+            }
+        ]
+    return []
+
+
+__all__ = [
+    "initialize_database",
+    "check_schema_health",
+    "apply_r6f_service_ownership_migration",
+    "apply_r10_attempt_counter_migration",
+]

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Iterator
+
+import psycopg
+from psycopg.rows import dict_row
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
@@ -11,7 +15,115 @@ from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
 from plugins.crypto_guard.reasoning.market_state_builder import build_market_state_snapshot
 from plugins.crypto_guard.storage.parquet_archive import read_klines_file
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
+
+
+# ---------------------------------------------------------------------------
+# Scratch-schema isolation for historical replay / paired backtest
+# ---------------------------------------------------------------------------
+#
+# Replays run against an ISOLATED PostgreSQL schema on a dedicated
+# (non-pooled) connection, NOT a temp SQLite file. The old cutover built a
+# ``historical_replay.sqlite3`` via ``connect_db``; under the PG-only runtime
+# that path no longer exists. Instead we:
+#   1. Open a dedicated ``psycopg.connect`` to the same DSN the pool uses
+#      (resolved from ``CRYPTO_GUARD_DATABASE_URL``), with ``search_path`` set
+#      to a fresh unique schema so writes never touch the production ``public``
+#      schema (and the production pool is never opened by the replay).
+#   2. Apply ``schema_postgres.sql`` + the default symbol/strategy seeds
+#      directly into that schema (the schema SQL is schema-agnostic - it uses
+#      no ``public.`` qualification, so ``CREATE TABLE`` lands in ``search_path``).
+#      We deliberately do NOT call ``initialize_database()`` (which targets the
+#      production pool / advisory lock / contract markers).
+#   3. Yield a ``CryptoGuardRepository`` bound to that connection. Every repo
+#      write self-wraps ``conn.transaction()`` and resolves to the scratch
+#      schema, so ``build_market_state_snapshot`` / ``upsert_candles`` /
+#      ``no_lookahead_candles`` read+write only the scratch schema.
+#   4. On exit, ``DROP SCHEMA ... CASCADE`` + close the connection - no residue.
+
+
+def _validate_replay_connected_identity(conn: psycopg.Connection) -> None:
+    """Verify the authenticated replay principal before any replay DDL."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT current_user AS current_user, session_user AS session_user,
+                   current_database() AS database_name,
+                   r.rolsuper, r.rolcreatedb, r.rolcreaterole,
+                   r.rolreplication, r.rolbypassrls
+            FROM pg_roles r WHERE r.rolname=current_user
+            """
+        )
+        row = cur.fetchone()
+    allowed = {
+        ("crypto_guard_replay", "crypto_guard_replay"),
+        ("crypto_guard_test_app", "crypto_guard_test"),
+    }
+    if not row:
+        raise RuntimeError("PostgreSQL replay identity is unavailable")
+    current = str(row["current_user"])
+    session = str(row["session_user"])
+    database = str(row["database_name"])
+    dangerous = any(bool(row[key]) for key in (
+        "rolsuper", "rolcreatedb", "rolcreaterole",
+        "rolreplication", "rolbypassrls",
+    ))
+    if current != session or (current, database) not in allowed or dangerous:
+        raise RuntimeError(
+            "PostgreSQL replay principal violates the dedicated-role contract"
+        )
+
+
+@contextmanager
+def _scratch_replay_repo() -> Iterator[CryptoGuardRepository]:
+    """Yield a repo bound to an isolated scratch schema; drop it on exit.
+
+    The replay reads/writes only its own schema; the caller's production repo
+    (used to persist ``historical_replay_results``) is untouched by the replay
+    loop itself. Fail-closed: if the scratch connection cannot be opened or
+    seeded, the error propagates (NO SQLite fallback).
+    """
+    from plugins.crypto_guard.storage import pg_db
+    from plugins.crypto_guard.storage.migrations import SCHEMA_PATH, _seed_symbols, _seed_strategies
+
+    schema_name = f"replay_{uuid.uuid4().hex}".lower()
+    from plugins.crypto_guard.config.loader import resolve_replay_database_url
+
+    dsn = resolve_replay_database_url()
+    conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
+    try:
+        _validate_replay_connected_identity(conn)
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema_name}"')
+        # Route all unqualified table names to the scratch schema. We commit
+        # the CREATE SCHEMA + SET search_path as its own transaction so the
+        # schema exists before we apply the DDL into it.
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(f'SET search_path = "{schema_name}", public')
+        # Apply the schema SQL + seeds directly into the scratch schema. The
+        # schema SQL is idempotent (IF NOT EXISTS / ON CONFLICT); seeds are
+        # upserts. Run as one transaction so a seed failure drops nothing
+        # into the scratch schema half-built (we DROP on exit regardless).
+        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        cfg = load_config()
+        with conn.cursor() as cur:
+            cur.execute(schema_sql)
+            _seed_symbols(cur, cfg.symbols)
+            _seed_strategies(cur, cfg.strategies)
+        conn.commit()
+        yield CryptoGuardRepository(conn)
+    finally:
+        # Drop the scratch schema (autocommit so DROP works outside a txn) and
+        # close the dedicated connection. Swallow only DROP errors so a replay
+        # exception still propagates from the ``yield``.
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+        except Exception:
+            pass
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Trade simulation
@@ -284,70 +396,52 @@ def run_historical_replay(
 
     signals: list[dict[str, Any]] = []
     no_lookahead_violations = 0
-    with TemporaryDirectory() as tmp:
-        replay_db = Path(tmp) / "historical_replay.sqlite3"
-        import os
+    with _scratch_replay_repo() as replay_repo:
+        for idx, candle in enumerate(rows):
+            replay_repo.upsert_candles([candle])
+            if idx + 1 < warmup:
+                continue
+            analysis_time = int(candle["close_time"])
+            check = replay_repo.no_lookahead_candles(symbol, interval, analysis_time_utc=analysis_time, limit=500)
+            no_lookahead_violations += int(check["violation_count"])
 
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        os.environ["CRYPTO_GUARD_DB"] = str(replay_db)
-        cfg = load_config()
-        from plugins.crypto_guard.storage.migrations import initialize_database
+            # Classify market regime at this point
+            regime = _classify_market_regime(rows[: idx + 1])
 
-        initialize_database(cfg)
-        if old_db is not None:
-            os.environ["CRYPTO_GUARD_DB"] = old_db
-        else:
-            os.environ.pop("CRYPTO_GUARD_DB", None)
-        replay_conn = connect_db(replay_db)
-        try:
-            replay_repo = CryptoGuardRepository(replay_conn)
-            for idx, candle in enumerate(rows):
-                replay_repo.upsert_candles([candle])
-                if idx + 1 < warmup:
-                    continue
-                analysis_time = int(candle["close_time"])
-                check = replay_repo.no_lookahead_candles(symbol, interval, analysis_time_utc=analysis_time, limit=500)
-                no_lookahead_violations += int(check["violation_count"])
+            snapshot = build_market_state_snapshot(
+                replay_repo,
+                symbol=symbol,
+                analysis_time_utc=analysis_time,
+                mode="shadow_test",
+                timeframes=[interval],
+            )
+            decision = run_ga_sop_decision(snapshot)
 
-                # Classify market regime at this point
-                regime = _classify_market_regime(rows[: idx + 1])
+            signal: dict[str, Any] = {
+                "analysis_time_utc": analysis_time,
+                "symbol": symbol,
+                "close": candle["close"],
+                "decision": decision["decision"],
+                "signal_grade": decision["signal_grade"],
+                "confidence": decision["confidence"],
+                "market_bias": decision.get("market_bias"),
+                "market_regime": regime,
+            }
 
-                snapshot = build_market_state_snapshot(
-                    replay_repo,
-                    symbol=symbol,
-                    analysis_time_utc=analysis_time,
-                    mode="shadow_test",
-                    timeframes=[interval],
-                )
-                decision = run_ga_sop_decision(snapshot)
+            # Real trade simulation for signals with a trade plan
+            trade_plan = decision.get("trade_plan")
+            if trade_plan and decision["decision"] == "trade_plan_available":
+                subsequent = rows[idx + 1: idx + 51]  # up to 50 candles ahead
+                sim = _simulate_trade(trade_plan, subsequent)
+                signal["trade_simulation"] = sim
+                signal["pnl_r"] = sim["pnl_r"]
+                signal["trade_outcome"] = sim["outcome"]
+            else:
+                signal["trade_simulation"] = None
+                signal["pnl_r"] = None
+                signal["trade_outcome"] = None
 
-                signal: dict[str, Any] = {
-                    "analysis_time_utc": analysis_time,
-                    "symbol": symbol,
-                    "close": candle["close"],
-                    "decision": decision["decision"],
-                    "signal_grade": decision["signal_grade"],
-                    "confidence": decision["confidence"],
-                    "market_bias": decision.get("market_bias"),
-                    "market_regime": regime,
-                }
-
-                # Real trade simulation for signals with a trade plan
-                trade_plan = decision.get("trade_plan")
-                if trade_plan and decision["decision"] == "trade_plan_available":
-                    subsequent = rows[idx + 1: idx + 51]  # up to 50 candles ahead
-                    sim = _simulate_trade(trade_plan, subsequent)
-                    signal["trade_simulation"] = sim
-                    signal["pnl_r"] = sim["pnl_r"]
-                    signal["trade_outcome"] = sim["outcome"]
-                else:
-                    signal["trade_simulation"] = None
-                    signal["pnl_r"] = None
-                    signal["trade_outcome"] = None
-
-                signals.append(signal)
-        finally:
-            replay_conn.close()
+            signals.append(signal)
 
     stats = _performance_stats(signals)
     comparisons = _compare_strategy_versions(signals, strategy_versions or [])
@@ -440,80 +534,62 @@ def run_paired_backtest(
     no_lookahead_violations = 0
     all_trigger_counts: dict[str, int] = {}
 
-    with TemporaryDirectory() as tmp:
-        replay_db = Path(tmp) / "paired_backtest.sqlite3"
-        import os
+    with _scratch_replay_repo() as replay_repo:
+        for idx, candle in enumerate(rows):
+            replay_repo.upsert_candles([candle])
+            if idx + 1 < warmup:
+                continue
+            analysis_time = int(candle["close_time"])
+            check = replay_repo.no_lookahead_candles(symbol, interval, analysis_time_utc=analysis_time, limit=500)
+            no_lookahead_violations += int(check["violation_count"])
 
-        old_db = os.environ.get("CRYPTO_GUARD_DB")
-        os.environ["CRYPTO_GUARD_DB"] = str(replay_db)
-        cfg = load_config()
-        from plugins.crypto_guard.storage.migrations import initialize_database
+            regime = _classify_market_regime(rows[: idx + 1])
 
-        initialize_database(cfg)
-        if old_db is not None:
-            os.environ["CRYPTO_GUARD_DB"] = old_db
-        else:
-            os.environ.pop("CRYPTO_GUARD_DB", None)
-        replay_conn = connect_db(replay_db)
-        try:
-            replay_repo = CryptoGuardRepository(replay_conn)
-            for idx, candle in enumerate(rows):
-                replay_repo.upsert_candles([candle])
-                if idx + 1 < warmup:
-                    continue
-                analysis_time = int(candle["close_time"])
-                check = replay_repo.no_lookahead_candles(symbol, interval, analysis_time_utc=analysis_time, limit=500)
-                no_lookahead_violations += int(check["violation_count"])
+            snapshot = build_market_state_snapshot(
+                replay_repo,
+                symbol=symbol,
+                analysis_time_utc=analysis_time,
+                mode="shadow_test",
+                timeframes=[interval],
+            )
 
-                regime = _classify_market_regime(rows[: idx + 1])
+            # Read real market_phase from snapshot modules
+            market_phase = str(
+                (snapshot.get("modules") or {}).get("market_regime", {}).get("market_phase", "")
+            )
 
-                snapshot = build_market_state_snapshot(
-                    replay_repo,
-                    symbol=symbol,
-                    analysis_time_utc=analysis_time,
-                    mode="shadow_test",
-                    timeframes=[interval],
-                )
+            # Run active decision (no adjustment)
+            active_decision = run_ga_sop_decision(snapshot)
+            market_bias = str(active_decision.get("market_bias", ""))
+            active_signal = _build_signal(analysis_time, symbol, candle, active_decision, regime)
 
-                # Read real market_phase from snapshot modules
-                market_phase = str(
-                    (snapshot.get("modules") or {}).get("market_regime", {}).get("market_phase", "")
-                )
+            # Run candidate decision with conditional adjustments from patch
+            candidate_adjustment, trigger_counts = _evaluate_conditional_adjustment(
+                candidate_patch, snapshot, regime,
+                active_decision=active_decision,
+                market_bias=market_bias,
+            )
+            for k, v in trigger_counts.items():
+                all_trigger_counts[k] = all_trigger_counts.get(k, 0) + v
+            candidate_decision = run_ga_sop_decision(snapshot, score_adjustment=candidate_adjustment)
+            candidate_signal = _build_signal(analysis_time, symbol, candle, candidate_decision, regime)
 
-                # Run active decision (no adjustment)
-                active_decision = run_ga_sop_decision(snapshot)
-                market_bias = str(active_decision.get("market_bias", ""))
-                active_signal = _build_signal(analysis_time, symbol, candle, active_decision, regime)
+            # Simulate trades for both if trade plan available
+            for signal, decision in [(active_signal, active_decision), (candidate_signal, candidate_decision)]:
+                trade_plan = decision.get("trade_plan")
+                if trade_plan and decision["decision"] == "trade_plan_available":
+                    subsequent = rows[idx + 1: idx + 51]
+                    sim = _simulate_trade(trade_plan, subsequent)
+                    signal["trade_simulation"] = sim
+                    signal["pnl_r"] = sim["pnl_r"]
+                    signal["trade_outcome"] = sim["outcome"]
+                else:
+                    signal["trade_simulation"] = None
+                    signal["pnl_r"] = None
+                    signal["trade_outcome"] = None
 
-                # Run candidate decision with conditional adjustments from patch
-                candidate_adjustment, trigger_counts = _evaluate_conditional_adjustment(
-                    candidate_patch, snapshot, regime,
-                    active_decision=active_decision,
-                    market_bias=market_bias,
-                )
-                for k, v in trigger_counts.items():
-                    all_trigger_counts[k] = all_trigger_counts.get(k, 0) + v
-                candidate_decision = run_ga_sop_decision(snapshot, score_adjustment=candidate_adjustment)
-                candidate_signal = _build_signal(analysis_time, symbol, candle, candidate_decision, regime)
-
-                # Simulate trades for both if trade plan available
-                for signal, decision in [(active_signal, active_decision), (candidate_signal, candidate_decision)]:
-                    trade_plan = decision.get("trade_plan")
-                    if trade_plan and decision["decision"] == "trade_plan_available":
-                        subsequent = rows[idx + 1: idx + 51]
-                        sim = _simulate_trade(trade_plan, subsequent)
-                        signal["trade_simulation"] = sim
-                        signal["pnl_r"] = sim["pnl_r"]
-                        signal["trade_outcome"] = sim["outcome"]
-                    else:
-                        signal["trade_simulation"] = None
-                        signal["pnl_r"] = None
-                        signal["trade_outcome"] = None
-
-                active_signals.append(active_signal)
-                candidate_signals.append(candidate_signal)
-        finally:
-            replay_conn.close()
+            active_signals.append(active_signal)
+            candidate_signals.append(candidate_signal)
 
     active_stats = _performance_stats(active_signals)
     candidate_stats = _performance_stats(candidate_signals)

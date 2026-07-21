@@ -199,6 +199,8 @@ def _load_path(trade: dict[str, Any]) -> list[dict[str, Any]]:
     raw = trade.get("stop_take_path_json")
     if not raw:
         return []
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
     try:
         values = json.loads(raw)
     except Exception:

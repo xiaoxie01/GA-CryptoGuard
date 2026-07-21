@@ -275,7 +275,7 @@ class AccountRiskGuard:
         rows = self.repo.conn.execute(
             """
             SELECT pnl_r, closed_at FROM paper_trades
-            WHERE pnl_r IS NOT NULL AND closed_at IS NOT NULL AND datetime(closed_at) >= datetime(?)
+            WHERE pnl_r IS NOT NULL AND closed_at IS NOT NULL AND closed_at >= %s::timestamptz
             ORDER BY closed_at DESC
             """,
             (today_start_iso,),
@@ -328,7 +328,7 @@ class AccountRiskGuard:
         row = self.repo.conn.execute(
             """
             SELECT closed_at FROM paper_trades
-            WHERE symbol=? AND side=? AND pnl_r IS NOT NULL AND pnl_r < 0
+            WHERE symbol=%s AND side=%s AND pnl_r IS NOT NULL AND pnl_r < 0
             ORDER BY closed_at DESC LIMIT 1
             """,
             (symbol, side),
@@ -347,8 +347,8 @@ class AccountRiskGuard:
         rows = self.repo.conn.execute(
             """
             SELECT pnl_r FROM paper_trades
-            WHERE symbol=? AND side=? AND pnl_r IS NOT NULL AND closed_at IS NOT NULL
-            ORDER BY closed_at DESC LIMIT ?
+            WHERE symbol=%s AND side=%s AND pnl_r IS NOT NULL AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC LIMIT %s
             """,
             (symbol, side, lookback),
         ).fetchall()
@@ -381,7 +381,7 @@ class AccountRiskGuard:
             """
             SELECT pnl_r FROM paper_trades
             WHERE pnl_r IS NOT NULL AND closed_at IS NOT NULL
-            ORDER BY closed_at DESC LIMIT ?
+            ORDER BY closed_at DESC LIMIT %s
             """,
             (lookback,),
         ).fetchall()

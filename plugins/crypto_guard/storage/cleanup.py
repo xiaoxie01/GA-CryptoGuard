@@ -1,4 +1,8 @@
-"""SQLite database cleanup and maintenance.
+"""PostgreSQL database cleanup and maintenance.
+
+CryptoGuard runs on PostgreSQL only (no SQLite fallback). This module replaces
+the legacy SQLite cleanup CLI: it deletes aged operational rows by retention
+policy and runs ``VACUUM (ANALYZE)`` to reclaim space.
 
 Usage:
     python -m plugins.crypto_guard.storage.cleanup --vacuum
@@ -7,152 +11,146 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sqlite3
 from datetime import datetime, timezone
+from typing import Any
+
+import psycopg
 
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage import pg_db
 
 LOGGER = get_logger("crypto_guard.storage.cleanup")
 
-# Table -> (column_with_timestamp, retention_days)
-# None retention means "never auto-delete"
-RETENTION_POLICY: dict[str, tuple[str | None, int | None]] = {
-    "candles": ("open_time", 7),                    # 7 days, historical in Parquet
-    "module_analysis_results": ("created_at", 30),   # 30 days
-    "skill_execution_logs": ("created_at", 30),      # 30 days
-    "market_snapshots": ("created_at", 30),           # 30 days
-    "scheduler_runs": ("started_at", 30),             # 30 days
-    "agent_jobs": ("created_at", 30),                 # 30 days
-    "paper_equity_snapshots": ("snapshot_time", 30),  # 30 days
-    "analysis_states": ("updated_at", 30),            # 30 days
-    "alert_outbox": ("created_at", 14),               # 14 days
+# Table -> (timestamp_column, retention_days, column_kind)
+# column_kind:
+#   "timestamptz" - column is TIMESTAMPTZ; compare against NOW() - interval
+#   "epoch_ms"    - column is BIGINT epoch-milliseconds; compare against ms cutoff
+# None retention means "never auto-delete".
+RETENTION_POLICY: dict[str, tuple[str, int | None, str]] = {
+    "candles": ("open_time", 7, "epoch_ms"),                # 7 days, historical in Parquet
+    "module_analysis_results": ("created_at", 30, "timestamptz"),  # 30 days
+    "skill_execution_logs": ("created_at", 30, "timestamptz"),     # 30 days
+    "market_snapshots": ("created_at", 30, "timestamptz"),          # 30 days
+    "scheduler_runs": ("started_at", 30, "timestamptz"),            # 30 days
+    "agent_jobs": ("created_at", 30, "timestamptz"),                # 30 days
+    "paper_equity_snapshots": ("ts", 30, "epoch_ms"),               # 30 days
+    "analysis_states": ("created_at", 30, "timestamptz"),           # 30 days
+    "alert_outbox": ("created_at", 14, "timestamptz"),              # 14 days
     # Keep indefinitely: ga_decisions, skill_feedback_memory, strategy_*, symbols, parquet_archive_runs
 }
 
 
-def clean_old_data(db_path: str, retention_days: int | None = None) -> dict[str, int]:
+def clean_old_data(retention_days: int | None = None) -> dict[str, int]:
     """Delete rows older than retention period from operational tables.
 
     Args:
-        db_path: Path to SQLite database.
         retention_days: Override retention for all tables. If None, uses per-table policy.
     """
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
     deleted: dict[str, int] = {}
-
-    try:
-        for table, (col, default_days) in RETENTION_POLICY.items():
-            if col is None:
-                continue
+    with pg_db.get_conn() as conn:
+        for table, (col, default_days, kind) in RETENTION_POLICY.items():
             days = retention_days if retention_days is not None else default_days
             if days is None:
                 continue
 
-            # Check table and column exist
+            # Check table and column exist (best-effort: skip silently if absent)
             try:
-                conn.execute(f"SELECT {col} FROM [{table}] LIMIT 1")
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_schema=current_schema() "
+                            "AND table_name=%s AND column_name=%s",
+                            (table, col),
+                        )
+                        if cur.fetchone() is None:
+                            continue
             except Exception:
                 continue
 
-            cutoff_ms = int((datetime.now(timezone.utc).timestamp() - days * 86400) * 1000)
-            cutoff_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-            # For candles, use millisecond timestamp comparison
-            if table == "candles":
-                cur = conn.execute(f"DELETE FROM [{table}] WHERE {col} < ?", (cutoff_ms,))
+            if kind == "epoch_ms":
+                cutoff_ms = int((datetime.now(timezone.utc).timestamp() - days * 86400) * 1000)
+                sql = f'DELETE FROM "{table}" WHERE "{col}" IS NOT NULL AND "{col}" < %s'
+                params: tuple[Any, ...] = (cutoff_ms,)
             else:
-                # For other tables, try ISO string comparison
-                cur = conn.execute(
-                    f"DELETE FROM [{table}] WHERE {col} IS NOT NULL AND {col} < ?",
-                    (cutoff_iso,),
+                # TIMESTAMPTZ column: compare against NOW() - interval (server-side)
+                sql = (
+                    f'DELETE FROM "{table}" WHERE "{col}" IS NOT NULL '
+                    f'AND "{col}" < (NOW() - (%s || \' days\')::interval)'
                 )
-            count = cur.rowcount
-            if count > 0:
+                params = (str(int(days)),)
+
+            try:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        count = cur.rowcount
+            except Exception as exc:  # noqa: BLE001 - best-effort per-table
+                LOGGER.warning("cleanup failed for %s.%s: %s", table, col, exc)
+                continue
+            if count and count > 0:
                 deleted[table] = count
                 LOGGER.info("Deleted %d rows from %s (older than %d days)", count, table, days)
-
-        conn.commit()
-    finally:
-        conn.close()
-
     return deleted
 
 
-def vacuum_database(db_path: str) -> dict[str, Any]:
-    """Run VACUUM to reclaim space. Returns size before/after."""
-    import os
+def vacuum_database() -> dict[str, Any]:
+    """Run VACUUM ANALYZE to reclaim space and refresh planner stats.
 
-    size_before = os.path.getsize(db_path)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("VACUUM")
-        LOGGER.info("VACUUM complete on %s", db_path)
-    finally:
-        conn.close()
-    size_after = os.path.getsize(db_path)
-
-    freed_mb = (size_before - size_after) / (1024 * 1024)
-    LOGGER.info("VACUUM freed %.1f MB (%.1f MB -> %.1f MB)", freed_mb, size_before / (1024*1024), size_after / (1024*1024))
-
-    return {
-        "ok": True,
-        "size_before_mb": round(size_before / (1024 * 1024), 1),
-        "size_after_mb": round(size_after / (1024 * 1024), 1),
-        "freed_mb": round(freed_mb, 1),
-    }
+    PostgreSQL ``VACUUM`` cannot run inside a transaction block, so it opens a
+    dedicated autocommit connection from the pool (not the transactional
+    ``get_conn`` path). Returns an ok marker - PG does not expose a reliable
+    size delta per-VACUUM the way SQLite's file did, so no before/after MB.
+    """
+    pool = pg_db.get_pool()
+    with pool.connection() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("VACUUM (ANALYZE)")
+    LOGGER.info("VACUUM (ANALYZE) complete on crypto_guard")
+    return {"ok": True, "engine": "postgresql"}
 
 
-def get_table_stats(db_path: str) -> dict[str, Any]:
-    """Get row counts and estimated sizes for all tables."""
-    conn = sqlite3.connect(db_path)
+def get_table_stats() -> dict[str, Any]:
+    """Get row counts for all CryptoGuard tables."""
     stats: dict[str, Any] = {}
-    try:
-        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        tables = [r[0] for r in cur.fetchall()]
-        total_rows = 0
-        for t in tables:
-            try:
-                cnt = conn.execute(f"SELECT COUNT(*) FROM [{t}]").fetchone()[0]
-                stats[t] = {"rows": cnt}
-                total_rows += cnt
-            except Exception:
-                stats[t] = {"rows": -1}
-        stats["_total_rows"] = total_rows
-        stats["_db_size_mb"] = round(os.path.getsize(db_path) / (1024 * 1024), 1)
-    finally:
-        conn.close()
+    with pg_db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """
+            )
+            tables = [r["table_name"] for r in cur.fetchall()]
+            total_rows = 0
+            for t in tables:
+                try:
+                    with conn.cursor() as c2:
+                        c2.execute(f'SELECT COUNT(*) AS n FROM "{t}"')
+                        cnt = int(c2.fetchone()["n"])
+                    stats[t] = {"rows": cnt}
+                    total_rows += cnt
+                except Exception:
+                    stats[t] = {"rows": -1}
+            stats["_total_rows"] = total_rows
+        conn.rollback()
     return stats
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SQLite cleanup and maintenance")
-    parser.add_argument("--db", default=None, help="Database path (default: auto-detect)")
+    parser = argparse.ArgumentParser(description="PostgreSQL cleanup and maintenance")
     parser.add_argument("--clean-old", type=int, metavar="DAYS", help="Delete data older than N days")
-    parser.add_argument("--vacuum", action="store_true", help="Run VACUUM to reclaim space")
+    parser.add_argument("--vacuum", action="store_true", help="Run VACUUM ANALYZE to reclaim space")
     parser.add_argument("--stats", action="store_true", help="Show table statistics")
     parser.add_argument("--full", action="store_true", help="Clean old data + VACUUM + stats")
     args = parser.parse_args()
 
-    db_path = args.db or os.environ.get(
-        "CRYPTO_GUARD_DB",
-        str(os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "crypto_guard", "crypto_guard.sqlite3")),
-    )
-
-    if not os.path.exists(db_path):
-        # Try alternate path
-        alt = os.path.join(os.path.dirname(__file__), "..", "..", "..", "crypto_guard.sqlite3")
-        if os.path.exists(alt):
-            db_path = alt
-        else:
-            print(f"Database not found: {db_path}")
-            return
-
     if args.stats or args.full:
-        stats = get_table_stats(db_path)
-        print(f"\nDatabase: {db_path}")
-        print(f"Size: {stats.pop('_db_size_mb')} MB, Total rows: {stats.pop('_total_rows'):,}")
+        stats = get_table_stats()
+        total_rows = stats.pop("_total_rows")
+        print(f"Engine: PostgreSQL (crypto_guard), Total rows: {total_rows:,}")
         print(f"{'Table':<30} {'Rows':>10}")
         print("-" * 42)
         for t, info in sorted(stats.items()):
@@ -162,7 +160,7 @@ def main() -> None:
     if args.clean_old is not None or args.full:
         days = args.clean_old or 30
         print(f"\nCleaning data older than {days} days...")
-        deleted = clean_old_data(db_path, days)
+        deleted = clean_old_data(days)
         if deleted:
             total = sum(deleted.values())
             print(f"Deleted {total:,} rows total:")
@@ -172,11 +170,12 @@ def main() -> None:
             print("No rows to delete.")
 
     if args.vacuum or args.full:
-        print("\nRunning VACUUM...")
-        result = vacuum_database(db_path)
-        print(f"  Before: {result['size_before_mb']} MB")
-        print(f"  After:  {result['size_after_mb']} MB")
-        print(f"  Freed:  {result['freed_mb']} MB")
+        print("\nRunning VACUUM ANALYZE...")
+        result = vacuum_database()
+        if result.get("ok"):
+            print("  VACUUM (ANALYZE) complete.")
+        else:
+            print(f"  VACUUM failed: {result}")
 
 
 if __name__ == "__main__":

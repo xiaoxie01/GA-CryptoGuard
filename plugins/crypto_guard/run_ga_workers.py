@@ -23,9 +23,9 @@ from plugins.crypto_guard.review.daily_reviewer import run_daily_review
 from plugins.crypto_guard.review.trade_reviewer import review_trade
 from plugins.crypto_guard.scheduler.opportunity_watcher import render_watch_alert_text, update_opportunity_watches
 from plugins.crypto_guard.storage.migrations import initialize_database
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository, validate_job_identity
+from plugins.crypto_guard.storage.repository import CryptoGuardRepository, validate_job_identity, _decode_json
 from plugins.crypto_guard.storage.redis_adapter import RedisAdapter, should_use_redis_for_path
-from plugins.crypto_guard.storage.sqlite_db import connect_db
+from plugins.crypto_guard.storage.pg_db import get_conn as _pg_get_conn
 from plugins.crypto_guard.tools.ga_crypto_tools import crypto_handle_text_command
 from plugins.crypto_guard.utils import utc_ms
 
@@ -38,6 +38,10 @@ LOGGER = get_logger("crypto_guard.worker")
 # batch lifetime. When the batch finishes, the snapshot is merged into
 # the batch summary and the breaker is removed from the cache.
 _batch_breakers: dict[str, Any] = {}
+
+
+class _FairBatchOwnershipLost(RuntimeError):
+    """The database lease/CAS no longer belongs to this worker."""
 
 # 07-10 R3-P0-1 + R4-P0-1 + R5-P0 (terminal-review-repair-plan-r5 P0): a
 # ``single_flight_skipped`` symbol defers THIS tick's own ``agent_jobs`` claim
@@ -170,9 +174,8 @@ def _resolve_single_flight_defer_config(llm_cfg: dict[str, Any]) -> _SingleFligh
     )
 
 
-def _parse_sqlite_ts_ms(ts: str | None) -> int | None:
-    """07-10 R4-P0-1: parse a SQLite ``CURRENT_TIMESTAMP`` / ``datetime('now')``
-    string (``YYYY-MM-DD HH:MM:SS`` or an ISO-8601 variant with optional
+def _parse_db_ts_ms(ts: str | None) -> int | None:
+    """Parse a database timestamp string (``YYYY-MM-DD HH:MM:SS`` or an ISO-8601 variant with optional
     fractional seconds / timezone) into epoch milliseconds. Returns ``None`` on
     any parse failure so the caller can treat an unparseable ``deferred_at`` as
     "elapsed unknown -> do NOT exhaust" (fail-safe: a None/unknown elapsed time
@@ -182,12 +185,12 @@ def _parse_sqlite_ts_ms(ts: str | None) -> int | None:
     s = str(ts).strip()
     if not s:
         return None
-    # Normalize the SQLite "YYYY-MM-DD HH:MM:SS" form to ISO-8601.
+    # Normalize the database "YYYY-MM-DD HH:MM:SS" form to ISO-8601.
     iso = s.replace(" ", "T", 1) if " " in s else s
     try:
         dt = datetime.fromisoformat(iso)
     except ValueError:
-        # Fall back to the common SQLite UTC format without timezone.
+        # Fall back to the common UTC format without timezone.
         try:
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
         except ValueError:
@@ -373,9 +376,14 @@ def process_fair_batch(
     if not jobs:
         return {"ok": True, "processed": False, "reason": "empty_batch"}
     # All jobs share one batch_id (claim_next_batch grouped them). Read it
-    # from the first job's payload.
-    first_payload = json.loads(jobs[0]["payload_json"])
+    # from the first job's payload.  07-16 cutover: payload_json is JSONB ->
+    # already a dict under PG; _decode_json handles both str and decoded forms.
+    first_payload = _decode_json(jobs[0]["payload_json"], {})
     batch_id = first_payload.get("batch_id") or ""
+    claim_tokens = {str(job.get("claim_token") or "") for job in jobs}
+    if len(claim_tokens) != 1 or not next(iter(claim_tokens), ""):
+        raise RuntimeError("fair batch rows do not share one non-empty claim token")
+    batch_claim_token = next(iter(claim_tokens))
     # Collect per-symbol snapshot + job metadata keyed by symbol. A symbol
     # appearing twice in the batch (shouldn't happen — enqueue dedupes by
     # session_id) would collapse to its last job.
@@ -394,7 +402,7 @@ def process_fair_batch(
     # (it must NOT render ``success`` with a job that crashed on ingest).
     malformed_jobs: list[dict[str, Any]] = []
     for job in jobs:
-        payload = json.loads(job["payload_json"])
+        payload = _decode_json(job["payload_json"], {})
         snap = payload.get("snapshot") or {}
         # 07-15 R8-A (P0-2): the worker uses ONLY ``payload.symbol`` as the
         # authoritative symbol, validated by the SHARED identity contract (the
@@ -426,6 +434,7 @@ def process_fair_batch(
                         "batch_id": batch_id,
                     },
                     error_message="invalid_scheduled_payload: payload failed identity contract (symbol missing or snapshot.symbol missing/swapped)",
+                    claim_token=str(job.get("claim_token") or ""),
                 )
             except Exception:
                 LOGGER.exception(
@@ -437,6 +446,7 @@ def process_fair_batch(
             continue
         snapshots[sym] = snap
         job_by_symbol[sym] = {"job": job, "payload": payload}
+    repo.conn.commit()
     symbols = list(snapshots.keys())
     if not symbols:
         # Every job in this batch was malformed (no symbol). Mark the batch
@@ -598,6 +608,12 @@ def process_fair_batch(
     from plugins.crypto_guard.utils import utc_ms
     cfg = resolve_fair_batch_config(llm_cfg)
     metrics = BatchMetrics(expected_symbols=len(symbols))
+    # Do not retain a PostgreSQL transaction while provider calls run. The
+    # continuity queries above may have opened an implicit read transaction;
+    # close it, then publish a short ownership heartbeat before dispatch.
+    repo.conn.commit()
+    if repo.renew_batch_claim(batch_claim_token) != len(jobs):
+        raise RuntimeError("fair batch ownership lost before provider dispatch")
     fair_results = run_fair_batch(
         batch_id=batch_id, symbols=attemptable_symbols, snapshots=snapshots,
         cfg=cfg, breaker=breaker, retry_budget=retry_budget,
@@ -605,6 +621,8 @@ def process_fair_batch(
         llm_call_fn=fair_llm_call_adapter, now_ms=utc_ms,
         release_lease=False,
     )
+    if repo.renew_batch_claim(batch_claim_token) != len(jobs):
+        raise RuntimeError("fair batch ownership lost during provider dispatch")
     # 07-10 P0-1 (design §11 fail-closed): synthesize a terminal
     # ``continuity_unavailable`` envelope for every symbol whose strict-prior
     # continuity could NOT be verified above. The coordinator never attempted
@@ -840,7 +858,7 @@ def process_fair_batch(
                 _deferred_at_known = False
                 if deferred_at:
                     try:
-                        _deferred_ms = _parse_sqlite_ts_ms(deferred_at)
+                        _deferred_ms = _parse_db_ts_ms(deferred_at)
                         _now_ms = utc_ms()
                         if _deferred_ms is not None:
                             _defer_elapsed_s = max(0, (_now_ms - _deferred_ms) // 1000)
@@ -869,29 +887,25 @@ def process_fair_batch(
                         if _absolute_exhausted
                         else "single_flight_defer_exhausted:backstop_cap"
                     )
+                    terminal_result = {
+                        "ok": False,
+                        "reason": "single_flight_defer_exhausted",
+                        "exhaust_reason": _exhaust_reason,
+                        "batch_id": batch_id,
+                        "symbol": sym,
+                        "defer_count": defer_count,
+                        "defer_elapsed_s": _defer_elapsed_s,
+                        "defer_window_s": _defer_cfg.defer_window_seconds,
+                        "per_symbol_timeout_s": _defer_cfg.per_symbol_timeout_seconds,
+                    }
                     try:
-                        repo.mark_batch_symbol_completed(
-                            batch_id=batch_id, symbol=sym, failed=True,
-                        )
-                    except Exception:
-                        LOGGER.warning(
-                            "process_fair_batch: mark_batch_symbol_completed"
-                            "(defer_exhausted) failed batch=%s symbol=%s",
-                            batch_id, sym,
-                        )
-                    try:
-                        repo.finish_job(
-                            job_id,
+                        finished = repo.finish_claimed_batch_symbol(
+                            batch_id=batch_id,
+                            symbol=sym,
+                            job_id=job_id,
+                            claim_token=str(claim_token or ""),
                             result={
-                                "ok": False,
-                                "reason": "single_flight_defer_exhausted",
-                                "exhaust_reason": _exhaust_reason,
-                                "batch_id": batch_id,
-                                "symbol": sym,
-                                "defer_count": defer_count,
-                                "defer_elapsed_s": _defer_elapsed_s,
-                                "defer_window_s": _defer_cfg.defer_window_seconds,
-                                "per_symbol_timeout_s": _defer_cfg.per_symbol_timeout_seconds,
+                                **terminal_result,
                             },
                             error_message=(
                                 f"single_flight_defer_exhausted: "
@@ -902,18 +916,23 @@ def process_fair_batch(
                                 f"reason={_exhaust_reason}"
                             ),
                         )
+                        if not finished:
+                            raise _FairBatchOwnershipLost(
+                                "fair batch ownership lost before defer-exhausted commit"
+                            )
+                    except _FairBatchOwnershipLost:
+                        raise
                     except Exception:
-                        LOGGER.warning(
-                            "process_fair_batch: finish_job(defer_exhausted) "
+                        LOGGER.exception(
+                            "process_fair_batch: finish_claimed_batch_symbol"
+                            "(defer_exhausted) "
                             "failed batch=%s symbol=%s job_id=%s",
                             batch_id, sym, job_id,
                         )
+                        raise
                     defer_exhausted_symbols.append(sym)
                     failed_symbols.append(sym)
-                    per_symbol_results.append({
-                        "symbol": sym, "ok": False,
-                        "reason": "single_flight_defer_exhausted",
-                    })
+                    per_symbol_results.append(terminal_result)
                     continue
                 # Defer this tick's claim: CAS running->pending keyed on THIS
                 # worker's claim_token. Zero rows = claim-loss (another worker
@@ -973,6 +992,7 @@ def process_fair_batch(
                 # batch is NOT falsely completed while the symbol awaits
                 # re-claim (R3 §3.2.7). NO lease release here -- this tick never
                 # acquired the symbol's lease (the owning tick holds it).
+                repo.conn.commit()
                 continue
             if _skip_reason == "missing_snapshot":
                 # R3 §3.2 final paragraph: ``missing_snapshot`` is malformed
@@ -990,18 +1010,11 @@ def process_fair_batch(
                     sym, batch_id, job_id,
                 )
                 try:
-                    repo.mark_batch_symbol_completed(
-                        batch_id=batch_id, symbol=sym, failed=True,
-                    )
-                except Exception:
-                    LOGGER.warning(
-                        "process_fair_batch: mark_batch_symbol_completed"
-                        "(missing_snapshot) failed batch=%s symbol=%s",
-                        batch_id, sym,
-                    )
-                try:
-                    repo.finish_job(
-                        job_id,
+                    finished = repo.finish_claimed_batch_symbol(
+                        batch_id=batch_id,
+                        symbol=sym,
+                        job_id=job_id,
+                        claim_token=str(sym_meta["job"].get("claim_token") or ""),
                         result={
                             "ok": False,
                             "reason": "missing_snapshot",
@@ -1010,12 +1023,20 @@ def process_fair_batch(
                         },
                         error_message="missing_snapshot: malformed scheduled payload",
                     )
+                    if not finished:
+                        raise _FairBatchOwnershipLost(
+                            "fair batch ownership lost before missing-snapshot commit"
+                        )
+                except _FairBatchOwnershipLost:
+                    raise
                 except Exception:
-                    LOGGER.warning(
-                        "process_fair_batch: finish_job(missing_snapshot) "
+                    LOGGER.exception(
+                        "process_fair_batch: finish_claimed_batch_symbol"
+                        "(missing_snapshot) "
                         "failed batch=%s symbol=%s job_id=%s",
                         batch_id, sym, job_id,
                     )
+                    raise
                 failed_symbols.append(sym)
                 per_symbol_results.append({
                     "symbol": sym, "ok": False, "reason": "missing_snapshot",
@@ -1036,13 +1057,6 @@ def process_fair_batch(
                     preset_llm_candidate=preset_candidate,
                     preset_llm_attempt_meta=preset_attempt_meta,
                 )
-                try:
-                    repo.mark_batch_symbol_completed(batch_id=batch_id, symbol=sym)
-                except Exception:
-                    LOGGER.warning(
-                        "process_fair_batch: mark_batch_symbol_completed failed "
-                        "batch=%s symbol=%s", batch_id, sym,
-                    )
                 _post_decision_effects(
                     repo, decision, payload,
                     send_message=send_message, job_id=sym_meta["job"].get("id"),
@@ -1058,32 +1072,26 @@ def process_fair_batch(
                 # per-job success/failed; we call it here per-symbol so the job
                 # row's status reflects THIS symbol's outcome. The uniform loop
                 # in ``run_once`` is removed (it would double-finish + mislabel).
-                try:
-                    repo.finish_job(
-                        int(sym_meta["job"].get("id")),
-                        result=per_symbol_results[-1],
-                    )
-                except Exception:
-                    LOGGER.warning(
-                        "process_fair_batch: finish_job(success) failed "
-                        "batch=%s symbol=%s job_id=%s",
-                        batch_id, sym, sym_meta["job"].get("id"),
+                completed = repo.finish_claimed_batch_symbol(
+                    batch_id=batch_id,
+                    symbol=sym,
+                    job_id=int(sym_meta["job"].get("id")),
+                    claim_token=str(sym_meta["job"].get("claim_token") or ""),
+                    result=per_symbol_results[-1],
+                )
+                if not completed:
+                    repo.conn.rollback()
+                    raise _FairBatchOwnershipLost(
+                        "fair batch ownership lost before symbol commit"
                     )
             except Exception as sym_exc:
+                if isinstance(sym_exc, _FairBatchOwnershipLost):
+                    raise
                 LOGGER.exception(
                     "process_fair_batch: analyze_symbol failed batch=%s symbol=%s",
                     batch_id, sym,
                 )
                 failed_symbols.append(sym)
-                try:
-                    repo.mark_batch_symbol_completed(
-                        batch_id=batch_id, symbol=sym, failed=True,
-                    )
-                except Exception:
-                    LOGGER.warning(
-                        "process_fair_batch: failed-mark_batch_symbol_completed "
-                        "failed batch=%s symbol=%s", batch_id, sym,
-                    )
                 per_symbol_results.append(
                     {"symbol": sym, "ok": False, "error": str(sym_exc)},
                 )
@@ -1093,12 +1101,22 @@ def process_fair_batch(
                 # ``finish_job(result=<batch result>)`` (no error_message ->
                 # status='success'), mislabeling the failed symbol.
                 try:
-                    repo.finish_job(
-                        int(sym_meta["job"].get("id")),
+                    failed_written = repo.finish_claimed_batch_symbol(
+                        batch_id=batch_id,
+                        symbol=sym,
+                        job_id=int(sym_meta["job"].get("id")),
+                        claim_token=str(sym_meta["job"].get("claim_token") or ""),
                         result=per_symbol_results[-1],
                         error_message=str(sym_exc)[:500],
                     )
-                except Exception:
+                    if not failed_written:
+                        repo.conn.rollback()
+                        raise _FairBatchOwnershipLost(
+                            "fair batch ownership lost before failure commit"
+                        )
+                except Exception as finish_exc:
+                    if isinstance(finish_exc, _FairBatchOwnershipLost):
+                        raise
                     LOGGER.warning(
                         "process_fair_batch: finish_job(failed) failed "
                         "batch=%s symbol=%s job_id=%s",
@@ -1129,6 +1147,7 @@ def process_fair_batch(
                         )
                     else:
                         _released_symbols.add(sym)
+                repo.conn.commit()
     finally:
         # Safety net: release any acquired symbol NOT already released (e.g. an
         # unexpected exception skipped its per-symbol finally). Idempotent --
@@ -1207,7 +1226,7 @@ def process_fair_batch(
 
 
 def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
-    payload = json.loads(job["payload_json"])
+    payload = _decode_json(job["payload_json"], {})
     job_type = job["job_type"]
     LOGGER.info("process_job start id=%s type=%s priority=%s session=%s", job.get("id"), job_type, job.get("priority"), job.get("session_id"))
     if job_type == "feishu_user_message":
@@ -1472,7 +1491,7 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
             # Mark pushed_to_feishu on successful send
             if sent_result.get("sent") and review_date:
                 repo.conn.execute(
-                    "UPDATE daily_review_reports SET pushed_to_feishu=1 WHERE review_date=?",
+                    "UPDATE daily_review_reports SET pushed_to_feishu=1 WHERE review_date=%s",
                     (review_date,),
                 )
         else:
@@ -1657,7 +1676,7 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
                 }
         else:
             signal = repo.get_signal(int(signal_id)) if signal_id else None
-            watch = json.loads(signal.get("opportunity_watch_json") or "{}") if signal else {}
+            watch = _decode_json(signal.get("opportunity_watch_json"), {}) if signal else {}
             if not signal:
                 result = {"ok": False, "error": "该 signal 不存在"}
             elif str(signal.get("signal_grade") or "D").upper() in {"D", "C"}:
@@ -1687,7 +1706,7 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
         else:
             # Find strategy name from strategy_versions
             row = repo.conn.execute(
-                "SELECT strategy_name FROM strategy_versions WHERE version=?",
+                "SELECT strategy_name FROM strategy_versions WHERE version=%s",
                 (candidate_version,)
             ).fetchone()
             strategy_name = row["strategy_name"] if row else "smc_pullback_long"
@@ -1704,36 +1723,38 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
             # Only update trigger and patches if promotion succeeded
             if result.get("ok"):
                 # Update trigger resolved_at
-                repo.conn.execute(
-                    "UPDATE evolution_triggers SET resolved_at=datetime('now'), status='active' WHERE id IN "
-                    "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-                    (candidate_version,)
-                )
-                repo.conn.execute(
-                    "UPDATE strategy_patches SET status='active' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate', 'active')",
-                    (candidate_version,)
-                )
-                repo.conn.commit()
+                # 07-16 cutover: datetime('now')->NOW(), ?->%s, self-wrap transaction.
+                with repo.conn.transaction():
+                    repo.conn.execute(
+                        "UPDATE evolution_triggers SET resolved_at=NOW(), status='active' WHERE id IN "
+                        "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                        (candidate_version,)
+                    )
+                    repo.conn.execute(
+                        "UPDATE strategy_patches SET status='active' WHERE candidate_version=%s AND status NOT IN ('rejected', 'duplicate', 'active')",
+                        (candidate_version,)
+                    )
     elif action == "reject_evolution":
         candidate_version = payload.get("candidate_version")
         if not candidate_version:
             result = {"ok": False, "error": "missing candidate_version"}
         else:
             # Update all 3 tables to rejected
-            repo.conn.execute(
-                "UPDATE strategy_versions SET status='rejected', change_reason='manual reject from Feishu' WHERE version=?",
-                (candidate_version,)
-            )
-            repo.conn.execute(
-                "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=? AND status NOT IN ('rejected', 'duplicate')",
-                (candidate_version,)
-            )
-            repo.conn.execute(
-                "UPDATE evolution_triggers SET status='rejected', resolved_at=datetime('now') WHERE id IN "
-                "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=? AND trigger_id IS NOT NULL)",
-                (candidate_version,)
-            )
-            repo.conn.commit()
+            # 07-16 cutover: ?->%s, self-wrap transaction.
+            with repo.conn.transaction():
+                repo.conn.execute(
+                    "UPDATE strategy_versions SET status='rejected', change_reason='manual reject from Feishu' WHERE version=%s",
+                    (candidate_version,)
+                )
+                repo.conn.execute(
+                    "UPDATE strategy_patches SET status='rejected' WHERE candidate_version=%s AND status NOT IN ('rejected', 'duplicate')",
+                    (candidate_version,)
+                )
+                repo.conn.execute(
+                    "UPDATE evolution_triggers SET status='rejected', resolved_at=NOW() WHERE id IN "
+                    "(SELECT trigger_id FROM strategy_patches WHERE candidate_version=%s AND trigger_id IS NOT NULL)",
+                    (candidate_version,)
+                )
             result = {"ok": True, "action": "reject_evolution", "candidate_version": candidate_version}
     else:
         result = {"ok": False, "error": f"未知按钮动作: {action}"}
@@ -1804,7 +1825,7 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         order_id = payload.get("order_id")
         if order_id:
             try:
-                order_row = repo.conn.execute("SELECT entry_price, stop_loss FROM paper_orders WHERE id=?", (int(order_id),)).fetchone()
+                order_row = repo.conn.execute("SELECT entry_price, stop_loss FROM paper_orders WHERE id=%s", (int(order_id),)).fetchone()
                 if order_row:
                     entry = float(order_row["entry_price"] or 0)
                     stop = float(order_row["stop_loss"] or 0)
@@ -2105,7 +2126,7 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
                           AVG(CASE WHEN pnl_r IS NOT NULL AND outcome_source='real_pnl' THEN pnl_r END) as avg_r,
                           AVG(CASE WHEN pnl_r IS NULL OR outcome_source IS NULL OR outcome_source!='real_pnl' THEN (score - 0.5) * 2 END) as pseudo_avg_r
                    FROM strategy_evaluations
-                   WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND ga_decision_id IS NOT NULL""",
+                   WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE AND ga_decision_id IS NOT NULL""",
                 (strategy_name, candidate_version),
             ).fetchone()
 
@@ -2118,7 +2139,7 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
             if real_count >= 5:
                 win_row = repo.conn.execute(
                     """SELECT COUNT(*) as wins FROM strategy_evaluations
-                       WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
+                       WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE AND pnl_r IS NOT NULL AND outcome_source='real_pnl' AND pnl_r > 0.005""",
                     (strategy_name, candidate_version),
                 ).fetchone()
                 wins = int(win_row["wins"]) if win_row else 0
@@ -2172,7 +2193,7 @@ def _build_evolution_status_text(repo: CryptoGuardRepository) -> str:
 
             # Last shadow sample time
             last_eval = repo.conn.execute(
-                "SELECT created_at FROM strategy_evaluations WHERE strategy_name=? AND strategy_version=? AND is_shadow=1 ORDER BY created_at DESC LIMIT 1",
+                "SELECT created_at FROM strategy_evaluations WHERE strategy_name=%s AND strategy_version=%s AND is_shadow=TRUE ORDER BY created_at DESC LIMIT 1",
                 (strategy_name, candidate_version),
             ).fetchone()
             if last_eval:
@@ -2212,16 +2233,14 @@ def _parse_json_list(val: Any) -> list:
 
 def _get_backtest_status(repo: CryptoGuardRepository, candidate_version: str) -> dict[str, Any]:
     """Get backtest result for a candidate version."""
-    import json
     row = repo.conn.execute(
-        "SELECT backtest_result_json FROM strategy_patches WHERE candidate_version=? AND backtest_result_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        "SELECT backtest_result_json FROM strategy_patches WHERE candidate_version=%s AND backtest_result_json IS NOT NULL ORDER BY id DESC LIMIT 1",
         (candidate_version,)
     ).fetchone()
     if row and row["backtest_result_json"]:
-        try:
-            return json.loads(row["backtest_result_json"])
-        except Exception:
-            pass
+        bt = _decode_json(row["backtest_result_json"], None)
+        if isinstance(bt, dict):
+            return bt
     return {"status": "unknown", "skipped": True, "reason": "no_backtest_data"}
 
 
@@ -2230,11 +2249,15 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
     import json
     from plugins.crypto_guard.notify.time_utils import format_event_time_cst_for_line
 
-    # Cleanup old text-type evolution_review alerts (should be interactive)
-    repo.conn.execute(
-        "UPDATE alert_outbox SET status='superseded' WHERE alert_type='evolution_review' AND payload_json LIKE '%\"msg_type\": \"text\"%' AND status IN ('pending', 'sent')"
-    )
-    repo.conn.commit()
+    # Cleanup old text-type evolution_review alerts (should be interactive).
+    # 07-16 cutover: literal % in LIKE -> %%; ``payload_json`` is ``jsonb`` and PG
+    # has no ``~~`` (LIKE) operator for jsonb, so cast to text first to preserve
+    # the SQLite-era substring match on the JSON text representation; self-wrap
+    # transaction.
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE alert_outbox SET status='superseded' WHERE alert_type='evolution_review' AND payload_json::text LIKE '%%\"msg_type\": \"text\"%%' AND status IN ('pending', 'sent')"
+        )
 
     target = resolve_report_target(repo, payload)
     trigger_type = payload.get("trigger_type", "unknown")
@@ -2351,16 +2374,33 @@ def handle_evolution_trigger_alert(repo: CryptoGuardRepository, payload: dict[st
 def run_once(*, user_only: bool = False, background: bool = False, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PostgreSQL writes commit in short repository transactions. In
+    # particular, the fair-batch path closes any implicit read transaction
+    # before the provider call, heartbeats ownership on both sides of that
+    # call, and CAS-finalizes each symbol independently.
+    with _pg_get_conn() as conn:
         repo = CryptoGuardRepository(conn)
-        redis = RedisAdapter() if should_use_redis_for_path(cfg.database_path) else None
+        # 07-16 cutover: Redis eligibility no longer depends on the (removed)
+        # SQLite file path. PostgreSQL is a single shared durable DB, so Redis
+        # is always eligible unless explicitly disabled via env
+        # (``should_use_redis_for_path(None)`` encodes the production case in the
+        # adapter -- matches feishu_integration.py / repository.py).
+        redis = RedisAdapter() if should_use_redis_for_path(None) else None
         redis_payload = (redis.pop_user_job() if user_only else (redis.pop_background_job() if background else None)) if redis else None
-        if redis_payload and redis_payload.get("database_path"):
-            db_row = conn.execute("PRAGMA database_list").fetchone()
-            current_db = db_row["file"] if db_row and "file" in db_row.keys() else None
-            if current_db and str(redis_payload.get("database_path")) != str(current_db):
-                redis_payload = None
+        # 07-16 cutover: Redis is an acceleration channel ONLY. The PostgreSQL
+        # ``agent_jobs`` table is the single authoritative job source. The legacy
+        # SQLite cross-file mismatch guard (``PRAGMA database_list`` vs
+        # ``redis_payload['database_path']``) was removed with the cutover --
+        # PostgreSQL is one shared durable DB with no file path, so there is no
+        # cross-SQLite-file identity check of any kind on this path. The Redis
+        # payload's legacy ``database_path`` field is carried for backward
+        # compatibility and does NOT participate in any PostgreSQL identity
+        # decision. The consumer-side defenses that remain are: (1) the
+        # job-type gate below (``scheduled_market_analysis`` must NOT run via the
+        # Redis single-job path) and (2) ``claim_job_by_id_cas``, which is the
+        # database-ownership gate for an ordinary Redis job (it rechecks id +
+        # status + scheduled_at<=NOW() against PostgreSQL before the row may
+        # flip to running).
         # 07-10 P1-4 (terminal review): consumer-side guard. The S2 producer
         # guard (``_enqueue_job_redis``) already keeps
         # ``scheduled_market_analysis`` out of the Redis queue, so a popped
@@ -2369,32 +2409,32 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
         # ``enqueue_job``/``_enqueue_job_redis``, or a manual RPUSH). Without
         # this guard, ``run_once`` would execute it as a SINGLE serial
         # ``process_job`` here -> bypassing ``claim_next_batch`` and the fair
-        # batch entirely (the known LLM starvation path), and the SQLite row
+        # batch entirely (the known LLM starvation path), and the PostgreSQL row
         # (the sole authority) would never be claimed by the batch coordinator.
         # Defense in depth: drop the Redis payload (do NOT claim its
-        # ``sqlite_job_id`` here -- the row stays ``status='pending'`` so
+        # ``db_job_id`` here -- the row stays ``status='pending'`` so
         # ``claim_next_batch`` can claim the whole batch together below) and
         # fall through to the fair-pool path. We MUST NOT execute it serially,
-        # even if Redis says so. The ``database_path`` mismatch check above
-        # already ran; this is a job-type gate independent of which DB the item
-        # came from.
+        # even if Redis says so. This is a job-type gate only; no
+        # ``database_path`` mismatch check exists on the PostgreSQL path (the
+        # legacy SQLite file check was removed by the cutover).
         if redis_payload and redis_payload.get("job_type") == "scheduled_market_analysis":
             LOGGER.warning(
                 "run_once: Redis popped a scheduled_market_analysis payload "
-                "(job_type=%s sqlite_job_id=%s) -- the S2 producer guard should "
+                "(job_type=%s db_job_id=%s) -- the S2 producer guard should "
                 "have kept this out of Redis. Dropping the Redis item and "
                 "re-routing to the fair-pool batch path (claim_next_batch); the "
-                "SQLite row is the sole authority and stays pending for the "
+                "PostgreSQL row is the sole authority and stays pending for the "
                 "batch coordinator to claim as a group. NOT executing it as a "
                 "single serial job (would bypass the fair batch / starve LLM).",
-                redis_payload.get("job_type"), redis_payload.get("sqlite_job_id"),
+                redis_payload.get("job_type"), redis_payload.get("db_job_id"),
             )
             redis_payload = None
         if redis_payload:
             payload = redis_payload.get("payload") or {}
-            sqlite_job_id = redis_payload.get("sqlite_job_id")
-            if sqlite_job_id:
-                # 07-13 R6-C (P0-2): Redis is an acceleration channel; SQLite is
+            db_job_id = redis_payload.get("db_job_id")
+            if db_job_id:
+                # Redis is an acceleration channel; PostgreSQL is
                 # the sole ownership authority. The consumer MUST recheck
                 # scheduled_at before flipping a row to running -- evidence §3.3
                 # showed a future-scheduled Redis payload (report retry with
@@ -2402,9 +2442,9 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                 # a nominal 300s wait in ~20s. claim_job_by_id_cas verifies
                 # id + status='pending' + datetime(scheduled_at)<=datetime('now')
                 # in ONE statement; a future or stale/duplicate payload fails
-                # closed (0 rows) and the row stays pending for the SQLite path.
+                # closed (0 rows) and the row stays pending for the database path.
                 claimed = repo.claim_job_by_id_cas(
-                    job_id=int(sqlite_job_id), expected_status="pending",
+                    job_id=int(db_job_id), expected_status="pending",
                 )
                 if not claimed:
                     redis_payload = None
@@ -2414,9 +2454,9 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                     return {"ok": True, "processed": False, "reason": "redis_payload_stale"}
                 result = process_job(repo, job, send_message=send_message)
                 repo.finish_job(job["id"], result=result)
-                return {"ok": True, "processed": True, "job_id": job["id"], "result": result, "queue": "sqlite_after_stale_redis"}
+                return {"ok": True, "processed": True, "job_id": job["id"], "result": result, "queue": "postgres_after_stale_redis"}
             job = {
-                "id": sqlite_job_id or redis_payload.get("redis_job_id") or "redis",
+                "id": db_job_id or redis_payload.get("redis_job_id") or "redis",
                 "job_type": redis_payload.get("job_type"),
                 "priority": redis_payload.get("priority", 1),
                 "source": redis_payload.get("source", "redis"),
@@ -2425,12 +2465,26 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
             }
             try:
                 result = process_job(repo, job, send_message=send_message)
-                if sqlite_job_id:
-                    repo.finish_job(int(sqlite_job_id), result=result)
+                if db_job_id:
+                    repo.finish_job(int(db_job_id), result=result)
                 return {"ok": True, "processed": True, "job_id": job["id"], "result": result, "queue": "redis"}
             except Exception as exc:
-                if sqlite_job_id:
-                    repo.finish_job(int(sqlite_job_id), error_message=str(exc))
+                if db_job_id:
+                    repo.finish_job(int(db_job_id), error_message=str(exc))
+                # Persist the failure-side finish_job before re-raising: the
+                # outer ``transaction()`` rolls back on the propagating
+                # exception, which would otherwise discard this savepointed
+                # write (the same discard bug ``transaction()`` fixes for the
+                # clean path). Commit if the txn is still usable; if it was
+                # aborted by the underlying error, rollback so the job is
+                # retried instead of wedged.
+                try:
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 raise
         # 07-10 R5-2: fair-pool dispatch. When the configured LLM scheduling
         # mode is ``fair_pool`` and this is a background worker (not a user-
@@ -2469,7 +2523,7 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                     except Exception as exc:
                         LOGGER.exception(
                             "process_fair_batch failed batch_id=%s",
-                            (json.loads(batch_jobs[0]["payload_json"]) if batch_jobs else {}).get("batch_id"),
+                            (_decode_json(batch_jobs[0]["payload_json"], {}) if batch_jobs else {}).get("batch_id"),
                         )
                         # 07-10 S6 (P1 #6): a whole-batch exception means
                         # ``process_fair_batch`` raised BEFORE or AFTER the
@@ -2483,13 +2537,29 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
                             try:
                                 _jid = int(j["id"])
                                 _cur = repo.conn.execute(
-                                    "SELECT status FROM agent_jobs WHERE id=?",
+                                    "SELECT status FROM agent_jobs WHERE id=%s",
                                     (_jid,),
                                 ).fetchone()
                                 _cur_status = _cur["status"] if _cur else None
                                 if _cur_status in ("success", "failed"):
                                     continue  # already finished per-symbol
-                                repo.finish_job(_jid, error_message=str(exc))
+                                repo.finish_job(
+                                    _jid,
+                                    error_message=str(exc),
+                                    claim_token=str(j.get("claim_token") or ""),
+                                )
+                            except Exception:
+                                pass
+                        # Persist the still-running->failed cleanup marks before
+                        # re-raising (see the redis-path sibling above): without
+                        # this commit the outer ``transaction()`` rollback would
+                        # discard them and the jobs would be wedged in the
+                        # (rolled-back) claim state.
+                        try:
+                            conn.commit()
+                        except Exception:
+                            try:
+                                conn.rollback()
                             except Exception:
                                 pass
                         raise
@@ -2519,9 +2589,16 @@ def run_once(*, user_only: bool = False, background: bool = False, send_message:
             LOGGER.exception("process_job failed id=%s type=%s", job.get("id"), job.get("job_type"))
             _send_job_error_to_user(repo, job, exc, send_message)
             repo.finish_job(job["id"], error_message=str(exc))
+            # Persist the failure-side finish_job before re-raising (same
+            # reason as the redis and fair-batch sibling blocks above).
+            try:
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise
-    finally:
-        conn.close()
 
 
 def run_loop(*, user_only: bool = False, background: bool = False, sleep_seconds: float = 1.0) -> None:
@@ -2589,7 +2666,7 @@ def _send_job_error_to_user(repo: CryptoGuardRepository, job: dict[str, Any], ex
     if not send_message:
         return
     try:
-        payload = json.loads(job.get("payload_json") or "{}")
+        payload = _decode_json(job.get("payload_json"), {})
         receive_id = payload.get("receive_id")
         if not receive_id:
             return
@@ -2618,7 +2695,7 @@ def _send_interactive_alert(
     quiet_cfg = ((load_config().trading_mode.get("feishu") or {}).get("quiet_period") or {})
     quiet_minutes = int(quiet_cfg.get("normal_duplicate_alert_minutes", 5))
     never_silence = set(quiet_cfg.get("never_silence") or [])
-    redis = RedisAdapter() if should_use_redis_for_path(load_config().database_path) else None
+    redis = RedisAdapter() if should_use_redis_for_path(None) else None
     redis_quiet_symbol = symbol or "-"
     if alert_type not in never_silence and redis and redis.is_quiet(redis_quiet_symbol, alert_type):
         return {"ok": True, "sent": False, "silenced": True, "source": "redis_quiet"}
@@ -2711,11 +2788,12 @@ def _ensure_ga_decision_for_watch_signal(repo: CryptoGuardRepository, signal: di
     )
     ga_decision_id = repo.create_ga_decision(ga_decision)
     legacy["ga_decision_id"] = ga_decision_id
-    repo.conn.execute(
-        "UPDATE signals SET ga_decision_id=?, ga_decision_json=? WHERE id=?",
-        (ga_decision_id, json.dumps(legacy, ensure_ascii=False), int(signal["id"])),
-    )
-    repo.conn.commit()
+    # 07-16 cutover: UPDATE self-wraps in a transaction (writes self-commit).
+    with repo.conn.transaction():
+        repo.conn.execute(
+            "UPDATE signals SET ga_decision_id=%s, ga_decision_json=%s WHERE id=%s",
+            (ga_decision_id, json.dumps(legacy, ensure_ascii=False), int(signal["id"])),
+        )
     return int(ga_decision_id)
 
 

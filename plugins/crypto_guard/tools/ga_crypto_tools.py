@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.data.candle_store import fetch_and_upsert_closed_klines
@@ -20,18 +21,35 @@ from plugins.crypto_guard.scheduler.opportunity_watcher import update_opportunit
 from plugins.crypto_guard.strategy.version_manager import list_strategy_versions
 from plugins.crypto_guard.strategy.shadow_testing import run_shadow_test
 from plugins.crypto_guard.strategy.self_evolution import run_self_evolution_cycle
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.tools.status_tools import crypto_list_recent_errors as _crypto_list_recent_errors, crypto_system_status as _crypto_system_status, render_system_status_text
 from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
 
 
-def _repo() -> tuple[Any, CryptoGuardRepository]:
+@contextmanager
+def _repo() -> Iterator[tuple[Any, CryptoGuardRepository]]:
+    """Yield a (pooled-connection, repository) pair.
+
+    PG cutover: the connection is borrowed from the pool (``pg_db.get_conn``)
+    and returned on CM exit - callers must NOT ``close()`` it (closing a pooled
+    connection physically destroys it rather than returning it to the pool, which
+    would leak). Every repo write self-wraps ``conn.transaction()``, so no manual
+    commit is needed here.
+
+    07-16 cutover: the whole tool body is wrapped in one explicit top-level
+    transaction. Repository write scopes become savepoints within it, so all
+    tool effects commit together on success and roll back together on error.
+    ``pg_db.get_conn()`` also closes any clean pending transaction at its outer
+    boundary, but this explicit wrapper is still required for tool-level
+    atomicity rather than persistence by statement order.
+    """
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    return conn, CryptoGuardRepository(conn)
+    with pg_db.get_conn() as conn:
+        with conn.transaction():
+            yield conn, CryptoGuardRepository(conn)
 
 
 def crypto_init() -> dict[str, Any]:
@@ -39,51 +57,35 @@ def crypto_init() -> dict[str, Any]:
 
 
 def crypto_symbol_add(symbol: str, category: str = "custom", timeframes: list[str] | None = None, enabled: bool = True) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         result = add_symbol(repo, symbol, category=category, timeframes=timeframes, validate=True)
         if result.get("ok") and not enabled:
             pause_symbol(repo, result["symbol"])
         return result
-    finally:
-        conn.close()
 
 
 def crypto_symbol_remove(symbol: str) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return remove_symbol(repo, symbol)
-    finally:
-        conn.close()
 
 
 def crypto_symbol_pause(symbol: str) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return pause_symbol(repo, symbol)
-    finally:
-        conn.close()
 
 
 def crypto_symbol_resume(symbol: str) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return resume_symbol(repo, symbol)
-    finally:
-        conn.close()
 
 
 def crypto_symbol_list() -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return list_symbols(repo)
-    finally:
-        conn.close()
 
 
 def crypto_analyze_symbol_once(symbol: str, timeframes: list[str] | None = None, requested_by: str | None = None, request_text: str = "") -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         symbol = normalize_symbol(symbol)
         tfs = timeframes or DEFAULT_TIMEFRAMES
         analysis_time = latest_closed_close_time_ms("15m", utc_ms())
@@ -144,90 +146,63 @@ def crypto_analyze_symbol_once(symbol: str, timeframes: list[str] | None = None,
             "card_json": build_analysis_card_json(decision, signal_id=signal_id),
             "text": render_text(decision, signal_id=signal_id),
         }
-    finally:
-        conn.close()
 
 
 def crypto_create_opportunity_watch(symbol: str, watch_condition: dict[str, Any], expire_minutes: int = 240, signal_id: int | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return {
             "ok": False,
             "error": "机会监控必须由 GA decision 的飞书按钮确认创建，工具层不能直接创建。",
             "symbol": normalize_symbol(symbol),
             "signal_id": signal_id,
         }
-    finally:
-        conn.close()
 
 
 def crypto_update_opportunity_watches(analysis_time_utc: int | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return update_opportunity_watches(repo, analysis_time_utc=analysis_time_utc)
-    finally:
-        conn.close()
 
 
 def crypto_create_paper_order_from_signal(signal_id: int) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return create_paper_order_from_signal(repo, int(signal_id))
-    finally:
-        conn.close()
 
 
 def crypto_get_market_state(symbol: str, timeframes: list[str] | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         symbol = normalize_symbol(symbol)
         analysis_time = latest_closed_close_time_ms("15m", utc_ms())
         snapshot = build_market_state_snapshot(repo, symbol=symbol, analysis_time_utc=analysis_time, mode="ad_hoc", timeframes=timeframes or DEFAULT_TIMEFRAMES)
         return {"ok": True, "snapshot": snapshot}
-    finally:
-        conn.close()
 
 
 def crypto_get_closed_candles(symbol: str, interval: str, analysis_time_utc: int, limit: int = 200) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         symbol = normalize_symbol(symbol)
         return repo.no_lookahead_candles(symbol, interval, analysis_time_utc=int(analysis_time_utc), limit=limit)
-    finally:
-        conn.close()
 
 
 def crypto_get_open_paper_positions() -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return {"ok": True, "orders": repo.list_open_paper_orders()}
-    finally:
-        conn.close()
 
 
 def crypto_review_trade(trade_id: int) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return review_trade(repo, int(trade_id))
-    finally:
-        conn.close()
 
 
 def crypto_daily_review(day_utc: str | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return run_daily_review(repo, day_utc=day_utc)
-    finally:
-        conn.close()
 
 
 def crypto_paper_positions(limit: int = 20, symbol: str | None = None, status: str | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         conditions = []
         params: list[Any] = []
         if symbol:
-            conditions.append("t.symbol=?")
+            conditions.append("t.symbol=%s")
             params.append(symbol)
         if status == "open":
             conditions.append("t.exit_price IS NULL")
@@ -242,7 +217,7 @@ def crypto_paper_positions(limit: int = 20, symbol: str | None = None, status: s
             LEFT JOIN paper_orders o ON t.order_id = o.id
             {where}
             ORDER BY t.id DESC
-            LIMIT ?
+            LIMIT %s
         """
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
@@ -374,24 +349,16 @@ def crypto_paper_positions(limit: int = 20, symbol: str | None = None, status: s
         lines.append("")
         lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
         return {"ok": True, "trades": trades, "text": "\n".join(lines), "total": total, "wins": wins, "losses": losses, "total_pnl": total_pnl, "total_pnl_r": total_pnl_r}
-    finally:
-        conn.close()
 
 
 def crypto_list_strategy_versions(strategy_name: str | None = None) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return list_strategy_versions(repo, strategy_name)
-    finally:
-        conn.close()
 
 
 def crypto_run_shadow_test(strategy_name: str, candidate_version: str, min_samples: int = 30) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return run_shadow_test(repo, strategy_name=strategy_name, candidate_version=candidate_version, min_samples=min_samples)
-    finally:
-        conn.close()
 
 
 def crypto_run_historical_replay(
@@ -403,8 +370,7 @@ def crypto_run_historical_replay(
     strategy_versions: list[str] | None = None,
     export_path: str | None = None,
 ) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         symbol = normalize_symbol(symbol)
         return run_historical_replay(
             repo,
@@ -416,13 +382,10 @@ def crypto_run_historical_replay(
             strategy_versions=strategy_versions,
             export_path=export_path,
         )
-    finally:
-        conn.close()
 
 
 def crypto_run_self_evolution(strategy_name: str = "smc_pullback_long", min_reviews: int = 5, min_symbols: int = 2, min_shadow_samples: int = 30) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         return run_self_evolution_cycle(
             repo,
             strategy_name=strategy_name,
@@ -431,13 +394,10 @@ def crypto_run_self_evolution(strategy_name: str = "smc_pullback_long", min_revi
             min_shadow_samples=min_shadow_samples,
             allow_auto_promote=False,
         )
-    finally:
-        conn.close()
 
 
 def crypto_request_config_update(config_key: str, new_value: Any, requested_by: str | None = None, request_text: str = "") -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         change_id = repo.request_config_hot_reload(
             config_key=config_key,
             new_value=new_value,
@@ -451,19 +411,14 @@ def crypto_request_config_update(config_key: str, new_value: Any, requested_by: 
             "confirmation_required": True,
             "text": f"这是关键参数修改，请回复“确认 {change_id}”以执行：{config_key} -> {new_value}",
         }
-    finally:
-        conn.close()
 
 
 def crypto_confirm_config_update(change_id: int) -> dict[str, Any]:
-    conn, repo = _repo()
-    try:
+    with _repo() as (conn, repo):
         result = repo.confirm_config_hot_reload(int(change_id))
         if result.get("ok"):
             result["text"] = "配置热更新已执行，并已写入审计表。\n" + result.get("audit_summary", "")
         return result
-    finally:
-        conn.close()
 
 
 def crypto_list_recent_errors(limit: int = 20) -> dict[str, Any]:

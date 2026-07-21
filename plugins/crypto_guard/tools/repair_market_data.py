@@ -26,8 +26,9 @@ from plugins.crypto_guard.config.loader import CryptoGuardConfig, load_config
 from plugins.crypto_guard.data.candle_backfill import backfill_symbol_interval, compute_missing_ranges
 from plugins.crypto_guard.data.market_data_health import assess_health
 from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+from plugins.crypto_guard.storage import pg_db
+from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.utils import INTERVAL_MS, latest_closed_close_time_ms, utc_ms
 
 
@@ -79,8 +80,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: failed to load config: {exc}", file=sys.stderr)
         return 1
 
-    conn = connect_db(cfg.database_path)
-    try:
+    initialize_database(cfg)
+    # PG cutover: pooled connection (auto-returned). Every repo write self-wraps
+    # ``conn.transaction()``, so no manual commit/close is needed here.
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
 
         # Resolve symbols and intervals.
@@ -103,8 +106,6 @@ def main(argv: list[str] | None = None) -> int:
         if is_dry_run:
             return _print_gap_report(repo, cfg, symbols, intervals, analysis_times)
         return _execute_backfill(repo, cfg, symbols, intervals, analysis_times, resume=bool(args.resume))
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

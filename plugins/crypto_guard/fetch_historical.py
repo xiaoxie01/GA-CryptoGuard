@@ -1,4 +1,4 @@
-"""Fetch historical klines from Binance Futures API and persist to SQLite + Parquet.
+"""Fetch historical klines from Binance Futures API and persist to PostgreSQL + Parquet.
 
 Usage:
     python -m plugins.crypto_guard.fetch_historical
@@ -15,9 +15,9 @@ from typing import Any
 
 from plugins.crypto_guard.data.binance_rest import fetch_klines, normalize_symbol
 from plugins.crypto_guard.logging_utils import get_logger
+from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.parquet_archive import ParquetKlineArchive
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
-from plugins.crypto_guard.storage.sqlite_db import connect_db
 from plugins.crypto_guard.utils import INTERVAL_MS, utc_ms
 
 LOGGER = get_logger("crypto_guard.fetch_historical")
@@ -113,7 +113,7 @@ def fetch_and_persist_historical(
 ) -> dict[str, Any]:
     """Fetch historical klines for all configured symbols/timeframes.
 
-    Persists to SQLite via repo.upsert_candles() and archives to Parquet.
+    Persists to PostgreSQL via repo.upsert_candles() and archives to Parquet.
     """
     if archive is None:
         archive = ParquetKlineArchive()
@@ -148,7 +148,7 @@ def fetch_and_persist_historical(
                 })
                 continue
 
-            # Historical data goes to Parquet only (not SQLite) to avoid DB bloat
+            # Historical data goes to Parquet only (not the OLTP DB) to avoid DB bloat
             archive_result = archive.write_closed_klines(candles, repo=repo)
             parquet_ok = archive_result.get("ok", False)
             written = archive_result.get("closed_rows", len(candles))
@@ -181,8 +181,9 @@ def main() -> None:
 
     cfg = load_config()
     initialize_database(cfg)
-    conn = connect_db(cfg.database_path)
-    try:
+    # PG cutover: pooled connection (auto-returned; every repo write self-wraps
+    # ``conn.transaction()``).
+    with pg_db.get_conn() as conn:
         repo = CryptoGuardRepository(conn)
         archive = ParquetKlineArchive()
 
@@ -202,8 +203,6 @@ def main() -> None:
             print(f"  {r['symbol']:>10} {r['interval']:>4}  {r['candles']:>6} candles  [{status_marker}] [{parquet_marker}]")
 
         print(f"\nTotal: {result['total_candles']} candles")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":
