@@ -192,15 +192,22 @@ def classify_command(command: str) -> set[str]:
     if persistent_database_env:
         operations.add("service-control")
 
-    # Match Windows PostgreSQL service names (postgresql-x64-17) and bare
-    # postgres/postgresql process/service tokens, but never the URI scheme
-    # ``postgresql://`` used in process-scoped DSN injection.
+    # Match Windows PostgreSQL service names (postgresql-x64-17) and the
+    # fsapp/hub launchers. The bare ``postgres``/``postgresql`` token is NOT
+    # a service target here: inside an inline ``python -c`` admin command it
+    # is a psycopg connection user (``user='postgres'``), not a Windows
+    # service. A bare service name only counts under an explicit
+    # service-manager verb or ``Start-Process`` (see ``postgres_service_name``
+    # below). The URI scheme ``postgresql://`` is never a service target.
     service_target = bool(
         re.search(
             r"\b(frontends[./\\])?(fsapp(?:\.py)?|hub(?:\.pyw)?|"
-            r"postgresql-x64-\d+|postgres(?:ql)?(?!://))\b",
+            r"postgresql-x64-\d+)\b",
             lower,
         )
+    )
+    postgres_service_name = bool(
+        re.search(r"\bpostgres(?:ql)?(?!://)\b", lower)
     )
     service_start = bool(
         re.search(
@@ -214,7 +221,15 @@ def classify_command(command: str) -> set[str]:
         or re.search(r"\bnet(?:\.exe)?\s+(?:start|stop)\b", lower)
         or re.search(r"\bsc(?:\.exe)?\s+(?:start|stop)\b", lower)
     )
-    if service_stop or (service_target and (service_start or service_manager)):
+    explicit_service_launch = bool(re.search(r"\bstart-process\b", lower))
+    if (
+        service_stop
+        or (service_target and (service_start or service_manager))
+        or (
+            postgres_service_name
+            and (service_manager or explicit_service_launch)
+        )
+    ):
         operations.add("service-control")
 
     return operations

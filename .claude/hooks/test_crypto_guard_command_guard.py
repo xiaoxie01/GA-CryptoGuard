@@ -71,6 +71,54 @@ class CryptoGuardCommandGuardTest(unittest.TestCase):
                     {"database-mutation"},
                 )
 
+    def test_inline_postgres_admin_is_not_service_control(self) -> None:
+        """``user='postgres'`` inside ``python -c`` is a psycopg user, not a service."""
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"import psycopg; psycopg.connect(user='postgres'); "
+                "cur.execute('CREATE DATABASE crypto_guard')\""
+            ),
+            {"database-mutation"},
+        )
+
+    def test_direct_fsapp_launch_is_service_control(self) -> None:
+        self.assertEqual(
+            guard.classify_command("python frontends/fsapp.py"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("pythonw hub.pyw"),
+            {"service-control"},
+        )
+
+    def test_subprocess_fsapp_launch_is_service_control(self) -> None:
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"import subprocess; "
+                "subprocess.Popen(['python','frontends/fsapp.py'])\""
+            ),
+            {"service-control"},
+        )
+
+    def test_postgresql_service_management_remains_service_control(self) -> None:
+        self.assertEqual(
+            guard.classify_command("Start-Service postgresql-x64-17"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Restart-Service postgresql-x64-17"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Stop-Service postgresql"),
+            {"service-control"},
+        )
+        # Bare postgres + explicit service-manager verb still matches.
+        self.assertEqual(
+            guard.classify_command("Start-Process postgres"),
+            {"service-control"},
+        )
+
     def test_persistent_database_dsn_change_requires_service_control(self) -> None:
         self.assertEqual(
             guard.classify_command(
