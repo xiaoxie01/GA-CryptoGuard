@@ -32,6 +32,10 @@ NOT a mock; uses a real pooled conn.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.pg
+
 import os
 import unittest
 

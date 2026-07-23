@@ -54,6 +54,10 @@ Reference: task ``07-16-postgresql-greenfield-cutover`` P8-4.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+
 import os
 import unittest
 from datetime import datetime, timezone

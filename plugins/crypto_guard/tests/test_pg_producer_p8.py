@@ -31,6 +31,10 @@ Phase-2 rollback; Phase-2 atomic ``conn.transaction()``).
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.concurrency, pytest.mark.e2e]
+
 import unittest
 from unittest.mock import patch
 

@@ -29,6 +29,10 @@ Revert-fail: without the commit, the fresh-connection read returns no row ->
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+
 import unittest
 
 from plugins.crypto_guard.storage import pg_db

@@ -16,6 +16,10 @@ Uses per-test schema isolation against the dedicated ``crypto_guard_test`` DB.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.schema_mutation]
+
 import unittest
 
 from plugins.crypto_guard.storage import pg_db

@@ -14,6 +14,10 @@ collapses and I must use a different commit model.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.concurrency]
+
 import unittest
 
 from psycopg.errors import UniqueViolation

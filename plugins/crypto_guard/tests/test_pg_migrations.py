@@ -16,12 +16,17 @@ from __future__ import annotations
 import threading
 import unittest
 
+import pytest
+
 from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import (
     check_schema_health,
     initialize_database,
 )
 from plugins.crypto_guard.tests.pg_fixtures import direct_conn, make_repo
+
+
+pytestmark = [pytest.mark.pg, pytest.mark.schema_mutation]
 
 
 # Every contract marker initialize_database() must write. Each name MUST appear
@@ -166,6 +171,7 @@ class TestPostgresInitializeDatabase(unittest.TestCase):
         )
         self.assertTrue(check_schema_health()["ok"])
 
+    @pytest.mark.serial
     def test_advisory_lock_blocks_concurrent_init(self) -> None:
         """Direct proof the transaction-scoped advisory lock serializes init.
 

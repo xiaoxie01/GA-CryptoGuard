@@ -14,6 +14,10 @@ used only by ``_pg_bootstrap`` to create the role/DB; it never appears here.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.pg
+
 import os
 import unittest
 from unittest.mock import MagicMock, patch

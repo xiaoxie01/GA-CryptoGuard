@@ -55,6 +55,10 @@ NOT a mock; uses a real pooled conn on an isolated ``public`` schema.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+
 import json
 import unittest
 from datetime import datetime, timedelta, timezone

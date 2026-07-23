@@ -10,6 +10,10 @@ file and the information_schema introspection.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.schema_mutation]
+
 import os
 import unittest
 

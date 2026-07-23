@@ -47,6 +47,8 @@ from __future__ import annotations
 import os
 import unittest
 
+import pytest
+
 from plugins.crypto_guard import service_manager as sm
 from plugins.crypto_guard.service_manager import (
     _OWNERSHIP_LOST,
@@ -56,8 +58,13 @@ from plugins.crypto_guard.service_manager import (
     _renew_service_ownership_lease,
     release_service_ownership,
 )
+
+
 from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.tests.pg_fixtures import make_repo
+
+
+pytestmark = [pytest.mark.pg, pytest.mark.concurrency, pytest.mark.serial]
 
 
 def _redacted_dbid() -> str:

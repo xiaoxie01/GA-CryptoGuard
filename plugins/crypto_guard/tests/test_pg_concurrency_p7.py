@@ -39,6 +39,10 @@ NOT a mock; uses two real pooled conns (two ``pg_db.get_conn()``).
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.concurrency]
+
 import unittest
 from unittest.mock import patch
 

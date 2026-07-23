@@ -15,6 +15,10 @@ Affects ~40+ repository.py sites. Settles:
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.pg
+
 import json
 import unittest
 

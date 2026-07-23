@@ -17,6 +17,10 @@ This test proves the contract on real PostgreSQL:
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.pg
+
 import unittest
 
 from plugins.crypto_guard.storage import pg_db

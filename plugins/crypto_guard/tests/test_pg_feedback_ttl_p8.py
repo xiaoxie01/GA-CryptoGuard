@@ -28,6 +28,10 @@ NOT a mock; uses a real pooled conn on an isolated schema.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.pg
+
 import json
 import os
 import unittest

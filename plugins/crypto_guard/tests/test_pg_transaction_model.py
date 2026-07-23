@@ -23,6 +23,10 @@ We answer four questions empirically on real PostgreSQL:
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.concurrency]
+
 import unittest
 
 from plugins.crypto_guard.storage import pg_db

@@ -134,7 +134,10 @@ def _build_conn_kwargs_for_pool(conn: psycopg.Connection) -> None:
     statements = ["SET TimeZone=UTC"]
     if schema:
         safe = schema.replace("'", "''")
-        statements.append(f'SET search_path={safe},public')
+        # Test schemas must not fall through to ``public``. A schema-health
+        # test that renames a scratch table would otherwise resolve a stale
+        # public table and falsely report healthy state.
+        statements.append(f'SET search_path={safe}')
     was_autocommit = conn.autocommit
     conn.autocommit = True
     try:
@@ -293,8 +296,9 @@ def set_test_search_path(schema: str | None) -> None:
     """Test-only: route pool connections to an isolated schema.
 
     When ``schema`` is non-None, every pooled connection sets
-    ``search_path=<schema>,public`` so test fixtures never touch the production
-    schema. Pass ``None`` to restore the default. Existing pool connections
+    ``search_path=<schema>`` so a missing scratch object cannot fall through to
+    a same-named object in ``public``. Pass ``None`` to restore the default.
+    Existing pool connections
     pick up the new search_path on their next checkout via the configure hook
     re-SET; to be safe, tests should reset the pool (``reset_pool``) after
     changing the schema so no stale connection retains the old search_path.

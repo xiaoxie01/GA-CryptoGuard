@@ -49,6 +49,10 @@ candle data. Everything else runs against the real PG schema.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+
 import os
 import unittest
 from datetime import datetime, timezone
