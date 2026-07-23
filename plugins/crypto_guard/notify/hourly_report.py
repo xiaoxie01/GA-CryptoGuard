@@ -1415,15 +1415,16 @@ def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
             "total_issues": result["total_issues"],
             "issues": result["issues"],
         }
-        query_failures = [
+        unavailable_failures = [
             issue for issue in out["issues"]
             if issue.get("type") == "diagnostic_query_failed"
+            or str(issue.get("type") or "").startswith("schema_health_")
         ]
-        if query_failures:
+        if unavailable_failures:
             out["ok"] = False
             out["error"] = (
                 f"state consistency unavailable "
-                f"({len(query_failures)} diagnostic queries failed)"
+                f"({len(unavailable_failures)} diagnostic/schema checks failed)"
             )
         return out
     except Exception as exc:

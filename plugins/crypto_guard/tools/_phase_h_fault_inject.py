@@ -23,7 +23,7 @@ import json
 import os
 import uuid
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from typing import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
@@ -55,12 +55,11 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
     BATCH_TIME_HEALTH_MISMATCH,
     FAILED_JOBS_OUTSIDE_WINDOW,
     # Phase I (07-07): LLM retry + hourly accuracy repair diagnostic codes.
-    LLM_FAILURE_RATE_HIGH,
     LLM_CONFIG_ERROR_DETECTED,
     LLM_RETRY_EXHAUSTED,
     LLM_CIRCUIT_BREAKER_OPEN,
     DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN,
-    RAW_GRADE_EXCEEDS_HTF_CAP,
+    EFFECTIVE_GRADE_EXCEEDS_HTF_CAP,
     SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS,
     HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH,
     # 07-10 P1-1 (design §10): eight formal Phase F fair-scheduling +
@@ -582,15 +581,19 @@ def fault_deterministic_candidate_reported_as_trade_plan_negative(conn):
 
 
 def fault_raw_grade_exceeds_htf_cap(conn):
-    """Fault: raw_signal_grade=S but 1D+4H both opposite to candidate.
+    """Fault: *effective* grade=S while HTF Cap 1 allows max B.
 
-    Per design §7.1 Step 4b Cap 1: 1D and 4H both opposite to candidate →
-    max grade B. A raw S grade in this configuration violates the cap.
+    07-22 Phase-2 contract correction: raw_signal_grade is a pre-gate audit
+    value and may exceed the cap. The diagnostic now fires only when the
+    *effective* / canonical grade exceeds the cap. This seed plants
+    effective=S (and column grade=S) with Cap 1 conditions so the active
+    code ``effective_grade_exceeds_htf_cap`` is caught.
     """
     at_ms = _recent_analysis_time_ms()
     _insert_decision(conn, raw={
         "signal_grade": "S",
         "raw_signal_grade": "S",
+        "effective_signal_grade": "S",
         "market_bias": "bullish",
         "timeframe_context": {
             "1d": {"bias": "bearish"},
@@ -1214,7 +1217,7 @@ def main():
          fault_deterministic_candidate_reported_as_trade_plan_negative,
          DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN, "not_caught", None),
         ("raw_grade_exceeds_htf_cap", fault_raw_grade_exceeds_htf_cap,
-         RAW_GRADE_EXCEEDS_HTF_CAP, "caught", None),
+         EFFECTIVE_GRADE_EXCEEDS_HTF_CAP, "caught", None),
         ("success_batch_missing_completed_symbols",
          fault_success_batch_missing_completed_symbols,
          SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS, "caught", None),

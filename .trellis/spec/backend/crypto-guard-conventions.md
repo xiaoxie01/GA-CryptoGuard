@@ -2174,7 +2174,7 @@ Selection criteria for hourly report: `status='success'` AND `enabled_count > 0`
 - `LLM_RETRY_EXHAUSTED` - any 24h `ga_decisions.raw_decision_json.llm_fallback_reason == "retry_exhausted"`.
 - `LLM_CIRCUIT_BREAKER_OPEN` - latest batch `summary_json.llm_health.breaker_state == "open"`.
 - `DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN` - any 24h `ga_decisions` with `candidate_trade_plan` non-empty AND `has_trade_plan=False` AND `plan_execution_state` not in {`confirmed`, `no_candidate`}. **Source is `raw_decision_json` data fields, NOT rendered text.**
-- `RAW_GRADE_EXCEEDS_HTF_CAP` - recomputes Step 4b/4c/4d caps from `raw_decision_json.timeframe_context`; fires when `raw_signal_grade` exceeds the cap.
+- `EFFECTIVE_GRADE_EXCEEDS_HTF_CAP` - recomputes Step 4b/4c/4d caps from `raw_decision_json.timeframe_context`; fires when the *effective* / canonical grade (`effective_signal_grade` preferred, else column `signal_grade`) exceeds the cap. `raw_signal_grade` is a pre-gate audit value and MAY exceed the cap without error. (Deprecated alias: `RAW_GRADE_EXCEEDS_HTF_CAP`.)
 - `SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS` - reads raw `completed_symbols_json` column; fires when `status='success'` + raw column empty/malformed + live `batch_symbol_status` has completed rows.
 - `HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH` - latest batch `status='running'` + recent `alert_outbox` `alert_type='hourly_summary'` row in last hour.
 

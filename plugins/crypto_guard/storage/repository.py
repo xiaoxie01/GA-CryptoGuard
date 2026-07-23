@@ -206,7 +206,7 @@ class CryptoGuardRepository:
                         notes=COALESCE(excluded.notes, symbols.notes),
                         updated_at=NOW()
                     """,
-                    (symbol, base_asset, category, bool(enabled), source, json.dumps(timeframes or [], ensure_ascii=False), notes),
+                    (symbol, base_asset, category, bool(enabled), source, _json_dumps_payload(timeframes or []), notes),
                 )
         return self.get_symbol(symbol) or {"symbol": symbol}
 
@@ -345,7 +345,7 @@ class CryptoGuardRepository:
                         result_json=excluded.result_json,
                         confidence=excluded.confidence
                     """,
-                    (symbol, timeframe, int(analysis_time_utc), module, json.dumps(result, ensure_ascii=False), confidence),
+                    (symbol, timeframe, int(analysis_time_utc), module, _json_dumps_payload(result), confidence),
                 )
 
     def save_market_snapshot(self, snapshot: dict[str, Any]) -> int:
@@ -362,13 +362,13 @@ class CryptoGuardRepository:
                         snapshot["symbol"],
                         int(snapshot["analysis_time_utc"]),
                         snapshot["mode"],
-                        json.dumps(snapshot, ensure_ascii=False),
+                        _json_dumps_payload(snapshot),
                     ),
                 )
                 snapshot_id = int(cur.fetchone()["id"])
                 cur.execute(
                     "UPDATE market_snapshots SET data_quality_json=%s WHERE id=%s",
-                    (json.dumps(snapshot.get("data_quality", _build_data_quality(snapshot)), ensure_ascii=False), snapshot_id),
+                    (_json_dumps_payload(snapshot.get("data_quality", _build_data_quality(snapshot))), snapshot_id),
                 )
             self.link_module_results_to_snapshot(snapshot_id, snapshot["symbol"], int(snapshot["analysis_time_utc"]))
         return snapshot_id
@@ -400,19 +400,19 @@ class CryptoGuardRepository:
                         int(state["analysis_time"]),
                         state["analysis_time_utc"],
                         state.get("analysis_mode", "unknown"),
-                        json.dumps(state.get("timeframes", []), ensure_ascii=False),
-                        json.dumps(state.get("market_structure") or {}, ensure_ascii=False),
-                        json.dumps(state.get("trend_clarity") or {}, ensure_ascii=False),
-                        json.dumps(state.get("no_trade_reason") or {}, ensure_ascii=False),
-                        json.dumps(state.get("key_levels") or {}, ensure_ascii=False),
-                        json.dumps(state.get("next_triggers") or [], ensure_ascii=False),
-                        json.dumps(state.get("next_analysis") or {}, ensure_ascii=False),
-                        json.dumps(state.get("breakout_watch") or {}, ensure_ascii=False),
-                        json.dumps(state.get("trade_permission") or {}, ensure_ascii=False),
-                        json.dumps(state.get("trade_plan") or {}, ensure_ascii=False),
+                        _json_dumps_payload(state.get("timeframes", [])),
+                        _json_dumps_payload(state.get("market_structure") or {}),
+                        _json_dumps_payload(state.get("trend_clarity") or {}),
+                        _json_dumps_payload(state.get("no_trade_reason") or {}),
+                        _json_dumps_payload(state.get("key_levels") or {}),
+                        _json_dumps_payload(state.get("next_triggers") or []),
+                        _json_dumps_payload(state.get("next_analysis") or {}),
+                        _json_dumps_payload(state.get("breakout_watch") or {}),
+                        _json_dumps_payload(state.get("trade_permission") or {}),
+                        _json_dumps_payload(state.get("trade_plan") or {}),
                         bool(state.get("opportunity_watch_recommended")),
                         bool((state.get("trade_permission") or {}).get("paper_trade_allowed")),
-                        json.dumps(state, ensure_ascii=False),
+                        _json_dumps_payload(state),
                     ),
                 )
                 analysis_state_id = int(cur.fetchone()["id"])
@@ -481,15 +481,15 @@ class CryptoGuardRepository:
                         decision.get("market_bias"),
                         decision.get("trend_stage"),
                         decision["decision"],
-                        json.dumps(decision.get("skill_result_refs") or {}, ensure_ascii=False),
-                        json.dumps(decision.get("evidence") or [], ensure_ascii=False),
-                        json.dumps(decision.get("counter_evidence") or [], ensure_ascii=False),
-                        json.dumps(decision.get("risk_check") or {}, ensure_ascii=False),
-                        json.dumps(trade_plan, ensure_ascii=False) if trade_plan else None,
-                        json.dumps(opportunity_watch, ensure_ascii=False) if opportunity_watch else None,
-                        json.dumps(decision.get("feishu_actions") or [], ensure_ascii=False),
+                        _json_dumps_payload(decision.get("skill_result_refs") or {}),
+                        _json_dumps_payload(decision.get("evidence") or []),
+                        _json_dumps_payload(decision.get("counter_evidence") or []),
+                        _json_dumps_payload(decision.get("risk_check") or {}),
+                        _json_dumps_payload(trade_plan) if trade_plan else None,
+                        _json_dumps_payload(opportunity_watch) if opportunity_watch else None,
+                        _json_dumps_payload(decision.get("feishu_actions") or []),
                         decision.get("final_summary") or decision.get("summary") or "",
-                        json.dumps(decision, ensure_ascii=False),
+                        _json_dumps_payload(decision),
                         decision.get("analysis_state_id"),
                         decision.get("snapshot_id"),
                         decision.get("created_by", "ga_master_controller"),
@@ -572,7 +572,7 @@ class CryptoGuardRepository:
                     if not e_syms:
                         cur.execute(
                             "UPDATE analysis_batches SET enabled_symbols_json=%s WHERE id=%s",
-                            (json.dumps(enabled_symbols, ensure_ascii=False), row_id),
+                            (_json_dumps_payload(enabled_symbols), row_id),
                         )
                     return row_id
                 cur.execute(
@@ -582,7 +582,7 @@ class CryptoGuardRepository:
                     VALUES (%s, %s, %s, 'running', %s)
                     RETURNING id
                     """,
-                    (batch_id, primary_interval, int(analysis_time), json.dumps(enabled_symbols, ensure_ascii=False)),
+                    (batch_id, primary_interval, int(analysis_time), _json_dumps_payload(enabled_symbols)),
                 )
                 return int(cur.fetchone()["id"])
 
@@ -773,9 +773,9 @@ class CryptoGuardRepository:
                     """,
                     (
                         status,
-                        json.dumps(summary, ensure_ascii=False) if summary is not None else None,
-                        json.dumps(completed, ensure_ascii=False),
-                        json.dumps(failed, ensure_ascii=False),
+                        _json_dumps_payload(summary) if summary is not None else None,
+                        _json_dumps_payload(completed),
+                        _json_dumps_payload(failed),
                         batch_id,
                     ),
                 )
@@ -1172,10 +1172,10 @@ class CryptoGuardRepository:
                         symbol,
                         timeframe,
                         int(analysis_time),
-                        json.dumps(input_summary or {}, ensure_ascii=False),
-                        json.dumps(tool_result, ensure_ascii=False),
-                        json.dumps(ga_interpretation, ensure_ascii=False),
-                        json.dumps(final_result, ensure_ascii=False),
+                        _json_dumps_payload(input_summary or {}),
+                        _json_dumps_payload(tool_result),
+                        _json_dumps_payload(ga_interpretation),
+                        _json_dumps_payload(final_result),
                         confidence,
                         commit_state,
                         batch_id,
@@ -1239,10 +1239,10 @@ class CryptoGuardRepository:
                         source_type,
                         source_id,
                         pattern_type,
-                        json.dumps(affected_symbols or [], ensure_ascii=False),
-                        json.dumps(affected_sides or [], ensure_ascii=False),
+                        _json_dumps_payload(affected_symbols or []),
+                        _json_dumps_payload(affected_sides or []),
                         finding,
-                        json.dumps(suggested_adjustment or {}, ensure_ascii=False),
+                        _json_dumps_payload(suggested_adjustment or {}),
                         status,
                     ),
                 )
@@ -1277,17 +1277,17 @@ class CryptoGuardRepository:
                         alert_level_for_grade(decision.get("signal_grade")),
                         decision.get("decision"),
                         snapshot_id,
-                        json.dumps(trade_plan, ensure_ascii=False) if trade_plan else None,
-                        json.dumps(watch, ensure_ascii=False) if watch else None,
+                        _json_dumps_payload(trade_plan) if trade_plan else None,
+                        _json_dumps_payload(watch) if watch else None,
                         decision.get("summary"),
-                        json.dumps(decision.get("risk_notes", []), ensure_ascii=False),
+                        _json_dumps_payload(decision.get("risk_notes", [])),
                         ga_decision_id or decision.get("ga_decision_id"),
                     ),
                 )
                 signal_id = int(cur.fetchone()["id"])
                 cur.execute(
                     "UPDATE signals SET ga_decision_json=%s WHERE id=%s",
-                    (json.dumps(decision, ensure_ascii=False), signal_id),
+                    (_json_dumps_payload(decision), signal_id),
                 )
             if snapshot_id:
                 self.save_strategy_evaluation(decision, snapshot_id)
@@ -1322,8 +1322,8 @@ class CryptoGuardRepository:
                         decision.get("strategy_version", "1.0"),
                         float(decision.get("confidence") or 0),
                         decision.get("decision"),
-                        json.dumps(decision.get("evidence", []), ensure_ascii=False),
-                        json.dumps(decision.get("counter_evidence", []), ensure_ascii=False),
+                        _json_dumps_payload(decision.get("evidence", [])),
+                        _json_dumps_payload(decision.get("counter_evidence", [])),
                         bool(is_shadow),
                         decision.get("ga_decision_id"),
                         outcome_source,
@@ -1353,8 +1353,8 @@ class CryptoGuardRepository:
                         symbol,
                         requested_by,
                         request_text,
-                        json.dumps(result.get("timeframes", []), ensure_ascii=False),
-                        json.dumps(result, ensure_ascii=False),
+                        _json_dumps_payload(result.get("timeframes", [])),
+                        _json_dumps_payload(result),
                         result.get("summary"),
                         bool(result.get("has_trade_plan")),
                         signal_id,
@@ -1407,8 +1407,8 @@ class CryptoGuardRepository:
                         symbol,
                         watch.get("direction"),
                         watch.get("reason"),
-                        json.dumps(conditions, ensure_ascii=False),
-                        json.dumps(watch.get("invalid_condition"), ensure_ascii=False),
+                        _json_dumps_payload(conditions),
+                        _json_dumps_payload(watch.get("invalid_condition")),
                         source_signal_id,
                         expires_at,
                         ga_decision_id,
@@ -2135,7 +2135,13 @@ class CryptoGuardRepository:
                     """,
                     (
                         status, error_message,
-                        json.dumps(result or {}, ensure_ascii=False), int(job_id),
+                        # 07-22 Phase-2: bare json.dumps cannot serialize
+                        # PG-decoded datetime/date values that worker results
+                        # routinely carry (e.g. update_paper_positions /
+                        # hourly_feishu_report). Always use the shared
+                        # serializer so finish_job cannot raise TypeError
+                        # after a successful job body.
+                        _json_dumps_payload(result or {}), int(job_id),
                         *([str(claim_token)] if claim_token is not None else []),
                     ),
                 )
@@ -2166,7 +2172,8 @@ class CryptoGuardRepository:
                     """,
                     (
                         job_status, error_message,
-                        json.dumps(result or {}, ensure_ascii=False), int(job_id),
+                        # Same datetime-safe serializer as finish_job (Phase-2).
+                        _json_dumps_payload(result or {}), int(job_id),
                         str(batch_id), str(symbol), str(claim_token),
                     ),
                 )
@@ -2385,7 +2392,7 @@ class CryptoGuardRepository:
                     SET status=%s, finished_at=NOW(), result_json=%s, error_message=%s
                     WHERE id=%s
                     """,
-                    (status, json.dumps(result or {}, ensure_ascii=False), error_message, int(run_id)),
+                    (status, _json_dumps_payload(result or {}), error_message, int(run_id)),
                 )
 
     def acquire_lock(self, lock_name: str, owner: str, ttl_seconds: int) -> bool:
@@ -2478,7 +2485,7 @@ class CryptoGuardRepository:
                         trade_plan.get("trigger_price"),
                         trade_plan["stop_loss"],
                         trade_plan["stop_loss"],  # initial_stop_loss = stop_loss at creation
-                        json.dumps(trade_plan.get("take_profits", []), ensure_ascii=False),
+                        _json_dumps_payload(trade_plan.get("take_profits", [])),
                         trade_plan.get("quantity"),
                         trade_plan.get("risk_percent"),
                         trade_plan.get("reason"),
@@ -2760,7 +2767,7 @@ class CryptoGuardRepository:
                         _compute_initial_risk_usdt(order, entry_price),
                         _json_dumps_value(order.get("take_profit_json")),
                         order.get("quantity"),
-                        json.dumps([{"event": "filled", "entry_price": entry_price, "ts": ts_iso}], ensure_ascii=False),
+                        _json_dumps_payload([{"event": "filled", "entry_price": entry_price, "ts": ts_iso}]),
                         fill_method or order.get("fill_method"),
                         ts_iso,
                     ),
@@ -2808,7 +2815,7 @@ class CryptoGuardRepository:
                         stop_take_path_json=%s
                     WHERE id=%s AND closed_at IS NULL
                     """,
-                    (float(mfe), float(mae), json.dumps(stop_take_path, ensure_ascii=False), int(trade_id)),
+                    (float(mfe), float(mae), _json_dumps_payload(stop_take_path), int(trade_id)),
                 )
 
     def close_paper_trade(
@@ -2876,7 +2883,7 @@ class CryptoGuardRepository:
                         entry_efficiency,
                         exit_efficiency,
                         signal_decay_score,
-                        json.dumps(stop_take_path, ensure_ascii=False) if stop_take_path is not None else None,
+                        _json_dumps_payload(stop_take_path) if stop_take_path is not None else None,
                         closed_at_iso,
                         int(trade_id),
                     ),
@@ -3079,8 +3086,8 @@ class CryptoGuardRepository:
                            RETURNING id""",
                         (symbol, analysis_time, strategy_name, strategy_version,
                          ga_decision_id, outcome_source, timeframe, score, decision,
-                         "{}" if evidence is None else json.dumps(evidence, ensure_ascii=False),
-                         "{}" if counter_evidence is None else json.dumps(counter_evidence, ensure_ascii=False),
+                         "{}" if evidence is None else _json_dumps_payload(evidence),
+                         "{}" if counter_evidence is None else _json_dumps_payload(counter_evidence),
                          snapshot_id))
                     eval_id = int(cur.fetchone()["id"])
 
@@ -3266,7 +3273,7 @@ class CryptoGuardRepository:
                         float(snapshot.get("realized_pnl", 0)),
                         snapshot.get("margin_used"),
                         int(snapshot.get("open_position_count", 0)),
-                        json.dumps(snapshot, ensure_ascii=False),
+                        _json_dumps_payload(snapshot),
                     ),
                 )
                 new_id = int(cur.fetchone()["id"])
@@ -3456,7 +3463,7 @@ class CryptoGuardRepository:
                         pnl,
                         pnl_pct,
                         reason,
-                        json.dumps(event_payload, ensure_ascii=False),
+                        _json_dumps_payload(event_payload),
                         dedupe_key,
                         ts_iso,
                     ),
@@ -3527,7 +3534,7 @@ class CryptoGuardRepository:
         # Ensure market_regime_at_loss is serialized as JSON string if it's a dict
         regime_at_loss = review.get("market_regime_at_loss")
         if isinstance(regime_at_loss, dict):
-            regime_at_loss = json.dumps(regime_at_loss, ensure_ascii=False)
+            regime_at_loss = _json_dumps_payload(regime_at_loss)
         elif regime_at_loss is None:
             regime_at_loss = "unknown"
         with self.conn.transaction():
@@ -3545,10 +3552,10 @@ class CryptoGuardRepository:
                         int(trade_id),
                         review["result"],
                         review["primary_reason"],
-                        json.dumps(review.get("secondary_reasons", []), ensure_ascii=False),
+                        _json_dumps_payload(review.get("secondary_reasons", [])),
                         review.get("summary"),
-                        json.dumps(review.get("improvement_suggestion", {}), ensure_ascii=False),
-                        json.dumps(review, ensure_ascii=False),
+                        _json_dumps_payload(review.get("improvement_suggestion", {})),
+                        _json_dumps_payload(review),
                         regime_at_loss,
                         bool(review.get("evolution_trigger_allowed", True)),
                     ),
@@ -3584,8 +3591,8 @@ class CryptoGuardRepository:
                         review_date,
                         _json_dumps_payload(summary),
                         ga_report,
-                        json.dumps(skill_updates or [], ensure_ascii=False),
-                        json.dumps(evolution_actions or {}, ensure_ascii=False),
+                        _json_dumps_payload(skill_updates or []),
+                        _json_dumps_payload(evolution_actions or {}),
                         bool(pushed_to_feishu),
                     ),
                 )
@@ -3635,9 +3642,9 @@ class CryptoGuardRepository:
                         symbol,
                         float(trigger_value),
                         float(threshold_value),
-                        json.dumps(related_trade_ids or [], ensure_ascii=False),
-                        json.dumps(related_trade_ids or [], ensure_ascii=False),
-                        json.dumps(related_trade_ids or [], ensure_ascii=False),
+                        _json_dumps_payload(related_trade_ids or []),
+                        _json_dumps_payload(related_trade_ids or []),
+                        _json_dumps_payload(related_trade_ids or []),
                         market_regime,
                         bool(evolution_allowed),
                         status,
@@ -3836,7 +3843,7 @@ class CryptoGuardRepository:
                     (
                         config_key,
                         old["value_json"] if old else None,
-                        json.dumps(new_value, ensure_ascii=False),
+                        _json_dumps_payload(new_value),
                         requested_by,
                         request_text,
                         bool(confirmation_required),
@@ -4101,7 +4108,7 @@ class CryptoGuardRepository:
                         change_reason=excluded.change_reason
                     RETURNING id
                     """,
-                    (strategy_name, version, status, json.dumps(config, ensure_ascii=False), change_reason, created_from_review_id),
+                    (strategy_name, version, status, _json_dumps_payload(config), change_reason, created_from_review_id),
                 )
                 row = cur.fetchone()
         return int(row["id"])
@@ -4139,8 +4146,8 @@ class CryptoGuardRepository:
                         result["candidate_version"],
                         result.get("active_version"),
                         int(result.get("sample_count") or 0),
-                        json.dumps(result.get("active_stats", {}), ensure_ascii=False),
-                        json.dumps(result.get("candidate_stats", {}), ensure_ascii=False),
+                        _json_dumps_payload(result.get("active_stats", {})),
+                        _json_dumps_payload(result.get("candidate_stats", {})),
                         result.get("recommendation"),
                         result.get("status", "running"),
                     ),
@@ -4164,7 +4171,7 @@ class CryptoGuardRepository:
                         result["interval"],
                         int(result["start_time"]),
                         int(result["end_time"]),
-                        json.dumps(result.get("strategy_versions", []), ensure_ascii=False),
+                        _json_dumps_payload(result.get("strategy_versions", [])),
                         _json_dumps_payload(result),
                         result.get("export_path"),
                     ),

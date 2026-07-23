@@ -38,6 +38,10 @@ NOT a mock; uses a real pooled conn on an isolated schema.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+
 import json
 import os
 import unittest
@@ -310,9 +314,9 @@ class TestPgHourlyReportAndFeishuP8(unittest.TestCase):
         self.assertFalse(state.get("ok"), state)
         self.assertIn("error", state, state)
         self.assertTrue(any(
-            issue.get("type") == "diagnostic_query_failed"
+            issue.get("type") == "schema_health_missing_column"
             for issue in state.get("issues", [])
-        ))
+        ), state)
         text = self._render_with_health(state_consistency=state)
         self.assertIn("状态一致性诊断：", text)
         self.assertIn("不可用（查询失败）", text)

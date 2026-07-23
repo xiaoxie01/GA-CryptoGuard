@@ -78,7 +78,14 @@ LLM_CONFIG_ERROR_DETECTED = "llm_config_error_detected"
 LLM_RETRY_EXHAUSTED = "llm_retry_exhausted"
 LLM_CIRCUIT_BREAKER_OPEN = "llm_circuit_breaker_open"
 DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN = "deterministic_candidate_reported_as_trade_plan"
-RAW_GRADE_EXCEEDS_HTF_CAP = "raw_grade_exceeds_htf_cap"
+# 07-22 Phase-2 contract correction: ``raw_signal_grade`` is a pre-gate
+# audit value and MAY exceed the HTF cap (it records the uncapped LLM/SOP
+# grade). The cap must constrain the effective / canonical grade only.
+# ``raw_grade_exceeds_htf_cap`` is retained as a deprecated alias string so
+# historical fault-injection / log greps still resolve, but the active
+# diagnostic code is ``effective_grade_exceeds_htf_cap``.
+RAW_GRADE_EXCEEDS_HTF_CAP = "raw_grade_exceeds_htf_cap"  # deprecated alias
+EFFECTIVE_GRADE_EXCEEDS_HTF_CAP = "effective_grade_exceeds_htf_cap"
 SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS = "success_batch_missing_completed_symbols"
 HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH = "hourly_report_used_partial_running_batch"
 # 07-10 R6-E (P1-4): a batch whose status is still 'running' but every enabled
@@ -177,7 +184,7 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_llm_retry_exhausted(repo))
     issues.extend(_check_llm_circuit_breaker_open(repo))
     issues.extend(_check_deterministic_candidate_reported_as_trade_plan(repo))
-    issues.extend(_check_raw_grade_exceeds_htf_cap(repo))
+    issues.extend(_check_effective_grade_exceeds_htf_cap(repo))
     issues.extend(_check_success_batch_missing_completed_symbols(repo))
     issues.extend(_check_hourly_report_used_partial_running_batch(repo))
     # 07-10 R6-E (P1-4): a running batch whose every enabled symbol is
@@ -284,6 +291,8 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         LLM_RETRY_EXHAUSTED: _count(issues, LLM_RETRY_EXHAUSTED),
         LLM_CIRCUIT_BREAKER_OPEN: _count(issues, LLM_CIRCUIT_BREAKER_OPEN),
         DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN: _count(issues, DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN),
+        EFFECTIVE_GRADE_EXCEEDS_HTF_CAP: _count(issues, EFFECTIVE_GRADE_EXCEEDS_HTF_CAP),
+        # deprecated alias kept at 0 unless a legacy emitter still uses it
         RAW_GRADE_EXCEEDS_HTF_CAP: _count(issues, RAW_GRADE_EXCEEDS_HTF_CAP),
         SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS: _count(issues, SUCCESS_BATCH_MISSING_COMPLETED_SYMBOLS),
         HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH: _count(issues, HOURLY_REPORT_USED_PARTIAL_RUNNING_BATCH),
@@ -2923,19 +2932,26 @@ def _check_deterministic_candidate_reported_as_trade_plan(
     return issues
 
 
-def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    """Flag ga_decisions whose ``raw_signal_grade`` exceeds the HTF-alignment
-    cap allowed by Step 4b/4c/4d rules.
+def _check_effective_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Flag ga_decisions whose *effective* grade exceeds the HTF-alignment cap.
 
-    Per PRD AC18 / R5 and design §7.1, the caps are:
-    - Step 4b Cap 1: 1D and 4H both opposite to candidate → max B.
-    - Step 4b Cap 2: 4H range/transition/mixed/unknown → max B.
-    - Step 4b Cap 3: 1H and 15M both not aligned with candidate → max B.
-    - Step 4b Cap 4: only 5M supports, 4H and 1H don't → max C.
+    07-22 Phase-2 contract correction (production evidence: Phase-2 verifier
+    failed on 5× ``raw_grade_exceeds_htf_cap`` while analysis batches were
+    10/10 complete):
 
-    Detection recomputes the cap from ``raw_decision_json.timeframe_context``
-    and asserts ``raw_signal_grade`` does not exceed. The GRADE_ORDER is
-    ``S > A > B > C > D``.
+    - ``raw_signal_grade`` is the pre-gate audit value. It MAY exceed the HTF
+      cap; that is intentional and is NOT an error.
+    - The cap must constrain the effective / canonical grade only:
+      ``effective_signal_grade`` (preferred) or the column ``signal_grade``.
+    - Issue code: ``effective_grade_exceeds_htf_cap``.
+
+    Caps (recomputed from ``raw_decision_json.timeframe_context``):
+    - Cap 1: 1D and 4H both opposite to candidate → max B.
+    - Cap 2: 4H range/transition/mixed/unknown → max B.
+    - Cap 3: 1H and 15M both not aligned with candidate → max B.
+    - Cap 4: only 5M supports, 4H and 1H don't → max C.
+
+    GRADE_ORDER is ``S > A > B > C > D``.
     """
     issues: list[dict[str, Any]] = []
     grade_rank = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
@@ -2954,8 +2970,15 @@ def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[s
         raw = _safe_json(r["raw_decision_json"]) or {}
         if not isinstance(raw, dict):
             continue
-        raw_grade = str(raw.get("raw_signal_grade") or r["signal_grade"] or "D").upper()
-        if raw_grade not in grade_rank:
+        # Pre-gate audit value — recorded for detail only, never the fail trigger.
+        raw_grade = str(raw.get("raw_signal_grade") or "").upper()
+        # Effective / canonical grade is what the cap must constrain.
+        effective_grade = str(
+            raw.get("effective_signal_grade")
+            or r["signal_grade"]
+            or "D"
+        ).upper()
+        if effective_grade not in grade_rank:
             continue
         ctx = raw.get("timeframe_context") or {}
         if not isinstance(ctx, dict):
@@ -2974,11 +2997,7 @@ def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[s
         candidate_side = "LONG" if market_bias == "bullish" else "SHORT" if market_bias == "bearish" else None
         opposite = "bearish" if candidate_side == "LONG" else "bullish" if candidate_side == "SHORT" else None
         # R6 fix: compare bias values ("bullish"/"bearish") against bias values,
-        # NOT against candidate_side.lower() ("long"/"short"). The
-        # market_semantics.py implementation uses candidate_side_lower which
-        # is "bullish"/"bearish" (the bias value), not "long"/"short" (the
-        # side value). The previous diagnostic compared bias against side,
-        # which never matched -> Cap 3 and Cap 4 were dead branches.
+        # NOT against candidate_side.lower() ("long"/"short").
         candidate_bias = "bullish" if candidate_side == "LONG" else "bearish" if candidate_side == "SHORT" else None
 
         # Implementation uses INDEPENDENT if-statements (market_semantics.py
@@ -3008,14 +3027,16 @@ def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[s
                 max_allowed = "C"
             applied_reasons.append("low_tf_rebound_only_cap")
 
-        if grade_rank[raw_grade] > grade_rank[max_allowed]:
+        if grade_rank[effective_grade] > grade_rank[max_allowed]:
             issues.append(_issue(
-                RAW_GRADE_EXCEEDS_HTF_CAP, "error",
+                EFFECTIVE_GRADE_EXCEEDS_HTF_CAP, "error",
                 {
                     "decision_id": int(r["id"]),
                     "symbol": r["symbol"],
                     "analysis_time": int(r["analysis_time"] or 0),
-                    "raw_signal_grade": raw_grade,
+                    "raw_signal_grade": raw_grade or None,
+                    "effective_signal_grade": effective_grade,
+                    "canonical_signal_grade": str(r["signal_grade"] or "").upper() or None,
                     "max_allowed_grade": max_allowed,
                     "applied_cap_reasons": applied_reasons or ["none"],
                     "timeframe_context_bias": {
@@ -3024,10 +3045,18 @@ def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[s
                     },
                     "market_bias": market_bias,
                 },
-                f"raw_signal_grade={raw_grade} 超过 HTF 对齐上限 {max_allowed}（{', '.join(applied_reasons)}）："
-                "Step 4b/4c/4d cap 未生效；检查 normalize_market_semantics 的 cap 逻辑是否被绕过。",
+                f"effective_signal_grade={effective_grade} 超过 HTF 对齐上限 {max_allowed}"
+                f"（{', '.join(applied_reasons) or 'none'}）；"
+                f"raw_signal_grade={raw_grade or '-'} 为门禁前审计值，允许 raw>cap。"
+                "检查 normalize_market_semantics / controller 的 cap 是否被绕过。",
             ))
     return issues
+
+
+# Backward-compatible alias used by older tests / fault-injection imports.
+def _check_raw_grade_exceeds_htf_cap(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Deprecated alias for ``_check_effective_grade_exceeds_htf_cap``."""
+    return _check_effective_grade_exceeds_htf_cap(repo)
 
 
 def _check_success_batch_missing_completed_symbols(
