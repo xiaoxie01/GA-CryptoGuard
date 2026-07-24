@@ -67,6 +67,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_hourly_market_semantic_accuracy_contract_marker,
         _ensure_hourly_report_accuracy_r4_contract_marker,
         _ensure_llm_fair_scheduling_context_contract_marker,
+        _ensure_llm_provider_timeout_envelope_contract_marker,
         _ensure_market_data_contract_marker,
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
@@ -79,6 +80,10 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     _ensure_hourly_market_semantic_accuracy_contract_marker(cur)
     _ensure_hourly_decision_context_continuity_contract_marker(cur)
     _ensure_llm_fair_scheduling_context_contract_marker(cur)
+    # 07-22 Codex P1-1: independent timeout-envelope marker must be present on
+    # a fresh schema so diagnose_report_accuracy does not fail-closed on
+    # llm_provider_timeout_envelope_contract_marker_missing.
+    _ensure_llm_provider_timeout_envelope_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 

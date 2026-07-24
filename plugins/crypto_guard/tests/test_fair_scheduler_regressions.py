@@ -26,6 +26,28 @@ Test07_10FairBatchProductionChain.test_s4_fair_path_hard_timeout_surfaces_symbol
         )
     )
 )
+# P0-2 large-response Pipe drain also spawns a real child; under xdist it
+# contends for CPU/IO and can falsely trip the wall-clock gate. Keep it on
+# the serial stage with the other hard subprocess contracts.
+Test07_10FairBatchProductionChain.test_p0_2_large_response_does_not_false_hard_timeout = (
+    pytest.mark.serial(
+        pytest.mark.subprocess(
+            pytest.mark.slow(
+                Test07_10FairBatchProductionChain.test_p0_2_large_response_does_not_false_hard_timeout
+            )
+        )
+    )
+)
+# R4-P0-1 seeds deferred_at near the absolute window bound with real wall-clock
+# arithmetic. Under xdist the 30s margin was eaten by run_once latency; keep
+# it serial (and the seed margin is 90s) so host load cannot false-exhaust.
+Test07_10FairBatchProductionChain.test_r4_p0_1_legitimate_long_lease_not_prematurely_exhausted = (
+    pytest.mark.serial(
+        pytest.mark.slow(
+            Test07_10FairBatchProductionChain.test_r4_p0_1_legitimate_long_lease_not_prematurely_exhausted
+        )
+    )
+)
 
 __all__ = [
     "TestPhaseA07_10LLMFairSchedulingRepro",

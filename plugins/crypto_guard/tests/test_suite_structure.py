@@ -18,9 +18,19 @@ pytestmark = pytest.mark.unit
 # Captured from HEAD's pre-split test_smoke.py. The sole intentional class
 # rename is normalized before hashing. This makes coverage loss detectable
 # independently of the current implementation module and domain exports.
-BASELINE_TEST_DEFINITION_COUNT = 1205
+# 1211 + 9 Codex 终审返工 tests (07-23):
+# - Test07_10FairBatchProductionChain::test_codex_p1_1_timeout_envelope_* (5)
+# - Test07_10FairBatchProductionChain::test_p2_2_continuity_age_eq_* (2)
+# - TestHourlyAnalysisSemanticAccuracy07_03::test_p2_1_htf_countertrend_* (2)
+# Plus strengthened test_p1_1_fair_adapter_exhausted_deadline_skips_provider
+# (no count change — same method name).
+# Codex P2 exclude-only (07-23): renamed
+# test_codex_p1_1_pre_envelope_marker_timeout_is_legacy_info
+# -> test_codex_p1_1_pre_envelope_marker_timeout_is_excluded_not_current_error
+# (count unchanged; SHA updated).
+BASELINE_TEST_DEFINITION_COUNT = 1220
 BASELINE_TEST_DEFINITION_SHA256 = (
-    "e178779e6c1d60f5415c0474540118cac0982374dede8258ef3e236543f6bfe1"
+    "ee1ceef0e7efb501551fa93d54b385ac55e4161e836663014c03b6dfb3532af3"
 )
 BASELINE_CLASS_RENAMES = {
     "Btc9RegressionChainTest": "TradeGateRegressionChainTest",
@@ -120,3 +130,19 @@ def test_compatibility_proxy_does_not_rebind_test_classes() -> None:
         mark.name for mark in getattr(hard_timeout, "pytestmark", ())
     }
     assert {"serial", "subprocess", "slow"} <= hard_timeout_marks
+    large_resp = (
+        fair.Test07_10FairBatchProductionChain
+        .test_p0_2_large_response_does_not_false_hard_timeout
+    )
+    large_resp_marks = {
+        mark.name for mark in getattr(large_resp, "pytestmark", ())
+    }
+    assert {"serial", "subprocess", "slow"} <= large_resp_marks
+    r4_lease = (
+        fair.Test07_10FairBatchProductionChain
+        .test_r4_p0_1_legitimate_long_lease_not_prematurely_exhausted
+    )
+    r4_lease_marks = {
+        mark.name for mark in getattr(r4_lease, "pytestmark", ())
+    }
+    assert {"serial", "slow"} <= r4_lease_marks

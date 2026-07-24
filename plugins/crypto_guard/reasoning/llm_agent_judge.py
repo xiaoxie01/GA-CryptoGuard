@@ -901,15 +901,15 @@ def _call_ga_llm_with_retry(
             cfg_name=cfg_name, model_name=model_name,
             prompt_builders=prompt_builders, last_category=last_category,
             budget_violation_is_skip=False,  # legacy path: budget violation is a failed terminal
-            # 07-10 R2-1: thread the per-symbol deadline's provider timeout
-            # into the call so the legacy retry path is ALSO bounded when a
-            # deadline is injected (R5 controller wiring). When the deadline is
+            # 07-10 R2-1 + Phase B P1-1 (07-22): pass the deadline object so
+            # post-prompt admission re-checks remaining time after prompt build
+            # and captures an immutable effective timeout. Do NOT pre-resolve
+            # provider_timeout_seconds here (that freezes a pre-prompt value
+            # and lets floors re-admit a zero remaining). When the deadline is
             # absent (legacy callers, Phase A repro), None preserves the 60s
             # read-timeout floor + the session's default max_retries.
-            provider_timeout_seconds=(
-                None if per_symbol_deadline is None
-                else float(per_symbol_deadline.provider_timeout_ms()) / 1000.0
-            ),
+            provider_timeout_seconds=None,
+            deadline=per_symbol_deadline,
         )
 
         # Merge the per-attempt §8 envelope fields onto the wrapper's outer
@@ -922,13 +922,14 @@ def _call_ga_llm_with_retry(
         attempt_meta["llm_effective_thinking_budget_tokens"] = _am.get("llm_effective_thinking_budget_tokens")
         attempt_meta["llm_effective_max_output_tokens"] = _am.get("llm_effective_max_output_tokens")
         attempt_meta["llm_effective_temperature"] = _am.get("llm_effective_temperature")
-        # 07-10 R1-1: surface the per-symbol deadline's provider timeout
-        # (Phase B). The admission gate above already returned
-        # ``llm_provider_timeout_ms=0`` on the exhausted-deadline skip path;
-        # for a real call, derive it from the deadline's remaining time so
-        # the §8 envelope records the effective per-attempt timeout.
-        if per_symbol_deadline is not None:
-            attempt_meta["llm_provider_timeout_ms"] = per_symbol_deadline.provider_timeout_ms()
+        # Phase B P1-1 (07-22): prefer the immutable timeout captured at
+        # post-prompt admission inside ``_run_single_llm_attempt``. A post-call
+        # re-read of ``deadline.provider_timeout_ms()`` can collapse to 0 after
+        # a successful call (production d49) and must NOT overwrite the
+        # admitted positive timeout. Fall back to the pre-call admission value
+        # already on attempt_meta when the single-attempt unit did not set one.
+        if _am.get("llm_provider_timeout_ms") is not None:
+            attempt_meta["llm_provider_timeout_ms"] = _am.get("llm_provider_timeout_ms")
         _prov_calls = int(_am.get("llm_provider_call_count") or 0)
         if _prov_calls:
             attempt_meta["llm_provider_call_count"] = attempt_meta.get("llm_provider_call_count", 0) + _prov_calls
@@ -1069,6 +1070,7 @@ def _run_single_llm_attempt(
     budget_violation_is_skip: bool = False,
     provider_timeout_seconds: float | None = None,
     subprocess_hard_timeout: bool = False,
+    deadline: Any = None,  # optional PerSymbolDeadline for post-prompt admission
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """07-10 R1-1: ONE LLM attempt - prompt build + budget-contract check +
     ONE provider call + JSON parse + unwrap + schema validation + schema-alias
@@ -1185,6 +1187,56 @@ def _run_single_llm_attempt(
         attempt_meta["llm_latency_ms"] = None
         return None, attempt_meta
 
+    # Phase B P1-1 (07-22): provider admission AFTER prompt build, BEFORE the
+    # provider call. Prefer a fresh read from the optional ``deadline`` object
+    # so wall-clock spent on prompt build is accounted for; fall back to the
+    # pre-resolved ``provider_timeout_seconds`` when no deadline is supplied
+    # (legacy retry wrapper). Capture a single IMMUTABLE effective timeout; if
+    # it is already exhausted (<=0) return a skip envelope WITHOUT calling the
+    # provider. Socket floors (max(15, ...)) and subprocess floors (max(1.0,
+    # ...)) must never re-admit a zero/negative timeout into a real call —
+    # that is the production d49 defect (pcc>=1 with timeout_ms=0). Never use
+    # max(1, remaining) to mask exhaustion.
+    effective_provider_timeout_seconds = provider_timeout_seconds
+    if deadline is not None:
+        try:
+            if bool(deadline.exhausted()):
+                effective_provider_timeout_seconds = 0.0
+            else:
+                _pt_ms = deadline.provider_timeout_ms()
+                effective_provider_timeout_seconds = (
+                    None if _pt_ms is None else float(_pt_ms) / 1000.0
+                )
+        except Exception:
+            # Keep the pre-resolved value if the deadline probe fails closed
+            # only when it was already known; otherwise force skip.
+            if effective_provider_timeout_seconds is None:
+                effective_provider_timeout_seconds = 0.0
+    if effective_provider_timeout_seconds is not None:
+        try:
+            _eff_s = float(effective_provider_timeout_seconds)
+        except (TypeError, ValueError):
+            _eff_s = 0.0
+        if _eff_s <= 0:
+            attempt_meta["llm_status"] = "skipped"
+            attempt_meta["llm_fallback_reason"] = "wall_clock_budget_exhausted"
+            attempt_meta["llm_terminal_reason"] = "symbol_timeout"
+            attempt_meta["llm_error_category"] = None
+            attempt_meta["llm_error_stage"] = "admission"
+            attempt_meta["llm_error"] = (
+                "per-symbol provider deadline exhausted after prompt build; "
+                "provider call suppressed"
+            )
+            attempt_meta["llm_provider_call_count"] = 0
+            attempt_meta["llm_provider_timeout_ms"] = 0
+            attempt_meta["llm_latency_ms"] = None
+            return None, attempt_meta
+        # Immutable positive timeout for socket/subprocess/envelope. Do NOT
+        # re-read the deadline after the call (post-call remaining may be 0
+        # even when the call was admitted with remaining>0).
+        effective_provider_timeout_seconds = _eff_s
+        attempt_meta["llm_provider_timeout_ms"] = int(round(_eff_s * 1000.0))
+
     # --- ONE provider call + JSON parse ---
     # 07-10 R2-1: thread the per-symbol deadline's provider timeout into the
     # call via the thread-local ``_llm_call_state.provider_timeout_seconds``
@@ -1195,7 +1247,7 @@ def _run_single_llm_attempt(
     # ``_call_ga_llm`` sets ``session.read_timeout`` + ``session.max_retries=0``
     # so the call is bounded. None (no deadline) preserves the 60s floor +
     # default retries.
-    _llm_call_state.provider_timeout_seconds = provider_timeout_seconds
+    _llm_call_state.provider_timeout_seconds = effective_provider_timeout_seconds
     # 07-10 S4 (P0 #3): the fair adapter opts the call into process-isolation
     # hard timeout. When True (and a provider timeout is set), ``_call_ga_llm``
     # runs ``session.raw_ask`` in a child process bounded by
@@ -1457,12 +1509,13 @@ def fair_llm_call_adapter(
     and the breaker record. This satisfies the directive: "fair coordinator
     调用单次-attempt adapter，不能再套内部三次 retry wrapper".
 
-    The adapter resolves the per-symbol deadline's provider timeout from
-    ``deadline.provider_timeout_ms()`` and surfaces it in the §8 envelope
-    (``llm_provider_timeout_ms``). R2 will thread it into ``_call_ga_llm`` so
-    the provider actually honors it; until then it is surfaced for
-    diagnostics only (the adapter calls ``_call_ga_llm(prompt)`` with the
-    legacy 60s read-timeout floor).
+    Provider-timeout admission is NOT done in this adapter. The adapter passes
+    ``deadline=`` (and ``provider_timeout_seconds=None``) into
+    ``_run_single_llm_attempt``, which re-reads ``deadline.provider_timeout_ms()``
+    AFTER prompt build / BEFORE the provider call and captures an immutable
+    ``llm_provider_timeout_ms`` (0 on skip; positive admitted ms on call). The
+    adapter must never re-read or overwrite ``llm_provider_timeout_ms`` after
+    the attempt returns — that post-call overwrite was the production d49 path.
 
     Returns ``(candidate_or_None, attempt_meta)`` exactly as the coordinator
     contract expects: ``llm_status`` ("ok" | "failed" | "skipped"),
@@ -1498,19 +1551,14 @@ def fair_llm_call_adapter(
         model_name = _resolve_llm_model(cfg_name)
         breaker.llm_model = model_name
 
-    # Provider timeout derived from the per-symbol deadline. R2-1 threads it
-    # into ``_call_ga_llm`` (``session.read_timeout`` + ``max_retries = 0``)
-    # AND surfaces it in the §8 envelope for diagnostics / accounting.
-    provider_timeout_ms = None
-    if deadline is not None:
-        try:
-            provider_timeout_ms = deadline.provider_timeout_ms()
-        except Exception:
-            provider_timeout_ms = None
-    provider_timeout_seconds = (
-        None if provider_timeout_ms is None
-        else float(provider_timeout_ms) / 1000.0
-    )
+    # Phase B P1-1 (07-22): do NOT resolve/overwrite the provider timeout here.
+    # Admission + the immutable effective timeout MUST be captured inside
+    # ``_run_single_llm_attempt`` AFTER prompt build and BEFORE the provider
+    # call (passing ``deadline=`` so wall-clock spent on fallback + prompt is
+    # accounted for). A post-call re-read of ``deadline.provider_timeout_ms()``
+    # was the production d49 defect path: a call admitted with remaining>0
+    # finished with remaining=0, then the adapter overwrote the envelope to
+    # timeout_ms=0 while pcc>=1. Never mask exhaustion with max(1, remaining).
 
     # 07-10 S4 (P0 #3): opt the fair-path call into process-isolation hard
     # timeout. Read from ``llm.scheduling.subprocess_hard_timeout`` (default
@@ -1533,13 +1581,14 @@ def fair_llm_call_adapter(
         last_category=None,  # the coordinator retries with a fresh attempt;
         # the single-attempt unit's tier selection is by ``attempt`` index.
         budget_violation_is_skip=True,  # P0-2: budget violation is a skip
-        provider_timeout_seconds=provider_timeout_seconds,  # R2-1: bound call
+        provider_timeout_seconds=None,  # resolved post-prompt from deadline
         subprocess_hard_timeout=subprocess_hard_timeout,  # S4: hard-kill child
+        deadline=deadline,  # P1-1: post-prompt admission + immutable timeout
     )
 
-    # Surface the per-symbol deadline's provider timeout + schedule context
-    # so the §8 envelope is complete for the fair path.
-    attempt_meta["llm_provider_timeout_ms"] = provider_timeout_ms
+    # Surface schedule context only. Do NOT overwrite
+    # ``llm_provider_timeout_ms`` — the immutable value from admission lives
+    # on attempt_meta already (0 on skip; positive admitted timeout on call).
     attempt_meta["llm_schedule_round"] = schedule_round
     attempt_meta["llm_schedule_position"] = schedule_position
 
@@ -3012,9 +3061,10 @@ def _call_ga_llm(prompt: str) -> str:
     #
     # The legacy 60s read-timeout floor is preserved when the thread-local has
     # no provider timeout (legacy retry-wrapper callers and ad-hoc script
-    # callers). The fair adapter stashes the per-symbol deadline's provider
-    # timeout (``PerSymbolDeadline.provider_timeout_ms()/1000``) before the
-    # call.
+    # callers). On the fair path the sole setter of
+    # ``_llm_call_state.provider_timeout_seconds`` is post-prompt admission
+    # inside ``_run_single_llm_attempt`` (via the immutable positive timeout);
+    # this function only reads that already-admitted value.
     provider_timeout_seconds = _provider_timeout_seconds
     if provider_timeout_seconds is not None:
         try:

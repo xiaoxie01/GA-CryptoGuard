@@ -32,8 +32,8 @@ pytestmark = [pytest.mark.pg, pytest.mark.schema_mutation]
 # Every contract marker initialize_database() must write. Each name MUST appear
 # as a row in _migration_state after a successful init. Sourced from the marker
 # helpers called by initialize_database() (R4/BTC#9/market-data/semantic/
-# continuity/fair-scheduling + the profit-protection cutoff + the
-# stop-loss-adjustment dedup marker).
+# continuity/fair-scheduling/timeout-envelope + the profit-protection cutoff +
+# the stop-loss-adjustment dedup marker).
 EXPECTED_MARKERS = {
     "hourly_report_accuracy_r4_contract_v1",
     "btc9_trade_gate_contract_v1",
@@ -41,6 +41,8 @@ EXPECTED_MARKERS = {
     "hourly_market_semantic_accuracy_contract_v1",
     "hourly_decision_context_continuity_contract_v1",
     "llm_fair_scheduling_context_contract_v1",
+    # 07-22 Codex P1-1: independent timeout-envelope cutoff marker.
+    "llm_provider_timeout_envelope_contract_v2",
     "profit_protection_mark_price_contract_v1",
     "stop_loss_adjustment_dedup_v1",
 }

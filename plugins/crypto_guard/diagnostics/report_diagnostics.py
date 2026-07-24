@@ -98,9 +98,14 @@ LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING = "llm_fair_scheduling_contract_mark
 FAIR_PATH_CONTINUITY_REAL_INJECTION = "fair_path_continuity_real_injection"
 PER_JOB_FAILURE_CONSISTENCY = "per_job_failure_consistency"
 # 07-10 P1-1 (design §10): eight formal Phase F diagnostic codes. Each
-# corresponds to a post-marker production-chain contract (design §10). These
-# are marker-cutoff-scoped: pre-marker findings demote to ``legacy_info`` via
-# ``_apply_llm_fair_scheduling_marker_cutoff`` (extended below to include them).
+# corresponds to a post-marker production-chain contract (design §10).
+# Seven of the eight (all except ``llm_timeout_config_out_of_range``) are
+# fair-scheduling-marker-cutoff-scoped: pre-marker findings demote to
+# ``legacy_info`` via ``_apply_llm_fair_scheduling_marker_cutoff``.
+# ``llm_timeout_config_out_of_range`` uses the independent
+# ``llm_provider_timeout_envelope_contract_v2`` marker instead: pre-marker
+# rows are SQL-excluded (no error, no ``legacy_info``); post-marker stays
+# error; marker-missing is fail-closed.
 LLM_FIRST_ATTEMPT_COVERAGE_LOW = "llm_first_attempt_coverage_low"
 LLM_SYMBOL_STARVATION = "llm_symbol_starvation"
 LLM_REPORT_COUNT_MISMATCH = "llm_report_count_mismatch"
@@ -110,6 +115,16 @@ LLM_TIMEOUT_CONFIG_OUT_OF_RANGE = "llm_timeout_config_out_of_range"
 LLM_BATCH_DEGRADED_REPORTED_HEALTHY = "llm_batch_degraded_reported_healthy"
 DIAGNOSTIC_QUERY_FAILED = "diagnostic_query_failed"
 LLM_REPAIR_COUNTED_AS_PROVIDER_CALL = "llm_repair_counted_as_provider_call"
+# 07-22 Codex P1-1 / P2 exclude-only: independent provider-timeout envelope
+# contract marker. ``llm_timeout_config_out_of_range`` uses this marker's
+# applied_at as the SQL lower bound (NOT the fair-scheduling marker).
+# Pre-marker pcc>=1 / timeout_ms=0 rows remain in ga_decisions for audit but
+# are EXCLUDED from current diagnose_report_accuracy issues (no error and no
+# legacy_info). Post-marker violations stay error. Marker-missing is
+# fail-closed (error).
+LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_MISSING = (
+    "llm_provider_timeout_envelope_contract_marker_missing"
+)
 # 07-14 R8 P2-NEW-1 (contract #4): crash-residue diagnostic. A producer that
 # died between Phase 1 (prepared skill-execution log autocommit write) and
 # Phase 2 (the BEGIN IMMEDIATE commit/abort) leaves ``skill_execution_logs``
@@ -202,6 +217,12 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # 07-10 P1-1 (design §10): eight formal Phase F diagnostics. Each verifies
     # a post-marker fair-scheduling + context-continuity contract on the latest
     # batches / decisions. Marker-cutoff-scoped above.
+    # 07-22 Codex P1-1 / P2 exclude-only: timeout envelope has its OWN marker
+    # (independent of fair-scheduling). Marker-missing is fail-closed. The
+    # timeout-config check applies SQL lower bound = envelope marker applied_at
+    # so pre-marker rows never enter issues (no error, no legacy_info). No
+    # demotion pass for this code — unique contract is exclude-only.
+    issues.extend(_check_llm_provider_timeout_envelope_contract_markers_missing(repo))
     issues.extend(_check_llm_first_attempt_coverage_low(repo))
     issues.extend(_check_llm_symbol_starvation(repo))
     issues.extend(_check_llm_report_count_mismatch(repo))
@@ -247,6 +268,10 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # created before this marker are demoted to legacy_info; post-marker errors
     # stay error/warning.
     _apply_llm_fair_scheduling_marker_cutoff(repo, issues)
+
+    # 07-22 Codex P2: NO _apply_llm_timeout_envelope_marker_cutoff here.
+    # Timeout-envelope unique contract is SQL exclude-only (pre-marker rows
+    # never enter issues). Demotion-to-legacy_info is not part of this code.
 
     error_count = sum(1 for i in issues if i["severity"] == "error")
     warning_count = sum(1 for i in issues if i["severity"] == "warning")
@@ -300,6 +325,9 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING: _count(issues, LLM_FAIR_SCHEDULING_CONTRACT_MARKER_MISSING),
         FAIR_PATH_CONTINUITY_REAL_INJECTION: _count(issues, FAIR_PATH_CONTINUITY_REAL_INJECTION),
         PER_JOB_FAILURE_CONSISTENCY: _count(issues, PER_JOB_FAILURE_CONSISTENCY),
+        LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_MISSING: _count(
+            issues, LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_MISSING
+        ),
         LLM_FIRST_ATTEMPT_COVERAGE_LOW: _count(issues, LLM_FIRST_ATTEMPT_COVERAGE_LOW),
         LLM_SYMBOL_STARVATION: _count(issues, LLM_SYMBOL_STARVATION),
         LLM_REPORT_COUNT_MISMATCH: _count(issues, LLM_REPORT_COUNT_MISMATCH),
@@ -380,6 +408,17 @@ CONTINUITY_CONTRACT_MARKER_KEY = "hourly_decision_context_continuity_contract_v1
 # marker are demoted to ``legacy_info``; rows after are evaluated against the
 # full S1-S6 contract.
 LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY = "llm_fair_scheduling_context_contract_v1"
+
+# 07-22 Codex P1-1 / P2 exclude-only: independent provider-timeout envelope
+# contract marker. Written by initialize_database via
+# _ensure_llm_provider_timeout_envelope_contract_marker. SQL lower bound for
+# llm_timeout_config_out_of_range: pre-marker rows stay in ga_decisions for
+# audit but never enter current issues (no error, no legacy_info); post-marker
+# pcc>=1 timeout_ms not in (0, cap] = error. Distinct from the fair-scheduling
+# marker so historical d49 is excluded without coupling Phase F cutoffs.
+LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY = (
+    "llm_provider_timeout_envelope_contract_v2"
+)
 
 # Phase H (07-05): default serialized size budget for the
 # MultiTimeframeFeaturePack. The builder enforces 24 KiB at construction
@@ -528,9 +567,16 @@ def _llm_attempt_check_created_at_lower_bound(repo: CryptoGuardRepository) -> st
     """07-10 R6-E (P1-3 #4 second half): lower bound on
     ``ga_decisions.created_at`` for the attempt-metadata checks
     (_check_llm_success_missing_attempt_metadata,
-    _check_llm_continuity_not_included, _check_llm_timeout_config_out_of_range,
+    _check_llm_continuity_not_included,
     _check_llm_repair_counted_as_provider_call), applied in SQL BEFORE
     ``LIMIT``.
+
+    NOTE (07-22 Codex P1-1 / P2): ``_check_llm_timeout_config_out_of_range`` no
+    longer uses this bound. It uses
+    ``_llm_timeout_envelope_check_created_at_lower_bound`` keyed to the
+    independent ``llm_provider_timeout_envelope_contract_v2`` marker so
+    historical d49 is SQL-excluded (not demoted) without coupling to the
+    fair-scheduling cutoff.
 
     The attempt-metadata checks read ``ga_decisions ORDER BY id DESC LIMIT 200``
     with no time/marker bound and relied SOLELY on
@@ -561,6 +607,50 @@ def _llm_attempt_check_created_at_lower_bound(repo: CryptoGuardRepository) -> st
     return datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _get_llm_provider_timeout_envelope_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """07-22 Codex P1-1: return the provider-timeout envelope marker's
+    applied_at, or None.
+
+    None means the marker has not been deployed — the marker-missing check
+    (_check_llm_provider_timeout_envelope_contract_markers_missing) surfaces
+    the absence as an error (fail-closed). Callers of the timeout-config check
+    use this as the SQL lower bound so pre-marker rows are never counted as
+    current errors.
+    """
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _llm_timeout_envelope_check_created_at_lower_bound(
+    repo: CryptoGuardRepository,
+) -> str:
+    """07-22 Codex P1-1 / P2 exclude-only: lower bound on
+    ``ga_decisions.created_at`` for ``_check_llm_timeout_config_out_of_range``,
+    applied in SQL BEFORE ``LIMIT``.
+
+    Unique contract for the timeout envelope: pre-marker rows remain in
+    ``ga_decisions`` for audit but must NEVER enter current
+    ``diagnose_report_accuracy`` issues — not as ``error`` and not as
+    ``legacy_info``. The SQL bound is the sole mechanism (exclude-only; no
+    demotion pass). When the marker is deployed, the bound is its
+    ``applied_at``. When absent, the bound is ``now_utc - 24h`` so ancient
+    rows cannot silently re-surface; the marker-missing check still emits
+    fail-closed error independently.
+    """
+    marker_ts = _get_llm_provider_timeout_envelope_contract_marker_ts(repo)
+    if marker_ts is not None:
+        return marker_ts
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    return datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _apply_llm_fair_scheduling_marker_cutoff(repo: CryptoGuardRepository, issues: list[dict[str, Any]]) -> None:
     """07-10 S7 (P1 #7): demote pre-marker fair-scheduling-contract findings
     to ``legacy_info``.
@@ -574,9 +664,12 @@ def _apply_llm_fair_scheduling_marker_cutoff(repo: CryptoGuardRepository, issues
     marker_ts = _get_llm_fair_scheduling_contract_marker_ts(repo)
     if marker_ts is None:
         return
-    # 07-10 P1-1: the eight formal Phase F diagnostic codes (design §10) are
-    # scoped to this same marker cutoff so pre-marker findings demote to
-    # legacy_info alongside the three S1-S6 contract checks.
+    # 07-10 P1-1: the formal Phase F diagnostic codes (design §10) are scoped
+    # to this same marker cutoff so pre-marker findings demote to legacy_info
+    # alongside the three S1-S6 contract checks.
+    # 07-22 Codex P1-1 / P2: LLM_TIMEOUT_CONFIG_OUT_OF_RANGE is NO LONGER in
+    # this set — it has its own envelope marker and SQL exclude-only bound
+    # (no demotion-to-legacy_info path for that code).
     scoped = {
         FAIR_PATH_CONTINUITY_REAL_INJECTION,
         PER_JOB_FAILURE_CONSISTENCY,
@@ -585,7 +678,6 @@ def _apply_llm_fair_scheduling_marker_cutoff(repo: CryptoGuardRepository, issues
         LLM_REPORT_COUNT_MISMATCH,
         LLM_SUCCESS_MISSING_ATTEMPT_METADATA,
         LLM_CONTINUITY_NOT_INCLUDED,
-        LLM_TIMEOUT_CONFIG_OUT_OF_RANGE,
         LLM_BATCH_DEGRADED_REPORTED_HEALTHY,
         LLM_REPAIR_COUNTED_AS_PROVIDER_CALL,
     }
@@ -1653,23 +1745,36 @@ def _check_bias_stage_semantic_conflict(repo: CryptoGuardRepository) -> list[dic
 
 
 def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    """Phase E: flag ga_decisions where 1D bias opposes 1H/15M bias in the
-    raw_decision_json snapshot profiles AND confidence >= the paper-order
-    threshold.
+    """Phase E / conventions §38.7: flag LONG/SHORT decisions with directional
+    S/A/B grade while ``htf_conflict=True`` and confidence is not capped at or
+    below the paper-order threshold.
 
-    Per PRD FR-3, a countertrend rebound must not reach executable-level
-    confidence purely on 15M/1H momentum. The fault test seeds
-    ``raw_decision_json.snapshot.profiles`` with ``1d.market_structure=bearish``
-    + ``1h.market_structure=bullish`` and ``confidence=0.85``.
+    Per Contract 38.7 and PRD FR-3, a countertrend rebound must not reach
+    executable-level confidence purely on 15M/1H momentum. Phase B P1-3
+    (07-22) tightens the check to match §38.7 literally; Codex P2-1 (07-22)
+    further requires a directional ``market_bias`` on the production shape:
+
+    - require explicit ``htf_conflict is True`` on the persisted decision
+      (do not infer solely from TF bias opposition — production d57 was
+      grade C / htf_conflict=False / monitor_only and was over-flagged);
+    - require signal_grade in {S, A, B} (C/D observation grades are out of
+      scope for this executable-overconfidence code);
+    - require confidence >= MIN_CONFIDENCE_FOR_PAPER_ORDER (uncapped);
+    - production shape (``timeframe_context`` present): also require
+      ``market_bias ∈ {bullish, bearish}``. A-grade neutral/unknown +
+      htf_conflict=True must NOT fire (not a directional countertrend
+      overconfidence). Legacy snapshot.profiles fixtures keep the pre-P2-1
+      path so FAULTHTF still fires without a top-level market_bias.
+
+    TF bias opposition is retained as a corroborating signal when present
+    (legacy snapshot.profiles fixtures that omit the explicit flag still
+    need a path to fire when the row is S/A/B + high confidence AND either
+    the flag is set OR the production-shape TF conflict is present). The
+    fault tests seed grade A + conf 0.85 + htf_conflict=True + directional
+    market_bias (FAULTHTF2) or the legacy profile opposition (FAULTHTF).
 
     Detection parses ``raw_decision_json`` (the structured audit JSON), NOT
     the free-text ``final_summary``. Severity: ``error`` post-marker.
-
-    Production ``raw_decision_json`` stores ``timeframe_context`` at the top
-    level (set by ``controller_decision_from_legacy`` from the normalized
-    legacy decision). Older rows or test fixtures may nest the data under
-    ``snapshot.profiles`` or ``raw_legacy_decision.snapshot.profiles`` —
-    fall back to those shapes so the diagnostic stays robust.
     """
     from plugins.crypto_guard.strategy.grade_config import MIN_CONFIDENCE_FOR_PAPER_ORDER
     issues: list[dict[str, Any]] = []
@@ -1689,6 +1794,10 @@ def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[
     for r in rows:
         conf = float(r["confidence"] or 0)
         if conf < MIN_CONFIDENCE_FOR_PAPER_ORDER:
+            continue
+        grade = str(r["signal_grade"] or "").upper()
+        # §38.7: only directional S/A/B grades are in scope.
+        if grade not in {"S", "A", "B"}:
             continue
         raw = _safe_json(r["raw_decision_json"]) or {}
         if not isinstance(raw, dict):
@@ -1719,26 +1828,55 @@ def _check_htf_countertrend_overconfidence(repo: CryptoGuardRepository) -> list[
             bias_4h = _profile_structure_bias(profiles.get("4h"))
             bias_1h = _profile_structure_bias(profiles.get("1h"))
             bias_15m = _profile_structure_bias(profiles.get("15m"))
-        if not bias_1d or bias_1d not in {"bullish", "bearish"}:
-            continue
-        opposite = "bullish" if bias_1d == "bearish" else "bearish"
-        low_tf_opposite = opposite in {bias_1h, bias_15m}
-        if not low_tf_opposite:
-            continue
-        # 4H must NOT confirm the low-TF direction to count as a conflict.
-        if bias_4h == opposite:
-            continue
+        # Explicit htf_conflict flag (production shape) OR nested copies.
+        htf_conflict = raw.get("htf_conflict")
+        if htf_conflict is None:
+            for _blk_key in ("flags", "risk", "judge", "execution"):
+                _blk = raw.get(_blk_key)
+                if isinstance(_blk, dict) and "htf_conflict" in _blk:
+                    htf_conflict = _blk.get("htf_conflict")
+                    break
+        htf_explicit = htf_conflict is True
+        # Corroborating TF opposition (legacy fixtures without the flag).
+        tf_conflict = False
+        if bias_1d in {"bullish", "bearish"}:
+            opposite = "bullish" if bias_1d == "bearish" else "bearish"
+            low_tf_opposite = opposite in {bias_1h, bias_15m}
+            # 4H must NOT confirm the low-TF direction to count as a conflict.
+            if low_tf_opposite and bias_4h != opposite:
+                tf_conflict = True
+        # §38.7: require explicit htf_conflict=True. Legacy snapshot.profiles
+        # fixtures historically omit the flag; accept TF-derived conflict only
+        # for that legacy shape (no top-level timeframe_context) so FAULTHTF
+        # still fires. Production shape (timeframe_context present) MUST carry
+        # the explicit flag — TF inference alone is not enough (d57 FP).
+        if isinstance(tf_ctx, dict) and tf_ctx:
+            if not htf_explicit:
+                continue
+            # Codex P2-1: production shape also requires a directional
+            # market_bias. Prefer the row column, fall back to raw envelope.
+            market_bias = str(
+                r["market_bias"] if r["market_bias"] is not None
+                else raw.get("market_bias") or ""
+            ).lower()
+            if market_bias not in {"bullish", "bearish"}:
+                continue
+        else:
+            if not (htf_explicit or tf_conflict):
+                continue
         issues.append(_issue(
             HTF_COUNTERTREND_OVERCONFIDENCE, "error",
             {
                 "decision_id": int(r["id"]), "symbol": r["symbol"],
                 "grade": r["signal_grade"], "confidence": conf,
                 "threshold": MIN_CONFIDENCE_FOR_PAPER_ORDER,
+                "htf_conflict": bool(htf_explicit),
                 "1d_bias": bias_1d, "1h_bias": bias_1h,
                 "15m_bias": bias_15m, "4h_bias": bias_4h,
             },
-            "高周期空头中的低周期反弹不得获得执行级置信度；"
-            "htf_conflict 须触发置信度上限并降级。",
+            "§38.7: S/A/B 级且 htf_conflict=True 时不得保留执行级置信度；"
+            "须触发置信度上限并降级。C/D、htf_conflict=False 或非方向性 "
+            "market_bias（neutral/unknown/mixed）不在本码范围（生产 shape）。",
         ))
     return issues
 
@@ -3378,12 +3516,49 @@ def _check_llm_fair_scheduling_contract_markers_missing(
     return issues
 
 
+def _check_llm_provider_timeout_envelope_contract_markers_missing(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """07-22 Codex P1-1 / P2: flag a missing provider-timeout envelope marker.
+
+    The marker ``llm_provider_timeout_envelope_contract_v2`` must exist in
+    ``_migration_state``. If absent, emit an ``error`` (fail-closed) so callers
+    never receive a silently-healthy report while the post-prompt admission
+    contract is undeployed. Pre-marker historical rows (e.g. production d49)
+    stay in ``ga_decisions`` for audit; once the marker is present the SQL
+    lower bound excludes them from current issues entirely (exclude-only —
+    no legacy_info issue is generated). Rows are NOT deleted.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s LIMIT 1",
+            (LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception:
+        raise
+    if not row or not row["applied_at"]:
+        issues.append(_issue(
+            LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_MISSING, "error",
+            {
+                "marker_key": LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,
+                "contract": "llm-provider-timeout-envelope",
+                "issue": "marker_absent",
+            },
+            "provider-timeout envelope contract marker 未部署。"
+            "运行 initialize_database() 部署 llm_provider_timeout_envelope_contract_v2；"
+            "marker 缺失时 llm_timeout_config_out_of_range 无法区分历史 d49 与当前"
+            "契约违约（fail-closed）。",
+        ))
+    return issues
+
+
 def _check_fair_path_continuity_real_injection(
     repo: CryptoGuardRepository,
 ) -> list[dict[str, Any]]:
-    """07-10 S7 (P1 #7, validates S1 / P0 #1): flag ga_decisions where a
-    STRICT cross-batch previous-analysis row exists for the symbol but the
-    persisted ``analysis_continuity.continuity_status`` is NOT ``ok``.
+    """07-10 S7 (P1 #7, validates S1 / P0 #1): flag ga_decisions where the
+    CANONICAL continuity classification expects ``ok`` but the persisted
+    ``analysis_continuity.continuity_status`` is NOT ``ok``.
 
     The S1 (P0 #1) fix pre-injects the real strict cross-batch previous
     analysis into each fair-path snapshot BEFORE the LLM prompt is built, so
@@ -3394,17 +3569,17 @@ def _check_fair_path_continuity_real_injection(
     ``build_analysis_continuity`` re-derives the same status from the strict
     row, so the persisted block is the audit-grade witness.
 
-    Detection: for the latest 200 ``ga_decisions`` rows, look up the strict
-    prior row the SAME way the controller does
-    (``latest_analysis_state_for_continuity(symbol, analysis_time_utc,
-    exclude_batch_id=batch_id)``). When a strict prior row EXISTS, the
-    persisted ``analysis_continuity.continuity_status`` MUST be ``ok``.
-    A non-``ok`` status (``missing``/``stale``/``future``/``same_batch``/
-    ``cross_symbol``) despite a qualifying prior row means the S1 pre-injection
-    regressed -> the LLM prompt was built without real prior context (the
-    original P0 #1 defect). Severity: ``error`` post-marker, ``legacy_info``
-    pre-marker (applied by ``_apply_llm_fair_scheduling_marker_cutoff``).
+    Phase B P1-2 (07-22): do NOT flag merely because a prior row exists. A
+    prior row can legitimately yield ``stale`` when
+    ``age_ms > CONTINUITY_MAX_AGE_MS`` (24h) — production batch6 after a
+    30.75h gap recorded correct ``stale`` for all 10 symbols and was
+    over-flagged. Reuse the canonical ``_continuity_status`` classifier; only
+    flag when expected=``ok`` AND persisted ≠ ``ok``. Severity: ``error``
+    post-marker, ``legacy_info`` pre-marker (applied by
+    ``_apply_llm_fair_scheduling_marker_cutoff``).
     """
+    from plugins.crypto_guard.reasoning.decision_context import _continuity_status
+
     issues: list[dict[str, Any]] = []
     rows = repo.conn.execute(
         """
@@ -3427,9 +3602,9 @@ def _check_fair_path_continuity_real_injection(
         status = str(continuity.get("continuity_status") or "").lower()
         if status == "ok":
             continue
-        # Re-derive whether a strict cross-batch prior row SHOULD have been
-        # found for this decision. Only flag when the controller COULD have
-        # produced ``ok`` (a qualifying prior row exists) but did not.
+        # Re-derive the CANONICAL expected status the same way the controller
+        # does. Only flag when expected is ``ok`` (injection should have
+        # produced a valid prior) but the persisted status is not.
         symbol = str(r["symbol"] or "")
         batch_id = str(r["batch_id"] or "") or None
         try:
@@ -3446,9 +3621,16 @@ def _check_fair_path_continuity_real_injection(
             )
         except Exception:
             raise
-        if not prior:
-            # No qualifying prior row -> a non-ok status (e.g. "missing") is
-            # the correct first-analysis outcome. Not a defect.
+        expected = _continuity_status(
+            previous_row=prior if isinstance(prior, dict) else None,
+            current_symbol=symbol,
+            current_analysis_time_utc=at_utc,
+            current_batch_id=batch_id,
+        )
+        if expected != "ok":
+            # Legitimate non-ok (missing / stale / future / same_batch /
+            # cross_symbol). A prior may exist but still be too old for
+            # continuity — not an S1 injection regression.
             continue
         issues.append(_issue(
             FAIR_PATH_CONTINUITY_REAL_INJECTION, "error",
@@ -3460,13 +3642,16 @@ def _check_fair_path_continuity_real_injection(
                 "decision": r["decision"],
                 "analysis_time": at_utc,
                 "observed_continuity_status": status,
-                "expected_continuity_status": "ok",
-                "prior_analysis_time": int(prior.get("analysis_time") or 0),
+                "expected_continuity_status": expected,
+                "prior_analysis_time": int(
+                    (prior or {}).get("analysis_time") or 0
+                ) if isinstance(prior, dict) else 0,
             },
-            "fair 路径 continuity 真实注入回归：存在严格跨批前序 analysis_states "
-            "行但持久化 continuity_status != ok。S1 (P0 #1) 预注入被绕过 -> "
+            "fair 路径 continuity 真实注入回归：canonical 期望 continuity_status=ok "
+            "但持久化 status != ok。S1 (P0 #1) 预注入被绕过 -> "
             "LLM prompt 在无真实前序上下文下构建（生产饥饿/误判根因）。检查 "
-            "process_fair_batch 的预注入循环是否在 run_fair_batch 之前执行。",
+            "process_fair_batch 的预注入循环是否在 run_fair_batch 之前执行。"
+            "合法 stale（age > CONTINUITY_MAX_AGE_MS）不得报此码。",
         ))
     return issues
 
@@ -3963,9 +4148,9 @@ def _check_llm_continuity_not_included(repo: CryptoGuardRepository) -> list[dict
 
 
 def _check_llm_timeout_config_out_of_range(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
-    """07-10 P1-1 (design §10): flag a decision whose persisted
-    ``llm_provider_timeout_ms`` is outside the valid config range on a symbol
-    that made a real provider call.
+    """07-10 P1-1 (design §10) / 07-22 Codex P2 exclude-only: flag a decision
+    whose persisted ``llm_provider_timeout_ms`` is outside the valid config
+    range on a symbol that made a real provider call.
 
     The per-symbol deadline (Phase B) derives ``provider_timeout_ms =
     min(per_attempt_timeout_ms, remaining_ms())``. Config validation
@@ -3977,12 +4162,21 @@ def _check_llm_timeout_config_out_of_range(repo: CryptoGuardRepository) -> list[
     configured cap, or a negative value, is a config/timeout regression that
     would either let a call run unbounded or mis-bounds the hard kill. ``0``
     on a no-call skip path is the legitimate exhausted-deadline value and is
-    NOT flagged. Severity: ``error``.
+    NOT flagged.
+
+    Severity / window (unique contract, 07-22 Codex P2):
+    - Post-envelope-marker violations → ``error``.
+    - Pre-marker historical rows (e.g. d49) stay in ``ga_decisions`` for audit
+      but are SQL-excluded from this check (``created_at >= marker applied_at``)
+      so they never enter issues — not as error and not as ``legacy_info``.
+    - Marker missing → independent fail-closed error from the marker-missing
+      check; this SQL bound falls back to a 24h window only.
     """
     issues: list[dict[str, Any]] = []
-    # R6-E P1-3 #4 (second half): marker/time bound BEFORE LIMIT (see
-    # _llm_attempt_check_created_at_lower_bound).
-    bound = _llm_attempt_check_created_at_lower_bound(repo)
+    # 07-22 Codex P2 exclude-only: SQL bound to envelope marker applied_at is
+    # the sole pre-marker filter. Removing this bound is the revert-fail trigger
+    # (pre-marker d49-shaped seed would reappear as current error).
+    bound = _llm_timeout_envelope_check_created_at_lower_bound(repo)
     rows = repo.conn.execute(
         """
         SELECT id, symbol, batch_id, analysis_time, signal_grade, decision,

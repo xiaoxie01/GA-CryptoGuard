@@ -34116,6 +34116,213 @@ class TestHourlyAnalysisSemanticAccuracy07_03(unittest.TestCase):
             f"Production timeframe_context shape must be detected; got symbols={htf_symbols}",
         )
 
+    def test_p1_3_htf_countertrend_does_not_fire_on_grade_c_without_flag(
+        self,
+    ) -> None:
+        """P1-3 / §38.7 (07-22): grade C + htf_conflict=False must NOT fire
+        ``htf_countertrend_overconfidence`` even when 1d/1h biases oppose and
+        confidence is at paper threshold. Production d57 (ADAUSDT C / 0.79 /
+        htf_conflict=False / monitor_only) was a diagnostic FP.
+
+        Revert-fail: restore TF-only inference without S/A/B + explicit flag
+        filters -> this seed fires as error -> assertion fails.
+        """
+        self._seed_fault_ga_decision(
+            symbol="ADACFP", grade="C", confidence=0.79,
+            decision_name="monitor_only", market_bias="bearish",
+            trend_stage="middle", final_summary="C 级 偏空观察",
+            risk_ok=False,
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='ADACFP'",
+            (json.dumps({
+                "timeframe_context": {
+                    "1d": {"bias": "bullish", "structure": "uptrend", "closed": True},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                    "1h": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                    "15m": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": False,
+                "market_bias": "bearish",
+                "confidence": 0.79,
+                "decision": "monitor_only",
+                "signal_grade": "C",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        htf_issues = [
+            i for i in result.get("issues", [])
+            if i.get("type") == "htf_countertrend_overconfidence"
+            and (i.get("details") or {}).get("symbol") == "ADACFP"
+        ]
+        self.assertEqual(
+            len(htf_issues), 0,
+            "P1-3/§38.7: grade C + htf_conflict=False must NOT fire "
+            "htf_countertrend_overconfidence; got %r" % (htf_issues,),
+        )
+
+    def test_p1_3_htf_countertrend_still_fires_on_sab_with_explicit_flag(
+        self,
+    ) -> None:
+        """P1-3 boundary: S/A/B + htf_conflict=True + high confidence MUST
+        still fire (real §38.7 defect). Complements the C-grade non-fire
+        test so a total check deletion is caught.
+        """
+        self._seed_fault_ga_decision(
+            symbol="SABHTF", grade="A", confidence=0.85,
+            decision_name="trade_plan_available", market_bias="bullish",
+            trend_stage="middle", final_summary="A 级 偏多",
+            risk_ok=True,
+            trade_plan={
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='SABHTF'",
+            (json.dumps({
+                "timeframe_context": {
+                    "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                    "1h": {"bias": "bullish", "structure": "rebound", "closed": True},
+                    "15m": {"bias": "bullish", "structure": "rebound", "closed": True},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": True,
+                "market_bias": "bullish",
+                "confidence": 0.85,
+                "decision": "trade_plan_available",
+                "signal_grade": "A",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        htf_issues = [
+            i for i in result.get("issues", [])
+            if i.get("type") == "htf_countertrend_overconfidence"
+            and (i.get("details") or {}).get("symbol") == "SABHTF"
+        ]
+        self.assertGreaterEqual(
+            len(htf_issues), 1,
+            "P1-3/§38.7: grade A + htf_conflict=True + conf>=paper must fire "
+            "htf_countertrend_overconfidence. Got %d." % (len(htf_issues),),
+        )
+
+    def test_p2_1_htf_countertrend_does_not_fire_on_neutral_bias_with_flag(
+        self,
+    ) -> None:
+        """Codex P2-1: production shape with grade A + htf_conflict=True +
+        high conf but market_bias=neutral MUST NOT fire
+        ``htf_countertrend_overconfidence``. §38.7 is about directional
+        countertrend overconfidence; neutral/unknown is out of scope.
+
+        Revert-fail: drop the market_bias ∈ {bullish,bearish} gate on the
+        production shape -> this seed fires -> assertion fails.
+        """
+        self._seed_fault_ga_decision(
+            symbol="NEUTHTF", grade="A", confidence=0.85,
+            decision_name="trade_plan_available", market_bias="neutral",
+            trend_stage="middle", final_summary="A 级 中性",
+            risk_ok=True,
+            trade_plan={
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='NEUTHTF'",
+            (json.dumps({
+                "timeframe_context": {
+                    "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                    "1h": {"bias": "bullish", "structure": "rebound", "closed": True},
+                    "15m": {"bias": "bullish", "structure": "rebound", "closed": True},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": True,
+                "market_bias": "neutral",
+                "confidence": 0.85,
+                "decision": "trade_plan_available",
+                "signal_grade": "A",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        htf_issues = [
+            i for i in result.get("issues", [])
+            if i.get("type") == "htf_countertrend_overconfidence"
+            and (i.get("details") or {}).get("symbol") == "NEUTHTF"
+        ]
+        self.assertEqual(
+            len(htf_issues), 0,
+            "P2-1: grade A + htf_conflict=True + market_bias=neutral must NOT "
+            "fire htf_countertrend_overconfidence; got %r" % (htf_issues,),
+        )
+
+    def test_p2_1_htf_countertrend_still_fires_on_directional_bias_with_flag(
+        self,
+    ) -> None:
+        """Codex P2-1 boundary: production shape with grade A +
+        htf_conflict=True + conf high + market_bias=bullish MUST still fire.
+        Complements the neutral non-fire so a total check deletion is caught.
+        """
+        self._seed_fault_ga_decision(
+            symbol="DIRHTF", grade="A", confidence=0.85,
+            decision_name="trade_plan_available", market_bias="bullish",
+            trend_stage="middle", final_summary="A 级 偏多",
+            risk_ok=True,
+            trade_plan={
+                "side": "LONG", "entry_type": "limit",
+                "entry_price": 100.0, "stop_loss": 95.0,
+                "take_profits": [{"price": 110.0}],
+            },
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET raw_decision_json=%s WHERE symbol='DIRHTF'",
+            (json.dumps({
+                "timeframe_context": {
+                    "1d": {"bias": "bearish", "structure": "downtrend", "closed": True},
+                    "4h": {"bias": "mixed", "structure": "range", "closed": True},
+                    "1h": {"bias": "bullish", "structure": "rebound", "closed": True},
+                    "15m": {"bias": "bullish", "structure": "rebound", "closed": True},
+                },
+                "alignment": "countertrend_rebound",
+                "htf_conflict": True,
+                "market_bias": "bullish",
+                "confidence": 0.85,
+                "decision": "trade_plan_available",
+                "signal_grade": "A",
+            }),),
+        )
+        self.conn.commit()
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        result = diagnose_report_accuracy(self.repo)
+        htf_issues = [
+            i for i in result.get("issues", [])
+            if i.get("type") == "htf_countertrend_overconfidence"
+            and (i.get("details") or {}).get("symbol") == "DIRHTF"
+        ]
+        self.assertGreaterEqual(
+            len(htf_issues), 1,
+            "P2-1: grade A + htf_conflict=True + directional market_bias + "
+            "conf>=paper must fire. Got %d." % (len(htf_issues),),
+        )
+
     # ── p) Fault injection: summary structured mismatch detected ──────────
 
     def test_fault_injection_summary_structured_mismatch_detected(self) -> None:
@@ -46314,12 +46521,18 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "wrong payload was drained. Got len=%d, want len=%d."
                 % (len(_payload[1]), len(_canned)),
             )
+            # Bound is <15s (the join timeout), not a tight 10s wall-clock.
+            # True Queue join-before-drain blocks to the full 15s deadline;
+            # under xdist/serial machine load, healthy drain+reap can exceed
+            # 10s without being the deadlock (observed 12s false fail). Keep
+            # the contract: finish strictly under the hard-timeout budget.
             self.assertLess(
-                _dt, 10.0,
-                "P0-2: a large response must complete WELL under the 15s "
-                "deadline (the child returns instantly and the parent drains "
-                "first). dt=%.2fs means the parent blocked on a join before "
-                "draining -- the Queue join-before-drain deadlock regressed."
+                _dt, 14.0,
+                "P0-2: a large response must complete under the 15s hard "
+                "timeout (the child returns instantly and the parent drains "
+                "first). dt=%.2fs near/at 15s means the parent blocked on a "
+                "join before draining -- the Queue join-before-drain deadlock "
+                "regressed."
                 % _dt,
             )
             # R3 §7.2.2: large result -> no false timeout AND child PID is reaped.
@@ -47776,6 +47989,295 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "fair_path_continuity_real_injection. Got %d." % (len(fired),),
         )
 
+    def test_p1_2_continuity_real_injection_does_not_fire_on_legitimate_stale(
+        self,
+    ) -> None:
+        """P1-2 (07-22): a prior row that is older than CONTINUITY_MAX_AGE_MS
+        (24h) correctly yields continuity_status='stale'. The diagnostic must
+        reuse the canonical ``_continuity_status`` classifier and NOT flag
+        ``fair_path_continuity_real_injection`` — only expected=ok &
+        persisted≠ok is a defect. Production batch6 (30.75h gap) was a FP.
+
+        Revert-fail: restore the old ``if prior: flag any non-ok`` branch ->
+        this seed fires as error -> assertion fails.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            CONTINUITY_MAX_AGE_MS,
+        )
+
+        # Prior at t=1000; current 30h later (> 24h max age) -> stale.
+        prior_at = 1_000
+        current_at = prior_at + CONTINUITY_MAX_AGE_MS + 6 * 3_600_000  # +30h
+        self.conn.execute(
+            """INSERT INTO analysis_states(symbol, analysis_time, analysis_time_utc,
+               analysis_mode, timeframes, market_structure_json, trend_clarity_json,
+               no_trade_reason_json, key_levels_json, next_triggers_json,
+               next_analysis_json, breakout_watch_json, trade_permission_json,
+               trade_plan_json, state_json)
+               VALUES('STALEUSDT', %s, '2026-01-01T00:00:00Z', 'live', '[]',
+               '{}', '{}', NULL, '{}', '[]', '{}', '{}', '{}', '{}', '{}')""",
+            (prior_at,),
+        )
+        raw = json.dumps({
+            "llm_status": "ok",
+            "analysis_continuity": {
+                "contract_version": "analysis_continuity_v1",
+                "continuity_status": "stale",
+                "previous": {"analysis_time": prior_at},
+                "delta": {},
+            },
+        })
+        self.conn.execute(
+            """INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc,
+               decision_type, signal_grade, confidence, decision,
+               skill_result_refs_json, evidence_json, counter_evidence_json,
+               risk_check_json, feishu_actions_json, final_summary,
+               raw_decision_json, batch_id)
+               VALUES('STALEUSDT', %s, '2026-01-02T06:00:00Z', 'market_analysis',
+               'B', 0.5, 'observe', '[]', '[]', '[]', '{}', '[]', 'summary',
+               %s, '15m:%s')""",
+            (current_at, raw, current_at),
+        )
+        self.conn.commit()
+
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "fair_path_continuity_real_injection"
+            and i.get("severity") == "error"
+            and (i.get("details") or {}).get("symbol") == "STALEUSDT"
+        ]
+        self.assertEqual(
+            len(fired), 0,
+            "P1-2: legitimate stale (prior age > 24h) must NOT fire "
+            "fair_path_continuity_real_injection; got %r" % (fired,),
+        )
+
+    def test_p1_2_continuity_real_injection_still_fires_on_missing_with_fresh_prior(
+        self,
+    ) -> None:
+        """P1-2 boundary: when a FRESH prior exists (age << 24h) but the
+        persisted status is 'missing', the diagnostic MUST still fire —
+        that is the real S1 injection regression. Complements the stale
+        non-fire test above.
+
+        Revert-fail: if the check is deleted entirely both seeds pass
+        quietly; this assertion catches the total-removal case.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+
+        prior_at = 1_000
+        current_at = prior_at + 900_000  # 15m later — well inside 24h
+        self.conn.execute(
+            """INSERT INTO analysis_states(symbol, analysis_time, analysis_time_utc,
+               analysis_mode, timeframes, market_structure_json, trend_clarity_json,
+               no_trade_reason_json, key_levels_json, next_triggers_json,
+               next_analysis_json, breakout_watch_json, trade_permission_json,
+               trade_plan_json, state_json)
+               VALUES('FRESHUSDT', %s, '2026-01-01T00:00:00Z', 'live', '[]',
+               '{}', '{}', NULL, '{}', '[]', '{}', '{}', '{}', '{}', '{}')""",
+            (prior_at,),
+        )
+        raw = json.dumps({
+            "llm_status": "ok",
+            "analysis_continuity": {
+                "contract_version": "analysis_continuity_v1",
+                "continuity_status": "missing",
+                "previous": None,
+                "delta": {},
+            },
+        })
+        self.conn.execute(
+            """INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc,
+               decision_type, signal_grade, confidence, decision,
+               skill_result_refs_json, evidence_json, counter_evidence_json,
+               risk_check_json, feishu_actions_json, final_summary,
+               raw_decision_json, batch_id)
+               VALUES('FRESHUSDT', %s, '2026-01-01T00:15:00Z', 'market_analysis',
+               'B', 0.5, 'observe', '[]', '[]', '[]', '{}', '[]', 'summary',
+               %s, '15m:%s')""",
+            (current_at, raw, current_at),
+        )
+        self.conn.commit()
+
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "fair_path_continuity_real_injection"
+            and i.get("severity") == "error"
+            and (i.get("details") or {}).get("symbol") == "FRESHUSDT"
+        ]
+        self.assertGreaterEqual(
+            len(fired), 1,
+            "P1-2: missing status with a FRESH prior (expected=ok) must still "
+            "fire fair_path_continuity_real_injection. Got %d." % (len(fired),),
+        )
+
+    def test_p2_2_continuity_age_eq_max_expected_ok_missing_must_error(
+        self,
+    ) -> None:
+        """Codex P2-2: age_ms == CONTINUITY_MAX_AGE_MS is still ok (classifier
+        uses strict ``>``). A prior at exact MAX age with persisted
+        continuity_status='missing' MUST fire fair_path_continuity_real_injection.
+
+        Do NOT copy CONTINUITY_MAX_AGE_MS into the diagnostic — reuse the
+        canonical ``_continuity_status`` only. Revert-fail: change classifier
+        or diagnostic to ``>=`` so equality becomes stale -> this seed no
+        longer fires -> assertion fails.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            CONTINUITY_MAX_AGE_MS,
+            _continuity_status,
+        )
+
+        prior_at = 1_000
+        current_at = prior_at + CONTINUITY_MAX_AGE_MS  # exact equality
+        expected = _continuity_status(
+            previous_row={
+                "symbol": "EQMAXUSDT",
+                "analysis_time": prior_at,
+                "batch_id": "15m:prior",
+            },
+            current_symbol="EQMAXUSDT",
+            current_analysis_time_utc=current_at,
+            current_batch_id="15m:cur",
+        )
+        self.assertEqual(
+            expected, "ok",
+            "canonical classifier: age==MAX must be ok (strict >), got %r"
+            % (expected,),
+        )
+        self.conn.execute(
+            """INSERT INTO analysis_states(symbol, analysis_time, analysis_time_utc,
+               analysis_mode, timeframes, market_structure_json, trend_clarity_json,
+               no_trade_reason_json, key_levels_json, next_triggers_json,
+               next_analysis_json, breakout_watch_json, trade_permission_json,
+               trade_plan_json, state_json)
+               VALUES('EQMAXUSDT', %s, '2026-01-01T00:00:00Z', 'live', '[]',
+               '{}', '{}', NULL, '{}', '[]', '{}', '{}', '{}', '{}', '{}')""",
+            (prior_at,),
+        )
+        raw = json.dumps({
+            "llm_status": "ok",
+            "analysis_continuity": {
+                "contract_version": "analysis_continuity_v1",
+                "continuity_status": "missing",
+                "previous": None,
+                "delta": {},
+            },
+        })
+        self.conn.execute(
+            """INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc,
+               decision_type, signal_grade, confidence, decision,
+               skill_result_refs_json, evidence_json, counter_evidence_json,
+               risk_check_json, feishu_actions_json, final_summary,
+               raw_decision_json, batch_id)
+               VALUES('EQMAXUSDT', %s, '2026-01-02T00:00:00Z', 'market_analysis',
+               'B', 0.5, 'observe', '[]', '[]', '[]', '{}', '[]', 'summary',
+               %s, '15m:%s')""",
+            (current_at, raw, current_at),
+        )
+        self.conn.commit()
+
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "fair_path_continuity_real_injection"
+            and i.get("severity") == "error"
+            and (i.get("details") or {}).get("symbol") == "EQMAXUSDT"
+        ]
+        self.assertGreaterEqual(
+            len(fired), 1,
+            "P2-2: age==CONTINUITY_MAX_AGE_MS expected=ok + persisted missing "
+            "must fire. Got %d." % (len(fired),),
+        )
+
+    def test_p2_2_continuity_age_eq_max_plus_one_stale_must_not_error(
+        self,
+    ) -> None:
+        """Codex P2-2: age_ms == CONTINUITY_MAX_AGE_MS + 1 is stale. Persisted
+        continuity_status='stale' must NOT fire fair_path_continuity_real_injection.
+
+        Complements the equality-ok test so a total check deletion or a
+        constant-copy drift (diagnostic using a local MAX) is caught.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+        from plugins.crypto_guard.reasoning.decision_context import (
+            CONTINUITY_MAX_AGE_MS,
+            _continuity_status,
+        )
+
+        prior_at = 1_000
+        current_at = prior_at + CONTINUITY_MAX_AGE_MS + 1
+        expected = _continuity_status(
+            previous_row={
+                "symbol": "STALE1USDT",
+                "analysis_time": prior_at,
+                "batch_id": "15m:prior",
+            },
+            current_symbol="STALE1USDT",
+            current_analysis_time_utc=current_at,
+            current_batch_id="15m:cur",
+        )
+        self.assertEqual(
+            expected, "stale",
+            "canonical classifier: age==MAX+1 must be stale, got %r" % (expected,),
+        )
+        self.conn.execute(
+            """INSERT INTO analysis_states(symbol, analysis_time, analysis_time_utc,
+               analysis_mode, timeframes, market_structure_json, trend_clarity_json,
+               no_trade_reason_json, key_levels_json, next_triggers_json,
+               next_analysis_json, breakout_watch_json, trade_permission_json,
+               trade_plan_json, state_json)
+               VALUES('STALE1USDT', %s, '2026-01-01T00:00:00Z', 'live', '[]',
+               '{}', '{}', NULL, '{}', '[]', '{}', '{}', '{}', '{}', '{}')""",
+            (prior_at,),
+        )
+        raw = json.dumps({
+            "llm_status": "ok",
+            "analysis_continuity": {
+                "contract_version": "analysis_continuity_v1",
+                "continuity_status": "stale",
+                "previous": {"analysis_time": prior_at},
+                "delta": {},
+            },
+        })
+        self.conn.execute(
+            """INSERT INTO ga_decisions(symbol, analysis_time, analysis_time_utc,
+               decision_type, signal_grade, confidence, decision,
+               skill_result_refs_json, evidence_json, counter_evidence_json,
+               risk_check_json, feishu_actions_json, final_summary,
+               raw_decision_json, batch_id)
+               VALUES('STALE1USDT', %s, '2026-01-02T00:00:00Z', 'market_analysis',
+               'B', 0.5, 'observe', '[]', '[]', '[]', '{}', '[]', 'summary',
+               %s, '15m:%s')""",
+            (current_at, raw, current_at),
+        )
+        self.conn.commit()
+
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "fair_path_continuity_real_injection"
+            and i.get("severity") == "error"
+            and (i.get("details") or {}).get("symbol") == "STALE1USDT"
+        ]
+        self.assertEqual(
+            len(fired), 0,
+            "P2-2: age==MAX+1 expected=stale + persisted stale must NOT fire; "
+            "got %r" % (fired,),
+        )
+
     def test_s7_p1_7_per_job_failure_consistency_fires_on_mismatch(self) -> None:
         """S7 (P1 #7, validates S6/P1 #6): a ``batch_symbol_status='failed'``
         row whose matching ``agent_jobs.status`` is 'success' must be flagged
@@ -48244,6 +48746,201 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             "P1-1: diagnose_report_accuracy must flag a real call with "
             "llm_provider_timeout_ms=0 as llm_timeout_config_out_of_range. "
             "Got %d." % (len(fired),),
+        )
+
+    def test_codex_p1_1_timeout_envelope_marker_written_on_fresh_db(self) -> None:
+        """Codex P1-1: ``initialize_database`` writes
+        ``llm_provider_timeout_envelope_contract_v2`` with non-null applied_at.
+
+        Revert-fail: remove
+        ``_ensure_llm_provider_timeout_envelope_contract_marker`` from the init
+        sequence -> marker row is absent -> assertion fails.
+        """
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
+            ("llm_provider_timeout_envelope_contract_v2",),
+        ).fetchone()
+        self.assertIsNotNone(
+            row,
+            "Codex P1-1: initialize_database must write the "
+            "llm_provider_timeout_envelope_contract_v2 marker.",
+        )
+        self.assertTrue(
+            bool(row and row["applied_at"]),
+            "Codex P1-1: envelope marker applied_at must be non-null.",
+        )
+
+    def test_codex_p1_1_timeout_envelope_marker_idempotent(self) -> None:
+        """Codex P1-1: envelope marker applied_at is immutable on re-init
+        (ON CONFLICT DO NOTHING). Revert-fail: change _ensure_marker to
+        DO UPDATE SET applied_at=EXCLUDED.applied_at -> sentinel is overwritten.
+        """
+        from datetime import datetime, timezone
+        from plugins.crypto_guard.storage.migrations import initialize_database
+
+        KEY = "llm_provider_timeout_envelope_contract_v2"
+        sentinel = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.conn.execute(
+            "UPDATE _migration_state SET applied_at = %s WHERE key = %s",
+            (sentinel, KEY),
+        )
+        self.conn.commit()
+        initialize_database()
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
+            (KEY,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        applied = row["applied_at"]
+        if hasattr(applied, "tzinfo") and applied.tzinfo is None:
+            applied = applied.replace(tzinfo=timezone.utc)
+        self.assertEqual(
+            applied, sentinel,
+            "Codex P1-1: envelope marker applied_at must survive re-init "
+            "unchanged (cutoff semantics).",
+        )
+
+    def test_codex_p1_1_timeout_envelope_marker_missing_is_error(self) -> None:
+        """Codex P1-1 fail-closed: deleting the envelope marker makes
+        ``diagnose_report_accuracy`` emit
+        ``llm_provider_timeout_envelope_contract_marker_missing`` at error.
+
+        Revert-fail: drop the marker-missing check -> ok stays true / count 0.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+        )
+
+        KEY = "llm_provider_timeout_envelope_contract_v2"
+        self.conn.execute(
+            "DELETE FROM _migration_state WHERE key = %s", (KEY,),
+        )
+        self.conn.commit()
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "llm_provider_timeout_envelope_contract_marker_missing"
+            and i.get("severity") == "error"
+        ]
+        self.assertGreaterEqual(
+            len(fired), 1,
+            "Codex P1-1: missing envelope marker must fire fail-closed error. "
+            "Got %d." % (len(fired),),
+        )
+        # Restore so later tests in the same class still see the marker.
+        from plugins.crypto_guard.storage.migrations import initialize_database
+        initialize_database()
+
+    def test_codex_p1_1_pre_envelope_marker_timeout_is_excluded_not_current_error(
+        self,
+    ) -> None:
+        """Codex P1-1 / P2 exclude-only: a pcc>=1 / timeout_ms=0 row with
+        created_at BEFORE the envelope marker must be fully absent from
+        ``diagnose_report_accuracy`` issues of type
+        ``llm_timeout_config_out_of_range`` (any severity — not error and not
+        legacy_info). The source row remains in ``ga_decisions`` for audit.
+
+        Unique contract (no either-or demotion path): SQL lower bound =
+        envelope marker ``applied_at`` is the sole mechanism.
+
+        Revert-fail: remove the ``created_at >= bound`` SQL lower bound from
+        ``_check_llm_timeout_config_out_of_range`` (or wire bound to something
+        older than the seed) -> D49PRE reappears as current error -> assertion
+        fails.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+            LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,
+        )
+
+        # Push the envelope marker forward so the seed is pre-marker.
+        self.conn.execute(
+            "UPDATE _migration_state SET applied_at=%s::timestamptz WHERE key=%s",
+            ("2026-07-22T12:00:00Z", LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY),
+        )
+        # Seed a d49-shaped row with created_at before the marker.
+        at_ms = int(
+            __import__("datetime").datetime(
+                2026, 7, 22, 10, 0, 0,
+                tzinfo=__import__("datetime").timezone.utc,
+            ).timestamp() * 1000
+        )
+        self._p1_1_insert_decision(
+            symbol="D49PRE", analysis_time=at_ms,
+            llm_status="ok", llm_provider_call_count=1, llm_attempt_count=1,
+            llm_latency_ms=10, llm_prompt_bytes=100,
+            llm_continuity_included=True, llm_terminal_reason=None,
+            llm_provider_timeout_ms=0,
+        )
+        self.conn.execute(
+            "UPDATE ga_decisions SET created_at=%s::timestamptz "
+            "WHERE symbol='D49PRE'",
+            ("2026-07-22T10:00:00Z",),
+        )
+        self.conn.commit()
+
+        # Audit row must still exist in ga_decisions.
+        audit = self.conn.execute(
+            "SELECT id FROM ga_decisions WHERE symbol='D49PRE'",
+        ).fetchone()
+        self.assertIsNotNone(
+            audit,
+            "Codex P2: pre-marker d49-shaped row must remain in ga_decisions "
+            "for audit (exclude-only, not delete).",
+        )
+
+        rd = diagnose_report_accuracy(self.repo)
+        # Unique contract: symbol fully absent from timeout-envelope issues
+        # (any severity). No either-or demotion acceptance.
+        any_severity = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "llm_timeout_config_out_of_range"
+            and (i.get("details") or {}).get("symbol") == "D49PRE"
+        ]
+        self.assertEqual(
+            any_severity, [],
+            "Codex P2 exclude-only: pre-marker D49PRE must not appear in "
+            "llm_timeout_config_out_of_range issues at any severity "
+            "(not error, not legacy_info). Got %r" % (any_severity,),
+        )
+
+    def test_codex_p1_1_post_envelope_marker_timeout_remains_error(self) -> None:
+        """Codex P1-1: a pcc>=1 / timeout_ms=0 row AFTER the envelope marker
+        remains ``error`` (current contract fault). Complements the pre-marker
+        exclusion so a total SQL bound that excludes everything is caught.
+        """
+        from plugins.crypto_guard.diagnostics.report_diagnostics import (
+            diagnose_report_accuracy,
+            LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,
+        )
+
+        row = self.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s",
+            (LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+        self.assertIsNotNone(row and row["applied_at"])
+        # Anchor post-marker analysis_time to envelope marker (not fair marker).
+        at_ms = int(row["applied_at"].timestamp() * 1000) + 60_000
+        self._p1_1_insert_decision(
+            symbol="POSTENV", analysis_time=at_ms,
+            llm_status="ok", llm_provider_call_count=1, llm_attempt_count=1,
+            llm_latency_ms=10, llm_prompt_bytes=100,
+            llm_continuity_included=True, llm_terminal_reason=None,
+            llm_provider_timeout_ms=0,
+        )
+        self.conn.commit()
+
+        rd = diagnose_report_accuracy(self.repo)
+        fired = [
+            i for i in rd.get("issues", [])
+            if i.get("type") == "llm_timeout_config_out_of_range"
+            and i.get("severity") == "error"
+            and (i.get("details") or {}).get("symbol") == "POSTENV"
+        ]
+        self.assertGreaterEqual(
+            len(fired), 1,
+            "Codex P1-1: post-envelope-marker pcc>=1 timeout_ms=0 must remain "
+            "error. Got %d." % (len(fired),),
         )
 
     def test_p1_1_llm_batch_degraded_reported_healthy_fires(self) -> None:
@@ -49021,11 +49718,13 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         We pre-stamp the held symbol's PENDING job with ``defer_count=3`` (far
         under the R5-P0 dynamic max_defers, which is >= 17 for the smallest
         window) and ``deferred_at`` set to a timestamp such
-        that the elapsed defer window is just SHORT of each config's absolute
-        bound (window - 30s), then run the REAL ``run_once(background=True) ->
-        claim_next_batch -> process_fair_batch -> run_fair_batch`` chain with the
-        global lease pre-held for the symbol. For each of per_symbol_timeout in
-        {180, 300, 1200} we assert the held symbol is DEFERRED (not exhausted):
+        that the elapsed defer window is SHORT of each config's absolute
+        bound (window - 90s; generous enough that xdist/serial host load cannot
+        eat the margin before run_once returns), then run the REAL
+        ``run_once(background=True) -> claim_next_batch -> process_fair_batch ->
+        run_fair_batch`` chain with the global lease pre-held for the symbol.
+        For each of per_symbol_timeout in {180, 300, 1200} we assert the held
+        symbol is DEFERRED (not exhausted):
           - ``defer_exhausted_symbols`` excludes the symbol;
           - ``deferred_symbols`` includes the symbol;
           - the job's ``defer_count`` was atomically incremented by exactly one
@@ -49043,7 +49742,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
 
         Revert-fail (per config): (a) if the defer window were the legacy fixed
         120s, the 300/1200 cases would exhaust at 120s (deferred_at stamped at
-        window-30s => 270s/1170s elapsed, both > 120) -> ``defer_exhausted_symbols``
+        window-90s => 270s/1170s elapsed, both > 120) -> ``defer_exhausted_symbols``
         would contain the symbol + batch_symbol_status ``failed`` + the job would
         NOT be incremented. (b) if ``claim_next_batch`` reset ``defer_count`` /
         ``deferred_at`` on reclaim (the pre-R4-P0-1 bug), the pre-stamped
@@ -49064,17 +49763,20 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         from unittest.mock import patch
 
         # Per-symbol timeout -> (absolute window, elapsed-at-seed). The seed
-        # stamps deferred_at at (window - 30s) ago so the elapsed defer window is
-        # SHORT of the bound: the symbol is still legitimately behind a live lease
-        # and must be deferred, NOT exhausted. defer_count=3 is far under the
-        # R5-P0 dynamic max_defers (>= 17 for the smallest window) AND, because
-        # deferred_at is parseable, the absolute window is the SOLE authority --
-        # the count backstop is not even consulted.
+        # stamps deferred_at at (window - 90s) ago so the elapsed defer window is
+        # SHORT of the bound even under xdist load (30s margin was eaten by
+        # run_once wall-clock + second-precision deferred_at). The symbol is
+        # still legitimately behind a live lease and must be deferred, NOT
+        # exhausted. defer_count=3 is far under the R5-P0 dynamic max_defers
+        # (>= 17 for the smallest window) AND, because deferred_at is parseable,
+        # the absolute window is the SOLE authority -- the count backstop is not
+        # even consulted.
         _BUFFER = run_ga_workers._SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS  # 60
+        _MARGIN = 90  # must stay well under _BUFFER+pst; 30s was flaky under xdist
         _cases = [
-            {"pst": 180, "window": 180 + _BUFFER, "elapsed_seed": 180 + _BUFFER - 30},
-            {"pst": 300, "window": 300 + _BUFFER, "elapsed_seed": 300 + _BUFFER - 30},
-            {"pst": 1200, "window": 1200 + _BUFFER, "elapsed_seed": 1200 + _BUFFER - 30},
+            {"pst": 180, "window": 180 + _BUFFER, "elapsed_seed": 180 + _BUFFER - _MARGIN},
+            {"pst": 300, "window": 300 + _BUFFER, "elapsed_seed": 300 + _BUFFER - _MARGIN},
+            {"pst": 1200, "window": 1200 + _BUFFER, "elapsed_seed": 1200 + _BUFFER - _MARGIN},
         ]
         lease = global_single_flight_lease()
         for _case in _cases:
@@ -49127,7 +49829,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
             # Stamp deferred_at = (now - elapsed_seed) in real wall-clock UTC, the
             # same ``YYYY-MM-DD HH:MM:SS`` form SQLite ``NOW()`` uses, so
             # ``_parse_db_ts_ms`` parses it and the absolute-window comparison
-            # reads the configured (window - 30s) elapsed. defer_count=3 (far
+            # reads the configured (window - 90s) elapsed. defer_count=3 (far
             # under the R5-P0 dynamic max_defers) AND deferred_at is parseable,
             # so the absolute window is the SOLE authority.
             _seed_at_ms = utc_ms() - int(_case["elapsed_seed"]) * 1000
@@ -49139,7 +49841,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
                 "WHERE session_id=%s",
                 (
                     3,  # far under the R5-P0 dynamic max_defers
-                    _seed_at_str,  # elapsed = window - 30s (short of the bound)
+                    _seed_at_str,  # elapsed = window - 90s (short of the bound)
                     "single_flight_deferred:3",
                     self._prod_session_id(held_sym),
                 ),
@@ -55166,6 +55868,210 @@ class TestPhaseB07_10ConfigAndDeadlinePrimitives(unittest.TestCase):
         lease.release(batch_id="15m:1", symbol="BTCUSDT")
         lease.release(batch_id="15m:1", symbol="BTCUSDT")  # double-release — no error
         self.assertEqual(lease.held_count(), 0)
+
+    # ------------------------------------------------------------------
+    # Phase B P1-1 (07-22): post-prompt provider admission — exhausted
+    # deadline must NOT reach the provider; admitted positive timeout is
+    # immutable across the call (no post-call re-read to 0).
+    # ------------------------------------------------------------------
+
+    def test_p1_1_fair_adapter_exhausted_deadline_skips_provider(self) -> None:
+        """P1-1 / Codex P1-2 (07-22): adapter entry remaining MUST be >0;
+        the REAL ``build_llm_decision_prompt`` runs; the fake clock advances
+        mid-prompt so post-prompt admission sees remaining<=0; the adapter
+        returns a skip envelope (``llm_status=skipped``, ``pcc=0``,
+        ``timeout_ms=0``, ``terminal=symbol_timeout``) and NEVER calls the
+        provider. Production d49 had pcc=1 with timeout_ms=0 because socket
+        floors re-admitted a zero remaining AFTER prompt spend.
+
+        Revert-fail: move admission BEFORE prompt build (or remove the
+        post-prompt ``_eff_s <= 0`` gate in ``_run_single_llm_attempt``) ->
+        provider is called / pcc>=1 with timeout_ms=0 -> assertion fails.
+        Pre-prompt-only exhaustion (the old test shape) does NOT prove
+        post-prompt admission.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning import llm_agent_judge
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            CircuitBreaker, PerSymbolDeadline,
+        )
+        from plugins.crypto_guard.reasoning.llm_fair_scheduler import (
+            resolve_fair_batch_config,
+        )
+        clock = {"t": 0}
+
+        def fake_now_ms():
+            return clock["t"]
+
+        with patch("plugins.crypto_guard.reasoning.llm_breaker._now_ms",
+                   side_effect=fake_now_ms):
+            deadline = PerSymbolDeadline(
+                per_symbol_timeout_seconds=300,
+                per_attempt_timeout_seconds=180,
+            )
+            # Codex P1-2: remaining MUST be >0 at adapter ENTRY so the test
+            # cannot pass via a pre-prompt-only admission gate.
+            clock["t"] = 5_000
+            self.assertFalse(deadline.exhausted())
+            self.assertGreater(deadline.provider_timeout_ms(), 0)
+
+        breaker = CircuitBreaker(
+            enabled=True, consecutive_threshold=3,
+            rate_threshold=0.5, rate_window=10, min_rate_samples=5,
+        )
+        breaker.llm_config_name = "test_cfg"
+        breaker.llm_model = "test_model"
+        snapshot = self._minimal_snapshot()
+        called = {"n": 0}
+        prompt_ran = {"n": 0}
+
+        def must_not_be_called(prompt):
+            called["n"] += 1
+            self.fail(
+                "P1-1: _call_ga_llm must NOT be called when the post-prompt "
+                "provider timeout is <= 0 (exhausted deadline admission)."
+            )
+
+        real_build = llm_agent_judge.build_llm_decision_prompt
+
+        def build_then_exhaust(snapshot, deterministic_decision, *, context=None):
+            # Real prompt builder must run so admission is AFTER prompt spend.
+            out = real_build(snapshot, deterministic_decision, context=context)
+            prompt_ran["n"] += 1
+            # Collapse remaining to 0 DURING prompt build — the production
+            # race that post-prompt admission must catch.
+            clock["t"] = 301_000
+            return out
+
+        cfg = resolve_fair_batch_config({
+            "scheduling": {
+                "mode": "fair_pool", "max_concurrency": 4,
+                "per_symbol_timeout_seconds": 300,
+                "per_attempt_timeout_seconds": 180,
+                "batch_completion_guard_seconds": 60,
+                "rotate_start_symbol": True,
+            },
+            "retry": {"max_attempts_per_symbol": 3},
+        })
+        with patch.object(llm_agent_judge, "_call_ga_llm",
+                          side_effect=must_not_be_called):
+            with patch.object(llm_agent_judge, "build_llm_decision_prompt",
+                              side_effect=build_then_exhaust):
+                with patch("plugins.crypto_guard.reasoning.llm_breaker._now_ms",
+                           side_effect=fake_now_ms):
+                    candidate, attempt_meta = llm_agent_judge.fair_llm_call_adapter(
+                        snapshot=snapshot, deadline=deadline, breaker=breaker,
+                        retry_budget=cfg, wall_clock_budget=cfg,
+                        attempt=1, max_attempts=cfg.max_attempts_per_symbol,
+                        schedule_position=0, schedule_round=1, context=None,
+                    )
+        self.assertIsNone(candidate)
+        self.assertEqual(called["n"], 0)
+        self.assertGreaterEqual(
+            prompt_ran["n"], 1,
+            "P1-1/Codex P1-2: real build_llm_decision_prompt must run so "
+            "admission is proven post-prompt (not pre-prompt only).",
+        )
+        self.assertEqual(attempt_meta.get("llm_status"), "skipped")
+        self.assertEqual(int(attempt_meta.get("llm_provider_call_count") or 0), 0)
+        self.assertEqual(int(attempt_meta.get("llm_provider_timeout_ms") or 0), 0)
+        self.assertIn(
+            attempt_meta.get("llm_fallback_reason"),
+            {"wall_clock_budget_exhausted", "symbol_timeout"},
+        )
+        self.assertEqual(attempt_meta.get("llm_terminal_reason"), "symbol_timeout")
+
+    def test_p1_1_fair_adapter_admitted_timeout_immutable_after_call(self) -> None:
+        """P1-1: when a call is admitted with remaining>0, the §8 envelope
+        must keep that positive ``llm_provider_timeout_ms`` even if the
+        deadline collapses to 0 during the provider call. No post-call
+        re-read, no max(1, remaining) mask.
+
+        Revert-fail: restore
+        ``attempt_meta['llm_provider_timeout_ms'] = deadline.provider_timeout_ms()``
+        after ``_run_single_llm_attempt`` in the adapter -> envelope shows 0
+        with pcc=1 -> assertion fails.
+        """
+        from unittest.mock import patch
+        from plugins.crypto_guard.reasoning import llm_agent_judge
+        from plugins.crypto_guard.reasoning.llm_breaker import (
+            CircuitBreaker, PerSymbolDeadline,
+        )
+        from plugins.crypto_guard.reasoning.llm_fair_scheduler import (
+            resolve_fair_batch_config,
+        )
+        clock = {"t": 0}
+
+        def fake_now_ms():
+            return clock["t"]
+
+        with patch("plugins.crypto_guard.reasoning.llm_breaker._now_ms",
+                   side_effect=fake_now_ms):
+            deadline = PerSymbolDeadline(
+                per_symbol_timeout_seconds=300,
+                per_attempt_timeout_seconds=180,
+            )
+            # 5s elapsed — plenty of remaining at admission.
+            clock["t"] = 5_000
+        admitted_ms = deadline.provider_timeout_ms()
+        self.assertGreater(admitted_ms, 0)
+
+        breaker = CircuitBreaker(
+            enabled=True, consecutive_threshold=3,
+            rate_threshold=0.5, rate_window=10, min_rate_samples=5,
+        )
+        breaker.llm_config_name = "test_cfg"
+        breaker.llm_model = "test_model"
+        snapshot = self._minimal_snapshot()
+        seen = {"pt": None}
+
+        def fake_call(prompt: str) -> str:
+            # Collapse remaining to 0 DURING the provider call — the
+            # production race that produced d49's timeout_ms=0 after a real
+            # call. The envelope must still carry the admitted positive
+            # timeout, not the post-call re-read.
+            clock["t"] = 400_000
+            seen["pt"] = getattr(
+                llm_agent_judge._llm_call_state,
+                "provider_timeout_seconds", None,
+            )
+            return self._phase_a_llm_response(symbol="ADAUSDT")
+
+        cfg = resolve_fair_batch_config({
+            "scheduling": {
+                "mode": "fair_pool", "max_concurrency": 4,
+                "per_symbol_timeout_seconds": 300,
+                "per_attempt_timeout_seconds": 180,
+                "batch_completion_guard_seconds": 60,
+                "rotate_start_symbol": True,
+            },
+            "retry": {"max_attempts_per_symbol": 3},
+        })
+        with patch.object(llm_agent_judge, "_call_ga_llm",
+                          side_effect=fake_call):
+            with patch("plugins.crypto_guard.reasoning.llm_breaker._now_ms",
+                       side_effect=fake_now_ms):
+                candidate, attempt_meta = llm_agent_judge.fair_llm_call_adapter(
+                    snapshot=snapshot, deadline=deadline, breaker=breaker,
+                    retry_budget=cfg, wall_clock_budget=cfg,
+                    attempt=1, max_attempts=cfg.max_attempts_per_symbol,
+                    schedule_position=0, schedule_round=1, context=None,
+                )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(attempt_meta.get("llm_status"), "ok")
+        self.assertEqual(int(attempt_meta.get("llm_provider_call_count") or 0), 1)
+        env_pt = int(attempt_meta.get("llm_provider_timeout_ms") or 0)
+        self.assertGreater(
+            env_pt, 0,
+            "admitted positive timeout must survive post-call; got "
+            f"llm_provider_timeout_ms={env_pt} (production d49 defect)",
+        )
+        # Thread-local must have carried a positive timeout into the call
+        # (not a floor-masked zero).
+        self.assertIsNotNone(seen["pt"])
+        self.assertGreater(float(seen["pt"]), 0.0)
+        # Envelope equals the immutable admitted value (within 1s rounding).
+        self.assertAlmostEqual(env_pt / 1000.0, float(seen["pt"]), places=0)
 
     # ---- helpers ----
 

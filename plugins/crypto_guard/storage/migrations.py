@@ -245,6 +245,7 @@ def initialize_database(
                     _ensure_hourly_market_semantic_accuracy_contract_marker(cur)
                     _ensure_hourly_decision_context_continuity_contract_marker(cur)
                     _ensure_llm_fair_scheduling_context_contract_marker(cur)
+                    _ensure_llm_provider_timeout_envelope_contract_marker(cur)
                     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
                     # 4. Health gate - fail-closed BEFORE commit. If the schema
@@ -377,6 +378,20 @@ def _ensure_hourly_decision_context_continuity_contract_marker(cur: psycopg.Curs
 
 def _ensure_llm_fair_scheduling_context_contract_marker(cur: psycopg.Cursor) -> None:
     _ensure_marker(cur, "llm_fair_scheduling_context_contract_v1")
+
+
+def _ensure_llm_provider_timeout_envelope_contract_marker(cur: psycopg.Cursor) -> None:
+    """07-22 Codex P1-1 / P2 exclude-only: provider-timeout envelope marker.
+
+    ``llm_timeout_config_out_of_range`` uses this marker's ``applied_at`` as the
+    SQL lower bound for current-contract evaluation. Pre-marker rows (e.g.
+    production decision 49 written before the post-prompt admission fix) remain
+    in ``ga_decisions`` for audit but are EXCLUDED from current
+    ``diagnose_report_accuracy`` issues — not as error and not as
+    ``legacy_info``. Post-marker pcc>=1 with timeout_ms<=0 remains ``error``.
+    ``ON CONFLICT DO NOTHING`` keeps applied_at immutable on re-init.
+    """
+    _ensure_marker(cur, "llm_provider_timeout_envelope_contract_v2")
 
 
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:
