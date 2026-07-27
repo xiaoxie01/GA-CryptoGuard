@@ -87,17 +87,57 @@ def crypto_symbol_list() -> dict[str, Any]:
 def crypto_analyze_symbol_once(symbol: str, timeframes: list[str] | None = None, requested_by: str | None = None, request_text: str = "") -> dict[str, Any]:
     with _repo() as (conn, repo):
         symbol = normalize_symbol(symbol)
-        tfs = timeframes or DEFAULT_TIMEFRAMES
+        # P1-2 (2026-07-24): separate DISPLAY timeframes (what the user asked
+        # to see) from INTERNAL required context (what the GA decision
+        # analysis must always run on). The production fail-closed gate in
+        # ``market_semantics`` Step 1 requires ``1d/4h/1h/15m`` to all be
+        # closed; building the snapshot on a partial set (e.g. the old
+        # parser default ``["4h","1h","15m","5m"]`` that dropped ``1d``)
+        # made healthy BTC ad-hoc analyses fall into ``data_incomplete``/
+        # ``unknown``/``C``/``0.30``. The internal analysis ALWAYS runs on
+        # the full ``DEFAULT_TIMEFRAMES`` (which includes ``1d``); the user's
+        # explicit display periods are recorded separately and never gate the
+        # fail-closed. We never bypass the production gate via
+        # ``partial_tf_mode`` (that flag is reserved for ``shadow_test``
+        # historical replays with intentionally partial TFs).
+        display_timeframes: list[str] = list(timeframes or [])
+        # De-dup while preserving order; keep only known canonical TFs.
+        # 终审返工 reviewer P1 (2026-07-25): ``3m`` is EXCLUDED from the
+        # canonical display set. ``DEFAULT_TIMEFRAMES`` lacks ``3m``, the config
+        # ``required_samples`` has no ``3m`` entry (default 200), the scheduler
+        # never pre-seeds ``3m``, and the ad-hoc fetch below uses
+        # ``lookback=160`` with no ``required_count`` backfill. Accepting ``3m``
+        # would add it to ``internal_tfs`` with <=160 candles against a 200
+        # threshold, set ``any_degraded=True`` and force a healthy BTC ad-hoc
+        # analysis into ``data_incomplete``/``unknown``/``C``/``0.30``. The
+        # P1-1 contract forbids claiming a period the system did not actually
+        # analyze to a healthy state, so ``3m`` is rejected here AND in
+        # ``intent_parser._timeframes`` (symmetric).
+        canonical = ("1d", "4h", "1h", "15m", "5m")
+        display_timeframes = [tf for tf in display_timeframes if tf in canonical]
+        # Internal context: always the full default set so 1d/4h/1h/15m are
+        # all built, health-checked, and closed before the fail-closed gate.
+        # 终审返工 P1-1 (2026-07-25): ``internal_tfs`` is the ORDERED UNION of
+        # ``DEFAULT_TIMEFRAMES`` and the user's legal explicit display periods
+        # (de-duped, order preserved). This makes an explicit ``3m`` TRULY
+        # fetched / built / profiled instead of a "displayed but no profile /
+        # data" illusion - ``DEFAULT_TIMEFRAMES`` lacks ``3m`` (the parser
+        # accepts ``3m`` but the default set does not contain it), so without
+        # this union the analysis would claim ``3m`` without ever running it.
+        internal_tfs: list[str] = list(DEFAULT_TIMEFRAMES)
+        for tf in display_timeframes:
+            if tf not in internal_tfs:
+                internal_tfs.append(tf)
         analysis_time = latest_closed_close_time_ms("15m", utc_ms())
         # 临时分析只补齐数据，不写入长期 watchlist。
         fetch_errors: list[str] = []
-        for tf in tfs:
+        for tf in internal_tfs:
             try:
                 fetch_and_upsert_closed_klines(repo, symbol, tf, analysis_time_utc=analysis_time, lookback=160)
             except MarketDataError as exc:
                 fetch_errors.append(f"{tf}: {exc}")
         if fetch_errors:
-            available = sum(len(repo.get_candles(symbol, tf, analysis_time_utc=analysis_time, limit=1)) for tf in tfs)
+            available = sum(len(repo.get_candles(symbol, tf, analysis_time_utc=analysis_time, limit=1)) for tf in internal_tfs)
             if available == 0:
                 return {
                     "ok": False,
@@ -112,7 +152,7 @@ def crypto_analyze_symbol_once(symbol: str, timeframes: list[str] | None = None,
                         "可以稍后重试，或先发送“系统状态”查看队列与日志。"
                     ),
                 }
-        snapshot = build_market_state_snapshot(repo, symbol=symbol, analysis_time_utc=analysis_time, mode="ad_hoc", timeframes=tfs)
+        snapshot = build_market_state_snapshot(repo, symbol=symbol, analysis_time_utc=analysis_time, mode="ad_hoc", timeframes=internal_tfs)
         snapshot_id = repo.save_market_snapshot(snapshot)
         decision = GAMasterController(repo).analyze_symbol(
             GAAnalysisRequest(
@@ -120,14 +160,26 @@ def crypto_analyze_symbol_once(symbol: str, timeframes: list[str] | None = None,
                 decision_type="ad_hoc_analysis",
                 analysis_time_utc=analysis_time,
                 mode="ad_hoc",
-                timeframes=tfs,
+                timeframes=internal_tfs,
                 snapshot=snapshot,
                 snapshot_id=snapshot_id,
                 requested_by=requested_by,
                 request_text=request_text,
             )
         )
-        _attach_display_context(repo, decision, snapshot, tfs)
+        _attach_display_context(repo, decision, snapshot, internal_tfs)
+        # Surface the user's explicit display periods separately; fall back to
+        # the internal set when the user named no period.
+        # 终审返工 P1-1 (2026-07-25): record whether the user EXPLICITLY named
+        # display periods so ``render_text`` can show a separate "用户请求展示
+        # 周期" line ONLY when the user asked for specific periods (never when
+        # the set is just the internal fallback). ``display_timeframes`` keeps
+        # its existing fallback semantics (== internal set when user named
+        # none) for backward compatibility with renderers/readers that expect a
+        # non-empty list.
+        user_specified_display = bool(display_timeframes)
+        decision["display_timeframes"] = display_timeframes or list(internal_tfs)
+        decision["user_specified_display"] = user_specified_display
         if fetch_errors:
             decision["risk_notes"] = decision.get("risk_notes", []) + ["部分周期行情刷新失败，已使用本地已缓存 K 线；请注意数据可能不是最新。"]
         state_id = int(decision["analysis_state_id"])
@@ -459,7 +511,43 @@ def crypto_handle_text_command(text: str, user_id: str | None = None) -> dict[st
     symbol = intent.get("symbol")
     if not symbol:
         return {"ok": False, "error": "未识别到 symbol", "intent": intent}
+
+    # 终审返工 R3 P1-2 (2026-07-26): the unsupported-timeframe guard constrains
+    # ONLY the period-CONSUMING intents (``analyze_once``,
+    # ``create_paper_order``, ``add_symbol``) - for those, an explicitly-named
+    # unsupported timeframe (``3m``) must NEVER silently fall back to the
+    # default 5-TF analysis or persist anything (R2 P2-1 contract: the system
+    # cannot healthily analyze 3m - no ``required_samples`` entry, not in
+    # ``DEFAULT_TIMEFRAMES``, scheduler never pre-seeds, ad-hoc fetch uses
+    # ``lookback=160`` with no backfill). The R2 placement put this guard
+    # BEFORE branch dispatch, wrongly blocking ``pause_symbol`` /
+    # ``resume_symbol`` / ``remove_symbol`` - control intents that do not
+    # consume periods at all ("暂停 BTCUSDT 3m 分析" must still pause). Each
+    # period-consuming branch below calls this helper FIRST, before any
+    # analyze/persist entry; control branches never call it.
+    def _unsupported_timeframe_rejection() -> dict[str, Any] | None:
+        unsupported = intent.get("unsupported_timeframes") or []
+        if not unsupported:
+            return None
+        names = "、".join(unsupported)
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "intent": intent["intent"],
+            "unsupported_timeframes": list(unsupported),
+            "error": "unsupported_timeframe",
+            "text": (
+                f"{symbol} 当前不支持 {names}；支持 1d、4h、1h、15m、5m。\n\n"
+                "3m 等周期暂未配置完整的 required_samples、健康门禁与抓取链路，"
+                "强行分析会产生不完整的半态结论。请改用受支持的周期，或仅发送"
+                "“分析 <币种>” 让系统在完整周期上运行。"
+            ),
+        }
+
     if intent["intent"] == "add_symbol":
+        rejection = _unsupported_timeframe_rejection()
+        if rejection is not None:
+            return rejection
         return crypto_symbol_add(symbol, timeframes=intent.get("timeframes"))
     if intent["intent"] == "pause_symbol":
         return crypto_symbol_pause(symbol)
@@ -468,8 +556,14 @@ def crypto_handle_text_command(text: str, user_id: str | None = None) -> dict[st
     if intent["intent"] == "remove_symbol":
         return crypto_symbol_remove(symbol)
     if intent["intent"] == "analyze_once":
+        rejection = _unsupported_timeframe_rejection()
+        if rejection is not None:
+            return rejection
         return crypto_analyze_symbol_once(symbol, intent.get("timeframes"), requested_by=user_id, request_text=text)
     if intent["intent"] == "create_paper_order":
+        rejection = _unsupported_timeframe_rejection()
+        if rejection is not None:
+            return rejection
         analysis = crypto_analyze_symbol_once(symbol, intent.get("timeframes"), requested_by=user_id, request_text=text)
         if not analysis.get("ok"):
             return analysis
@@ -507,9 +601,31 @@ def _attach_display_context(repo: CryptoGuardRepository, decision: dict[str, Any
     decision["timeframes"] = timeframes
     decision["profiles"] = snapshot.get("profiles", {})
     decision["modules"] = snapshot.get("modules", {})
-    decision["data_quality"] = {
-        "closed_candles_only": True,
-        "analysis_time_utc": analysis_time,
-        "timeframes": timeframes,
-        "note": "所有 K 线查询限制 close_time <= analysis_time_utc；低周期实时订单流当前为 MVP 占位。",
-    }
+    # P1-2 (2026-07-24): PRESERVE the snapshot's authoritative ``data_quality``
+    # (status / health / missing / partial timeframes) instead of overwriting
+    # it with a display-only stub. The previous overwrite discarded
+    # ``snapshot["data_quality"]["status"]``/``["health"]`` so the decision
+    # lost its real data-quality verdict and downstream renderers could not
+    # tell a healthy five-timeframe snapshot from a degraded one. Start from
+    # the snapshot's real data_quality and only ADD display fields that don't
+    # clobber the authoritative ones.
+    snapshot_dq = snapshot.get("data_quality")
+    if isinstance(snapshot_dq, dict):
+        preserved = dict(snapshot_dq)
+    else:
+        preserved = {
+            "status": "complete",
+            "closed_candles_only": True,
+            "analysis_time_utc": analysis_time,
+            "missing_timeframes": [],
+            "low_sample_timeframes": [],
+            "note": "所有 K 线查询限制 close_time <= analysis_time_utc；低周期实时订单流当前为 MVP 占位。",
+        }
+    preserved["closed_candles_only"] = True
+    preserved["analysis_time_utc"] = analysis_time
+    preserved["timeframes"] = timeframes
+    preserved.setdefault(
+        "note",
+        "所有 K 线查询限制 close_time <= analysis_time_utc；低周期实时订单流当前为 MVP 占位。",
+    )
+    decision["data_quality"] = preserved

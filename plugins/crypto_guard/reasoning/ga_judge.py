@@ -250,6 +250,222 @@ def _extract_structured_entry_confirmation(
     return valid_events[0][1]
 
 
+# P1-3: structural-break event types accepted as closed-candle confirmation of
+# a direction flip. Mirrors report_diagnostics._STRUCTURAL_BREAK_TYPES so the
+# producer gate and the post-hoc diagnostic share one definition of "a real
+# breakout confirms the new direction".
+_FLIP_CONFIRMATION_BREAK_TYPES = frozenset({
+    "BOS", "BREAK_OF_STRUCTURE",
+    "CHOCH", "CHANGE_OF_CHARACTER",
+    "BREAKOUT", "BREAKDOWN",
+})
+
+# P1-3: timeframes whose structure_events may confirm a flip. Includes 1d
+# (mirrors report_diagnostics._SUPPORTED_TIMEFRAMES) so a higher-timeframe
+# closed-candle breakout counts just as much as an intraday one.
+_FLIP_CONFIRMATION_TIMEFRAMES = frozenset({
+    "1m", "5m", "15m", "1h", "4h", "1d",
+})
+
+# P1-3: map production price_action structure_event names to canonical break
+# types. Mirrors report_diagnostics._EVENT_NAME_TO_TYPE so the in-memory gate
+# accepts exactly the same events the DB-based diagnostic accepts.
+_FLIP_EVENT_NAME_TO_TYPE: dict[str, str] = {
+    "bullish_bos": "BOS",
+    "bearish_bos": "BOS",
+    "bullish_choch": "CHOCH",
+    "bearish_choch": "CHOCH",
+    "bullish_breakout": "BREAKOUT",
+    "bearish_breakout": "BREAKOUT",
+    "bullish_breakdown": "BREAKDOWN",
+    "bearish_breakdown": "BREAKDOWN",
+}
+
+
+def _normalize_in_memory_event(
+    raw: dict[str, Any], *, timeframe: str
+) -> dict[str, Any] | None:
+    """P1-3: map an in-memory structure_event dict to the canonical shape.
+
+    Mirrors ``report_diagnostics._normalize_snapshot_event`` but runs on the
+    snapshot's in-memory ``timeframe_modules[tf].price_action.structure_events``
+    (and ``smc`` equivalents) — no DB access. ``ga_judge`` has no repo handle,
+    so the producer-side flip gate must read structured evidence straight from
+    the snapshot that the analyzer already built.
+
+    Canonical shape: ``{"event_type", "timeframe", "closed", "time", "direction"}``.
+
+    Strict rules (same as the diagnostic):
+    - event time MUST come ONLY from the source event's ``close_time`` (candle
+      close), never invented and never substituted with ``time`` /
+      ``event_time`` / a module ``analysis_time``. 终审返工 P1-3 (2026-07-25):
+      an event that carries only ``time`` or ``event_time`` (missing
+      ``close_time``) MUST be rejected - previously the helper fell back to
+      ``time``/``event_time`` and could confirm a flip from a non-candle-close
+      timestamp, defeating the closed-candle guarantee.
+    - ``closed`` MUST be strictly ``is True`` (identity), mirroring the
+      production ``price_action_engine`` shape (see ga_judge.py line ~230:
+      ``if closed is not True: ...``). 终审返工 P1-3 (2026-07-25): explicit
+      ``closed=False``, missing ``closed``, and truthy strings ("true"/"1"/
+      "yes") are ALL rejected - no invented ``True``. Previously truthy strings
+      were accepted, which let a non-boolean ``closed`` confirm a flip.
+    - event_type must map to a structural-break type;
+    - direction must be derivable (event name prefix or explicit field);
+    - timeframe must be supported and non-empty.
+    """
+    event_name = str(raw.get("event", "")).lower().strip()
+    direct_type = raw.get("event_type")
+    if direct_type:
+        event_type = str(direct_type).upper()
+    elif event_name in _FLIP_EVENT_NAME_TO_TYPE:
+        event_type = _FLIP_EVENT_NAME_TO_TYPE[event_name]
+    else:
+        type_field = str(raw.get("type", "")).upper().strip()
+        if not type_field or type_field == "NONE":
+            return None
+        event_type = type_field
+
+    if event_type not in _FLIP_CONFIRMATION_BREAK_TYPES:
+        return None
+
+    direction = ""
+    if event_name.startswith("bullish") or event_name.startswith("bos_bull") or event_name.startswith("choch_bull"):
+        direction = "bullish"
+    elif event_name.startswith("bearish") or event_name.startswith("bos_bear") or event_name.startswith("choch_bear"):
+        direction = "bearish"
+    elif raw.get("direction"):
+        direction = str(raw.get("direction")).lower().strip()
+    if direction not in {"bullish", "bearish"}:
+        return None
+
+    tf = str(timeframe or "").lower().strip()
+    if not tf or tf not in _FLIP_CONFIRMATION_TIMEFRAMES:
+        return None
+
+    # 终审返工 P1-3 (2026-07-25): the event time MUST come ONLY from the
+    # source event's ``close_time`` (candle close). Fallback to ``time`` /
+    # ``event_time`` / module ``analysis_time`` is FORBIDDEN - a flip must be
+    # confirmed by a CLOSED CANDLE's close time, not an arbitrary timestamp
+    # carried on the event. An event missing ``close_time`` is rejected.
+    event_time = raw.get("close_time")
+    if event_time is None:
+        return None
+    try:
+        event_time_ms = int(event_time)
+    except (TypeError, ValueError):
+        return None
+    if event_time_ms <= 0:
+        return None
+
+    # 终审返工 P1-3 (2026-07-25): ``closed`` MUST be strictly ``is True``
+    # (identity), mirroring the production ``price_action_engine`` shape
+    # (ga_judge.py line ~230: ``if closed is not True: ...``). Truthy strings
+    # ("true"/"1"/"yes"), ints, missing, and False are ALL rejected - no
+    # invented ``True``.
+    if raw.get("closed") is not True:
+        return None
+    closed = True
+
+    return {
+        "event_type": event_type,
+        "timeframe": tf,
+        "closed": closed,
+        "time": event_time_ms,
+        "direction": direction,
+    }
+
+
+def _collect_in_memory_flip_events(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """P1-3: gather normalized structural-break events from the snapshot.
+
+    Reads ``snapshot["timeframe_modules"]`` (per-TF module dicts, the analyzer
+    keeps these for every required timeframe) and ``snapshot["modules"]``
+    (primary TF modules) — each module dict may carry ``price_action`` and
+    ``smc`` sub-dicts whose ``structure_events`` / ``events`` / ``structure_breaks``
+    lists hold the production shape events. This is the in-memory analogue of
+    ``report_diagnostics._lookup_snapshot_events``.
+    """
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[tuple] = set()
+
+    def _absorb(module_data: dict[str, Any], *, fallback_tf: str) -> None:
+        for module_key in ("price_action", "smc"):
+            sub = module_data.get(module_key) or {}
+            if not isinstance(sub, dict):
+                continue
+            for list_key in ("structure_events", "events", "structure_breaks", "breakouts", "breakdowns"):
+                items = sub.get(list_key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    tf = str(item.get("timeframe") or "").lower().strip() or fallback_tf
+                    canon = _normalize_in_memory_event(item, timeframe=tf)
+                    if canon is None:
+                        continue
+                    # De-dup by (type, tf, time, dir) — the same event may be
+                    # surfaced under both price_action and smc, and once in
+                    # primary modules and once in timeframe_modules.
+                    key = (canon["event_type"], canon["timeframe"], canon["time"], canon["direction"])
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    normalized.append(canon)
+
+    tf_modules = snapshot.get("timeframe_modules") or {}
+    if isinstance(tf_modules, dict):
+        for tf, modules_for_tf in tf_modules.items():
+            if isinstance(modules_for_tf, dict):
+                _absorb(modules_for_tf, fallback_tf=str(tf).lower().strip())
+
+    primary = snapshot.get("modules") or {}
+    if isinstance(primary, dict):
+        _absorb(primary, fallback_tf=str(primary.get("price_action", {}).get("timeframe") or "").lower().strip())
+
+    return normalized
+
+
+def _has_in_memory_closed_candle_flip_confirmation(
+    snapshot: dict[str, Any], new_side: str, *, prev_ts: int = 0
+) -> bool:
+    """P1-3: producer-side gate — closed-candle breakout confirms a flip.
+
+    Returns True when the snapshot's in-memory structural-break events contain
+    a closed-candle break (BOS / BREAK_OF_STRUCTURE / CHOCH / CHANGE_OF_CHARACTER
+    / BREAKOUT / BREAKDOWN) on a supported timeframe whose candle-close time is
+    strictly after ``prev_ts`` (the previous decision time) and not after the
+    current ``snapshot.analysis_time_utc``, and whose direction matches
+    ``new_side`` (LONG→bullish, SHORT→bearish).
+
+    Mirrors ``report_diagnostics._has_structured_confirmation`` but operates on
+    the in-memory snapshot rather than the DB, so ``ga_judge`` (no repo) can
+    apply the same fail-closed rule the post-hoc diagnostic applies. Text /
+    inline evidence is never accepted — only structured module events.
+    """
+    new_side_norm = str(new_side or "").upper().strip()
+    if new_side_norm not in {"LONG", "SHORT"}:
+        return False
+    analysis_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
+    if analysis_time is None:
+        return False
+
+    for event in _collect_in_memory_flip_events(snapshot):
+        event_time_ms = int(event.get("time") or 0)
+        if event_time_ms <= 0:
+            continue
+        if prev_ts > 0 and event_time_ms <= prev_ts:
+            continue
+        if event_time_ms > analysis_time:
+            continue
+        direction = str(event.get("direction", "")).lower().strip()
+        if new_side_norm == "LONG" and direction in {"bullish", "long", "up"}:
+            return True
+        if new_side_norm == "SHORT" and direction in {"bearish", "short", "down"}:
+            return True
+    return False
+
+
 def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | None:
     pa = snapshot["modules"].get("price_action") or {}
     momentum = snapshot["modules"].get("momentum") or {}
@@ -588,10 +804,62 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         result_invalidated_plan_status = None
         result_invalidated_plan_source = None
 
+    # P1-3 (07-22 production review): producer-side direction-flip gate. When
+    # the prior round had a concrete side (LONG/SHORT) and the current
+    # candidate trade_plan flips to the opposite side, the flip MUST be backed
+    # by a closed-candle structural breakout/failure event on the snapshot.
+    # Without it, the candidate plan is withheld - the system keeps observing
+    # rather than generating a new-direction candidate. This is the producer
+    # counterpart of report_diagnostics._check_direction_flip_without_closed_candle
+    # (which only warns post-hoc). Existing execution blocking (risk_gate,
+    # side_invalidated) stays as defense-in-depth; this gate stops the new
+    # candidate from even being proposed.
+    # Only applies when side_invalidated did NOT already withhold the plan
+    # (avoid double-gating) and a real candidate trade_plan still exists.
+    direction_flip_withheld = False
+    if trade_plan:
+        prev_block = (snapshot.get("analysis_continuity") or {}).get("previous") or {}
+        prev_side = str(prev_block.get("side") or "").upper().strip() if isinstance(prev_block, dict) else ""
+        cur_side = str(trade_plan.get("side") or "").upper().strip()
+        if prev_side in {"LONG", "SHORT"} and cur_side in {"LONG", "SHORT"} and prev_side != cur_side:
+            prev_ts = int(prev_block.get("analysis_time") or 0) if isinstance(prev_block, dict) else 0
+            if not _has_in_memory_closed_candle_flip_confirmation(snapshot, cur_side, prev_ts=prev_ts):
+                direction_flip_withheld = True
+                withheld_flip_plan = trade_plan
+                withheld_flip_side = cur_side
+                trade_plan = None
+                result_invalidated_candidate = withheld_flip_plan
+                result_invalidated_reasons = [
+                    f"方向由 {prev_side} 翻转至 {cur_side}，缺已收盘 K 线突破/失败证据，暂缓新方向候选（继续观察）",
+                ]
+                result_invalidated_blockers = [
+                    {
+                        "code": "direction_flip_without_closed_candle_confirmation",
+                        "stage": "synthesis",
+                        "detail": f"方向 {prev_side}->{cur_side} 翻转无已收盘结构突破确认",
+                    }
+                ]
+                result_invalidated_plan_status = "withheld"
+                result_invalidated_plan_source = "deterministic_sop"
+                decision = "wait_for_pullback"
+                suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
+                watch = {
+                    "needed": True, "direction": withheld_flip_side,
+                    "reason": "方向翻转缺已收盘突破确认，继续观察等待结构确认",
+                    "conditions": ["等待该方向已收盘 K 线突破/失败后重新确认", "5m/15m 动能与结构同向"],
+                    "invalid_condition": "结构反向突破", "expires_minutes": 240,
+                }
+    # Track whether the flip gate fired so the decision-routing block below
+    # can branch on it (the side_invalidated branch already routed via pass).
+    _flip_gate_routed = direction_flip_withheld
+
     if trade_plan:
         decision = "trade_plan_available"
         suggested = ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore"]
         watch = {"needed": True, "direction": trade_plan["side"], "reason": "若限价未成交，可继续观察回踩条件", "conditions": [trade_plan["invalid_condition"]], "invalid_condition": trade_plan["invalid_condition"], "expires_minutes": 240}
+    elif result_invalidated_candidate is not None and _flip_gate_routed:
+        # P1-3 flip-gate branch already set decision/suggested/watch above.
+        pass
     elif result_invalidated_candidate is not None:
         # side_invalidated branch already set decision/suggested/watch above.
         pass

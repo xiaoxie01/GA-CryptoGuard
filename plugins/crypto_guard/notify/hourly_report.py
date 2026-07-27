@@ -5,9 +5,11 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from plugins.crypto_guard.storage.duckdb_analytics import DuckDBAnalytics
 from plugins.crypto_guard.storage.migrations import check_schema_health
-from plugins.crypto_guard.storage.repository import CryptoGuardRepository
+from plugins.crypto_guard.storage.repository import (
+    CryptoGuardRepository,
+    RELEASE_AUDIT_ERROR_SIGNATURES,
+)
 from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
 from plugins.crypto_guard.diagnostics.report_diagnostics import run_for_report
 from plugins.crypto_guard.notify.report_consistency import (
@@ -288,12 +290,23 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     active_watches = repo.list_active_opportunity_watches()
     equity = repo.latest_equity_snapshot()
     failed_jobs = repo.recent_failed_jobs(limit=5)
+    # P1-4 (07-22 production review): release-audit terminal rows
+    # (stale-release cleanup / stale_snapshot_discarded_before_release) are
+    # excluded from ``recent_failed_jobs`` at the SQL layer so they never
+    # starve the LIMIT slot for real current failures. Fetch them separately
+    # and append to ``failed_jobs`` so the shared Python classifier
+    # (``_split_current_and_legacy_failed_jobs``) counts them into the
+    # archived-release-audit line instead of the current-risk list. The
+    # rendered "最近失败 N 个" therefore reflects ONLY current failures.
+    # Original ``agent_jobs`` rows are never deleted.
+    _release_audit_jobs = repo.recent_release_audit_jobs()
+    failed_jobs = failed_jobs + _release_audit_jobs
     queue_counts = {
         "pending_user": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority <= 2"),
         "pending_background": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority > 2"),
         "running": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='running'"),
     }
-    duckdb_stats = _duckdb_hourly_stats(now)
+    duckdb_stats = _pg_hourly_scheduled_stats(repo, generated_at_utc=now)
     risk_state = _fetch_risk_state(repo)
     shadow_data_quality = _fetch_shadow_data_quality(repo)
     feedback_patterns = _fetch_feedback_patterns(repo)
@@ -591,6 +604,13 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     open_orders = repo.list_open_paper_orders()
     equity = repo.latest_equity_snapshot()
     failed_jobs = repo.recent_failed_jobs(limit=5)
+    # P1-4 (07-22 production review): same release-audit reclassification as
+    # build_hourly_report - fetch archived release-audit rows separately and
+    # append so the shared classifier counts them into the archived-release-
+    # audit line, not the current-risk list. Degraded report's "最近失败 N 个"
+    # therefore reflects ONLY current failures.
+    _release_audit_jobs = repo.recent_release_audit_jobs()
+    failed_jobs = failed_jobs + _release_audit_jobs
     queue_counts = {
         "pending_user": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority <= 2"),
         "pending_background": _count(repo, "SELECT COUNT(*) FROM agent_jobs WHERE status='pending' AND priority > 2"),
@@ -600,9 +620,12 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=expected_batch_id)
 
-    # P2 (07-09 R3): split failed_jobs once at the top so the system-status
-    # line and the 三、风险事件 section share the same current_jobs list.
-    _current_failed_jobs, _legacy_schema_fail_count = _split_current_and_legacy_failed_jobs(
+    # P2 (07-09 R3) + P1-4 (07-22 review): split failed_jobs once at the
+    # top so the system-status line and the 三、风险事件 section share the
+    # same current_jobs list. Release-audit terminal records (stale-release
+    # cleanup / stale_snapshot_discarded_before_release) are also excluded
+    # and counted separately so they do NOT masquerade as current failures.
+    _current_failed_jobs, _legacy_schema_fail_count, _release_audit_count = _split_current_and_legacy_failed_jobs(
         failed_jobs,
     )
 
@@ -662,12 +685,14 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     lines.append(f"- 当前持仓/挂单：{len(open_orders)}")
 
     # Risk events
-    # P1/P2 fix (07-09): filter known legacy schema-fail signatures out of
-    # the current risk-events list. ``_current_failed_jobs`` /
-    # ``_legacy_schema_fail_count`` are computed once at the top of the
-    # renderer so the count shown at the top matches the items listed below.
+    # P1/P2 fix (07-09) + P1-4 (07-22 review): filter known legacy
+    # schema-fail signatures AND release-audit terminal records out of the
+    # current risk-events list. ``_current_failed_jobs`` /
+    # ``_legacy_schema_fail_count`` / ``_release_audit_count`` are computed
+    # once at the top of the renderer so the count shown at the top matches
+    # the items listed below.
     lines.extend(["", "**三、风险事件**"])
-    if _current_failed_jobs or _legacy_schema_fail_count > 0:
+    if _current_failed_jobs or _legacy_schema_fail_count > 0 or _release_audit_count > 0:
         for job in _current_failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
         if _legacy_schema_fail_count > 0:
@@ -675,7 +700,13 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
                 f"- 另有 {_legacy_schema_fail_count} 个历史 schema 校验失败已归档到审计"
                 "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
             )
-        if not _current_failed_jobs and _legacy_schema_fail_count == 0:
+        if _release_audit_count > 0:
+            lines.append(
+                f"- 另有 {_release_audit_count} 个发布清理审计记录已归档"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "发布运维动作，不计入当前风险事件）"
+            )
+        if not _current_failed_jobs and _legacy_schema_fail_count == 0 and _release_audit_count == 0:
             lines.append("- 暂无新的失败任务或风险事件")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
@@ -841,11 +872,15 @@ def render_ga_hourly_summary(
     observation: list[dict[str, Any]] = []
     no_edge: list[dict[str, Any]] = []
     now_ms = utc_ms()
-    # P2 (07-09 R3): split failed_jobs once at the top so the system-status
-    # line and the 九、风险事件 section share the same current_jobs list.
-    # Without this, "最近失败 N 个" would count archived legacy schema-fail
-    # jobs while the list below shows only current failures.
-    _current_failed_jobs, _legacy_schema_fail_count = _split_current_and_legacy_failed_jobs(
+    # P2 (07-09 R3) + P1-4 (07-22 review): split failed_jobs once at the top
+    # so the system-status line and the 九、风险事件 section share the same
+    # current_jobs list. Without this, "最近失败 N 个" would count archived
+    # legacy schema-fail jobs while the list below shows only current
+    # failures. P1-4 also excludes release-audit terminal records
+    # (stale-release cleanup / stale_snapshot_discarded_before_release) and
+    # counts them separately so a release-housekeeping action does NOT
+    # masquerade as a live failure.
+    _current_failed_jobs, _legacy_schema_fail_count, _release_audit_count = _split_current_and_legacy_failed_jobs(
         failed_jobs,
     )
     # The renderer's stale cutoff mirrors the batch completion gate (one
@@ -978,7 +1013,10 @@ def render_ga_hourly_summary(
             f" · 回撤 {dd_display:.2f}%"
             + ("（账号权益低于初始）" if dd_value < 0 else "（未回撤）" if dd_value >= 0 else "")
         )
-        analytics_source = "DuckDB 时序统计" if (duckdb_stats or {}).get("ok") else "PostgreSQL 实时统计"
+        # 终审返工 P2 (2026-07-25): the hourly aggregate is now a real
+        # PostgreSQL ``scheduled_analysis`` query, never DuckDB. The legacy
+        # "DuckDB 时序统计" label is gone - it always reads PostgreSQL.
+        analytics_source = "PostgreSQL 实时统计"
         lines.append(f"- 决策来源：GA 决策 · 统计来源：{analytics_source}")
     else:
         lines.append("- 暂无净值快照")
@@ -1029,11 +1067,40 @@ def render_ga_hourly_summary(
         lines.append(f"- #{watch['id']} {watch['symbol']} {watch.get('direction') or '-'}：{condition or watch.get('watch_reason') or '-'}")
 
     lines.extend(["", "**六、无优势品种汇总（C/D）**"])
-    distribution = (duckdb_stats or {}).get("signal_distribution") or grade_counts
-    source_raw = (duckdb_stats or {}).get("source") or "in_memory_fallback"
-    # P2 语法澄清 (research 09): describe the fallback honestly
-    source_label = _distribution_source_label(source_raw, duckdb_stats)
-    lines.append("- 等级分布：" + " · ".join(f"{k} {v}" for k, v in distribution.items()) + f"（{source_label}）")
+    # P1-1 (2026-07-24): the "等级分布" line MUST report the CURRENT batch's
+    # ga_decisions (``grade_counts``, built from the batch_id-filtered
+    # decisions) — its total equals the enabled_symbols count of this batch.
+    # The DuckDB ``hourly_signal_distribution`` aggregates the last 1 hour
+    # (4 batches x 10 symbols = 40 rows), which previously hijacked this line
+    # and made a B=4/C=6 batch render as B=16/C=22/D=2. The hourly aggregate,
+    # when available, is now a SEPARATE explicitly-labeled line so it can
+    # never masquerade as the current batch.
+    # 终审返工 P2 (2026-07-25) / R2 P2-2 (2026-07-26): the current-batch grade
+    # distribution is ALWAYS a PostgreSQL ``ga_decisions`` aggregate
+    # (``grade_counts`` built from the batch_id-filtered decisions). It must
+    # NEVER inherit the hourly aggregate's source label - the legacy
+    # ``_distribution_source_label`` helper (which could resolve to "DuckDB 时序"
+    # when the hourly source was DuckDB) was DELETED in R2 P2-2 as dead code;
+    # the current batch is always PostgreSQL and the label is hardcoded inline.
+    lines.append(
+        "- 等级分布（当前批次）：" + " · ".join(f"{k} {v}" for k, v in grade_counts.items()) + "（PostgreSQL 当前批次）"
+    )
+    # 终审返工 P1-2 (2026-07-25): the last-1-hour line is now a REAL PostgreSQL
+    # ``scheduled_analysis`` aggregate with real ``total_decisions`` (M) and a
+    # real distinct-``batch_id`` count (N) - never the legacy hardcoded
+    # "4 批次、共 40 条" / "（DuckDB 时序）". ``total_decisions`` == 0 means no
+    # scheduled decisions in the window, so no hourly line is rendered (no
+    # fabricated counts). The distribution values' sum equals M.
+    hourly_stats = duckdb_stats or {}
+    hourly_distribution = hourly_stats.get("signal_distribution") or {}
+    total_decisions = int(hourly_stats.get("total_decisions") or 0)
+    if hourly_stats.get("ok") and total_decisions > 0 and hourly_distribution:
+        batch_count = int(hourly_stats.get("batch_count") or 0)
+        lines.append(
+            f"- 最近1小时定时分析（{batch_count} 批次、共 {total_decisions} 条决策）等级分布："
+            + " · ".join(f"{k} {v}" for k, v in hourly_distribution.items())
+            + "（PostgreSQL 定时分析）"
+        )
     if no_edge:
         symbols = ", ".join(row["symbol"] for row in no_edge[:30])
         lines.append(f"- C/D：{symbols}")
@@ -1105,6 +1172,16 @@ def render_ga_hourly_summary(
                 lines.append(f"- 提示：{'，'.join(info_parts)}")
             if not critical_parts and not info_parts:
                 lines.append(f"- 发现问题 {total} 个（非关键）")
+            # P2 (2026-07-24) + AC17 regression fix: surface EVERY issue's
+            # ``type``/evidence, not just warnings, so error-severity issues
+            # (e.g. market_data_gap_detected) are not silently swallowed by the
+            # summary-count path. The two prod warnings (stalled_candidate,
+            # deterministic_direction_from_failed_llm) still surface their type
+            # and identity via the shared helper.
+            all_issues = state_consistency.get("issues") or []
+            if all_issues:
+                lines.append(f"- 明细 {len(all_issues[:10])} 项：")
+                lines.extend(_format_state_consistency_issue_lines(all_issues))
         else:
             lines.extend(["", "**状态一致性诊断**", "- 全部正常，未发现状态不一致"])
     elif state_consistency and state_consistency.get("error"):
@@ -1118,11 +1195,21 @@ def render_ga_hourly_summary(
             lines.extend(["", "**八、本周失败模式（反馈记忆）**"])
             if top_patterns:
                 for p in top_patterns:
-                    lines.append(f"- {p['pattern']}：{p['count']} 次")
+                    lines.append(f"- {p['pattern']}：{p['count']} 次（候选反馈）")
             else:
-                lines.append("- 暂无失败模式记录")
+                # P2 (2026-07-24): top_patterns only covers recorded candidate
+                # feedback patterns; when empty, do NOT imply these are all
+                # failures - say honestly that no distinct pattern was
+                # recorded (not "暂无失败模式记录", which implied all failures).
+                lines.append("- 暂无聚合失败模式（近 7 天未记录到聚合候选反馈模式）")
             if most_active:
-                lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
+                # P2 (2026-07-24): most_active_count is the cumulative candidate
+                # feedback count of the last 7 days (skill_feedback_memory
+                # WHERE status='candidate'), NOT a failure count. Label it.
+                lines.append(
+                    f"- 最活跃反馈 Skill：{most_active}"
+                    f"（近 7 天累计候选反馈 {feedback_patterns.get('most_active_count', 0)} 条，非失败计数）"
+                )
 
     # Account feedback gate stats
     if account_feedback_gate and not account_feedback_gate.get("error"):
@@ -1189,20 +1276,28 @@ def render_ga_hourly_summary(
                 lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**九、风险事件**"])
-    # P1/P2 fix (07-09): filter known legacy schema-fail signatures out of
-    # the current risk-events list. The 07-09 alias-repair SOP is already
-    # handling ``analysis_time_utc is a required property`` failures by
-    # normalizing ``entry_trigger_confirmation.type`` aliases to
+    # P1/P2 fix (07-09) + P1-4 (07-22 review): filter known legacy schema-fail
+    # signatures AND release-audit terminal records out of the current
+    # risk-events list. The 07-09 alias-repair SOP is already handling
+    # ``analysis_time_utc is a required property`` failures by normalizing
+    # ``entry_trigger_confirmation.type`` aliases to
     # ``closed_candle_confirmation``. Historical agent_jobs rows within the
     # 7-day ``recent_failed_jobs`` window would otherwise keep surfacing in
     # every hourly report and drown out actionable current failures.
-    # Filtered rows are surfaced as a single legacy-audit count line so the
-    # operator knows they were archived (not silently dropped).
+    # P1-4: release-audit terminal records (stale-release cleanup /
+    # stale_snapshot_discarded_before_release) are release-housekeeping
+    # actions, NOT current failures — they are excluded and surfaced as a
+    # separate archived-release-audit line so the operator can distinguish
+    # current failures from archived release audit.
+    # Filtered rows are surfaced as count lines so the operator knows they
+    # were archived (not silently dropped). Original ``agent_jobs`` rows are
+    # never deleted.
     #
     # P2 (07-09 R3): ``_current_failed_jobs`` / ``_legacy_schema_fail_count``
-    # are computed once at the top of the renderer (above the system-status
-    # line) so the count shown at the top matches the items listed below.
-    if _current_failed_jobs or _legacy_schema_fail_count > 0:
+    # / ``_release_audit_count`` are computed once at the top of the
+    # renderer (above the system-status line) so the count shown at the top
+    # matches the items listed below.
+    if _current_failed_jobs or _legacy_schema_fail_count > 0 or _release_audit_count > 0:
         for job in _current_failed_jobs[:5]:
             lines.append(f"- #{job['id']} {job['job_type']}：{(job.get('error_message') or '-')[:100]}")
         if _legacy_schema_fail_count > 0:
@@ -1210,7 +1305,13 @@ def render_ga_hourly_summary(
                 f"- 另有 {_legacy_schema_fail_count} 个历史 schema 校验失败已归档到审计"
                 "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
             )
-        if not _current_failed_jobs and _legacy_schema_fail_count == 0:
+        if _release_audit_count > 0:
+            lines.append(
+                f"- 另有 {_release_audit_count} 个发布清理审计记录已归档"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "发布运维动作，不计入当前风险事件）"
+            )
+        if not _current_failed_jobs and _legacy_schema_fail_count == 0 and _release_audit_count == 0:
             lines.append("- 暂无新的失败任务或风险事件")
     else:
         lines.append("- 暂无新的失败任务或风险事件")
@@ -1256,17 +1357,45 @@ def render_ga_hourly_summary(
     return "\n".join(lines)
 
 
-def _duckdb_hourly_stats(generated_at_utc: str) -> dict[str, Any]:
+def _pg_hourly_scheduled_stats(repo: CryptoGuardRepository, *, generated_at_utc: str) -> dict[str, Any]:
+    """终审返工 R1 P1-2 + P2 (2026-07-25) / R2 P2-2 (2026-07-26): real
+    PostgreSQL aggregate of the last 1 hour's ``scheduled_analysis`` decisions.
+
+    This is the ONLY hourly aggregate the production render path uses. The
+    legacy ``_duckdb_hourly_stats`` (which produced the hardcoded "4 批次、共
+    40 条" / "（DuckDB 时序）" labels) was DELETED in 终审返工 R2 P2-2 as dead
+    code - it had no production consumer, only test/comment references. The
+    ``DuckDBAnalytics`` import that existed solely to feed it was removed too
+    (``DuckDBAnalytics`` itself survives in ``run_backtest.py`` /
+    ``status_tools.py`` / the backtest acceptance test).
+
+    The aggregate counts ONLY ``decision_type='scheduled_analysis'`` and returns
+    REAL ``total_decisions`` + ``batch_count`` (distinct non-NULL batch_id) +
+    ``signal_distribution`` (whose values sum to ``total_decisions``).
+
+    The window is ``[start, end)`` where ``end = generated_at_utc`` and
+    ``start = end - 1 hour``. ``analysis_time_utc`` is a TEXT ISO-8601 column;
+    the parameters are emitted in the same ``...Z`` format so lexicographic
+    comparison is a correct window filter.
+    """
     try:
         end = datetime.fromisoformat(generated_at_utc.replace("Z", "+00:00"))
         start = end - timedelta(hours=1)
-        distribution = DuckDBAnalytics().hourly_signal_distribution(
-            start.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            end.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        )
-        return {"ok": True, "source": "duckdb", "signal_distribution": distribution}
+        start_utc = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        end_utc = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        agg = repo.hourly_scheduled_analysis_distribution(start_utc=start_utc, end_utc=end_utc)
+        return {
+            "ok": True,
+            "source": "postgres",
+            "total_decisions": int(agg.get("total_decisions") or 0),
+            "batch_count": int(agg.get("batch_count") or 0),
+            "signal_distribution": agg.get("signal_distribution") or {},
+        }
     except Exception as exc:
-        return {"ok": False, "source": "in_memory_fallback", "error": str(exc), "signal_distribution": {}}
+        return {
+            "ok": False, "source": "postgres", "error": str(exc),
+            "total_decisions": 0, "batch_count": 0, "signal_distribution": {},
+        }
 
 
 def _fetch_risk_state(repo: CryptoGuardRepository) -> dict[str, Any]:
@@ -1949,17 +2078,19 @@ def render_hourly_report_text(
                 lines.append(f"- 提示：{'，'.join(info_parts)}")
             if not critical_parts and not info_parts:
                 lines.append(f"- 发现问题 {total} 个（非关键）")
-            # R6/AC17: Show structured issue details — type, scope, time_window
-            issues = state_consistency.get("issues") or []
-            for issue in issues[:10]:
-                issue_type = issue.get("type") or issue.get("issue_type") or ""
-                scope = issue.get("scope") or ""
-                time_window = issue.get("time_window") or ""
-                severity = issue.get("severity") or ""
-                detail = issue.get("detail") or issue.get("details") or ""
-                parts = [p for p in (issue_type, scope, time_window, severity, detail) if p]
-                if parts:
-                    lines.append(f"  - {' | '.join(parts)}")
+            # P2 (2026-07-24) + AC17 regression fix: surface EVERY issue's
+            # ``type``/evidence via the shared helper - not just warnings. The
+            # old text path rendered all issues but jammed raw dict
+            # ``scope``/``time_window`` in (Python repr); the P2 narrowing
+            # switched to warnings-only and dropped error-severity issues like
+            # ``market_data_gap_detected`` (AC17). The helper now renders all
+            # severities with string-only evidence, so error issues surface
+            # their type/scope/time_window again while prod dict-shaped
+            # warnings stay readable.
+            all_issues = state_consistency.get("issues") or []
+            if all_issues:
+                lines.append(f"- 明细 {len(all_issues[:10])} 项：")
+                lines.extend(_format_state_consistency_issue_lines(all_issues))
         else:
             lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])
     elif state_consistency and state_consistency.get("error"):
@@ -1983,11 +2114,16 @@ def render_hourly_report_text(
             lines.extend(["", "**本周失败模式（反馈记忆）**"])
             if top_patterns:
                 for p in top_patterns:
-                    lines.append(f"- {p['pattern']}：{p['count']} 次")
+                    lines.append(f"- {p['pattern']}：{p['count']} 次（候选反馈）")
             else:
-                lines.append("- 暂无失败模式记录")
+                # P2 (2026-07-24): see GA path - do not imply these are all failures.
+                lines.append("- 暂无聚合失败模式（近 7 天未记录到聚合候选反馈模式）")
             if most_active:
-                lines.append(f"- 最活跃反馈 Skill：{most_active}（{feedback_patterns.get('most_active_count', 0)} 条）")
+                # P2 (2026-07-24): most_active_count is 7-day cumulative candidate feedback.
+                lines.append(
+                    f"- 最活跃反馈 Skill：{most_active}"
+                    f"（近 7 天累计候选反馈 {feedback_patterns.get('most_active_count', 0)} 条，非失败计数）"
+                )
 
     # Account feedback gate stats
     if account_feedback_gate and not account_feedback_gate.get("error"):
@@ -2054,16 +2190,18 @@ def render_hourly_report_text(
                 lines.append(f"- counter_regime 前三品种：{symbol_text}")
 
     lines.extend(["", "**队列：**", f"- 用户待处理：{queue_counts['pending_user']}", f"- 后台待处理：{queue_counts['pending_background']}", f"- 运行中：{queue_counts['running']}"])
-    # P1/P2 fix (07-09): split failed_jobs via the shared helper so this
-    # brief path stays consistent with the system-status count and the
-    # 九、风险事件 section in render_ga_hourly_summary /
-    # render_hourly_report_text.
-    _brief_current_failed, _brief_legacy_count = _split_current_and_legacy_failed_jobs(
+    # P1/P2 fix (07-09) + P1-4 (07-22 review): split failed_jobs via the
+    # shared helper so this brief path stays consistent with the
+    # system-status count and the 九、风险事件 section in
+    # render_ga_hourly_summary / render_hourly_report_text. Release-audit
+    # terminal records are also excluded and counted separately so they do
+    # NOT masquerade as current failures here either.
+    _brief_current_failed, _brief_legacy_count, _brief_release_audit_count = _split_current_and_legacy_failed_jobs(
         failed_jobs,
     )
     health = "正常" if not _brief_current_failed and queue_counts.get("running", 0) < 5 else "需关注"
     lines.extend(["", "**系统健康度：**", f"- 状态：{health}", f"- 飞书 outbox/队列：用户 {queue_counts['pending_user']}，后台 {queue_counts['pending_background']}，运行中 {queue_counts['running']}"])
-    if _brief_current_failed or _brief_legacy_count > 0:
+    if _brief_current_failed or _brief_legacy_count > 0 or _brief_release_audit_count > 0:
         lines.extend(["", "**最近失败任务：**"])
         for job in _brief_current_failed:
             err = (job.get("error_message") or "")[:120]
@@ -2072,6 +2210,12 @@ def render_hourly_report_text(
             lines.append(
                 f"- 另有 {_brief_legacy_count} 个历史 schema 校验失败已归档到审计"
                 "（07-09 alias-repair SOP 已处理，不再列入当前风险事件）"
+            )
+        if _brief_release_audit_count > 0:
+            lines.append(
+                f"- 另有 {_brief_release_audit_count} 个发布清理审计记录已归档"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "发布运维动作，不计入当前风险事件）"
             )
 
     # P2: report accuracy diagnostics (legacy renderer also surfaces them).
@@ -2573,13 +2717,66 @@ def _age_label(age: str) -> str:
     return ""
 
 
-def _distribution_source_label(source_raw: str, duckdb_stats: dict[str, Any] | None) -> str:
-    """P2 phrasing clarification for the distribution source label."""
-    if source_raw == "duckdb" and (duckdb_stats or {}).get("ok"):
-        return "DuckDB 时序"
-    if source_raw in {"in_memory_fallback", "sqlite_fallback"}:
-        return "PostgreSQL 实时等级统计（DuckDB 未启用）"
-    return str(source_raw or "PostgreSQL 实时等级统计（DuckDB 未启用）")
+def _format_state_consistency_issue_lines(issues: list[dict[str, Any]], *, limit: int = 10) -> list[str]:
+    """P2 (2026-07-24) + AC17 regression fix: render each state-consistency
+    issue as a readable ``type | <evidence>`` line.
+
+    The diagnostic emits two issue shapes, and the contract tests use a third:
+      - ``stalled_candidate`` (prod warning): ``details`` dict with
+        strategy_name/version, no ``message``. The strategy identity from
+        ``details`` is the operator-actionable bit.
+      - ``deterministic_direction_from_failed_llm`` (prod warning): a human
+        ``message`` plus ``scope``/``time_window``/``details`` dicts. The
+        message already names the symbol and decision_id, so it is the most
+        honest single-line summary; the dict ``scope``/``time_window`` must
+        NOT be jammed in (it would print ``{'decision_id': 215, ...}`` repr).
+      - AC17 ``market_data_gap_detected`` (contract test): flat string
+        ``scope``/``time_window``/``detail`` with no ``message``. These strings
+        ARE the evidence the contract asserts on, so they must render.
+
+    Rule that satisfies all three: ``type`` always visible; a string
+    ``message`` is preferred; additionally any **string-typed**
+    ``scope``/``time_window``/``detail`` is appended (dict-typed ones are
+    skipped to avoid Python dict repr); when there is no message and no
+    string evidence, fall back to a compact ``details``-dict identity digest.
+    """
+    out: list[str] = []
+    for issue in (issues or [])[:limit]:
+        issue_type = str(issue.get("type") or issue.get("issue_type") or "")
+        severity = str(issue.get("severity") or "")
+        message = str(issue.get("message") or "").strip()
+        parts: list[str] = []
+        if issue_type:
+            parts.append(issue_type)
+        if message:
+            parts.append(message)
+        # AC17 flat-string evidence: only string-typed fields, never dict repr.
+        for key in ("scope", "time_window", "detail"):
+            val = issue.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+        details = issue.get("details")
+        if isinstance(details, str) and details.strip():
+            parts.append(details.strip())
+        if not message and not any(isinstance(issue.get(k), str) and issue.get(k) for k in ("scope", "time_window", "detail")):
+            # No human message and no flat-string evidence: build a compact
+            # identity digest from the details dict (e.g. stalled_candidate).
+            if isinstance(details, dict):
+                ident_keys = ("symbol", "strategy_name", "decision_id", "version")
+                ident = ", ".join(
+                    f"{k}={details[k]}" for k in ident_keys
+                    if k in details and details[k] not in (None, "")
+                )
+                if ident:
+                    parts.append(ident)
+        if not parts:
+            continue
+        line = " | ".join(parts)
+        if severity:
+            out.append(f"  - [{severity}] {line}")
+        else:
+            out.append(f"  - {line}")
+    return out
 
 
 def _decision_text(value: Any) -> str:
@@ -2610,7 +2807,16 @@ def _agent_hourly_brief(
     # the brief would reference them as current failures, contradicting
     # the rendered "另有 N 个历史 schema 校验失败已归档" line. Making the
     # brief self-contained ensures every caller gets the filter for free.
-    brief_failed_jobs, _brief_legacy_count = _split_current_and_legacy_failed_jobs(
+    # P2 (07-09 R4) + P1-4 (07-22 review): apply the legacy schema-fail AND
+    # release-audit split INSIDE the brief builder so the LLM context never
+    # receives archived legacy or release-audit jobs. The renderers
+    # (``_render_degraded_report``, ``render_ga_hourly_summary``,
+    # ``render_hourly_report_text``) filter these out of the user-visible
+    # risk-events section - if the brief still received them, the brief
+    # would reference them as current failures, contradicting the rendered
+    # "另有 N 个 ... 已归档" line. Making the brief self-contained ensures
+    # every caller gets the filter for free.
+    brief_failed_jobs, _brief_legacy_count, _brief_release_audit_count = _split_current_and_legacy_failed_jobs(
         failed_jobs,
     )
     fallback = {
@@ -3218,6 +3424,24 @@ _LEGACY_SCHEMA_FAIL_SIGNATURES = (
     "no_edge fallback schema 校验失败: 'analysis_time_utc'",
 )
 
+# P1-4 (07-22 production review): terminal release-audit error_message
+# signatures written by the /trellis:crypto-guard-release R3 stale-release
+# cleanup step (and the snapshot-discard-before-release audit). These are
+# ARCHIVED release-audit records, NOT current failures or risk events.
+# Surfacing them as "最近失败" misrepresents a deliberate release-housekeeping
+# action as a live production failure. They are filtered out of the current
+# risk-events list and counted in a SEPARATE archived-release-audit line so
+# the operator can distinguish current failures from release audit.
+# The original ``agent_jobs`` rows are NEVER deleted — only reclassified in
+# the report view (history is preserved in the DB for audit).
+# SINGLE SOURCE OF TRUTH: this is an ALIAS for the canonical tuple
+# ``RELEASE_AUDIT_ERROR_SIGNATURES`` defined on ``CryptoGuardRepository``
+# (storage/repository.py), which the SQL-layer ``recent_failed_jobs`` /
+# ``recent_release_audit_jobs`` queries use. Importing the canonical tuple
+# keeps the SQL exclusion and this Python-side classifier in lock-step; a
+# signature added/changed in one place automatically applies to both.
+_RELEASE_AUDIT_SIGNATURES: tuple[str, ...] = RELEASE_AUDIT_ERROR_SIGNATURES
+
 
 def _is_legacy_schema_fail_job(job: dict[str, Any]) -> bool:
     """Return True if the job's error_message matches a known legacy
@@ -3228,11 +3452,24 @@ def _is_legacy_schema_fail_job(job: dict[str, Any]) -> bool:
     return any(sig in msg for sig in _LEGACY_SCHEMA_FAIL_SIGNATURES)
 
 
+def _is_release_audit_job(job: dict[str, Any]) -> bool:
+    """P1-4: return True if the job's error_message matches a known
+    release-audit terminal signature (stale-release cleanup /
+    stale_snapshot_discarded_before_release). Such rows are archived
+    release-housekeeping records, not current failures — used by
+    ``_split_current_and_legacy_failed_jobs`` to exclude them from the
+    current risk-events list and surface them as a separate audit line.
+    The original ``agent_jobs`` row is never deleted.
+    """
+    msg = str(job.get("error_message") or "")
+    return any(sig in msg for sig in _RELEASE_AUDIT_SIGNATURES)
+
+
 def _split_current_and_legacy_failed_jobs(
     failed_jobs: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """P2 (07-09 R3): split failed_jobs into ``(current_jobs,
-    legacy_schema_fail_count)``.
+) -> tuple[list[dict[str, Any]], int, int]:
+    """P2 (07-09 R3) + P1-4 (07-22 review): split failed_jobs into
+    ``(current_jobs, legacy_schema_fail_count, release_audit_count)``.
 
     The system-status line ("最近失败 N 个") and the 九、风险事件 section
     must share the same filtering logic so the count shown at the top
@@ -3241,17 +3478,28 @@ def _split_current_and_legacy_failed_jobs(
     legacy schema-fail) while the risk-events section filtered them out,
     producing a mismatch like "最近失败 2 个" above a 1-item list.
 
+    P1-4: release-audit terminal records (stale-release cleanup /
+    stale_snapshot_discarded_before_release) are now ALSO excluded from
+    ``current_jobs`` and counted in a SEPARATE ``release_audit_count`` so
+    the report can distinguish "current failures" from "archived release
+    audit" — a release housekeeping action must NOT masquerade as a live
+    failure. Original ``agent_jobs`` rows are never deleted; this only
+    reclassifies them in the report view.
+
     Returns:
-        ``(current_jobs, legacy_schema_fail_count)`` where ``current_jobs``
-        preserves the input order and ``legacy_schema_fail_count`` is the
-        number of jobs whose error_message matches a known legacy
-        schema-fail signature.
+        ``(current_jobs, legacy_schema_fail_count, release_audit_count)``
+        where ``current_jobs`` preserves the input order (excluding both
+        archived legacy schema-fail and archived release-audit jobs).
     """
     if not failed_jobs:
-        return [], 0
-    current = [j for j in failed_jobs if not _is_legacy_schema_fail_job(j)]
-    legacy_count = len(failed_jobs) - len(current)
-    return current, legacy_count
+        return [], 0, 0
+    current = [
+        j for j in failed_jobs
+        if not _is_legacy_schema_fail_job(j) and not _is_release_audit_job(j)
+    ]
+    legacy_count = sum(1 for j in failed_jobs if _is_legacy_schema_fail_job(j))
+    release_audit_count = sum(1 for j in failed_jobs if _is_release_audit_job(j))
+    return current, legacy_count, release_audit_count
 
 
 def _render_recent_failures(

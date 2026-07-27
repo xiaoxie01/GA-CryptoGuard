@@ -18831,25 +18831,14 @@ class HourlyReportAccuracyTest(unittest.TestCase):
             self.assertNotIn(forbidden, text)
 
     # ── P0 test 14: distribution source label clarifies fallback wording ─
-
-    def test_distribution_source_label_sqlite_fallback_phrasing(self) -> None:
-        """P2: in_memory_fallback renders as the PostgreSQL-clarified string.
-
-        Greenfield cutover: the in-process fallback now persists grades to
-        PostgreSQL (not SQLite), so the production label reads
-        ``PostgreSQL 实时等级统计（DuckDB 未启用）``. The ``sqlite_fallback``
-        alias is still accepted by the production helper and maps to the same
-        label. The ``duckdb`` success path is unchanged (``DuckDB 时序``).
-        """
-        from plugins.crypto_guard.notify.hourly_report import _distribution_source_label
-        self.assertEqual(
-            _distribution_source_label("in_memory_fallback", {"ok": False}),
-            "PostgreSQL 实时等级统计（DuckDB 未启用）",
-        )
-        self.assertEqual(
-            _distribution_source_label("duckdb", {"ok": True}),
-            "DuckDB 时序",
-        )
+    # 终审返工 R2 P2-2 (2026-07-26): the dead ``_distribution_source_label``
+    # helper was DELETED (no production consumer; the render path hardcodes the
+    # PostgreSQL labels inline). The old test that asserted the helper's return
+    # value was therefore also DELETED - it only validated a dead helper. The
+    # live contract (rendered text labels are PostgreSQL, never DuckDB/SQLite)
+    # is covered by
+    # ``test_pg_dead_duckdb_stats_helpers_removed_p2_2.py::...::test_postgresql_labels_preserved_in_render``
+    # and by ``test_pg_hourly_report_feishu_p8.py::...::test_report_labels_say_postgresql``.
 
     # ── P0 test 15: full pipeline runs without external Binance calls ────
 
@@ -42114,9 +42103,13 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
 
     # P2 (07-09 R3): shared helper splits failed_jobs into current vs legacy.
     def test_07_09_split_current_and_legacy_failed_jobs_helper(self) -> None:
-        """P2: ``_split_current_and_legacy_failed_jobs`` must return
-        ``(current_jobs, legacy_schema_fail_count)`` so the system-status
-        line and the 九、风险事件 section share the same filtering logic.
+        """P2 + P1-4: ``_split_current_and_legacy_failed_jobs`` must return
+        ``(current_jobs, legacy_schema_fail_count, release_audit_count)`` so
+        the system-status line and the 九、风险事件 section share the same
+        filtering logic. The P1-4 ``release_audit_count`` (terminal
+        release-audit rows) is the third element; this fixture has none, so
+        it asserts 0 (covered end-to-end by
+        test_pg_recent_failed_jobs_release_audit_p1_4).
 
         This test verifies the helper directly with three job shapes:
         - a current actionable failure (kept)
@@ -42136,7 +42129,7 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             {"id": 3, "job_type": "scheduled_market_analysis",
              "error_message": "connection timeout to exchange"},
         ]
-        current, legacy_count = _split_current_and_legacy_failed_jobs(jobs)
+        current, legacy_count, release_audit_count = _split_current_and_legacy_failed_jobs(jobs)
         self.assertEqual(legacy_count, 1,
                          "P2: exactly 1 legacy schema-fail job must be archived")
         self.assertEqual(len(current), 2,
@@ -42146,21 +42139,26 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
         self.assertIn(3, current_ids, "P2: timeout failure id=3 must be in current")
         self.assertNotIn(2, current_ids,
                          "P2: legacy schema-fail id=2 must NOT be in current")
+        # P1-4: none of the seeded jobs are release-audit rows.
+        self.assertEqual(release_audit_count, 0,
+                         "P1-4: no release-audit rows in this fixture -> count 0")
 
-        # Edge case: empty list returns ([], 0).
-        empty_current, empty_legacy = _split_current_and_legacy_failed_jobs([])
+        # Edge case: empty list returns ([], 0, 0).
+        empty_current, empty_legacy, empty_release_audit = _split_current_and_legacy_failed_jobs([])
         self.assertEqual(empty_current, [])
         self.assertEqual(empty_legacy, 0)
+        self.assertEqual(empty_release_audit, 0)
 
-        # Edge case: all legacy -> current empty, count = N.
+        # Edge case: all legacy -> current empty, legacy count = N, audit 0.
         all_legacy = [
             {"id": i, "job_type": "x",
              "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property"}
             for i in range(5)
         ]
-        all_current, all_legacy_count = _split_current_and_legacy_failed_jobs(all_legacy)
+        all_current, all_legacy_count, all_release_audit = _split_current_and_legacy_failed_jobs(all_legacy)
         self.assertEqual(all_current, [])
         self.assertEqual(all_legacy_count, 5)
+        self.assertEqual(all_release_audit, 0)
 
     # AC11: legacy analysis_time_utc failure not current risk event
     def test_07_09_legacy_analysis_time_utc_failure_not_current(self) -> None:
@@ -42472,7 +42470,7 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             "id": 1, "job_type": "scheduled_market_analysis",
             "error_message": "schema validation error: 'analysis_time_utc' is a required property",
         }
-        current, legacy_count = _split_current_and_legacy_failed_jobs([future_job])
+        current, legacy_count, release_audit_count = _split_current_and_legacy_failed_jobs([future_job])
         self.assertEqual(
             legacy_count, 0,
             "P2: future-shape failure WITHOUT the ``no_edge fallback`` prefix "
@@ -42482,13 +42480,15 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             len(current), 1,
             "P2: future-shape failure must stay in current risk events",
         )
+        self.assertEqual(release_audit_count, 0,
+                         "P1-4: future-shape failure is not a release-audit row")
 
         # Legacy-shape failure: still has the full prefix. Must be archived.
         legacy_job = {
             "id": 2, "job_type": "scheduled_market_analysis",
             "error_message": "no_edge fallback schema 校验失败: 'analysis_time_utc' is a required property",
         }
-        current2, legacy_count2 = _split_current_and_legacy_failed_jobs([legacy_job])
+        current2, legacy_count2, release_audit_count2 = _split_current_and_legacy_failed_jobs([legacy_job])
         self.assertEqual(
             legacy_count2, 1,
             "P2: legacy-shape failure WITH the full prefix must still be archived",
@@ -42497,6 +42497,8 @@ class TestPhaseA07_09SchemaRepairBreaker(unittest.TestCase):
             len(current2), 0,
             "P2: legacy-shape failure must NOT stay in current risk events",
         )
+        self.assertEqual(release_audit_count2, 0,
+                         "P1-4: legacy schema-fail is not a release-audit row")
 
     # P2 (07-09 R4 reviewer): design §4 case 5 — ``state=open`` AND
     # ``skipped_by_breaker > 0`` AND dominant is NOT in

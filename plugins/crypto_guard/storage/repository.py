@@ -162,6 +162,29 @@ def validate_job_identity(jp: dict[str, Any]) -> str | None:
     return sym
 
 
+# P1-4 (07-22 production review): terminal release-audit error_message
+# signatures written by the /trellis:crypto-guard-release R3 stale-release
+# cleanup step (and the snapshot-discard-before-release audit). These are
+# archived release-housekeeping records, NOT current failures. They must
+# NOT enter the current "最近失败/风险事件" list - surfacing them there
+# misrepresents a deliberate release-housekeeping action as a live
+# production failure. ``recent_failed_jobs`` excludes them at the SQL layer
+# so they cannot starve the LIMIT slot for real current failures, and
+# ``recent_release_audit_jobs`` surfaces them separately for the
+# archived-release-audit report line. Original ``agent_jobs`` rows are
+# NEVER deleted - only reclassified in the report view.
+#
+# MODULE-LEVEL SINGLE SOURCE OF TRUTH: ``CryptoGuardRepository`` aliases
+# this as a class attribute (so instance SQL queries read
+# ``self.RELEASE_AUDIT_ERROR_SIGNATURES``) and the hourly-report Python
+# classifier (``hourly_report._RELEASE_AUDIT_SIGNATURES``) imports it
+# directly, keeping the SQL exclusion and the classifier in lock-step.
+RELEASE_AUDIT_ERROR_SIGNATURES: tuple[str, ...] = (
+    "stale-release cleanup",
+    "stale_snapshot_discarded_before_release",
+)
+
+
 class CryptoGuardRepository:
     """Repository 层隔离所有 SQL，业务模块不直接拼 SQL。
 
@@ -549,6 +572,92 @@ class CryptoGuardRepository:
             )
             rows = [dict(r) for r in cur.fetchall()]
         return rows
+
+    def hourly_scheduled_analysis_distribution(
+        self, *, start_utc: str, end_utc: str,
+    ) -> dict[str, Any]:
+        """终审返工 P1-2 (2026-07-25): real PostgreSQL aggregate of the
+        ``scheduled_analysis`` decisions in ``[start_utc, end_utc)``.
+
+        Replaces the legacy hardcoded "4 批次、共 40 条" / DuckDB-labeled
+        hourly aggregate. Returns:
+          - ``total_decisions``: real ``COUNT(*)`` of scheduled decisions in
+            the window (decision_type='scheduled_analysis' ONLY; ad-hoc /
+            other decision types mixed into the window are excluded).
+          - ``batch_count``: real ``COUNT(DISTINCT batch_id)`` EXCLUDING NULL
+            ``batch_id`` (a partial batch with NULL batch_id must NOT be
+            fabricated into a batch count).
+          - ``signal_distribution``: ``{signal_grade: count}`` whose values
+            sum to ``total_decisions``.
+
+        ``analysis_time_utc`` is a TEXT ISO-8601 column; lexicographic
+        comparison against ISO-8601 parameters (same format/zone, e.g.
+        ``2026-07-24T17:05:00Z``) is a correct window filter.
+        """
+        # 终审返工 R2 P1-2 (2026-07-26): SINGLE STATEMENT. The prior code issued
+        # TWO ``cur.execute`` calls against the same window (one for total/batch,
+        # one for the per-grade GROUP BY). Under PostgreSQL's default READ
+        # COMMITTED isolation, two separate statements can observe DIFFERENT row
+        # snapshots: a row committed by another backend BETWEEN the two executes
+        # is visible to exactly one of them, so ``total_decisions`` (from
+        # statement 1) could be 10 while ``sum(signal_distribution.values())``
+        # (from statement 2) is 9 (or 11) - a self-inconsistent aggregate. There
+        # is no Python post-hoc reconciliation that can prove consistency here;
+        # the only fix is to derive both halves from ONE statement snapshot.
+        #
+        # The single statement below wraps the filtered set in a CTE ``w`` so
+        # the total/batch aggregate and the per-grade distribution both scan the
+        # SAME rows of the SAME snapshot in one ``execute``. ``jsonb_object_agg``
+        # folds the per-grade rows into a single JSON object so the whole result
+        # is ONE row, ONE fetchone, ONE snapshot. A zero-row window returns a
+        # JSON ``{}`` (not NULL) via ``COALESCE`` so the caller always gets a dict.
+        # ``signal_grade`` is NOT NULL in the schema, but the defensive ``COALESCE
+        # (... '-'`` preserves the prior ``row["signal_grade"] or "-"`` behavior.
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH w AS (
+                    SELECT signal_grade, batch_id
+                    FROM ga_decisions
+                    WHERE decision_type = 'scheduled_analysis'
+                      AND analysis_time_utc >= %s
+                      AND analysis_time_utc < %s
+                ),
+                agg AS (
+                    SELECT
+                      COUNT(*) AS total_decisions,
+                      COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL) AS batch_count
+                    FROM w
+                ),
+                dist AS (
+                    SELECT COALESCE(
+                      jsonb_object_agg(signal_grade, cnt), '{}'::jsonb
+                    ) AS signal_distribution
+                    FROM (
+                        SELECT COALESCE(signal_grade, '-') AS signal_grade,
+                               COUNT(*) AS cnt
+                        FROM w
+                        GROUP BY COALESCE(signal_grade, '-')
+                    ) g
+                )
+                SELECT agg.total_decisions, agg.batch_count, dist.signal_distribution
+                FROM agg, dist
+                """,
+                [start_utc, end_utc],
+            )
+            row = cur.fetchone() or {}
+            total = int(row.get("total_decisions") or 0)
+            batch_count = int(row.get("batch_count") or 0)
+            # ``signal_distribution`` is a JSONB column -> psycopg decodes it to a
+            # Python dict already; ``_decode_json`` passes dict through and
+            # coerces numeric JSON values to int for the caller.
+            raw_dist = _decode_json(row.get("signal_distribution"), {})
+            dist = {str(k): int(v) for k, v in raw_dist.items()} if raw_dist else {}
+        return {
+            "total_decisions": total,
+            "batch_count": batch_count,
+            "signal_distribution": dist,
+        }
 
     # ── Analysis batch lifecycle helpers (Hourly Report Accuracy) ──────────
     def start_analysis_batch(
@@ -2315,6 +2424,13 @@ class CryptoGuardRepository:
             rows = cur.fetchall()
         return [dict(r) for r in rows]
 
+    # P1-4 (07-22 production review): class-level alias for the module-level
+    # single source of truth (see ``RELEASE_AUDIT_ERROR_SIGNATURES`` above
+    # ``class CryptoGuardRepository``). Kept so the SQL queries read
+    # ``self.RELEASE_AUDIT_ERROR_SIGNATURES`` without an extra module lookup;
+    # editing the module constant propagates here automatically.
+    RELEASE_AUDIT_ERROR_SIGNATURES: tuple[str, ...] = RELEASE_AUDIT_ERROR_SIGNATURES
+
     def recent_failed_jobs(self, limit: int = 5, *, days: int = 7) -> list[dict[str, Any]]:
         """Return recent failed agent_jobs within the given day window.
 
@@ -2336,7 +2452,25 @@ class CryptoGuardRepository:
         a NULL-finished_at job falls back to ``started_at`` for the
         7-day window check. Jobs with both ``finished_at`` and
         ``started_at`` older than the window are excluded.
+
+        P1-4 (07-22 production review): ``LIMIT`` alone is not enough — a
+        ``LIMIT 5`` ordered by ``id DESC`` can be entirely consumed by
+        recent release-audit terminal rows (stale-release cleanup /
+        stale_snapshot_discarded_before_release), starving real current
+        failures out of the list so "最近失败 N 个" reads 0 while only
+        archived release-audit rows are fetched. Such rows are
+        release-housekeeping actions, NOT current failures. They are now
+        EXCLUDED at the SQL layer so they never occupy the LIMIT slot;
+        ``recent_release_audit_jobs`` surfaces them separately for the
+        archived-release-audit report line. Original ``agent_jobs`` rows
+        are never deleted.
         """
+        # Build the release-audit exclusion predicate from the shared
+        # signature tuple so the SQL and the Python-side classifier in
+        # hourly_report stay in lock-step (single source of truth). Note
+        # the LIKE wildcards are escaped as ``%%`` because psycopg treats a
+        # bare ``%`` in the query string as a placeholder prefix.
+        release_sigs = self.RELEASE_AUDIT_ERROR_SIGNATURES
         with self.conn.cursor() as cur:
             cur.execute(
                 """
@@ -2344,10 +2478,47 @@ class CryptoGuardRepository:
                 FROM agent_jobs
                 WHERE status='failed'
                   AND COALESCE(finished_at, started_at) >= NOW() - make_interval(days => %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM unnest(%s::text[]) AS sig(s)
+                      WHERE error_message LIKE '%%' || s || '%%'
+                  )
                 ORDER BY id DESC
                 LIMIT %s
                 """,
-                (int(days), int(limit)),
+                (int(days), list(release_sigs), int(limit)),
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_release_audit_jobs(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """P1-4 (07-22 production review): return archived release-audit
+        ``agent_jobs`` rows (stale-release cleanup /
+        stale_snapshot_discarded_before_release) within the given day
+        window, ordered by ``id DESC``.
+
+        These are deliberate release-housekeeping records written by the
+        /trellis:crypto-guard-release R3 cleanup step, NOT current
+        failures. The hourly report surfaces their COUNT as a separate
+        archived-release-audit line ("另有 N 个发布清理审计记录已归档 ... 不计入
+        当前风险事件") so the operator can distinguish current failures
+        from archived release audit. The original ``agent_jobs`` rows are
+        never deleted — this only reads them.
+        """
+        release_sigs = self.RELEASE_AUDIT_ERROR_SIGNATURES
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, job_type, priority, session_id, error_message, finished_at
+                FROM agent_jobs
+                WHERE status='failed'
+                  AND COALESCE(finished_at, started_at) >= NOW() - make_interval(days => %s)
+                  AND EXISTS (
+                      SELECT 1 FROM unnest(%s::text[]) AS sig(s)
+                      WHERE error_message LIKE '%%' || s || '%%'
+                  )
+                ORDER BY id DESC
+                """,
+                (int(days), list(release_sigs)),
             )
             rows = cur.fetchall()
         return [dict(r) for r in rows]

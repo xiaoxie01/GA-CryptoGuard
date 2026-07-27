@@ -85,7 +85,23 @@ def render_text(decision: dict[str, Any], *, signal_id: int | None = None) -> st
     if watch and not plan:
         lines.extend(["", "**等待触发条件**"])
         lines.extend([f"- {_textify_condition(x)}" for x in watch.get("conditions", [])])
-    lines.extend(["", "**数据说明**", f"- 分析周期：{', '.join(decision.get('timeframes') or [])}", "- 只使用已收盘 K 线；系统查询条件为 close_time <= 分析时间，避免未来函数。"])
+    lines.extend(["", "**数据说明**"])
+    # 终审返工 P1-1 (2026-07-25): distinguish the INTERNAL analysis base
+    # periods (the full set the GA decision actually analyzed) from the
+    # user's EXPLICIT display periods (only surfaced when the user named
+    # specific periods). Previously a single "分析周期" line rendered
+    # ``decision["timeframes"]`` (the internal set) and never surfaced the
+    # user's explicit ``display_timeframes``, so the Feishu consumer could
+    # not tell which periods the user asked to see vs. which the system
+    # always runs. ``decision["timeframes"]`` is the internal base;
+    # ``decision["display_timeframes"]`` is the user's explicit set (only
+    # present/meaningful when ``user_specified_display`` is True).
+    lines.append(f"- 内部分析周期：{', '.join(decision.get('timeframes') or [])}")
+    if decision.get("user_specified_display"):
+        display_tfs = decision.get("display_timeframes") or []
+        if display_tfs:
+            lines.append(f"- 用户请求展示周期：{', '.join(display_tfs)}")
+    lines.append("- 只使用已收盘 K 线；系统查询条件为 close_time <= 分析时间，避免未来函数。")
     lines.append("")
     lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
     return "\n".join(lines)

@@ -28,9 +28,18 @@ pytestmark = pytest.mark.unit
 # test_codex_p1_1_pre_envelope_marker_timeout_is_legacy_info
 # -> test_codex_p1_1_pre_envelope_marker_timeout_is_excluded_not_current_error
 # (count unchanged; SHA updated).
-BASELINE_TEST_DEFINITION_COUNT = 1220
+# 1220 -> 1219: 终审返工 R2 P2-2 (2026-07-26) deleted the dead-helper test
+# ``CryptoGuardSmokeTest::test_distribution_source_label_sqlite_fallback_phrasing``
+# from ``_smoke_suite``. That test only asserted the now-DELETED dead
+# ``_distribution_source_label`` helper's phrasing; it had no production
+# consumer (see ``test_pg_dead_duckdb_stats_helpers_removed_p2_2.py`` for the
+# live coverage that replaces it). The removal drops the legacy test-definition
+# manifest by exactly one object, so the count baseline moves 1220 -> 1219 and
+# the manifest SHA is recomputed. This is a compliance baseline update - no
+# production behavior, no test semantics, no coverage loss.
+BASELINE_TEST_DEFINITION_COUNT = 1219
 BASELINE_TEST_DEFINITION_SHA256 = (
-    "ee1ceef0e7efb501551fa93d54b385ac55e4161e836663014c03b6dfb3532af3"
+    "e01364b21f82d1dc10f1dfa1375786e3acfbc271052ba3f4f24c071df7d50c15"
 )
 BASELINE_CLASS_RENAMES = {
     "Btc9RegressionChainTest": "TradeGateRegressionChainTest",
