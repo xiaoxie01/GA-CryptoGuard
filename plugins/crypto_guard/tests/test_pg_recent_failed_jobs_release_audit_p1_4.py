@@ -345,8 +345,16 @@ class TestPgRecentFailedJobsReleaseAuditP1_4:
 
     def test_is_release_audit_job_and_signatures(self) -> None:
         """``_is_release_audit_job`` matches both release-audit signatures
-        and the shared signature tuple is exactly the two terminal
-        release-audit messages. A non-audit failure returns False.
+        and the shared signature tuple is the canonical terminal release-
+        audit message set. A non-audit failure returns False.
+
+        P2-1 (07-27) requirement E: the set was extended from two to four
+        signatures — the two original (stale-release cleanup /
+        stale_snapshot_discarded_before_release) plus the two postfix-restart
+        signatures (stale_batch_discarded_before_postfix_restart /
+        stale_maintenance_job_discarded_before_postfix_restart). See
+        ``test_pg_postfix_restart_release_audit_p2_1.py`` for the postfix-
+        restart coverage.
         """
         assert _is_release_audit_job({"error_message": "stale-release cleanup"}) is True
         assert _is_release_audit_job(
@@ -363,9 +371,12 @@ class TestPgRecentFailedJobsReleaseAuditP1_4:
         assert set(_RELEASE_AUDIT_SIGNATURES) == {
             "stale-release cleanup",
             "stale_snapshot_discarded_before_release",
+            "stale_batch_discarded_before_postfix_restart",
+            "stale_maintenance_job_discarded_before_postfix_restart",
         }, (
-            "P1-4: the release-audit signature tuple must be exactly the two "
-            "terminal release-audit messages"
+            "P1-4 + P2-1: the release-audit signature tuple must be exactly "
+            "the four terminal release-audit messages (two original + two "
+            "postfix-restart per requirement E)"
         )
 
     def test_original_agent_jobs_rows_preserved_no_deletion(self) -> None:

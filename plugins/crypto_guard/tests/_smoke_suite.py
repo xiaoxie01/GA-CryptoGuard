@@ -40365,7 +40365,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_origin="llm_confirmed",
                 has_trade_plan=True,
             )),
-            "候选计划已生成（LLM 已确认）",
+            "候选计划已生成（LLM 已确认）。",
             "AC10 branch 1: confirmed+llm_confirmed wording",
         )
 
@@ -40376,7 +40376,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_origin="deterministic_fallback",
                 candidate_trade_plan={"side": "LONG"},
             )),
-            "规则候选计划已生成，LLM 未确认，禁止执行",
+            "规则候选计划已生成，LLM 未确认，禁止执行。",
             "AC10 branch 2: unconfirmed+deterministic_fallback wording",
         )
 
@@ -40387,7 +40387,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_origin="llm_confirmed",
                 candidate_trade_plan={"side": "LONG"},
             )),
-            "候选计划已生成，但风控未通过",
+            "候选计划已生成，但风控未通过。",
             "AC10 branch 3: risk_rejected wording",
         )
 
@@ -40398,7 +40398,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_origin="llm_confirmed",
                 candidate_trade_plan={"side": "LONG"},
             )),
-            "候选计划已生成，但前次触发已反转",
+            "候选计划已生成，但前次触发已反转。",
             "AC10 branch 4: invalidated wording",
         )
 
@@ -40408,7 +40408,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_execution_state="no_candidate",
                 plan_origin=None,
             )),
-            "无候选计划，本轮仅观察",
+            "无候选计划，本轮仅观察。",
             "AC10 branch 5: no_candidate wording",
         )
 
@@ -40420,7 +40420,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 has_trade_plan=True,
                 llm_status="disabled",
             )),
-            "规则候选计划已生成（LLM 已禁用，SOP 确认）",
+            "规则候选计划已生成（LLM 已禁用，SOP 确认）。",
             "AC10 extra: confirmed+deterministic_sop wording",
         )
 
@@ -40430,7 +40430,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
                 plan_execution_state=None,
                 plan_origin=None,
             )),
-            "无候选计划，本轮仅观察",
+            "无候选计划，本轮仅观察。",
             "AC10 fallback: unknown combination defaults to no_candidate wording",
         )
 
@@ -40472,27 +40472,39 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
         label = _render_plan_state_label(row)
         self.assertEqual(
             label,
-            "规则候选计划已生成，LLM 未确认，禁止执行",
+            "规则候选计划已生成，LLM 未确认，禁止执行。",
             "AC9: deterministic fallback candidate must render as unconfirmed with 禁止执行",
         )
 
-        # AC9: the full opportunity row must include the state label so the
-        # operator sees the "禁止执行" wording in the rendered report.
+        # H (07-27) dedup: the full opportunity row must include the candidate
+        # detail + blocker line ("候选计划详情（...），阻断原因：LLM 解析失败。")
+        # and must NOT ALSO append the state label ("规则候选计划已生成，LLM 未
+        # 确认，禁止执行。") — the two lines would duplicate the "候选计划已
+        # 生成/详情" sentence AND the LLM-failed blocker wording. Pre-H the
+        # render appended BOTH; post-H only the detail line is appended.
         rendered = _format_opportunity_row(
             row, open_by_symbol={}, tier_label="观察候选",
         )
-        self.assertIn(
-            "规则候选计划已生成，LLM 未确认，禁止执行",
-            rendered,
-            "AC9: rendered opportunity row must include the unconfirmed label",
-        )
-        # The candidate plan details (side/entry/stop) should also appear
-        # via _trade_plan_summary, but WITHOUT the old "候选计划已生成"
-        # prefix (which is now handled by the state label).
+        # The candidate+blocker detail line is present.
         self.assertIn(
             "候选计划详情",
             rendered,
             "AC9: candidate plan details should appear with 候选计划详情 prefix",
+        )
+        self.assertIn(
+            "LLM 解析失败",
+            rendered,
+            "AC9: the LLM-failed blocker reason must surface in the detail line",
+        )
+        # The separate state-label line is NOT appended (dedup): the candidate
+        # carries a structured blocker, so the state label would duplicate the
+        # candidate sentence + the blocker wording.
+        self.assertNotIn(
+            "规则候选计划已生成，LLM 未确认，禁止执行",
+            rendered,
+            "H dedup: when the candidate carries a structured blocker, the "
+            "state label must NOT also be appended (it would duplicate the "
+            "candidate detail + blocker line).",
         )
         self.assertNotIn(
             "候选计划已生成（LONG 入场",
@@ -40515,7 +40527,7 @@ class TestPhaseC07_07PlanStateLabel(unittest.TestCase):
         legacy.pop("plan_origin")
         self.assertEqual(
             _render_plan_state_label(legacy),
-            "无候选计划，本轮仅观察",
+            "无候选计划，本轮仅观察。",
             "Legacy decision without plan_execution_state must fall back to no_candidate wording",
         )
 

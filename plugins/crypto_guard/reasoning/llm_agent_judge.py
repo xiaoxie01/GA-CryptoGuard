@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from plugins.crypto_guard.reasoning.decision_schema import (
     normalize_entry_trigger_confirmation,
+    normalize_suggested_actions,
     validate_json,
 )
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
@@ -319,6 +320,36 @@ def _try_repair_entry_trigger_confirmation(
     repaired_trade_plan = dict(trade_plan)
     repaired_trade_plan["entry_trigger_confirmation"] = normalized
     repaired["trade_plan"] = repaired_trade_plan
+    return repaired, notes, True
+
+
+def _try_repair_suggested_actions(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], list[str], bool]:
+    """Repair ``suggested_actions`` by rebuilding the canonical list from
+    decision semantics.
+
+    Phase-2 D (07-27): mirrors ``_try_repair_entry_trigger_confirmation``.
+    Returns ``(repaired_decision, audit_notes, changed_flag)``. When the
+    decision's ``suggested_actions`` is already canonical and valid, returns
+    ``(decision, [], False)`` and the caller falls through. The canonical
+    rebuild mapping is in ``normalize_suggested_actions`` (decision_schema.py)
+    — the raw list is NOT filtered against the enum (filtering would silently
+    drop the LLM's intent, e.g. ``wait_for_breakout`` should map to
+    ``add_to_watchlist``, not be dropped).
+    """
+    raw = decision.get("suggested_actions")
+    normalized, notes, changed = normalize_suggested_actions(
+        raw,
+        decision=decision.get("decision"),
+        has_trade_plan=decision.get("has_trade_plan"),
+        trade_plan=decision.get("trade_plan"),
+        opportunity_watch=decision.get("opportunity_watch"),
+    )
+    if not changed or normalized is None:
+        return decision, [], False
+    repaired = dict(decision)
+    repaired["suggested_actions"] = normalized
     return repaired, notes, True
 
 
@@ -1421,42 +1452,78 @@ def _run_single_llm_attempt(
     decision = _normalize_llm_decision(candidate, snapshot, fallback)
     ok, err = validate_json("ga_decision.schema.json", decision)
     if not ok:
-        # Phase B/C (07-09): schema-alias repair path.
-        repaired_decision, repair_notes, repair_changed = _try_repair_entry_trigger_confirmation(
-            decision, snapshot
+        # Phase B/C (07-09): schema-alias repair path. Phase-2 D (07-27):
+        # generalized to try ALL repairs in sequence (entry-trigger alias
+        # first, then suggested_actions rebuild), re-validate ONCE at the
+        # end. Each repair function returns ``(repaired, notes, changed)``;
+        # when a repair changes the decision, the next repair runs on the
+        # already-repaired working copy so BOTH repairs get a chance. A
+        # clean approach: collect a list of repair functions, apply them in
+        # sequence to a working copy, re-validate once at the end.
+        repair_fns = (
+            _try_repair_entry_trigger_confirmation,
+            _try_repair_suggested_actions,
         )
-        if repair_changed:
-            ok2, err2 = validate_json("ga_decision.schema.json", repaired_decision)
-            if ok2:
-                # Repaired success: ONE physical provider call that succeeded
-                # after a schema-alias repair. Surface ``llm_repair_event``
-                # so the caller emits BOTH breaker events (physical ok +
-                # repairable), mirroring legacy llm_agent_judge.py:223-226.
-                repaired_decision["plan_origin"] = "llm_confirmed"
-                repaired_decision["plan_execution_state"] = "confirmed"
-                existing_notes = list(repaired_decision.get("risk_notes") or [])
-                existing_notes.extend(repair_notes)
-                repaired_decision["risk_notes"] = existing_notes
-                parse_meta = repaired_decision.get("llm_parse_meta") or {}
-                if not isinstance(parse_meta, dict):
-                    parse_meta = {}
-                if repair_notes:
-                    parse_meta["original_entry_trigger_type"] = repair_notes[0]
-                repaired_decision["llm_parse_meta"] = parse_meta
-                attempt_meta["llm_status"] = "ok"
-                attempt_meta["llm_error_category"] = None
-                attempt_meta["llm_error_stage"] = None
-                attempt_meta["llm_error"] = None
-                attempt_meta["llm_fallback_reason"] = None
-                attempt_meta["llm_terminal_reason"] = "schema_repaired"
-                attempt_meta["llm_repair_event"] = True
-                # Merge the §8 envelope onto the repaired decision so the
-                # success row carries complete attempt metadata (mirrors
-                # legacy llm_agent_judge.py:246).
-                repaired_decision.update(attempt_meta)
-                return repaired_decision, attempt_meta
-            err = err2
-            decision = repaired_decision
+        working = decision
+        all_notes: list[str] = []
+        entry_trigger_changed = False
+        suggested_actions_changed = False
+        original_entry_trigger_note: str | None = None
+        original_suggested_actions: Any = None
+        for _fn in repair_fns:
+            working, notes, changed = _fn(working, snapshot)
+            if changed:
+                if _fn is _try_repair_entry_trigger_confirmation:
+                    entry_trigger_changed = True
+                    if notes:
+                        original_entry_trigger_note = notes[0]
+                elif _fn is _try_repair_suggested_actions:
+                    suggested_actions_changed = True
+                    # Capture the original (pre-repair) suggested_actions for
+                    # audit before the rebuild overwrote it.
+                    original_suggested_actions = decision.get("suggested_actions")
+                all_notes.extend(notes)
+        ok2, err2 = validate_json("ga_decision.schema.json", working)
+        if ok2:
+            # Repaired success: ONE physical provider call that succeeded
+            # after a schema-alias repair. Surface ``llm_repair_event``
+            # so the caller emits BOTH breaker events (physical ok +
+            # repairable), mirroring legacy llm_agent_judge.py:223-226.
+            # P1-4 (07-27): set ``plan_origin="llm_confirmed"`` /
+            # ``plan_execution_state="confirmed"`` ONLY when the repaired
+            # decision actually carries a confirmed trade_plan. When the
+            # LLM succeeded (repaired) but produced NO plan, keep the
+            # fallback's ``plan_origin`` — nothing was confirmed.
+            if working.get("has_trade_plan") and working.get("trade_plan"):
+                working["plan_origin"] = "llm_confirmed"
+                working["plan_execution_state"] = "confirmed"
+            existing_notes = list(working.get("risk_notes") or [])
+            existing_notes.extend(all_notes)
+            working["risk_notes"] = existing_notes
+            parse_meta = working.get("llm_parse_meta") or {}
+            if not isinstance(parse_meta, dict):
+                parse_meta = {}
+            if entry_trigger_changed and original_entry_trigger_note is not None:
+                parse_meta["original_entry_trigger_type"] = original_entry_trigger_note
+            if suggested_actions_changed:
+                parse_meta["suggested_actions_repaired"] = True
+                if original_suggested_actions is not None:
+                    parse_meta["original_suggested_actions"] = original_suggested_actions
+            working["llm_parse_meta"] = parse_meta
+            attempt_meta["llm_status"] = "ok"
+            attempt_meta["llm_error_category"] = None
+            attempt_meta["llm_error_stage"] = None
+            attempt_meta["llm_error"] = None
+            attempt_meta["llm_fallback_reason"] = None
+            attempt_meta["llm_terminal_reason"] = "schema_repaired"
+            attempt_meta["llm_repair_event"] = True
+            # Merge the §8 envelope onto the repaired decision so the
+            # success row carries complete attempt metadata (mirrors
+            # legacy llm_agent_judge.py:246).
+            working.update(attempt_meta)
+            return working, attempt_meta
+        err = err2
+        decision = working
         # Hard schema failure - non-retryable, fail-closed.
         attempt_meta["llm_status"] = "failed"
         attempt_meta["llm_error_category"] = "llm_schema_validation_failed"
@@ -1470,8 +1537,19 @@ def _run_single_llm_attempt(
     # repair event so the caller emits both breaker events (mirrors legacy
     # :192 + :278); a plain success has no repair event (caller emits one
     # physical-ok record).
-    decision["plan_origin"] = "llm_confirmed"
-    decision["plan_execution_state"] = "confirmed"
+    # P1-4 (07-27): set ``plan_origin="llm_confirmed"`` /
+    # ``plan_execution_state="confirmed"`` ONLY when the LLM actually
+    # confirmed a trade_plan. When the LLM succeeded but produced NO plan
+    # (monitor_only / no_edge), nothing was confirmed — setting
+    # ``plan_origin=llm_confirmed`` would mislabel the row. In that case keep
+    # ``plan_origin`` as the fallback's value (e.g. ``deterministic_sop``,
+    # cleared of stale deterministic_* by _normalize_llm_decision only when a
+    # plan WAS confirmed) and leave ``plan_execution_state`` as normalize left
+    # it. The §8 attempt_meta envelope is still merged (it records that the
+    # call succeeded regardless of whether a plan was produced).
+    if decision.get("has_trade_plan") and decision.get("trade_plan"):
+        decision["plan_origin"] = "llm_confirmed"
+        decision["plan_execution_state"] = "confirmed"
     attempt_meta["llm_status"] = "ok"
     attempt_meta["llm_error_category"] = None
     attempt_meta["llm_error_stage"] = None
@@ -1642,6 +1720,15 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             "entry_trigger_confirmation.type 必须恒等于 \"closed_candle_confirmation\"；禁止使用 price_rejection / pullback_rejection / breakout_retest / reclaim_confirmation 等别名",
             "若无法提供完整 closed-candle 确认对象，请将 entry_trigger_confirmation 设为 null，不要发明 type 值",
             "触发风格（price_rejection/pullback/breakout_retest/reclaim）请写入 event_type、reason、evidence 或 risk_notes，不要写入 type",
+            # Phase-2 D (07-27): tighten the suggested_actions contract. The
+            # schema enum only allows the 5 flat string values below; the LLM
+            # sometimes emits decision-enum values (wait_for_breakout /
+            # wait_for_reclaim / avoid_chop) inside suggested_actions, which
+            # are schema-invalid. The repair rebuilds the canonical list from
+            # decision semantics, but the prompt must instruct the LLM to emit
+            # a flat array of ONLY the 5 enum values so the repair is a
+            # fallback, not the common path.
+            "suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一或多个：create_paper_order、create_opportunity_watch、add_to_watchlist、ignore、monitor_only。合法示例：[\"monitor_only\"]、[\"create_paper_order\"]。非法示例：[\"monitor_only\",\"wait_for_breakout\",\"avoid_chop\"]（wait_for_breakout/avoid_chop 属于 decision 字段，不得放入 suggested_actions）",
         ],
         "market_snapshot": _compact_snapshot(snapshot),
         "pre_score": scoring,
@@ -3385,6 +3472,70 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     decision.setdefault("strategy_version", fallback.get("strategy_version", "1.0"))
     decision["analysis_source"] = "llm_agent"
     decision["llm_status"] = "ok"
+    # Phase-2 P2-1 (07-27): clear/rebuild fallback-only transient fields on
+    # LLM success. The ``decision = dict(fallback)`` merge (line 3331) copies
+    # the risk-processed disabled fallback's transient fields onto the
+    # LLM-success decision. On the fair-adapter path the fallback is built
+    # from ``run_agent_sop_decision(snapshot, use_llm=False)`` which runs
+    # ``apply_risk_to_decision`` with llm_status="disabled", so the fallback
+    # carries ``plan_blockers=[{code:"llm_disabled"...}]`` +
+    # ``fallback_trade_plan_blocked`` / ``fallback_block_reason`` /
+    # ``plan_status="withheld"`` / ``original_decision`` /
+    # ``downgraded_decision``. The LLM candidate never writes ``plan_blockers``
+    # (it is not an LLM-emitted field), so ``decision.update(candidate)`` (line
+    # 3370) leaves these stale fallback-only fields in place — polluting the
+    # LLM-success row with "LLM 已禁用" (symptom #1).
+    #
+    # Requirement B: on LLM success, the fallback-only transient fields MUST
+    # be cleared/rebuilt. The deterministic candidate plan stays preserved
+    # under ``candidate_trade_plan`` (Phase E invariant — do NOT touch it).
+    # Continuity / direction-flip blockers from the deterministic fallback are
+    # NOT fallback-only (they reflect real deterministic gates) and are kept.
+    # If the LLM did not confirm a plan, the blocker becomes
+    # ``llm_not_confirmed`` (never ``llm_disabled``) per requirement B.
+    _FALLBACK_ONLY_BLOCKER_CODES = {"llm_disabled", "llm_parse_failed"}
+    _fallback_only_transient_keys = (
+        "fallback_trade_plan_blocked",
+        "fallback_block_reason",
+        "original_decision",
+        "downgraded_decision",
+    )
+    _existing_blockers = decision.get("plan_blockers")
+    if isinstance(_existing_blockers, list):
+        _kept_blockers = [
+            b for b in _existing_blockers
+            if not (isinstance(b, dict)
+                    and str(b.get("code") or "") in _FALLBACK_ONLY_BLOCKER_CODES)
+        ]
+        # Only rewrite when something actually changed — do not perturb a
+        # clean blocker list (e.g. continuity_invalidated only).
+        if len(_kept_blockers) != len(_existing_blockers):
+            decision["plan_blockers"] = _kept_blockers
+    else:
+        _kept_blockers = list(_existing_blockers or [])
+    for _k in _fallback_only_transient_keys:
+        if _k in decision:
+            decision.pop(_k, None)
+    # Clear the stale fallback-only ``plan_status="withheld"`` from the
+    # disabled fallback. The downstream ``apply_risk_to_decision`` (line 286)
+    # re-derives ``plan_status`` from the LLM-confirmed outcome, so clearing
+    # here is safe and prevents the stale "withheld" label from persisting.
+    if decision.get("plan_status") == "withheld":
+        decision.pop("plan_status", None)
+    # P1-4 (07-27): when the LLM confirms a trade_plan, the fallback's
+    # ``plan_origin`` (``deterministic_sop`` / ``deterministic_fallback``) is a
+    # stale fallback-only value that must NOT remain on the LLM-success row.
+    # The caller (``_run_single_llm_attempt`` lines 1473-1474) sets
+    # ``plan_origin="llm_confirmed"`` when a plan is confirmed; this defensive
+    # clear ensures that even if a future caller forgets to set it, the
+    # normalize output does not carry the stale deterministic value on a
+    # confirmed-plan row. When the LLM did NOT confirm a plan, the fallback's
+    # ``plan_origin`` is intentionally kept (it correctly records that the
+    # deterministic SOP produced the candidate) — do NOT clear it there.
+    if decision.get("has_trade_plan") and decision.get("trade_plan"):
+        _cur_origin = decision.get("plan_origin")
+        if _cur_origin in {"deterministic_sop", "deterministic_fallback"}:
+            decision.pop("plan_origin", None)
     # Persisted audit reference (NOT the prompt payload path). The same
     # key name ``deterministic_reference`` is used in two paths:
     # (1) here — persisted on the decision row for audit/debugging;
@@ -3473,6 +3624,40 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         decision["has_trade_plan"] = False
     if not decision.get("has_trade_plan"):
         decision["trade_plan"] = None
+    # Phase-2 P2-1 (07-27) requirement B / Codex final-review P1-4: if the LLM
+    # did NOT confirm a candidate plan (no executable trade_plan after the S/A
+    # auto-build block above), surface a precise ``llm_not_confirmed`` blocker
+    # so the report/diagnostics label the outcome correctly (the LLM ran and
+    # returned ok, but produced no executable plan) — never the stale
+    # ``llm_disabled`` that was cleared earlier. This runs AFTER the auto-build
+    # so a bullish A-grade decision that auto-builds a plan is NOT marked
+    # llm_not_confirmed (it has a plan). The deterministic candidate plan stays
+    # preserved under ``candidate_trade_plan`` (Phase E invariant).
+    #
+    # P1-4 gating: the blocker is added ONLY when a dict-typed NON-EMPTY
+    # ``candidate_trade_plan`` exists AND the LLM did not confirm a trade_plan.
+    # A normal ``monitor_only`` / ``no_edge`` result WITHOUT a
+    # ``candidate_trade_plan`` must NOT get ``llm_not_confirmed`` — there was
+    # never a candidate plan to confirm, so labeling it "LLM 未确认" would
+    # pollute a clean observation row with a spurious blocker. Pre-fix the
+    # append was gated ONLY on ``not has_trade_plan`` and fired on every
+    # no-plan row regardless of whether a candidate existed.
+    _candidate_plan = decision.get("candidate_trade_plan")
+    _has_candidate = isinstance(_candidate_plan, dict) and bool(_candidate_plan)
+    if _has_candidate and (not decision.get("has_trade_plan") or not decision.get("trade_plan")):
+        _not_confirmed_codes = [
+            str(b.get("code") or "")
+            for b in (decision.get("plan_blockers") or [])
+            if isinstance(b, dict)
+        ]
+        if "llm_not_confirmed" not in _not_confirmed_codes:
+            _blockers = list(decision.get("plan_blockers") or [])
+            _blockers.append({
+                "code": "llm_not_confirmed",
+                "stage": "llm_synthesis",
+                "detail": "llm_status=ok 但 LLM 未给出可执行 trade_plan，候选计划保留为 candidate_trade_plan",
+            })
+            decision["plan_blockers"] = _blockers
     # BTC#9: LLM failed/disabled must NOT fake entry_trigger_confirmation
     trade_plan = decision.get("trade_plan")
     if isinstance(trade_plan, dict):

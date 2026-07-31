@@ -45,6 +45,10 @@ EXPECTED_MARKERS = {
     "llm_provider_timeout_envelope_contract_v2",
     "profit_protection_mark_price_contract_v1",
     "stop_loss_adjustment_dedup_v1",
+    # Phase-2 P2-1 (07-27) requirement F: current-vs-historical split marker
+    # for deterministic_direction_from_failed_llm. Written by initialize_database
+    # (release path only — NOT written to production here).
+    "llm_failed_direction_fail_closed_v1",
 }
 
 

@@ -703,7 +703,9 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
         if _release_audit_count > 0:
             lines.append(
                 f"- 另有 {_release_audit_count} 个发布清理审计记录已归档"
-                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release / "
+                "stale_batch_discarded_before_postfix_restart / "
+                "stale_maintenance_job_discarded_before_postfix_restart，"
                 "发布运维动作，不计入当前风险事件）"
             )
         if not _current_failed_jobs and _legacy_schema_fail_count == 0 and _release_audit_count == 0:
@@ -715,11 +717,28 @@ def _render_degraded_report(repo: CryptoGuardRepository, now: str, batch_state: 
     if state_consistency and not state_consistency.get("error"):
         summary = state_consistency.get("summary", {})
         total = state_consistency.get("total_issues", 0)
+        # P1-3 (07-27 final review): "发现问题 N 个" reflects ONLY current
+        # issues (severity in {error, warning}); legacy (pre-fix historical
+        # audit, severity == "legacy_info") collapses to a single summary line
+        # and MUST NOT inflate the current count. Fall back to ``total`` when the
+        # split keys are absent (back-compat for synthetic test dicts).
+        current_count = state_consistency.get("current_issue_count", total)
+        legacy_list = state_consistency.get("legacy_issues") or []
         lines.extend(["", "**状态一致性诊断**"])
-        if total > 0:
-            lines.append(f"- 发现问题 {total} 个")
+        if current_count > 0:
+            lines.append(f"- 发现问题 {current_count} 个")
+        elif legacy_list:
+            # Current is empty but legacy exists: do NOT print "发现问题 0 个"
+            # plus an empty block — state the current-zero line then the legacy
+            # summary line below.
+            lines.append("- 当前问题 0 个")
         else:
             lines.append("- 全部正常，未发现状态不一致")
+        if legacy_list:
+            lines.append(
+                f"- 另有 {len(legacy_list)} 条 fail-closed 修复部署前历史记录，"
+                "已归档审计，不计入当前问题。"
+            )
     elif state_consistency and state_consistency.get("error"):
         lines.extend(["", "**状态一致性诊断**", "- 不可用（查询失败）"])
 
@@ -1139,7 +1158,20 @@ def render_ga_hourly_summary(
     if state_consistency and not state_consistency.get("error"):
         summary = state_consistency.get("summary", {})
         total = state_consistency.get("total_issues", 0)
-        if total > 0:
+        # P1-3 (07-27 final review): "发现问题 N 个" and the per-item detail
+        # reflect ONLY current issues (severity in {error, warning}); legacy
+        # (pre-fix historical audit, severity == "legacy_info") collapses to a
+        # single summary line and MUST NOT inflate the current count or appear
+        # per-item. ``total_issues`` is UNCHANGED (still all-issues); the render
+        # uses ``current_issue_count`` for the count label and ``current_issues``
+        # for the detail first-10. Fall back to ``total``/``issues`` when the
+        # split keys are absent (back-compat for synthetic test dicts).
+        current_count = state_consistency.get("current_issue_count", total)
+        current_issues = state_consistency.get("current_issues")
+        if current_issues is None:
+            current_issues = state_consistency.get("issues") or []
+        legacy_list = state_consistency.get("legacy_issues") or []
+        if current_count > 0 or legacy_list:
             lines.extend(["", "**状态一致性诊断**"])
             critical_parts = []
             info_parts = []
@@ -1171,17 +1203,30 @@ def render_ga_hourly_summary(
             if info_parts:
                 lines.append(f"- 提示：{'，'.join(info_parts)}")
             if not critical_parts and not info_parts:
-                lines.append(f"- 发现问题 {total} 个（非关键）")
+                if current_count > 0:
+                    lines.append(f"- 发现问题 {current_count} 个（非关键）")
+                elif legacy_list:
+                    # Current is empty but legacy exists: do NOT print
+                    # "发现问题 0 个" — state the current-zero line then the
+                    # legacy summary line below.
+                    lines.append("- 当前问题 0 个")
             # P2 (2026-07-24) + AC17 regression fix: surface EVERY issue's
             # ``type``/evidence, not just warnings, so error-severity issues
             # (e.g. market_data_gap_detected) are not silently swallowed by the
             # summary-count path. The two prod warnings (stalled_candidate,
             # deterministic_direction_from_failed_llm) still surface their type
-            # and identity via the shared helper.
-            all_issues = state_consistency.get("issues") or []
-            if all_issues:
-                lines.append(f"- 明细 {len(all_issues[:10])} 项：")
-                lines.extend(_format_state_consistency_issue_lines(all_issues))
+            # and identity via the shared helper. P1-3: the detail iterates ONLY
+            # ``current_issues`` (legacy is the summary line below, NOT per-item).
+            if current_issues:
+                lines.append(f"- 明细 {len(current_issues[:10])} 项：")
+                lines.extend(_format_state_consistency_issue_lines(current_issues))
+            # P1-3: legacy (pre-fix historical audit) collapses to ONE summary
+            # line — it MUST NOT enter "发现问题 N 个" or the per-item detail.
+            if legacy_list:
+                lines.append(
+                    f"- 另有 {len(legacy_list)} 条 fail-closed 修复部署前历史记录，"
+                    "已归档审计，不计入当前问题。"
+                )
         else:
             lines.extend(["", "**状态一致性诊断**", "- 全部正常，未发现状态不一致"])
     elif state_consistency and state_consistency.get("error"):
@@ -1308,7 +1353,9 @@ def render_ga_hourly_summary(
         if _release_audit_count > 0:
             lines.append(
                 f"- 另有 {_release_audit_count} 个发布清理审计记录已归档"
-                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release / "
+                "stale_batch_discarded_before_postfix_restart / "
+                "stale_maintenance_job_discarded_before_postfix_restart，"
                 "发布运维动作，不计入当前风险事件）"
             )
         if not _current_failed_jobs and _legacy_schema_fail_count == 0 and _release_audit_count == 0:
@@ -1543,6 +1590,13 @@ def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
             "summary": result["summary"],
             "total_issues": result["total_issues"],
             "issues": result["issues"],
+            # P1-3 (07-27 final review): pass through the current/legacy split so
+            # the render paths show ONLY current issues for "发现问题 N 个" and
+            # the per-item detail; legacy rows collapse to one summary line.
+            "current_issues": result.get("current_issues", result["issues"]),
+            "current_issue_count": result.get("current_issue_count", result["total_issues"]),
+            "legacy_issues": result.get("legacy_issues", []),
+            "legacy_info_count": result.get("legacy_info_count", 0),
         }
         unavailable_failures = [
             issue for issue in out["issues"]
@@ -1569,6 +1623,8 @@ def _fetch_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         return {
             "error": issue["message"], "ok": False, "summary": {},
             "total_issues": 1, "issues": [issue],
+            "current_issues": [issue], "current_issue_count": 1,
+            "legacy_issues": [], "legacy_info_count": 0,
         }
 
 
@@ -2045,7 +2101,20 @@ def render_hourly_report_text(
     if state_consistency and not state_consistency.get("error"):
         summary = state_consistency.get("summary", {})
         total = state_consistency.get("total_issues", 0)
-        if total > 0:
+        # P1-3 (07-27 final review): "发现问题 N 个" and the per-item detail
+        # reflect ONLY current issues (severity in {error, warning}); legacy
+        # (pre-fix historical audit, severity == "legacy_info") collapses to a
+        # single summary line and MUST NOT inflate the current count or appear
+        # per-item. ``total_issues`` is UNCHANGED (still all-issues); the render
+        # uses ``current_issue_count`` for the count label and ``current_issues``
+        # for the detail first-10. Fall back to ``total``/``issues`` when the
+        # split keys are absent (back-compat for synthetic test dicts).
+        current_count = state_consistency.get("current_issue_count", total)
+        current_issues = state_consistency.get("current_issues")
+        if current_issues is None:
+            current_issues = state_consistency.get("issues") or []
+        legacy_list = state_consistency.get("legacy_issues") or []
+        if current_count > 0 or legacy_list:
             lines.extend(["", "**状态一致性诊断：**"])
             critical_parts = []
             info_parts = []
@@ -2077,7 +2146,13 @@ def render_hourly_report_text(
             if info_parts:
                 lines.append(f"- 提示：{'，'.join(info_parts)}")
             if not critical_parts and not info_parts:
-                lines.append(f"- 发现问题 {total} 个（非关键）")
+                if current_count > 0:
+                    lines.append(f"- 发现问题 {current_count} 个（非关键）")
+                elif legacy_list:
+                    # Current is empty but legacy exists: do NOT print
+                    # "发现问题 0 个" — state the current-zero line then the
+                    # legacy summary line below.
+                    lines.append("- 当前问题 0 个")
             # P2 (2026-07-24) + AC17 regression fix: surface EVERY issue's
             # ``type``/evidence via the shared helper - not just warnings. The
             # old text path rendered all issues but jammed raw dict
@@ -2086,11 +2161,18 @@ def render_hourly_report_text(
             # ``market_data_gap_detected`` (AC17). The helper now renders all
             # severities with string-only evidence, so error issues surface
             # their type/scope/time_window again while prod dict-shaped
-            # warnings stay readable.
-            all_issues = state_consistency.get("issues") or []
-            if all_issues:
-                lines.append(f"- 明细 {len(all_issues[:10])} 项：")
-                lines.extend(_format_state_consistency_issue_lines(all_issues))
+            # warnings stay readable. P1-3: the detail iterates ONLY
+            # ``current_issues`` (legacy is the summary line below, NOT per-item).
+            if current_issues:
+                lines.append(f"- 明细 {len(current_issues[:10])} 项：")
+                lines.extend(_format_state_consistency_issue_lines(current_issues))
+            # P1-3: legacy (pre-fix historical audit) collapses to ONE summary
+            # line — it MUST NOT enter "发现问题 N 个" or the per-item detail.
+            if legacy_list:
+                lines.append(
+                    f"- 另有 {len(legacy_list)} 条 fail-closed 修复部署前历史记录，"
+                    "已归档审计，不计入当前问题。"
+                )
         else:
             lines.extend(["", "**状态一致性诊断：**", "- 全部正常，未发现状态不一致"])
     elif state_consistency and state_consistency.get("error"):
@@ -2214,7 +2296,9 @@ def render_hourly_report_text(
         if _brief_release_audit_count > 0:
             lines.append(
                 f"- 另有 {_brief_release_audit_count} 个发布清理审计记录已归档"
-                "（stale-release cleanup / stale_snapshot_discarded_before_release，"
+                "（stale-release cleanup / stale_snapshot_discarded_before_release / "
+                "stale_batch_discarded_before_postfix_restart / "
+                "stale_maintenance_job_discarded_before_postfix_restart，"
                 "发布运维动作，不计入当前风险事件）"
             )
 
@@ -2483,19 +2567,36 @@ def _format_opportunity_row(
     # path produced a plan that was then blocked. This is required by
     # Phase A Fact 4 — the report must mention "候选计划已生成" / "LLM 失败".
     candidate = row.get("candidate_trade_plan")
-    plan_blockers = row.get("plan_blockers") or []
-    if isinstance(candidate, dict) and plan_blockers:
+    # H (07-27) + P2-A (07-27 final review): the candidate+blocker detail line
+    # and the concise state-label line are mutually exclusive. Do NOT gate on
+    # non-empty ``plan_blockers`` alone — ``_trade_plan_summary`` also emits a
+    # "候选计划详情（...），阻断原因：..." line when ``llm_status in {failed,
+    # disabled}`` or ``plan_status == "withheld"`` even with empty blockers.
+    # Gate on: candidate is a dict, then call ``_trade_plan_summary``; suppress
+    # the state label only when the returned summary actually starts with
+    # "候选计划详情". Clean states (confirmed / unconfirmed without detail /
+    # no_candidate) still get the state label.
+    _appended_candidate_detail = False
+    if isinstance(candidate, dict):
         candidate_summary = _trade_plan_summary(row)
         if candidate_summary and candidate_summary not in result:
-            result += f"\n  {candidate_summary}"
-    # Phase C (07-07): always append the plan_execution_state label per
-    # design §6.5 so the operator sees the 5-branch candidate state wording
-    # (confirmed / unconfirmed / risk_rejected / invalidated / no_candidate)
-    # regardless of whether a structured blocker exists. This replaces the
-    # legacy single "候选计划已生成" text with the 5-branch wording.
-    _state_label = _render_plan_state_label(row)
-    if _state_label and _state_label not in result:
-        result += f"\n  {_state_label}"
+            # Only append when this is the candidate+blocker narrative. Other
+            # ``_trade_plan_summary`` fall-throughs ("暂无完整交易计划。" etc.)
+            # must not replace the 5-branch state label.
+            if candidate_summary.startswith("候选计划详情"):
+                result += f"\n  {candidate_summary}"
+                _appended_candidate_detail = True
+    # Phase C (07-07): append the plan_execution_state label per design §6.5
+    # so the operator sees the 5-branch candidate state wording (confirmed /
+    # unconfirmed / risk_rejected / invalidated / no_candidate). H (07-27):
+    # SKIP the state label when the candidate+blocker detail line was just
+    # appended — the detail line already states both "候选计划详情" and the
+    # blocker reason, so the state label would duplicate them. The label is
+    # appended only for clean states that have no structured blocker narrative.
+    if not _appended_candidate_detail:
+        _state_label = _render_plan_state_label(row)
+        if _state_label and _state_label not in result:
+            result += f"\n  {_state_label}"
     return result
 
 
@@ -2956,12 +3057,12 @@ def _render_plan_state_label(decision: dict[str, Any]) -> str:
     parse rendered text.
 
     Branches (design §6.5):
-      1. confirmed + llm_confirmed  -> "候选计划已生成（LLM 已确认）"
+      1. confirmed + llm_confirmed  -> "候选计划已生成（LLM 已确认）。"
       2. unconfirmed + deterministic_fallback
-         -> "规则候选计划已生成，LLM 未确认，禁止执行"
-      3. risk_rejected              -> "候选计划已生成，但风控未通过"
-      4. invalidated                -> "候选计划已生成，但前次触发已反转"
-      5. no_candidate               -> "无候选计划，本轮仅观察"
+         -> "规则候选计划已生成，LLM 未确认，禁止执行。"
+      3. risk_rejected              -> "候选计划已生成，但风控未通过。"
+      4. invalidated                -> "候选计划已生成，但前次触发已反转。"
+      5. no_candidate               -> "无候选计划，本轮仅观察。"
 
     A ``confirmed`` state with ``plan_origin=deterministic_sop`` (LLM disabled
     path where the deterministic SOP produced a plan) renders a distinct label
@@ -2969,22 +3070,26 @@ def _render_plan_state_label(decision: dict[str, Any]) -> str:
     unrecognized combination falls back to the "no_candidate" observation
     wording so the report never claims a candidate exists when the state is
     ambiguous.
+
+    H (07-27): every returned label is a full sentence and ends with the
+    Chinese full stop "。" so the operator reads a coherent terminated line
+    (previously these ended without a terminator).
     """
     state = decision.get("plan_execution_state")
     origin = decision.get("plan_origin")
     if state == "confirmed" and origin == "llm_confirmed":
-        return "候选计划已生成（LLM 已确认）"
+        return "候选计划已生成（LLM 已确认）。"
     if state == "unconfirmed" and origin == "deterministic_fallback":
-        return "规则候选计划已生成，LLM 未确认，禁止执行"
+        return "规则候选计划已生成，LLM 未确认，禁止执行。"
     if state == "risk_rejected":
-        return "候选计划已生成，但风控未通过"
+        return "候选计划已生成，但风控未通过。"
     if state == "invalidated":
-        return "候选计划已生成，但前次触发已反转"
+        return "候选计划已生成，但前次触发已反转。"
     if state == "no_candidate":
-        return "无候选计划，本轮仅观察"
+        return "无候选计划，本轮仅观察。"
     if state == "confirmed" and origin == "deterministic_sop":
-        return "规则候选计划已生成（LLM 已禁用，SOP 确认）"
-    return "无候选计划，本轮仅观察"
+        return "规则候选计划已生成（LLM 已禁用，SOP 确认）。"
+    return "无候选计划，本轮仅观察。"
 
 
 def _trade_plan_summary(decision: dict[str, Any]) -> str:
@@ -3004,6 +3109,11 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
     # detailed plan info (side/entry/stop) and the blocker summary; the
     # "候选计划已生成" prefix is replaced with "候选计划详情" so the
     # state label is not duplicated.
+    # H (07-27): every FULL-SENTENCE return (the "候选计划详情（...），阻断
+    # 原因：..." lines and the "无可执行模拟盘计划；风控原因：..." line) ends
+    # with the Chinese full stop "。". The compact key-value display line
+    # ("{side} {entry_type}，入场 ... 风控=...") is NOT a full sentence and
+    # stays without a terminator (it is rendered as "  - 交易计划：{plan}").
     candidate = decision.get("candidate_trade_plan")
     plan_status = str(decision.get("plan_status") or "")
     blockers = decision.get("plan_blockers") or []
@@ -3020,6 +3130,11 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
                     blocker_texts.append("LLM 解析失败")
                 elif code == "llm_disabled":
                     blocker_texts.append("LLM 已禁用")
+                elif code == "llm_not_confirmed":
+                    # P2-B (07-27 final review): humanize the B-path1 blocker
+                    # so the operator sees Chinese "LLM 未确认" instead of the
+                    # raw code ``llm_not_confirmed（llm_synthesis）``.
+                    blocker_texts.append("LLM 未确认")
                 elif code == "risk_rejected":
                     blocker_texts.append(f"风控未通过（{detail}）")
                 elif code == "continuity_trigger_invalidated":
@@ -3032,11 +3147,11 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
         stop = candidate.get("stop_loss") or "-"
         if blocker_texts:
             blockers_text = "；".join(blocker_texts)
-            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：{blockers_text}"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：{blockers_text}。"
         if llm_status in {"failed", "disabled"}:
-            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：LLM 失败"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：LLM 失败。"
         if plan_status == "withheld":
-            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：执行门禁未通过"
+            return f"候选计划详情（{side} 入场 {entry} 止损 {stop}），阻断原因：执行门禁未通过。"
     if llm_status in {"failed", "disabled"}:
         # P1-10 (07-05 final review): if a candidate was expected
         # (plan_status=withheld/executable) but is missing, surface that
@@ -3049,7 +3164,7 @@ def _trade_plan_summary(decision: dict[str, Any]) -> str:
             return "候选计划被 LLM 失败阻断执行。"
         return "LLM 失败阻断本轮分析。"
     if risk.get("reasons"):
-        return "无可执行模拟盘计划；风控原因：" + "；".join(str(x) for x in risk.get("reasons", [])[:2])
+        return "无可执行模拟盘计划；风控原因：" + "；".join(str(x) for x in risk.get("reasons", [])[:2]) + "。"
     return "暂无完整交易计划。"
 
 

@@ -247,6 +247,7 @@ def initialize_database(
                     _ensure_llm_fair_scheduling_context_contract_marker(cur)
                     _ensure_llm_provider_timeout_envelope_contract_marker(cur)
                     _ensure_stop_loss_adjustment_dedup_marker(cur)
+                    _ensure_llm_failed_direction_fail_closed_marker(cur)
 
                     # 4. Health gate - fail-closed BEFORE commit. If the schema
                     # is wrong, ROLLBACK everything (no marker survives).
@@ -392,6 +393,47 @@ def _ensure_llm_provider_timeout_envelope_contract_marker(cur: psycopg.Cursor) -
     ``ON CONFLICT DO NOTHING`` keeps applied_at immutable on re-init.
     """
     _ensure_marker(cur, "llm_provider_timeout_envelope_contract_v2")
+
+
+def _ensure_llm_failed_direction_fail_closed_marker(cur: psycopg.Cursor) -> None:
+    """Phase-2 P2-1 (07-27) requirement F: current-vs-historical split marker for
+    the ``deterministic_direction_from_failed_llm`` diagnostic.
+
+    ``apply_risk_to_decision`` now fail-closes every LLM failed terminal row to
+    ``market_bias="unknown"`` BEFORE persistence (requirement C). Rows written
+    BEFORE this fix's deployment still carry bullish/bearish bias on failed rows
+    and are historical audit, not current error. This marker's ``applied_at`` is
+    the cutoff:
+
+      - marker-AFTER violation (created_at >= applied_at): a current
+        ``warning`` — the requirement-C fail-closed block was reverted or
+        bypassed.
+      - marker-BEFORE (created_at < applied_at): historical audit only
+        (``legacy_info``), NOT surfaced as a current issue.
+      - marker-MISSING: fail-closed — the diagnostic emits a marker-missing
+        ``error`` (requirement F: "marker 缺失必须 fail-closed") so callers
+        detect the missing contract rather than receiving a silently-healthy
+        report.
+
+    P1-1 (07-27 final review): the fail-closed block (and this diagnostic) scope
+    to ``llm_status == "failed"`` ONLY. ``disabled`` is the
+    ``CRYPTO_GUARD_LLM_ANALYSIS=0`` deterministic-only operating mode — the
+    deterministic direction IS the intended product there, so a ``disabled`` row
+    with bullish/bearish bias MUST NOT be flagged (not as a current warning, not
+    as a historical ``legacy_info``).
+
+    P1-2 (07-27 final review): the cutoff is compared against the row's
+    persisted creation time ``ga_decisions.created_at`` (``TIMESTAMPTZ DEFAULT
+    NOW()``), NOT ``analysis_time_utc`` (TEXT ISO-8601). The cross-format
+    ``analysis_time_utc`` vs ``applied_at`` comparison was unreliable.
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "llm_failed_direction_fail_closed_v1")
 
 
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:

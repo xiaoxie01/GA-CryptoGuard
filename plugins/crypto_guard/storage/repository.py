@@ -182,6 +182,18 @@ def validate_job_identity(jp: dict[str, Any]) -> str | None:
 RELEASE_AUDIT_ERROR_SIGNATURES: tuple[str, ...] = (
     "stale-release cleanup",
     "stale_snapshot_discarded_before_release",
+    # Phase-2 P2-1 (07-27) requirement E: two NEW postfix-restart release-
+    # audit signatures written by the /trellis:crypto-guard-release R3
+    # cleanup step after a postfix service restart. Production evidence
+    # (agent_jobs IDs 167-174) showed these occupying the recent-failed
+    # list and re-triggering the hourly risk-events line (symptom #4).
+    # Classifying them here (same as the existing two) makes
+    # ``recent_failed_jobs`` exclude them BEFORE the LIMIT so real current
+    # failures are not starved, and ``recent_release_audit_jobs`` surface
+    # them for the archived-release-audit report line. No production row
+    # deletion/modification — classification is report-view only.
+    "stale_batch_discarded_before_postfix_restart",
+    "stale_maintenance_job_discarded_before_postfix_restart",
 )
 
 

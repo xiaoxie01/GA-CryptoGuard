@@ -208,3 +208,133 @@ def normalize_entry_trigger_confirmation(
         )
         return normalized, audit_notes, True
     return normalized, audit_notes, False
+
+
+# Phase-2 D (07-27): ``suggested_actions`` schema-alias repair. The JSON
+# Schema (ga_decision.schema.json:72-74) declares ``suggested_actions`` as a
+# FLAT array of strings from a 5-value enum:
+#   create_paper_order | create_opportunity_watch | add_to_watchlist |
+#   ignore | monitor_only
+# The schema is NOT loosened here. The observed production defect is that the
+# LLM sometimes emits ``decision``-enum values
+# (``wait_for_breakout``/``wait_for_reclaim``/``avoid_chop``) inside
+# ``suggested_actions``, or a nested-array variant
+# (``[['monitor_only'], ['wait_for_breakout']]``). Those are schema-invalid
+# (not in the 5-value enum). Rather than blindly filtering the raw list
+# against the enum (which would keep ``monitor_only`` and drop the decision-
+# enum values, ignoring the LLM's INTENT — e.g. ``wait_for_breakout`` should
+# map to ``add_to_watchlist``, not be silently dropped), the canonical list
+# is REBUILT from the decision semantics. The rebuild mapping (verbatim from
+# the authoritative review):
+#   executable plan (has_trade_plan and trade_plan, or decision==
+#     trade_plan_available) -> create_paper_order
+#   opportunity watch (non-empty dict opportunity_watch) ->
+#     create_opportunity_watch
+#   wait_for_* (decision in {wait_for_pullback, wait_for_breakout,
+#     wait_for_reclaim}) -> add_to_watchlist
+#   no_edge / avoid_chop -> ignore
+#   other / fallback -> monitor_only
+# The order matters: executable plan is checked first (most specific), then
+# opportunity watch, then wait_for_*, then no_edge/avoid_chop, then the
+# monitor_only fallback. Empty ``opportunity_watch={}`` is NOT a real watch
+# (P2-1 07-27 final review) — it falls through so wait_for_* / ignore /
+# monitor_only can still win. The raw list is NOT the source of truth — the
+# decision semantics are. ``monitor_only`` is always a valid fallback so the
+# function always returns a non-None list.
+_SUGGESTED_ACTIONS_CANONICAL = frozenset(
+    {
+        "create_paper_order",
+        "create_opportunity_watch",
+        "add_to_watchlist",
+        "ignore",
+        "monitor_only",
+    }
+)
+_SUGGESTED_ACTIONS_WAIT_FOR_DECISIONS = frozenset(
+    {
+        "wait_for_pullback",
+        "wait_for_breakout",
+        "wait_for_reclaim",
+    }
+)
+_SUGGESTED_ACTIONS_IGNORE_DECISIONS = frozenset(
+    {
+        "no_edge",
+        "avoid_chop",
+    }
+)
+
+
+def normalize_suggested_actions(
+    raw: Any,
+    *,
+    decision: Any,
+    has_trade_plan: Any,
+    trade_plan: Any,
+    opportunity_watch: Any,
+) -> tuple[list[str] | None, list[str], bool]:
+    """Normalize ``suggested_actions`` to a schema-valid canonical list.
+
+    Returns ``(canonical_list_or_None, audit_notes, changed_flag)`` mirroring
+    ``normalize_entry_trigger_confirmation``. The canonical list is REBUILT
+    from the decision semantics (not filtered from the raw list) so the LLM's
+    INTENT is preserved even when the raw list carries illegal decision-enum
+    values. ``monitor_only`` is always a valid fallback so the function always
+    returns a non-None list.
+    """
+    # --- REBUILD the canonical list from decision semantics ---
+    # The decision semantics (has_trade_plan / trade_plan / opportunity_watch
+    # / decision) are the source of truth. The raw list is only used to detect
+    # whether a repair is needed (changed flag) — it is NOT filtered against
+    # the enum (filtering would silently drop the LLM's intent, e.g.
+    # ``wait_for_breakout`` should map to ``add_to_watchlist``, not be
+    # silently dropped).
+    canonical: list[str]
+    if has_trade_plan and trade_plan:
+        canonical = ["create_paper_order"]
+    # P2-1 (07-27 final review): only a non-empty dict is a real opportunity
+    # watch. ``opportunity_watch={}`` is schema-legal but carries no usable
+    # watch payload — treating ``is not None`` as truth over-fired
+    # ``create_opportunity_watch`` and skipped the more accurate wait_for_* ->
+    # ``add_to_watchlist`` branch. ``None`` / missing / ``{}`` all fall through.
+    elif isinstance(opportunity_watch, dict) and opportunity_watch:
+        canonical = ["create_opportunity_watch"]
+    elif isinstance(decision, str) and decision in _SUGGESTED_ACTIONS_WAIT_FOR_DECISIONS:
+        canonical = ["add_to_watchlist"]
+    elif isinstance(decision, str) and decision in _SUGGESTED_ACTIONS_IGNORE_DECISIONS:
+        canonical = ["ignore"]
+    else:
+        canonical = ["monitor_only"]
+
+    # --- Determine whether a repair is needed (changed flag) ---
+    # ``changed=True`` when the raw value was NOT already the exact canonical
+    # list (either schema-invalid, a different list, nested-array, or a
+    # non-list). ``changed=False`` only when the raw was already the canonical
+    # list (already valid + canonical — no repair).
+    raw_is_list = isinstance(raw, list)
+    raw_is_flat_valid = (
+        raw_is_list
+        and all(isinstance(x, str) and x in _SUGGESTED_ACTIONS_CANONICAL for x in raw)
+        and not any(isinstance(x, list) for x in raw)
+    )
+    if raw_is_flat_valid and raw == canonical:
+        changed = False
+    else:
+        changed = True
+
+    # --- Build audit notes ONLY when a repair actually happened ---
+    # (mirrors ``normalize_entry_trigger_confirmation`` which returns an empty
+    # notes list when the confirmation is already canonical).
+    audit_notes: list[str] = []
+    if changed:
+        if not raw_is_list:
+            audit_notes.append("suggested_actions_not_list")
+        else:
+            # Detect a nested-array variant (items that are themselves lists).
+            for _item in raw:
+                if isinstance(_item, list):
+                    audit_notes.append("suggested_actions_nested_array_flattened")
+                    break
+        audit_notes.append(f"suggested_actions_rebuilt_from_decision:{decision}")
+
+    return canonical, audit_notes, changed

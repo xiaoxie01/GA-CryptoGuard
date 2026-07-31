@@ -141,6 +141,76 @@ def _llm_fair_scheduling_contract_cutoff(repo: CryptoGuardRepository) -> str | N
     return None
 
 
+# Phase-2 P2-1 (07-27) requirement F: current-vs-historical split marker for the
+# ``deterministic_direction_from_failed_llm`` diagnostic. ``apply_risk_to_decision``
+# now fail-closes every LLM failed terminal row to
+# ``market_bias="unknown"`` BEFORE persistence (requirement C). Rows written
+# before this marker's ``applied_at`` are historical audit; rows after it that
+# still carry bullish/bearish bias are a CURRENT error (the fail-closed block
+# was reverted / bypassed). Absence of the marker is fail-closed (req F:
+# "marker 缺失必须 fail-closed").
+#
+# P1-1 (07-27 final review): the fail-closed block (and this diagnostic) scope
+# to ``llm_status == "failed"`` ONLY. ``disabled`` is the
+# ``CRYPTO_GUARD_LLM_ANALYSIS=0`` deterministic-only operating mode — the
+# deterministic direction IS the intended product there, so a ``disabled`` row
+# with bullish/bearish bias MUST NOT be flagged (not as a current warning, not
+# as a historical ``legacy_info``).
+#
+# P1-2 (07-27 final review): the current-vs-historical split MUST use the row's
+# persisted creation time ``ga_decisions.created_at`` (``TIMESTAMPTZ DEFAULT
+# NOW()``), NOT ``analysis_time_utc`` (TEXT ISO-8601). The cross-format
+# ``analysis_time_utc`` vs ``applied_at`` comparison was unreliable.
+# ``analysis_time_utc`` is kept in the issue's ``time_window`` for audit display
+# only — it is NOT the deployment-contract boundary.
+LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY = "llm_failed_direction_fail_closed_v1"
+
+
+def _llm_failed_direction_fail_closed_cutoff(repo: CryptoGuardRepository) -> datetime | None:
+    """Phase-2 P2-1 (07-27) requirement F: cutoff timestamp for the
+    current-vs-historical split of ``deterministic_direction_from_failed_llm``.
+
+    Uses the independent ``llm_failed_direction_fail_closed_v1`` marker. Returns
+    the marker's ``applied_at`` as an aware UTC ``datetime`` (the column is
+    ``TIMESTAMPTZ``, so psycopg returns an aware datetime; naive values are
+    assumed UTC). Returns None when the marker is absent — in that case the
+    directional check is skipped and
+    ``_check_llm_failed_direction_fail_closed_marker_missing`` separately emits
+    a fail-closed ``error`` (requirement F: marker absence must NOT produce a
+    silently-healthy report).
+
+    P1-2 (07-27 final review): the cutoff is compared against
+    ``ga_decisions.created_at`` (also ``TIMESTAMPTZ``), so both sides are aware
+    datetimes and the comparison is direct — no Python ``_coerce_iso`` helper is
+    needed and the unreliable ``analysis_time_utc`` (TEXT) vs ``applied_at``
+    cross-format comparison is removed.
+    """
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state "
+            "WHERE key = %s LIMIT 1",
+            (LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY,),
+        ).fetchone()
+        if row and row["applied_at"] is not None:
+            value = row["applied_at"]
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
+            # Fallback: parse a string representation (psycopg normally returns
+            # an aware datetime for TIMESTAMPTZ, so this branch is defensive).
+            text = str(value).strip()
+            if not text:
+                return None
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+    except Exception as exc:
+        raise RuntimeError("LLM failed-direction fail-closed marker query failed") from exc
+    return None
+
+
 def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     """Run all state consistency checks.
 
@@ -199,6 +269,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         _check_report_claims_complete_for_gapped_data,
         _check_deterministic_direction_from_failed_llm,
         _check_llm_fair_scheduling_contract_marker_missing,
+        _check_llm_failed_direction_fail_closed_marker_missing,
         _check_batch_claim_ownership_integrity,
     )
     for check in checks:
@@ -234,6 +305,8 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "paper_notification_missing_event_time": len([i for i in issues if i["type"] == "paper_notification_missing_event_time"]),
         "btc9_contract_marker_missing": len([i for i in issues if i["type"] == "btc9_contract_marker_missing"]),
         "llm_fair_scheduling_contract_marker_missing": len([i for i in issues if i["type"] == "llm_fair_scheduling_contract_marker_missing"]),
+        "llm_failed_direction_fail_closed_marker_missing": len([i for i in issues if i["type"] == "llm_failed_direction_fail_closed_marker_missing"]),
+        "deterministic_direction_from_failed_llm_historical": len([i for i in issues if i["type"] == "deterministic_direction_from_failed_llm_historical"]),
         "batch_claim_ownership_integrity": len([i for i in issues if i["type"] == "batch_claim_ownership_integrity"]),
     }
 
@@ -241,6 +314,18 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
     error_issues = [i for i in issues if i.get("severity") == "error"]
     warning_issues = [i for i in issues if i.get("severity") == "warning"]
     legacy_issues = [i for i in issues if i.get("severity") == "legacy_info"]
+
+    # P1-3 (07-27 final review): expose the current-vs-legacy split as explicit
+    # lists + a current-only count so the hourly-report render paths can show
+    # ONLY current issues for "发现问题 N 个" and the per-item detail, while
+    # legacy (pre-fix historical audit) rows collapse to a single summary line.
+    # ``current_issues`` = severity in {error, warning} (actionable now);
+    # ``legacy_issues``  = severity == "legacy_info" (historical audit only).
+    # ``total_issues`` is UNCHANGED (still the all-issues count) so existing
+    # tests that assert ``total_issues == N`` for a mix stay green; the render
+    # uses ``current_issue_count`` (not ``total_issues``) for the count label.
+    # ``ok`` is UNCHANGED (legacy never fails the gate: ok = error_count == 0).
+    current_issues = [i for i in issues if i.get("severity") in {"error", "warning"}]
 
     return {
         "ok": len(error_issues) == 0,
@@ -250,6 +335,9 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "error_count": len(error_issues),
         "warning_count": len(warning_issues),
         "legacy_info_count": len(legacy_issues),
+        "current_issues": current_issues,
+        "current_issue_count": len(current_issues),
+        "legacy_issues": legacy_issues,
     }
 
 
@@ -2836,22 +2924,81 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
     When the LLM fails, the deterministic fallback must force
     ``market_bias="unknown"`` — never bullish or bearish. This check catches
     cases where the fallback path leaked a definite direction.
+
+    P1-1 (07-27 final review): the guard scopes to ``llm_status == "failed"``
+    ONLY. ``disabled`` is the ``CRYPTO_GUARD_LLM_ANALYSIS=0`` deterministic-only
+    operating mode — the deterministic direction IS the intended product there,
+    so a ``disabled`` row with bullish/bearish bias MUST NOT be flagged (not as
+    a current warning, not as a historical ``legacy_info``). The
+    ``risk_engine.apply_risk_to_decision`` fail-closed block is already
+    ``failed``-only; this diagnostic now matches that scoping.
+
+    Phase-2 P2-1 (07-27) requirement F: split into current vs historical.
+    Rows written BEFORE the ``llm_failed_direction_fail_closed_v1`` marker's
+    ``applied_at`` predate the requirement-C fail-closed fix and are historical
+    audit only (``deterministic_direction_from_failed_llm_historical`` /
+    ``legacy_info``) — they are NOT surfaced as a current ``warning``. Rows
+    written AT OR AFTER the marker are a CURRENT violation
+    (``deterministic_direction_from_failed_llm`` / ``warning``): the fail-closed
+    block in ``apply_risk_to_decision`` was reverted or bypassed. When the
+    marker is absent this check is skipped and
+    ``_check_llm_failed_direction_fail_closed_marker_missing`` emits a
+    fail-closed ``error`` instead (requirement F: marker absence must NOT
+    produce a silently-healthy report).
+
+    P1-2 (07-27 final review): the current-vs-historical split MUST use the
+    row's persisted creation time ``ga_decisions.created_at`` (``TIMESTAMPTZ
+    DEFAULT NOW()``), NOT ``analysis_time_utc`` (TEXT ISO-8601). The SQL filters
+    ``raw_decision_json->>'llm_status' = 'failed'`` FIRST (JSONB arrow
+    operator) so success rows do not crowd out failed rows, then
+    ``market_bias IN ('bullish','bearish')`` (a column, not JSONB), then LIMIT.
+    The Python loop splits current vs historical purely by
+    ``row["created_at"] >= cutoff`` (both are aware datetimes from psycopg —
+    direct comparison, no ``_coerce_iso`` helper). ``analysis_time_utc`` is kept
+    in the issue's ``time_window`` for audit display only — it is NOT the
+    deployment-contract boundary.
     """
     import json
     issues: list[dict[str, Any]] = []
-    cutoff = _market_data_contract_cutoff(repo)
+    cutoff = _llm_failed_direction_fail_closed_cutoff(repo)
     if cutoff is None:
+        # Marker absent → fail-closed handled by the marker-missing check.
+        # Do NOT scan rows against an undeployed contract (no false-green, but
+        # also no false-RED against historical data).
         return issues
+    # Phase-2 P2-1 (07-27) requirement F + P1-2: scan BOTH sides of the marker
+    # (window lower bound = marker - 30d, upper bound = open) so the Python-side
+    # classifier can separate CURRENT (created_at >= marker) from HISTORICAL
+    # (created_at < marker). P1-1: filter llm_status='failed' FIRST (JSONB
+    # arrow) so success/disabled rows do not crowd out failed rows, and move
+    # market_bias IN ('bullish','bearish') into SQL (it's a column). The
+    # marker itself (created_at) is the split point.
+    # P1-2 fail-toward-surfacing: a row whose ``created_at`` is NULL cannot be
+    # compared against the cutoff and MUST be surfaced (as current), never
+    # hidden. SQL ``NULL`` comparisons yield NULL (false), so a bare
+    # ``created_at >= lower`` would silently drop NULL rows. The
+    # ``created_at IS NULL OR ...`` arm pulls them into the result set so the
+    # Python loop can classify them as current. (In practice ``created_at`` is
+    # ``DEFAULT NOW() NOT NULL`` and never NULL; this arm is the fail-closed
+    # defensive path the contract requires.)
     try:
         rows = repo.conn.execute(
             """
             SELECT gd.id AS decision_id, gd.symbol, gd.analysis_time,
-                   gd.analysis_time_utc, gd.market_bias, gd.signal_grade,
-                   gd.raw_decision_json
+                   gd.analysis_time_utc, gd.created_at, gd.market_bias,
+                   gd.signal_grade, gd.raw_decision_json
             FROM ga_decisions gd
             WHERE gd.raw_decision_json IS NOT NULL
-              AND gd.analysis_time_utc::timestamptz >= %s::timestamptz
-            ORDER BY gd.id DESC
+              AND gd.raw_decision_json->>'llm_status' = 'failed'
+              AND gd.market_bias IN ('bullish', 'bearish')
+              AND (
+                  gd.created_at IS NULL
+                  OR (
+                      gd.created_at >= (%s::timestamptz - INTERVAL '30 days')
+                      AND gd.created_at <= (NOW() AT TIME ZONE 'UTC' + INTERVAL '1 day')
+                  )
+              )
+            ORDER BY gd.created_at DESC
             LIMIT 500
             """,
             (cutoff,),
@@ -2865,10 +3012,38 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
         except (json.JSONDecodeError, TypeError):
             continue
         llm_status = str(raw.get("llm_status") or "ok").lower()
-        if llm_status not in {"failed", "disabled"}:
+        # P1-1 (07-27 final review): failed-only. ``disabled`` is deterministic-
+        # only mode — the deterministic direction is the product there and MUST
+        # NOT be flagged by this diagnostic (the SQL already filters
+        # llm_status='failed', so this guard is a defensive backstop against a
+        # JSONB-shaped row that decodes to something other than 'failed').
+        if llm_status != "failed":
             continue
         bias = str(row["market_bias"] or "neutral").lower()
-        if bias in {"bullish", "bearish"}:
+        if bias not in {"bullish", "bearish"}:
+            continue
+        # P1-2 (07-27 final review): current vs historical split by the row's
+        # PERSISTED creation time ``created_at`` (TIMESTAMPTZ), NOT
+        # ``analysis_time_utc`` (TEXT). Both ``row["created_at"]`` and
+        # ``cutoff`` are aware datetimes from psycopg — direct comparison. If
+        # ``created_at`` is None/unparseable (impossible in practice —
+        # DEFAULT NOW() NOT NULL — but fail toward surfacing, never hiding).
+        _current = False
+        try:
+            row_created = row["created_at"]
+            if isinstance(row_created, datetime):
+                if row_created.tzinfo is None:
+                    row_created = row_created.replace(tzinfo=timezone.utc)
+                _current = row_created >= cutoff
+            elif row_created is None:
+                # Non-comparable created_at → fail toward surfacing (current).
+                _current = True
+            else:
+                # Defensive: a non-datetime value is non-comparable → surface.
+                _current = True
+        except Exception:
+            _current = True
+        if _current:
             issues.append({
                 "type": "deterministic_direction_from_failed_llm",
                 "severity": "warning",
@@ -2879,6 +3054,8 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
                 "time_window": {
                     "analysis_time_utc": row["analysis_time_utc"],
                     "analysis_time_ms": row["analysis_time"],
+                    "created_at": row["created_at"],
+                    "fail_closed_marker_applied_at": cutoff,
                 },
                 "details": {
                     "decision_id": row["decision_id"],
@@ -2886,17 +3063,97 @@ def _check_deterministic_direction_from_failed_llm(repo: CryptoGuardRepository) 
                     "llm_status": llm_status,
                     "market_bias": bias,
                     "signal_grade": row["signal_grade"],
+                    "classification": "current",
+                    "fail_closed_marker_applied_at": cutoff,
                 },
                 "message": (
                     f"{row['symbol']} GA 决策 {row['decision_id']} llm_status={llm_status} "
-                    f"但 market_bias={bias}（应为 unknown），确定性引擎在 LLM 失败时输出了方向。"
+                    f"但 market_bias={bias}（应为 unknown）。该行 created_at 晚于 fail-closed 契约 marker "
+                    f"（{cutoff}），确定性引擎在 LLM 失败时仍输出方向——当前违规。"
                 ),
                 "suggested_action": (
-                    "检查 llm_agent_judge._normalize_llm_decision 在 llm_status=failed/disabled 时"
-                    "是否强制 market_bias=unknown。同时检查 report_consistency.rewrite_inconsistent_summary "
-                    "是否剥离了 bullish/bearish 文本。"
+                    "检查 risk/risk_engine.apply_risk_to_decision 的 fail-closed 块（requirement C）"
+                    "是否被回退或绕过：llm_status=failed 时必须强制 "
+                    "market_bias=unknown / grade≤B / 无可执行 plan，并保留 candidate_trade_plan。"
+                    "同时检查 llm_agent_judge._normalize_llm_decision 与 "
+                    "report_consistency.rewrite_inconsistent_summary 是否剥离了 bullish/bearish 文本。"
                 ),
             })
+        else:
+            # Historical audit only — predates the requirement-C fail-closed
+            # fix. Surfaced as legacy_info so it remains auditable but does NOT
+            # inflate the current issue count.
+            issues.append({
+                "type": "deterministic_direction_from_failed_llm_historical",
+                "severity": "legacy_info",
+                "scope": {
+                    "decision_id": row["decision_id"],
+                    "symbol": row["symbol"],
+                },
+                "time_window": {
+                    "analysis_time_utc": row["analysis_time_utc"],
+                    "analysis_time_ms": row["analysis_time"],
+                    "created_at": row["created_at"],
+                    "fail_closed_marker_applied_at": cutoff,
+                },
+                "details": {
+                    "decision_id": row["decision_id"],
+                    "symbol": row["symbol"],
+                    "llm_status": llm_status,
+                    "market_bias": bias,
+                    "signal_grade": row["signal_grade"],
+                    "classification": "historical",
+                    "fail_closed_marker_applied_at": cutoff,
+                },
+                "message": (
+                    f"{row['symbol']} GA 决策 {row['decision_id']} llm_status={llm_status} "
+                    f"但 market_bias={bias}（应为 unknown）。该行 created_at 早于 fail-closed 契约 marker "
+                    f"（{cutoff}），属 fail-closed 修复部署前的历史审计记录，不计入当前风险事件。"
+                ),
+                "suggested_action": (
+                    "历史记录：fail-closed 修复（requirement C）部署前的遗留行，无需当前动作。"
+                    "如需清理可经 release 审计路径归档，但不得删除或修改生产历史行。"
+                ),
+            })
+    return issues
+
+
+def _check_llm_failed_direction_fail_closed_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """Phase-2 P2-1 (07-27) requirement F: flag a missing fail-closed contract
+    marker. Mirrors ``_check_llm_fair_scheduling_contract_marker_missing``.
+
+    The marker ``llm_failed_direction_fail_closed_v1`` must exist in
+    ``_migration_state``. When absent, emit an ``error`` (fail-closed, req F:
+    "marker 缺失必须 fail-closed") so callers detect the missing contract
+    rather than receiving a silently-healthy report. When the marker is absent
+    ``_check_deterministic_direction_from_failed_llm`` skips itself (no
+    historical or current rows are flagged against an undeployed contract).
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
+            (LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY,),
+        ).fetchone()
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "llm_failed_direction_fail_closed_marker", exc,
+        )
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "llm_failed_direction_fail_closed_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "LLM 失败方向 fail-closed 契约 marker 缺失。"
+                "运行 initialize_database() 部署 marker（release 路径，需 /trellis:crypto-guard-release 授权）；"
+                "marker 缺失时 deterministic_direction_from_failed_llm 诊断被跳过，"
+                "可能导致 fail-closed 修复（requirement C）失效而报告假绿。"
+            ),
+        })
     return issues
 
 

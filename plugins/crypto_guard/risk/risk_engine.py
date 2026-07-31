@@ -67,6 +67,118 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
         ]
         result["risk_check"] = risk
 
+    # Phase-2 P2-1 (07-27) requirement C: fail-closed the LLM FAILED direction
+    # leak (symptom #2). When the LLM is enabled and a call FAILS, the
+    # deterministic fallback's bullish/bearish ``market_bias`` is a LEAK — the
+    # decision was supposed to be LLM-confirmed and was not. The fallback-
+    # blocked block above only fires when has_trade_plan + trade_plan (so a
+    # failed decision WITHOUT a plan bypasses it entirely) and even when it
+    # fires it NEVER touches market_bias / signal_grade. The final
+    # ``normalize_market_semantics`` gate only forces unknown via the
+    # ``data_incomplete`` path — when the data is healthy the bullish/bearish
+    # bias survives onto the persisted failed row, and
+    # ``deterministic_direction_from_failed_llm`` re-fires hourly.
+    #
+    # Scope decision (07-27 final review): this block fires ONLY for
+    # ``llm_status == "failed"`` — the LLM-was-enabled-but-the-call-failed
+    # leak. It does NOT fire for ``llm_status == "disabled"``
+    # (``use_llm=False`` / ``CRYPTO_GUARD_LLM_ANALYSIS=0``): the deterministic-
+    # only operating mode is a legitimate product in which the deterministic
+    # direction IS the intended output (07-03 semantic-accuracy tests
+    # ``test_doge_countertrend_rebound_not_bullish_middle`` /
+    # ``test_sol_short_bullish_but_explains_htf_mixed`` pin that HTF-aware
+    # bias must survive on disabled rows). The breaker-skip path
+    # (llm_agent_judge.py:164) and the preset-None / retry-None paths all set
+    # ``llm_status="failed"``, so they ARE covered here. Production runs with
+    # the LLM enabled, so the leaked rows in production are ``failed``; there
+    # are no ``disabled`` production rows to fail-close.
+    #
+    # Requirement C + P1-1 (07-27 final review) verbatim:
+    # - This block fail-closes ONLY when ``llm_status == "failed"`` (not
+    #   ``disabled``). ``disabled`` is intentional deterministic-only product
+    #   (CRYPTO_GUARD_LLM_ANALYSIS=0) and MUST keep HTF-aware bias.
+    # - Force market_bias="unknown", no executable trade_plan, effective
+    #   grade ≤ B, plan_execution_state=unconfirmed on the failed path BEFORE
+    #   persistence; keep deterministic direction in candidate_trade_plan.
+    # - Do NOT loosen or delete the
+    #   ``deterministic_direction_from_failed_llm`` diagnostic. That
+    #   diagnostic is ALSO scoped to ``llm_status == "failed"`` only
+    #   (P1-1); it does NOT fire on ``disabled`` rows (current or
+    #   historical). After this block, newly persisted ``failed`` rows
+    #   carry market_bias=unknown so the diagnostic finds zero *new*
+    #   failed+bullish/bearish leaks; pre-fix historical failed rows are
+    #   classified by created_at vs marker (P1-2/P1-3).
+    # P2-DOC-1: the previous comment wrongly claimed the diagnostic "may
+    # still fire on disabled rows" / "stays as-is" in a way that invited
+    # re-widening to {failed, disabled}. That wording is retired.
+    #
+    # P2-R1 (07-27 final review): direction fail-closed is INDEPENDENT of
+    # ``fallback_llm_failed_blocks_paper_order`` (``block_fallback`` /
+    # ``fallback_blocked``). That flag only governs the BTC#9 paper-order
+    # withhold block above. Coupling C to it reopened the bias leak whenever
+    # an operator set the paper-order flag false. Drive C from
+    # ``llm_status == "failed"`` alone.
+    if llm_status == "failed":
+        result["market_bias"] = "unknown"
+        result["trend_stage"] = "unknown"
+        # Effective grade ≤ B (order_value ≤ 2). Preserve raw_signal_grade /
+        # raw_score (set by _normalize_llm_decision on the success path; on
+        # the failed/disabled path they are not set, so do not invent them).
+        _grade = str(result.get("signal_grade") or "D").upper()
+        try:
+            from plugins.crypto_guard.strategy.grade_config import (
+                grade_order_value, grade_from_order_value,
+            )
+            if grade_order_value(_grade) > grade_order_value("B"):
+                result["signal_grade"] = "B"
+        except Exception:
+            # Fall back to a literal cap if the grade helper is unavailable.
+            if _grade in {"S", "A"}:
+                result["signal_grade"] = "B"
+        # P1-1 (07-27 final review residual under P2-R1): preserve the
+        # deterministic plan under ``candidate_trade_plan`` BEFORE clearing
+        # the executable fields. When ``fallback_llm_failed_blocks_paper_order``
+        # is false the paper-order withhold block above does not run, so this
+        # C block is the only place that can keep the candidate for audit /
+        # report ("候选计划详情"). Requirement C: keep deterministic direction
+        # in candidate_trade_plan on the failed path.
+        _plan_to_preserve = result.get("trade_plan")
+        if (
+            isinstance(_plan_to_preserve, dict)
+            and _plan_to_preserve
+            and not (
+                isinstance(result.get("candidate_trade_plan"), dict)
+                and result.get("candidate_trade_plan")
+            )
+        ):
+            result["candidate_trade_plan"] = dict(_plan_to_preserve)
+        # No executable trade_plan (the fallback-blocked block already cleared
+        # it when has_trade_plan; this is idempotent for the no-plan path).
+        result["has_trade_plan"] = False
+        result["trade_plan"] = None
+        result["decision"] = "monitor_only"
+        # plan_execution_state: unconfirmed for the LLM-failed outcome
+        # (matches the failed terminal paths' envelope). Do NOT override a
+        # more-specific state already set upstream (e.g.
+        # continuity_invalidated) — only normalize the generic confirmed /
+        # risk_rejected states that contradict a failed outcome.
+        _cur_state = str(result.get("plan_execution_state") or "").lower()
+        if _cur_state in {"confirmed", "risk_rejected", ""}:
+            result["plan_execution_state"] = "unconfirmed"
+        # Force risk_check to fail so downstream consumers (report, paper
+        # order gate) see the failed/disabled outcome as non-executable.
+        risk = dict(result.get("risk_check") or risk)
+        risk["ok"] = False
+        _existing_reasons = list(risk.get("reasons") or [])
+        _fail_reason = (
+            f"llm_status={llm_status} fail-closed: market_bias=unknown, "
+            f"grade ≤ B, no executable plan (deterministic direction "
+            f"preserved under candidate_trade_plan)"
+        )
+        if _fail_reason not in _existing_reasons:
+            risk["reasons"] = _existing_reasons + [_fail_reason]
+        result["risk_check"] = risk
+
     if result.get("has_trade_plan") and result.get("trade_plan") and not risk["ok"]:
         # Phase E (07-05): risk gate rejected the executable plan. Preserve
         # the candidate as candidate_trade_plan for audit and set structured
