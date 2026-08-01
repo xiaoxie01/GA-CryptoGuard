@@ -42924,8 +42924,11 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
             min_rate_samples=5,
         )
         # 2 fails, 1 success - 67% rate over 3 samples. Pre-fix: open.
-        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
-        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        # 07-31 P0-2: rate-window proof uses the DRIVING category
+        # (llm_transport_error); llm_json_parse_failed is non-driving and
+        # must not enter the rate window at all.
+        breaker.record_attempt(category="llm_transport_error", ok=False)
+        breaker.record_attempt(category="llm_transport_error", ok=False)
         breaker.record_attempt(category=None, ok=True)
 
         self.assertEqual(
@@ -42946,11 +42949,14 @@ class TestPhaseA07_09OvertriggerFollowup(unittest.TestCase):
             min_rate_samples=5,
         )
         # 3 fails, 2 successes - 60% rate over 5 samples. Post-fix: open.
-        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        # 07-31 P0-2: rate-window proof uses the DRIVING category
+        # (llm_transport_error); llm_json_parse_failed is non-driving and
+        # must not enter the rate window at all.
+        breaker.record_attempt(category="llm_transport_error", ok=False)
         breaker.record_attempt(category=None, ok=True)
-        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category="llm_transport_error", ok=False)
         breaker.record_attempt(category=None, ok=True)
-        breaker.record_attempt(category="llm_json_parse_failed", ok=False)
+        breaker.record_attempt(category="llm_transport_error", ok=False)
 
         self.assertEqual(
             breaker.state, "open",

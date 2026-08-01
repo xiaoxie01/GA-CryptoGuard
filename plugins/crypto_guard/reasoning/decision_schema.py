@@ -25,6 +25,31 @@ def validate_json(name: str, payload: dict[str, Any]) -> tuple[bool, str | None]
         return False, str(exc)
 
 
+def validate_json_detail(name: str, payload: dict[str, Any]) -> tuple[bool, str, str]:
+    """07-31 P1-4: validate and return BOTH a compact and a full error form.
+
+    Returns ``(ok, compact, full)``:
+
+    - ``ok``: schema passes.
+    - ``compact``: ``"/".join(absolute_path) + ": " + message`` (fallback
+      ``<root>`` when the path is empty) — a single-line field-path + type
+      description that fits the Feishu recent-failure ``llm_error[:100]``
+      display slice. NEVER carries the multi-line jsonschema traceback.
+    - ``full``: the complete ``str(exc)`` jsonschema traceback (with
+      ``Failed validating ...`` lines) preserved for the ``llm_error_detail``
+      audit field.
+    """
+    try:
+        jsonschema.validate(payload, load_schema(name))
+        return True, "", ""
+    except Exception as exc:
+        path = exc.absolute_path if isinstance(exc, jsonschema.ValidationError) else ()
+        loc = "/".join(str(p) for p in path) or "<root>"
+        message = exc.message if isinstance(exc, jsonschema.ValidationError) else str(exc)
+        compact = f"{loc}: {message}"
+        return False, compact, str(exc)
+
+
 def no_edge_decision(
     symbol: str,
     reason: str,

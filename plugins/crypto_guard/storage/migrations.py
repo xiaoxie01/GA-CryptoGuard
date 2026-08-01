@@ -248,6 +248,7 @@ def initialize_database(
                     _ensure_llm_provider_timeout_envelope_contract_marker(cur)
                     _ensure_stop_loss_adjustment_dedup_marker(cur)
                     _ensure_llm_failed_direction_fail_closed_marker(cur)
+                    _ensure_llm_schema_breaker_preset_integrity_marker(cur)
 
                     # 4. Health gate - fail-closed BEFORE commit. If the schema
                     # is wrong, ROLLBACK everything (no marker survives).
@@ -434,6 +435,35 @@ def _ensure_llm_failed_direction_fail_closed_marker(cur: psycopg.Cursor) -> None
     production service is untouched.
     """
     _ensure_marker(cur, "llm_failed_direction_fail_closed_v1")
+
+
+def _ensure_llm_schema_breaker_preset_integrity_marker(cur: psycopg.Cursor) -> None:
+    """07-31 P1-4: schema-repair / breaker / preset integrity split marker.
+
+    Production evidence #4: the pre-fix batch 15m:1785487499999 (5 schema
+    failures polluting the breaker rate window -> breaker open -> 10
+    breaker_skipped rows with provider_call_count=0) repeated every hour as
+    current ``llm_failure_rate_high`` + ``llm_circuit_breaker_open`` errors.
+    Post-fix those failures are repairable/isolated, so pre-deployment
+    historical batches must NOT repeat as current errors. This marker's
+    ``applied_at`` is the cutoff for the two LLM diagnostics:
+
+      - marker-AFTER batch (analysis_time >= applied_at): current ``error``
+        — a real post-deployment breach.
+      - marker-BEFORE (analysis_time < applied_at): historical audit only
+        (``legacy_info``), NEVER a current error (symptom #4: no hourly
+        repeat of the pre-fix breaker-open batch).
+      - marker-MISSING: fail-closed — the diagnostic emits a marker-missing
+        ``error`` and the two LLM checks SKIP (an undeployed contract must
+        not be evaluated as current; no silent green).
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "llm_schema_breaker_preset_integrity_v1")
 
 
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:

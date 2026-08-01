@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing as _mp_mod
 import os
 import re
@@ -11,6 +12,7 @@ from plugins.crypto_guard.reasoning.decision_schema import (
     normalize_entry_trigger_confirmation,
     normalize_suggested_actions,
     validate_json,
+    validate_json_detail,
 )
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
@@ -154,47 +156,17 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     from plugins.crypto_guard.reasoning.llm_breaker import _NullBreaker
     breaker = (context or {}).get("llm_breaker") or _NullBreaker()
 
-    # Check breaker state before attempting LLM
-    if not breaker.should_call():
-        breaker.record_skip()
-        fallback["analysis_source"] = "deterministic_fallback"
-        # Phase D §8: full per-decision metadata envelope even on the
-        # pre-call breaker skip path. No provider call was made, so
-        # llm_provider_call_count=0 and llm_latency_ms=0. The terminal
-        # reason is the exact structured value (design §9), never generic.
-        fallback["llm_status"] = "failed"
-        fallback["llm_error_category"] = None  # no call was made
-        fallback["llm_error_stage"] = None
-        fallback["llm_error"] = "circuit breaker open; LLM call skipped"
-        fallback["llm_fallback_reason"] = "circuit_breaker_open"
-        fallback["llm_attempt_count"] = 0
-        fallback["llm_provider_call_count"] = 0
-        fallback["llm_latency_ms"] = 0
-        fallback["llm_prompt_bytes"] = None
-        fallback["llm_continuity_included"] = None
-        fallback["llm_model"] = None
-        fallback["llm_terminal_reason"] = "breaker_skipped"
-        _sched_ctx = context or {}
-        fallback["llm_schedule_round"] = _sched_ctx.get("schedule_round")
-        fallback["llm_schedule_position"] = _sched_ctx.get("schedule_position")
-        fallback["plan_origin"] = "deterministic_fallback"
-        fallback["plan_execution_state"] = "unconfirmed"
-        notes = list(fallback.get("risk_notes") or [])
-        notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
-        fallback["risk_notes"] = notes
-        return apply_risk_to_decision(fallback, snapshot)
-
-    # 07-10 R5: fair-batch preset injection. When the fair coordinator has
-    # ALREADY run the provider call via ``fair_llm_call_adapter`` (one call,
-    # no inner retry wrapper — directive #2), the caller hands the produced
-    # candidate + §8 attempt_meta here through ``context``. We skip
-    # ``_call_ga_llm_with_retry`` entirely so the provider is NOT called a
-    # second time and the breaker is NOT re-recorded (the coordinator owns
-    # both for the fair path). This lets ``analyze_symbol`` reuse its ENTIRE
-    # post-decision pipeline (continuity, risk gate, hysteresis, clamp,
-    # performance gate, persistence) on the fair-batch candidate — closing
-    # the run_once -> fair_batch -> controller -> DB -> report chain without
-    # a second LLM call.
+    # 07-31 P0-1 (production batch 15m:1785487499999): fair-batch preset
+    # injection is consumed BEFORE the breaker gate. The fair coordinator
+    # has ALREADY run the provider call via ``fair_llm_call_adapter`` (one
+    # call, no inner retry wrapper — directive #2) and hands the produced
+    # candidate + §8 attempt_meta here through ``context``. Pre-fix the
+    # breaker gate ran FIRST, so 5 schema failures (P1-1/P1-2 emissions)
+    # opened the breaker and every symbol's preset candidate was DISCARDED —
+    # all 10 persisted rows became breaker_skipped with provider_call_count=0,
+    # destroying 8 coordinator successes. The controller path must NOT
+    # re-call the provider, re-record the breaker, or double-count; the
+    # coordinator owns those records for the fair path.
     preset_candidate = (context or {}).get("llm_preset_candidate", _SENTINEL)
     if preset_candidate is not _SENTINEL:
         attempt_meta = (context or {}).get("llm_preset_attempt_meta") or {}
@@ -202,11 +174,15 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
         if candidate is not None:
             # The fair adapter's ``_run_single_llm_attempt`` already normalized
             # + validated the candidate and set plan_origin / plan_execution_state.
+            # The coordinator's outcome survives even an open breaker — it was
+            # already produced and recorded before this call.
             return apply_risk_to_decision(candidate, snapshot)
         # Preset candidate is None -> the fair batch's terminal outcome for
         # this symbol was a failure/skip (symbol_timeout / schema fail /
         # breaker / budget). Fail closed to the deterministic fallback with
-        # the fair batch's attempt_meta so the §8 envelope is accurate.
+        # the fair batch's attempt_meta so the §8 envelope is accurate —
+        # the coordinator's REAL terminal reason is preserved, NOT
+        # overwritten with breaker_skipped just because the breaker is open.
         fallback["analysis_source"] = "deterministic_fallback"
         fallback["llm_status"] = "failed"
         fallback.update(attempt_meta)
@@ -234,6 +210,38 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
             notes.append("LLM/GA 跳过：缺少市场快照（missing_snapshot），本次使用规则 SOP 结果。")
         else:
             notes.append("LLM/GA 研判失败，本次使用规则 SOP 降级结果。")
+        fallback["risk_notes"] = notes
+        return apply_risk_to_decision(fallback, snapshot)
+
+    # Legacy path (NO preset in context): check breaker state before
+    # attempting LLM. This stays breaker-gated exactly as before — the
+    # P0-1 reorder only covers the fair-coordinator preset path.
+    if not breaker.should_call():
+        breaker.record_skip()
+        fallback["analysis_source"] = "deterministic_fallback"
+        # Phase D §8: full per-decision metadata envelope even on the
+        # pre-call breaker skip path. No provider call was made, so
+        # llm_provider_call_count=0 and llm_latency_ms=0. The terminal
+        # reason is the exact structured value (design §9), never generic.
+        fallback["llm_status"] = "failed"
+        fallback["llm_error_category"] = None  # no call was made
+        fallback["llm_error_stage"] = None
+        fallback["llm_error"] = "circuit breaker open; LLM call skipped"
+        fallback["llm_fallback_reason"] = "circuit_breaker_open"
+        fallback["llm_attempt_count"] = 0
+        fallback["llm_provider_call_count"] = 0
+        fallback["llm_latency_ms"] = 0
+        fallback["llm_prompt_bytes"] = None
+        fallback["llm_continuity_included"] = None
+        fallback["llm_model"] = None
+        fallback["llm_terminal_reason"] = "breaker_skipped"
+        _sched_ctx = context or {}
+        fallback["llm_schedule_round"] = _sched_ctx.get("schedule_round")
+        fallback["llm_schedule_position"] = _sched_ctx.get("schedule_position")
+        fallback["plan_origin"] = "deterministic_fallback"
+        fallback["plan_execution_state"] = "unconfirmed"
+        notes = list(fallback.get("risk_notes") or [])
+        notes.append("LLM/GA 研判失败（熔断），本次使用规则 SOP 降级结果。")
         fallback["risk_notes"] = notes
         return apply_risk_to_decision(fallback, snapshot)
 
@@ -287,6 +295,132 @@ def run_agent_sop_decision(snapshot: dict[str, Any], *, use_llm: bool | None = N
     return apply_risk_to_decision(candidate, snapshot)
 
 
+# 07-31 P1-1: the schema's flat string enum for ``decision`` (must NEVER be
+# loosened - requirement D). Shared by the decision-array repair and the
+# P1-3 prompt type-contract (schema_contract.decision). Tuple keeps the
+# canonical order for the prompt enum.
+_LEGAL_LLM_DECISIONS = (
+    "trade_plan_available", "wait_for_pullback", "wait_for_breakout",
+    "wait_for_reclaim", "avoid_chop", "no_edge", "monitor_only",
+)
+
+# 07-31 P1-3: verbatim type-contract rules embedded in EVERY real provider
+# tier (main decision prompt, strict-JSON retry, minimal-safe retry). The
+# P1-3 test asserts these exact strings inside each tier's hard_rules, so a
+# future drift between tiers fails the test.
+_PROMPT_DECISION_TYPE_RULE = (
+    "decision 必须是单个字符串，绝不允许输出为数组。"
+    "合法示例：\"monitor_only\"。"
+    "非法示例：[\"monitor_only\"]、[\"trade_plan_available\",\"wait_for_pullback\"]"
+)
+_PROMPT_SUGGESTED_ACTIONS_TYPE_RULE = (
+    "suggested_actions 必须是字符串数组，每个元素只能是 "
+    "create_paper_order、create_opportunity_watch、add_to_watchlist、ignore、"
+    "monitor_only 之一。"
+    "合法示例：[\"monitor_only\"]。"
+    "非法示例：[\"monitor_only\",\"wait_for_breakout\"]"
+)
+_PROMPT_TAKE_PROFITS_TYPE_RULE = (
+    "take_profits 必须是对象数组，每个元素必须是 {\"price\": 数字, \"ratio\": 数字}。"
+    "合法示例：[{\"price\":196.0,\"ratio\":1.0}]。"
+    "非法示例：[196.0]、[100.0,200.0]"
+)
+
+
+def _schema_contract() -> dict[str, Any]:
+    """07-31 final review P1-2: canonical typed ``schema_contract`` shared by
+    EVERY real provider tier (main decision prompt, strict-JSON retry, and
+    minimal-safe retry).
+
+    Every scalar field is ``{"type": "string", "enum": [...]}`` — NEVER a
+    bare array (a bare array teaches the model that the field may BE an
+    array; production evidence #1: models emitted ``decision`` as an array
+    and numeric ``take_profits`` items). ``suggested_actions`` is
+    ``{"type": "array", "items": {"type": "string", "enum": [...]}}``.
+    The P1-2 test asserts each field's exact type + enum on all three tiers.
+    """
+    return {
+        "decision": {"type": "string", "enum": list(_LEGAL_LLM_DECISIONS)},
+        "signal_grade": {"type": "string", "enum": ["S", "A", "B", "C", "D"]},
+        "market_bias": {"type": "string", "enum": ["bullish", "bearish", "neutral", "mixed", "unknown"]},
+        "trend_stage": {"type": "string", "enum": ["early", "middle", "late", "range", "transition", "unknown"]},
+        "suggested_actions": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore", "monitor_only"],
+            },
+        },
+    }
+
+
+def _downgrade_to_monitor_only(
+    decision: dict[str, Any], note: str
+) -> tuple[dict[str, Any], list[str], bool]:
+    """07-31 P1-1/P1-2: conservative semantic downgrade shared by the
+    decision-array and take_profits repairs.
+
+    When the LLM output is semantically ambiguous or unsafe (multi-element
+    decision array, multiple/unsafe take_profits numbers), the only safe
+    outcome is ``monitor_only`` with any executable trade_plan cancelled
+    and the grade capped at B - never guess the model's intent and never
+    keep a plan whose correctness is in doubt.
+    """
+    repaired = dict(decision)
+    repaired["decision"] = "monitor_only"
+    repaired["has_trade_plan"] = False
+    if "trade_plan" in repaired:
+        del repaired["trade_plan"]
+    grade = repaired.get("signal_grade")
+    if grade in ("S", "A"):
+        repaired["signal_grade"] = "B"
+    repaired["suggested_actions"] = ["monitor_only"]
+    return repaired, [note], True
+
+
+def _try_repair_decision(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], list[str], bool]:
+    """07-31 P1-1: repair ``decision`` emitted as an ARRAY back to a string.
+
+    Production evidence #1: models repeatedly emitted ``"decision":
+    [...]`` (single- and multi-element arrays) despite the prompt contract.
+    Runs FIRST in the schema-repair chain (BEFORE suggested_actions repair),
+    so the decision field is fixed before any downstream semantic mapping.
+
+    Returns ``(repaired_decision, audit_notes, changed_flag)``. Never
+    touches a non-list decision (bare string / missing key -> changed
+    False). Fail-closed shapes (empty array, mixed types, illegal enum
+    values) also return changed False so the caller routes them to the
+    hard schema-fail path - never guess the model's intent.
+    """
+    raw = decision.get("decision")
+    if not isinstance(raw, list):
+        return decision, [], False
+    if not raw:
+        # Empty array: nothing to fold, fail-closed (hard schema failure).
+        return decision, [], False
+    if not all(isinstance(v, str) for v in raw):
+        # Mixed types (e.g. [\"monitor_only\", 123]): fail-closed.
+        return decision, [], False
+    if not all(v in _LEGAL_LLM_DECISIONS for v in raw):
+        # Illegal enum value inside the array: fail-closed.
+        return decision, [], False
+
+    repaired = dict(decision)
+    if len(raw) == 1:
+        # Single legal value: safe collapse with zero semantic loss.
+        repaired["decision"] = raw[0]
+        return repaired, [f"decision 数组折叠为单字符串 {raw[0]!r}"], True
+
+    # Multi-element array of legal values: semantic ambiguity - we cannot
+    # know which position the model meant. Conservative downgrade.
+    return _downgrade_to_monitor_only(
+        decision,
+        "decision 为多元素数组（语义歧义），保守降级为 monitor_only 并取消交易计划",
+    )
+
+
 def _try_repair_entry_trigger_confirmation(
     decision: dict[str, Any], snapshot: dict[str, Any]
 ) -> tuple[dict[str, Any], list[str], bool]:
@@ -321,6 +455,103 @@ def _try_repair_entry_trigger_confirmation(
     repaired_trade_plan["entry_trigger_confirmation"] = normalized
     repaired["trade_plan"] = repaired_trade_plan
     return repaired, notes, True
+
+
+def _try_repair_take_profits(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], list[str], bool]:
+    """07-31 P1-2 + final review P1-1: repair ``trade_plan.take_profits``
+    numeric items.
+
+    Production evidence #2: models sometimes emit bare numbers where the
+    schema requires ``{"price": number, "ratio": number}`` objects
+    (ga_decision.schema.json items -> object). Never guess position
+    ratios, never bypass the risk gate - the repaired decision is
+    re-validated by the chain before it counts as a success.
+
+    Object contract (final review P1-1): ``price > 0``, ``0 < ratio <= 1``,
+    both finite, and the object ratios must sum to ~1.0 — an object outside
+    the contract (non-positive / non-finite price or ratio, ratio sum != 1.0)
+    downgrades the WHOLE list.
+
+    Returns ``(repaired_decision, audit_notes, changed_flag)``:
+
+    - no trade_plan / take_profits not a list -> unchanged.
+    - fully-valid object list whose ratios sum to ~1.0 -> unchanged
+      (``repaired is decision``).
+    - take_profits EXACTLY ``[single finite positive number]`` -> repaired
+      to ``[{"price": <n>, "ratio": 1.0}]`` (a SOLE position is
+      unambiguous), keep the decision.
+    - numbers MIXED with object items, multiple numbers, or ANY non-finite
+      / non-positive / bool / junk item -> conservative downgrade to
+      monitor_only (never guess which number meant what — a guessed ratio
+      could overlap the objects' coverage).
+    """
+    trade_plan = decision.get("trade_plan")
+    if not isinstance(trade_plan, dict):
+        return decision, [], False
+    raw = trade_plan.get("take_profits")
+    if not isinstance(raw, list) or not raw:
+        return decision, [], False
+
+    def _is_valid_object(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        price, ratio = item.get("price"), item.get("ratio")
+        return (
+            isinstance(price, (int, float)) and not isinstance(price, bool)
+            and isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
+            and math.isfinite(float(price)) and math.isfinite(float(ratio))
+            and price > 0 and 0.0 < ratio <= 1.0
+        )
+
+    def _is_safe_numeric(item: Any) -> bool:
+        # A single finite positive non-bool number is the only numeric shape
+        # we can unambiguously treat as a target price.
+        return (
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            and math.isfinite(float(item)) and item > 0
+        )
+
+    if all(_is_valid_object(item) for item in raw):
+        # Fully-valid object list: the plan is only trustworthy when the
+        # exit ratios cover the whole position (sum ~ 1.0). Incomplete or
+        # overlapping coverage cannot be interpreted reliably.
+        total_ratio = sum(float(item["ratio"]) for item in raw)
+        if math.isclose(total_ratio, 1.0):
+            return decision, [], False
+        return _downgrade_to_monitor_only(
+            decision,
+            "take_profits 对象比例总和不为 1.0（仓位覆盖不完整或重叠），"
+            "保守降级为 monitor_only 并取消交易计划",
+        )
+
+    numeric_indices = [i for i, item in enumerate(raw) if _is_safe_numeric(item)]
+    unsafe = [
+        item for item in raw
+        if not _is_safe_numeric(item) and not _is_valid_object(item)
+    ]
+
+    # The ONLY safe repair is a take_profits list consisting of exactly one
+    # finite positive number (a sole position is unambiguous). Numbers MIXED
+    # with object items, several numbers, or any unsafe item -> we cannot
+    # guess position ratios - conservatively cancel the plan.
+    if unsafe or len(numeric_indices) != 1 or len(raw) != 1:
+        return _downgrade_to_monitor_only(
+            decision,
+            "take_profits 数字项形状不安全（多数字/混合对象/非有限/非正/非数字），"
+            "保守降级为 monitor_only 并取消交易计划",
+        )
+
+    # take_profits == [one finite positive number]: repair to
+    # {price, ratio: 1.0} and keep the decision.
+    repaired_trade_plan = dict(trade_plan)
+    repaired_trade_plan["take_profits"] = [
+        {"price": raw[0], "ratio": 1.0}
+    ]
+    repaired = dict(decision)
+    repaired["trade_plan"] = repaired_trade_plan
+    return repaired, [f"take_profits 数字项 {raw[0]!r} 已修复为对象 {{price, ratio: 1.0}}"], True
 
 
 def _try_repair_suggested_actions(
@@ -597,21 +828,18 @@ def _classify_stop_reason(stop_reason: str | None) -> str | None:
     return None
 
 
-# The categories that open the infrastructure circuit breaker (llm_breaker.py
-# ``record_attempt``): transport / empty / tool-call-no-text drive the
-# consecutive-infra path (llm_breaker.py:149), ``llm_config_error`` opens
-# immediately (:137), and ``llm_rate_limited`` drives the rate-window open
-# (:160-170). Schema / format / truncation failures are EXPLICITLY ABSENT --
-# they are model-output problems for the symbol, not gateway health signals,
-# so they cannot breaker-skip unrelated symbols (AC8). This set is the
-# authoritative source consulted by diagnostics/tests to assert the isolation.
-_BREAKER_INFRA_REASONS = frozenset({
-    "llm_transport_error",
-    "llm_empty_response",
-    "llm_tool_call_no_text",
-    "llm_config_error",
-    "llm_rate_limited",
-})
+# The categories that open the infrastructure circuit breaker: transport /
+# empty / tool-call-no-text / rate_limited drive the consecutive-infra path
+# and the rate window, ``llm_config_error`` opens immediately. Schema /
+# format / truncation failures are EXPLICITLY ABSENT -- they are
+# model-output problems for the symbol, not gateway health signals, so they
+# cannot breaker-skip unrelated symbols (AC8). 07-31 P0-2: the single source
+# of truth moved to ``llm_breaker.BREAKER_DRIVING_CATEGORIES``; this name is
+# now an import ALIAS of the same object so judge / breaker / diagnostics
+# cannot drift again. Diagnostics/tests import this name to assert isolation.
+from plugins.crypto_guard.reasoning.llm_breaker import (
+    BREAKER_DRIVING_CATEGORIES as _BREAKER_INFRA_REASONS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +904,12 @@ def build_llm_minimal_safe_prompt(
     safe_dr = deterministic_decision or {}
     safe_ms = _compact_snapshot(snapshot) if snapshot else {}
     payload = {
+        # 07-31 final review P1-2: the minimal-safe tier must carry the SAME
+        # typed schema_contract as the main tier (pre-fix it had NO
+        # schema_contract key at all — the model was left without a type
+        # contract exactly when it was most degraded). Shared via
+        # _schema_contract() so the three tiers can never drift.
+        "schema_contract": _schema_contract(),
         "symbol": safe_ms.get("symbol") or safe_dr.get("symbol"),
         "analysis_time_utc": safe_ms.get("analysis_time_utc") or safe_dr.get("analysis_time_utc"),
         "strategy_name": safe_dr.get("strategy_name"),
@@ -684,6 +918,11 @@ def build_llm_minimal_safe_prompt(
             "不得输出实盘交易或真实下单能力",
             f"创建模拟盘必须经过风控：RR>={min_rr}、confidence>={min_conf}",
             "只输出一个 JSON 对象，禁止 Markdown",
+            # 07-31 P1-3: verbatim type contracts (production evidence #1/#2).
+            # These strings are asserted verbatim by test_pg_prompt_type_contract_p1_3.
+            _PROMPT_DECISION_TYPE_RULE,
+            _PROMPT_SUGGESTED_ACTIONS_TYPE_RULE,
+            _PROMPT_TAKE_PROFITS_TYPE_RULE,
         ],
         # Phase D §7.1: continuity survives even the minimal-safe tier.
         "analysis_continuity": safe_ms.get("analysis_continuity"),
@@ -1455,35 +1694,56 @@ def _run_single_llm_attempt(
         # Phase B/C (07-09): schema-alias repair path. Phase-2 D (07-27):
         # generalized to try ALL repairs in sequence (entry-trigger alias
         # first, then suggested_actions rebuild), re-validate ONCE at the
-        # end. Each repair function returns ``(repaired, notes, changed)``;
-        # when a repair changes the decision, the next repair runs on the
-        # already-repaired working copy so BOTH repairs get a chance. A
-        # clean approach: collect a list of repair functions, apply them in
-        # sequence to a working copy, re-validate once at the end.
+        # end. 07-31 P1-1: decision-array repair runs FIRST (before
+        # suggested_actions), so a ``decision: [...]`` is folded back to a
+        # string before any downstream semantic mapping. Each repair
+        # function returns ``(repaired, notes, changed)``; when a repair
+        # changes the decision, the next repair runs on the already-repaired
+        # working copy so ALL repairs get a chance. A clean approach:
+        # collect a list of repair functions, apply them in sequence to a
+        # working copy, re-validate once at the end.
         repair_fns = (
+            _try_repair_decision,
             _try_repair_entry_trigger_confirmation,
+            _try_repair_take_profits,
             _try_repair_suggested_actions,
         )
         working = decision
         all_notes: list[str] = []
+        decision_changed = False
+        original_decision: Any = None
         entry_trigger_changed = False
+        take_profits_changed = False
+        original_take_profits: Any = None
         suggested_actions_changed = False
         original_entry_trigger_note: str | None = None
         original_suggested_actions: Any = None
         for _fn in repair_fns:
             working, notes, changed = _fn(working, snapshot)
             if changed:
-                if _fn is _try_repair_entry_trigger_confirmation:
+                if _fn is _try_repair_decision:
+                    decision_changed = True
+                    # Capture the original (pre-repair) decision field for
+                    # audit before the fold/downgrade overwrote it.
+                    original_decision = decision.get("decision")
+                elif _fn is _try_repair_entry_trigger_confirmation:
                     entry_trigger_changed = True
                     if notes:
                         original_entry_trigger_note = notes[0]
+                elif _fn is _try_repair_take_profits:
+                    take_profits_changed = True
+                    # Capture the original (pre-repair) take_profits for
+                    # audit before the numeric item was rewritten.
+                    orig_tp = decision.get("trade_plan")
+                    if isinstance(orig_tp, dict):
+                        original_take_profits = orig_tp.get("take_profits")
                 elif _fn is _try_repair_suggested_actions:
                     suggested_actions_changed = True
                     # Capture the original (pre-repair) suggested_actions for
                     # audit before the rebuild overwrote it.
                     original_suggested_actions = decision.get("suggested_actions")
                 all_notes.extend(notes)
-        ok2, err2 = validate_json("ga_decision.schema.json", working)
+        ok2, err2, err2_full = validate_json_detail("ga_decision.schema.json", working)
         if ok2:
             # Repaired success: ONE physical provider call that succeeded
             # after a schema-alias repair. Surface ``llm_repair_event``
@@ -1503,8 +1763,16 @@ def _run_single_llm_attempt(
             parse_meta = working.get("llm_parse_meta") or {}
             if not isinstance(parse_meta, dict):
                 parse_meta = {}
+            if decision_changed:
+                parse_meta["decision_repaired"] = True
+                if original_decision is not None:
+                    parse_meta["original_decision"] = original_decision
             if entry_trigger_changed and original_entry_trigger_note is not None:
                 parse_meta["original_entry_trigger_type"] = original_entry_trigger_note
+            if take_profits_changed:
+                parse_meta["take_profits_repaired"] = True
+                if original_take_profits is not None:
+                    parse_meta["original_take_profits"] = original_take_profits
             if suggested_actions_changed:
                 parse_meta["suggested_actions_repaired"] = True
                 if original_suggested_actions is not None:
@@ -1528,7 +1796,12 @@ def _run_single_llm_attempt(
         attempt_meta["llm_status"] = "failed"
         attempt_meta["llm_error_category"] = "llm_schema_validation_failed"
         attempt_meta["llm_error_stage"] = "schema"
-        attempt_meta["llm_error"] = str(err)[:300]
+        # P1-4 (07-31): llm_error carries the COMPACT field-path + type error
+        # (single line, fits the Feishu recent-failure llm_error[:100] display
+        # slice) — the multi-line jsonschema traceback is preserved in the new
+        # llm_error_detail audit field (raw_decision_json §8 envelope).
+        attempt_meta["llm_error"] = err2
+        attempt_meta["llm_error_detail"] = err2_full
         attempt_meta["llm_fallback_reason"] = "schema_validation_failed"
         attempt_meta["llm_terminal_reason"] = "llm_schema_validation_failed"
         return None, attempt_meta
@@ -1680,13 +1953,13 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
     min_rr = risk_cfg.get("min_rr", 1.5)
     min_conf = risk_cfg.get("min_confidence", 0.72)
     payload = {
-        "schema_contract": {
-            "decision": ["trade_plan_available", "wait_for_pullback", "wait_for_breakout", "wait_for_reclaim", "avoid_chop", "no_edge", "monitor_only"],
-            "signal_grade": ["S", "A", "B", "C", "D"],
-            "market_bias": ["bullish", "bearish", "neutral", "mixed", "unknown"],
-            "trend_stage": ["early", "middle", "late", "range", "transition", "unknown"],
-            "suggested_actions": ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore", "monitor_only"],
-        },
+        # 07-31 final review P1-2: EVERY scalar contract field is a
+        # {type: string, enum: [...]} dict and suggested_actions a
+        # {type: array, items: {type: string, enum: [...]}} dict — NEVER a
+        # bare array (a bare array teaches the model the field may BE an
+        # array; production evidence #1). Shared verbatim by all three real
+        # provider tiers via _schema_contract().
+        "schema_contract": _schema_contract(),
         "task": "按 SOP_MULTI_TIMEFRAME_MARKET_ANALYSIS 输出最终 GADecision JSON。",
         "sop": [
             "检查数据完整性和未来函数风险",
@@ -1729,6 +2002,11 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             # a flat array of ONLY the 5 enum values so the repair is a
             # fallback, not the common path.
             "suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一或多个：create_paper_order、create_opportunity_watch、add_to_watchlist、ignore、monitor_only。合法示例：[\"monitor_only\"]、[\"create_paper_order\"]。非法示例：[\"monitor_only\",\"wait_for_breakout\",\"avoid_chop\"]（wait_for_breakout/avoid_chop 属于 decision 字段，不得放入 suggested_actions）",
+            # 07-31 P1-3: verbatim type contracts (production evidence #1/#2).
+            # These strings are asserted verbatim by test_pg_prompt_type_contract_p1_3.
+            _PROMPT_DECISION_TYPE_RULE,
+            _PROMPT_SUGGESTED_ACTIONS_TYPE_RULE,
+            _PROMPT_TAKE_PROFITS_TYPE_RULE,
         ],
         "market_snapshot": _compact_snapshot(snapshot),
         "pre_score": scoring,

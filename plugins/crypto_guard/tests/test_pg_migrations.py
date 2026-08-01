@@ -49,6 +49,11 @@ EXPECTED_MARKERS = {
     # for deterministic_direction_from_failed_llm. Written by initialize_database
     # (release path only — NOT written to production here).
     "llm_failed_direction_fail_closed_v1",
+    # 07-31 P1-4: schema-repair / breaker / preset integrity split marker.
+    # Written by initialize_database (release path only — NOT written to
+    # production here). Gates current-vs-historical split of the two LLM
+    # diagnostics (llm_failure_rate_high / llm_circuit_breaker_open).
+    "llm_schema_breaker_preset_integrity_v1",
 }
 
 

@@ -14,6 +14,28 @@ import time
 from typing import Any
 
 
+# 07-31 P0-2 (production batch 15m:1785487499999): the ONLY source of truth
+# for which LLM failure categories drive the circuit breaker. Schema / JSON /
+# semantic / truncation failures are model-output problems for ONE symbol, not
+# gateway health signals, so they must NOT open the breaker and skip the
+# remaining symbols (AC8). Pre-fix ``record_attempt`` appended every
+# non-repairable failure to the rate window, so 5 schema failures
+# (decision-as-array + numeric take_profits) pushed 5/10 = 50% >= 0.5 and
+# opened the breaker, converting all 10 persisted rows to breaker_skipped.
+#
+# ``llm_config_error`` opens IMMEDIATELY (any count); the other driving
+# categories drive the consecutive-infra path AND the rate window.
+# ``llm_agent_judge._BREAKER_INFRA_REASONS`` is an import ALIAS of this set
+# (same object) so the two definitions cannot drift again.
+BREAKER_DRIVING_CATEGORIES = frozenset({
+    "llm_transport_error",
+    "llm_empty_response",
+    "llm_tool_call_no_text",
+    "llm_rate_limited",
+    "llm_config_error",
+})
+
+
 class CircuitBreaker:
     """Batch-scoped LLM circuit breaker.
 
@@ -23,15 +45,21 @@ class CircuitBreaker:
     - half_open: allow ONE probe call; on success -> closed; on fail -> open.
 
     Open conditions (checked after each attempt):
-    - llm_config_error: open IMMEDIATELY (any count).
-    - ``consecutive_threshold`` consecutive llm_transport_error /
-      llm_empty_response: open.
+    - ``llm_config_error``: open IMMEDIATELY (any count).
+    - ``consecutive_threshold`` consecutive driving failures
+      (``llm_transport_error`` / ``llm_empty_response`` /
+      ``llm_tool_call_no_text`` / ``llm_rate_limited``): open.
     - fail rate >= ``rate_threshold`` over the latest ``rate_window`` LLM
-      calls, BUT only when at least ``min_rate_samples`` observations
-      exist. Pre-07-09-overtrigger the rate check fired at 3 samples, so
-      [fail, fail, success] opened the breaker and skipped the remaining
-      7-8 symbols of a 10-symbol batch. With ``min_rate_samples=5`` (the
-      default), the same sequence leaves the breaker closed.
+      calls (driving failures only), BUT only when at least
+      ``min_rate_samples`` observations exist. Pre-07-09-overtrigger the
+      rate check fired at 3 samples, so [fail, fail, success] opened the
+      breaker and skipped the remaining 7-8 symbols of a 10-symbol batch.
+      With ``min_rate_samples=5`` (the default), the same sequence leaves
+      the breaker closed.
+    - 07-31 P0-2: non-driving failures (schema / json / semantic /
+      truncation / unknown) never enter the rate window and reset the
+      consecutive counter — a one-symbol model-output defect cannot skip the
+      rest of the batch (AC8).
 
     Half-open transition: not automatic within a batch. A new batch starts
     with a fresh breaker in closed state (breaker lifetime == one batch).
@@ -129,7 +157,6 @@ class CircuitBreaker:
                 self._transition("closed", reason="half_open_probe_success")
         else:
             self._failed += 1
-            self._recent_results.append(False)
             if category:
                 self._by_category[category] = self._by_category.get(category, 0) + 1
 
@@ -138,15 +165,18 @@ class CircuitBreaker:
                 self._transition("open", reason="llm_config_error_immediate")
                 return
 
-            # Count consecutive infra failures (transport + empty +
-            # tool-call-no-text). 07-09-overtrigger R5/R6: a sustained
-            # stream of ``llm_tool_call_no_text`` (model hallucinating tool
-            # calls despite no tools being exposed) is a real model/prompt
-            # defect and should still be able to open the breaker on the
-            # consecutive-infrastructure path, even before ``min_rate_samples``
-            # is reached. The wall-clock budget still bounds total batch
-            # time so this cannot deadlock.
-            if category in ("llm_transport_error", "llm_empty_response", "llm_tool_call_no_text"):
+            if category in BREAKER_DRIVING_CATEGORIES:
+                # Driving failure: enters the rate window and the consecutive
+                # infra counter. 07-09-overtrigger R5/R6: a sustained stream
+                # of ``llm_tool_call_no_text`` (model hallucinating tool
+                # calls despite no tools being exposed) is a real
+                # model/prompt defect and should still be able to open the
+                # breaker on the consecutive-infrastructure path, even
+                # before ``min_rate_samples`` is reached. The wall-clock
+                # budget still bounds total batch time so this cannot
+                # deadlock. 07-31 P0-2: ``llm_rate_limited`` is driving too
+                # (gateway health), so it also counts on this path.
+                self._recent_results.append(False)
                 self._consecutive_infra_failures += 1
                 if self._consecutive_infra_failures >= self._consecutive_threshold:
                     self._transition(
@@ -154,20 +184,26 @@ class CircuitBreaker:
                         reason=f"{self._consecutive_threshold}_consecutive_{category}",
                     )
                     return
-            else:
-                self._consecutive_infra_failures = 0
 
-            # Rate-based open: >= rate_threshold failures in latest rate_window calls.
-            # 07-09-overtrigger P0-3: require at least ``min_rate_samples``
-            # observations before the rate check fires. Pre-fix the check
-            # used a hardcoded ``len(window) >= 3`` floor, so [fail, fail,
-            # success] (3 samples, 67% rate) opened the breaker and skipped
-            # the remaining 7-8 symbols of a 10-symbol batch.
-            window = self._recent_results[-self._rate_window:]
-            if len(window) >= self._min_rate_samples:
-                fail_rate = sum(1 for r in window if not r) / len(window)
-                if fail_rate >= self._rate_threshold:
-                    self._transition("open", reason=f"failure_rate_{fail_rate:.0%}")
+                # Rate-based open: >= rate_threshold failures in latest rate_window calls.
+                # 07-09-overtrigger P0-3: require at least ``min_rate_samples``
+                # observations before the rate check fires. Pre-fix the check
+                # used a hardcoded ``len(window) >= 3`` floor, so [fail, fail,
+                # success] (3 samples, 67% rate) opened the breaker and skipped
+                # the remaining 7-8 symbols of a 10-symbol batch.
+                window = self._recent_results[-self._rate_window:]
+                if len(window) >= self._min_rate_samples:
+                    fail_rate = sum(1 for r in window if not r) / len(window)
+                    if fail_rate >= self._rate_threshold:
+                        self._transition("open", reason=f"failure_rate_{fail_rate:.0%}")
+            else:
+                # 07-31 P0-2: non-driving failure (schema / json / semantic /
+                # truncation / unknown). Counted in total_attempts / failed /
+                # by_category above (conservation), but it does NOT enter the
+                # rate window and DOES reset the consecutive-infra counter: a
+                # one-symbol model-output defect must not breaker-skip the
+                # remaining symbols (AC8).
+                self._consecutive_infra_failures = 0
 
     def record_skip(self) -> None:
         """Record a symbol skipped because the breaker was open."""

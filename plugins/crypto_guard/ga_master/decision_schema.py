@@ -151,6 +151,13 @@ def controller_decision_from_legacy(
         "analysis_source": legacy.get("analysis_source") or "ga_master_controller",
         "llm_status": legacy.get("llm_status") or "ok",
         "llm_error": legacy.get("llm_error"),
+        # P1-4 (07-31): the full jsonschema traceback for schema-validation
+        # hard failures stays audit-visible at top level next to the compact
+        # llm_error (Feishu renders llm_error[:100]). Reviewer P2-1 closure:
+        # without this, operators reading raw_decision_json see the compact
+        # error but would have to descend into raw_legacy_decision for the
+        # traceback, contradicting the §8 top-level contract below.
+        "llm_error_detail": legacy.get("llm_error_detail"),
         # Phase B (07-07): new LLM error taxonomy fields (design §3.4)
         "llm_error_category": legacy.get("llm_error_category"),
         "llm_error_stage": legacy.get("llm_error_stage"),

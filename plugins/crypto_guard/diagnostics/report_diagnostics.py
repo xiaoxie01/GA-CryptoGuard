@@ -191,9 +191,17 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_batch_time_health_mismatch(repo))
     issues.extend(_check_failed_jobs_outside_window(repo))
 
+    # 07-31 P1-4: the schema/breaker/preset integrity marker-missing check
+    # runs FIRST so a missing contract is explicitly surfaced (fail-closed)
+    # even when the two LLM diagnostics skip themselves.
+    issues.extend(_check_llm_schema_breaker_preset_integrity_marker_missing(repo))
+
     # Phase I (07-07): LLM retry + hourly accuracy repair diagnostics. These
     # are runtime diagnostics without a marker cutoff — they fire on any
-    # matching data in the latest 24h / latest batch. See PRD AC18.
+    # matching data in the latest 24h / latest batch. See PRD AC18. P1-4
+    # (07-31): the two batch-level checks are now scoped to the
+    # llm_schema_breaker_preset_integrity_v1 marker (skip when absent;
+    # pre-marker batches demoted below).
     issues.extend(_check_llm_failure_rate_high(repo))
     issues.extend(_check_llm_config_error_detected(repo))
     issues.extend(_check_llm_retry_exhausted(repo))
@@ -269,6 +277,13 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # stay error/warning.
     _apply_llm_fair_scheduling_marker_cutoff(repo, issues)
 
+    # 07-31 P1-4: apply the independent schema/breaker/preset integrity marker
+    # cutoff to the two LLM diagnostics (llm_failure_rate_high /
+    # llm_circuit_breaker_open). Batches analysed BEFORE the marker are
+    # historical audit (legacy_info) — symptom #4: the pre-fix breaker-open
+    # batch must not repeat as a current error; post-marker errors stay error.
+    _apply_llm_schema_breaker_preset_integrity_marker_cutoff(repo, issues)
+
     # 07-22 Codex P2: NO _apply_llm_timeout_envelope_marker_cutoff here.
     # Timeout-envelope unique contract is SQL exclude-only (pre-marker rows
     # never enter issues). Demotion-to-legacy_info is not part of this code.
@@ -315,6 +330,9 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         LLM_CONFIG_ERROR_DETECTED: _count(issues, LLM_CONFIG_ERROR_DETECTED),
         LLM_RETRY_EXHAUSTED: _count(issues, LLM_RETRY_EXHAUSTED),
         LLM_CIRCUIT_BREAKER_OPEN: _count(issues, LLM_CIRCUIT_BREAKER_OPEN),
+        LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_MISSING: _count(
+            issues, LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_MISSING
+        ),
         DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN: _count(issues, DETERMINISTIC_CANDIDATE_REPORTED_AS_TRADE_PLAN),
         EFFECTIVE_GRADE_EXCEEDS_HTF_CAP: _count(issues, EFFECTIVE_GRADE_EXCEEDS_HTF_CAP),
         # deprecated alias kept at 0 unless a legacy emitter still uses it
@@ -408,6 +426,27 @@ CONTINUITY_CONTRACT_MARKER_KEY = "hourly_decision_context_continuity_contract_v1
 # marker are demoted to ``legacy_info``; rows after are evaluated against the
 # full S1-S6 contract.
 LLM_FAIR_SCHEDULING_CONTRACT_MARKER_KEY = "llm_fair_scheduling_context_contract_v1"
+
+# 07-31 P1-4: independent schema-repair / breaker / preset integrity marker.
+# Production evidence #4: the pre-fix batch 15m:1785487499999 (5 schema
+# failures polluting the breaker rate window -> breaker open -> 10
+# breaker_skipped rows with provider_call_count=0) repeated every hour as
+# current llm_failure_rate_high + llm_circuit_breaker_open errors. Post-fix
+# those failures are repairable/isolated, so pre-deployment historical
+# batches must NOT repeat as current errors. This marker's applied_at is the
+# cutoff for the two LLM diagnostics (_check_llm_failure_rate_high /
+# _check_llm_circuit_breaker_open): marker-BEFORE batches demote to
+# legacy_info; marker-AFTER stay current errors; marker-MISSING is
+# fail-closed (marker-missing error + the two checks SKIPPED - no silent
+# green, no false current errors against an undeployed contract). Written by
+# initialize_database via _ensure_llm_schema_breaker_preset_integrity_marker
+# (release path only).
+LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_KEY = (
+    "llm_schema_breaker_preset_integrity_v1"
+)
+LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_MISSING = (
+    "llm_schema_breaker_preset_integrity_marker_missing"
+)
 
 # 07-22 Codex P1-1 / P2 exclude-only: independent provider-timeout envelope
 # contract marker. Written by initialize_database via
@@ -626,6 +665,112 @@ def _get_llm_provider_timeout_envelope_contract_marker_ts(
     if row and row["applied_at"]:
         return str(row["applied_at"])
     return None
+
+
+def _get_llm_schema_breaker_preset_integrity_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """07-31 P1-4: return the schema/breaker/preset integrity marker's
+    applied_at, or None.
+
+    None means the marker has not been deployed — the two LLM diagnostics
+    (_check_llm_failure_rate_high / _check_llm_circuit_breaker_open) skip
+    themselves so an undeployed contract is never evaluated as current, and
+    the marker-missing check
+    (_check_llm_schema_breaker_preset_integrity_marker_missing) surfaces the
+    absence as a fail-closed error (no silent green).
+    """
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _apply_llm_schema_breaker_preset_integrity_marker_cutoff(
+    repo: CryptoGuardRepository,
+    issues: list[dict[str, Any]],
+) -> None:
+    """07-31 P1-4 + final review P1-3: demote pre-marker LLM-diagnostic
+    findings to legacy_info.
+
+    Scoped to the two LLM diagnostics (_check_llm_failure_rate_high /
+    _check_llm_circuit_breaker_open) driven by production evidence #4. Both
+    checks read ``analysis_batches.summary_json.llm_health`` and emit
+    ``details.runtime_timestamp_ms`` (int ms) — the batch's RUNTIME/outcome
+    timeline (COALESCE(started_at, finished_at, created_at)) — with no
+    ``decision_id``, so the cutoff compares that runtime timestamp against
+    the marker's ``applied_at``. ``analysis_time`` is ONLY a market-data
+    snapshot and must never drive the split (P1-3: it can disagree with the
+    runtime clock by hours; production batches also carry started_at /
+    finished_at / created_at).
+
+    A batch whose runtime timeline is before the marker is historical audit,
+    never a current error (symptom #4: no hourly repeat of the pre-fix
+    breaker-open batch). A MISSING or UNPARSEABLE ``runtime_timestamp_ms``
+    fails CLOSED: the finding stays a current error — it is never silently
+    archived on a guess (P1-3 ④). When the marker is absent this is a no-op
+    — the marker-missing check already surfaces the absence as an error and
+    the two checks skip themselves.
+    """
+    marker_ts = _get_llm_schema_breaker_preset_integrity_marker_ts(repo)
+    if marker_ts is None:
+        return
+    try:
+        # psycopg TIMESTAMPTZ -> str(datetime) is space- or T-separated ISO;
+        # normalize the same way the P1-4 test parses the cutoff.
+        marker_dt = datetime.fromisoformat(str(marker_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OSError):
+        return
+    scoped = {LLM_FAILURE_RATE_HIGH, LLM_CIRCUIT_BREAKER_OPEN}
+    for issue in issues:
+        if issue.get("type") not in scoped:
+            continue
+        runtime_ms = (issue.get("details") or {}).get("runtime_timestamp_ms")
+        if runtime_ms is None:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(runtime_ms) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        if dt < marker_dt:
+            _demote_to_legacy_info(issue)
+
+
+def _check_llm_schema_breaker_preset_integrity_marker_missing(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """07-31 P1-4: flag a missing schema/breaker/preset integrity marker.
+
+    Mirrors ``_check_llm_fair_scheduling_contract_markers_missing``. The
+    marker ``llm_schema_breaker_preset_integrity_v1`` must exist in
+    ``_migration_state`` (written by ``initialize_database`` on the release
+    path). If absent, emit an ``error`` (fail-closed) so callers detect the
+    missing contract rather than receiving a silently-healthy report — the
+    two LLM diagnostics skip themselves while the marker is absent, so this
+    error is the only LLM signal.
+    """
+    issues: list[dict[str, Any]] = []
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s LIMIT 1",
+        (LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_KEY,),
+    ).fetchone()
+    if not row or not row["applied_at"]:
+        issues.append(_issue(
+            LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_MISSING, "error",
+            {
+                "marker_key": LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_KEY,
+                "contract": "llm-schema-repair-breaker-preset-integrity",
+                "issue": "marker_absent",
+            },
+            "schema-repair/breaker/preset integrity marker 未部署。"
+            "运行 initialize_database() 部署 llm_schema_breaker_preset_integrity_v1；"
+            "marker 缺失时 llm_failure_rate_high / llm_circuit_breaker_open "
+            "诊断被 SKIP（未部署契约不得作为当前评估），避免假绿。",
+        ))
+    return issues
 
 
 def _llm_timeout_envelope_check_created_at_lower_bound(
@@ -2791,6 +2936,28 @@ def _check_failed_jobs_outside_window(repo: CryptoGuardRepository) -> list[dict[
 _LLM_DIAGNOSTIC_WINDOW_MS = 24 * 3600 * 1000
 
 
+def _batch_runtime_ms(row: dict[str, Any]) -> int | None:
+    """07-31 final review P1-3: the runtime/outcome timestamp of an
+    ``analysis_batches`` row, in epoch ms.
+
+    Uses ``COALESCE(started_at, finished_at, created_at)`` — the deployment
+    cutoff compares this RUNTIME timeline against the marker applied_at,
+    NEVER ``analysis_time`` (a market-data snapshot that can disagree with
+    the runtime clock). Returns None when no runtime column is populated or
+    a value fails to convert (e.g. ``'infinity'::timestamptz``) — callers
+    must fail CLOSED on None (keep the finding current), never archive it.
+    """
+    for col in ("started_at", "finished_at", "created_at"):
+        value = row.get(col)
+        if value is None:
+            continue
+        try:
+            return int(value.timestamp() * 1000)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+    return None
+
+
 def _check_llm_failure_rate_high(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
     """Flag batches whose LLM failure rate >= 50% over the latest 10 calls.
 
@@ -2800,16 +2967,43 @@ def _check_llm_failure_rate_high(repo: CryptoGuardRepository) -> list[dict[str, 
     even when the breaker itself was not queried (e.g., legacy batches).
 
     Detection reads ``analysis_batches.summary_json.llm_health`` from the
-    latest 5 batches. If ``recent_10_failure_rate >= 0.5`` (the breaker-open
-    condition over the latest 10 LLM calls), emit ``error``. Falls back to
-    whole-batch rate only when ``recent_10_failure_rate`` is missing
-    (legacy batches pre-Phase-I) AND ``total_attempts >= 10``.
+    latest 5 batches.
+
+    07-31 final review P2-1: the recent_10_* family is evaluated by FIELD
+    PRESENCE, never by the value 0 masquerading as "missing":
+
+    - recent_10_calls / recent_10_failure_rate PRESENT (any value, incl. 0)
+      -> the recent-10 path governs EXCLUSIVELY; a healthy (< 0.5) or
+      under-sampled (< 3 calls) recent window is a current fact -> no issue,
+      no whole-batch fallback, never labelled legacy.
+    - family genuinely MISSING (legacy pre-Phase-I shapes) AND total >= 10
+      -> whole-batch fallback allowed, explicitly labelled legacy.
+    - the breaker-driving rate (recent_10_failure_rate) and the overall LLM
+      outcome rate (whole_batch_failure_rate) are separately named with an
+      explicit rate_source; the ambiguous single ``failure_rate`` key is
+      gone. Each issue also carries ``runtime_timestamp_ms`` (P1-3) for the
+      marker cutoff.
+
+    P1-4 (07-31): scoped to the schema/breaker/preset integrity marker. When
+    the marker is ABSENT the check SKIPS entirely (returns []) — an
+    undeployed contract must not be evaluated as current (no silent green,
+    no false current errors against pre-deployment data). The marker-missing
+    check surfaces the absence as a fail-closed error.
+
+    Reviewer note (07-31, deliberate divergence): the primary-window floor is
+    ``recent_10_calls >= 3``, STRICTER than the breaker's ``min_rate_samples``
+    (5), so the diagnostic flags degraded infrastructure EARLIER than the
+    breaker can open. It only ever flags MORE (conservative direction), never
+    fewer, than the breaker itself.
     """
     issues: list[dict[str, Any]] = []
+    if _get_llm_schema_breaker_preset_integrity_marker_ts(repo) is None:
+        return issues
     cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
     rows = repo.conn.execute(
         """
-        SELECT batch_id, primary_interval, analysis_time, status, summary_json
+        SELECT batch_id, primary_interval, analysis_time,
+               started_at, finished_at, created_at, status, summary_json
         FROM analysis_batches
         WHERE analysis_time >= %s
         ORDER BY started_at DESC LIMIT 5
@@ -2825,34 +3019,48 @@ def _check_llm_failure_rate_high(repo: CryptoGuardRepository) -> list[dict[str, 
             continue
         total = int(health.get("total_attempts") or 0)
         failed = int(health.get("failed") or 0)
-        recent_10_calls = int(health.get("recent_10_calls") or 0)
-        recent_10_failed = int(health.get("recent_10_failed") or 0)
-        recent_10_rate = float(health.get("recent_10_failure_rate") or 0.0)
-        # Primary: latest-10 failure rate (matches breaker-open condition).
-        # Fallback: whole-batch rate for legacy batches missing recent_10_*
-        # fields, only when total >= 10.
-        if recent_10_calls >= 3 and recent_10_rate >= 0.5:
+        has_recent_10 = (
+            health.get("recent_10_calls") is not None
+            and health.get("recent_10_failure_rate") is not None
+        )
+        if has_recent_10:
+            recent_10_calls = int(health["recent_10_calls"])
+            recent_10_rate = float(health["recent_10_failure_rate"])
+            # A PRESENT recent_10 family governs exclusively: fewer than 3
+            # samples or a healthy rate is a current fact — never fall back
+            # to the whole-batch rate (P2-1: presence is not 0-as-missing).
+            if recent_10_calls < 3 or recent_10_rate < 0.5:
+                continue
             rate = recent_10_rate
             window = f"latest {recent_10_calls} calls"
+            rate_source = "recent_10"
         elif total >= 10:
+            # Fields genuinely MISSING (legacy pre-Phase-I shape): whole-batch
+            # fallback, explicitly labelled legacy.
             rate = failed / total
             window = f"whole batch ({total} calls, legacy)"
+            rate_source = "whole_batch"
             if rate < 0.5:
                 continue
         else:
             continue  # not enough samples to evaluate
+        details: dict[str, Any] = {
+            "batch_id": r["batch_id"] if r["batch_id"] else "",
+            "primary_interval": r["primary_interval"],
+            "analysis_time": int(r["analysis_time"] or 0),
+            "total_attempts": total,
+            "failed": failed,
+            "window": window,
+            "rate_source": rate_source,
+            "runtime_timestamp_ms": _batch_runtime_ms(r),
+            "dominant_error_category": health.get("dominant_error_category") or "",
+        }
+        if rate_source == "recent_10":
+            details["recent_10_failure_rate"] = round(rate, 3)
+        else:
+            details["whole_batch_failure_rate"] = round(rate, 3)
         issues.append(_issue(
-            LLM_FAILURE_RATE_HIGH, "error",
-            {
-                "batch_id": r["batch_id"] if r["batch_id"] else "",
-                "primary_interval": r["primary_interval"],
-                "analysis_time": int(r["analysis_time"] or 0),
-                "total_attempts": total,
-                "failed": failed,
-                "failure_rate": round(rate, 3),
-                "window": window,
-                "dominant_error_category": health.get("dominant_error_category") or "",
-            },
+            LLM_FAILURE_RATE_HIGH, "error", details,
             "LLM 失败率 ≥ 50%：检查 LLM 配置、网关、模型可用性；"
             "如已熔断，确认 breaker_state=open 并验证后续 symbol 走 deterministic fallback。",
         ))
@@ -2952,12 +3160,21 @@ def _check_llm_circuit_breaker_open(repo: CryptoGuardRepository) -> list[dict[st
     remaining symbols in that batch must use deterministic fallback. Any
     batch in the latest 5 with ``breaker_state=open`` is an ``error`` (the
     underlying config/transport issue must be addressed).
+
+    P1-4 (07-31): scoped to the schema/breaker/preset integrity marker. When
+    the marker is ABSENT the check SKIPS entirely (returns []) — an
+    undeployed contract must not be evaluated as current (no silent green,
+    no false current errors against pre-deployment data). The marker-missing
+    check surfaces the absence as a fail-closed error.
     """
     issues: list[dict[str, Any]] = []
+    if _get_llm_schema_breaker_preset_integrity_marker_ts(repo) is None:
+        return issues
     cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
     rows = repo.conn.execute(
         """
-        SELECT batch_id, primary_interval, analysis_time, status, summary_json
+        SELECT batch_id, primary_interval, analysis_time,
+               started_at, finished_at, created_at, status, summary_json
         FROM analysis_batches
         WHERE analysis_time >= %s
         ORDER BY started_at DESC LIMIT 5
@@ -2979,6 +3196,10 @@ def _check_llm_circuit_breaker_open(repo: CryptoGuardRepository) -> list[dict[st
                 "batch_id": r["batch_id"] if r["batch_id"] else "",
                 "primary_interval": r["primary_interval"],
                 "analysis_time": int(r["analysis_time"] or 0),
+                # 07-31 final review P1-3: the named runtime/outcome
+                # timestamp for the marker cutoff (COALESCE(started_at,
+                # finished_at, created_at)), never analysis_time.
+                "runtime_timestamp_ms": _batch_runtime_ms(r),
                 "total_attempts": int(health.get("total_attempts") or 0),
                 "successful": int(health.get("successful") or 0),
                 "failed": int(health.get("failed") or 0),

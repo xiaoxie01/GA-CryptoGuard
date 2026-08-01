@@ -96,8 +96,10 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_hourly_decision_context_continuity_contract_marker,
         _ensure_hourly_market_semantic_accuracy_contract_marker,
         _ensure_hourly_report_accuracy_r4_contract_marker,
+        _ensure_llm_failed_direction_fail_closed_marker,
         _ensure_llm_fair_scheduling_context_contract_marker,
         _ensure_llm_provider_timeout_envelope_contract_marker,
+        _ensure_llm_schema_breaker_preset_integrity_marker,
         _ensure_market_data_contract_marker,
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
@@ -114,6 +116,13 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # Without this marker, llm_timeout_config_out_of_range is fail-closed missing
     # or demoted, so the Phase H timeout fault seed cannot fire at error severity.
     _ensure_llm_provider_timeout_envelope_contract_marker(cur)
+    # 07-27 Phase-2 C: llm_failed_direction fail-closed marker (full-set
+    # mirror of _phase_i_fresh_verify; state_consistency is not run here).
+    _ensure_llm_failed_direction_fail_closed_marker(cur)
+    # 07-31 P1-4: schema/breaker/preset-integrity marker. Without it the two
+    # LLM diagnostics (_check_llm_failure_rate_high / _check_llm_circuit_breaker_open)
+    # fail-closed skip themselves and the breaker-open fault seed cannot fire.
+    _ensure_llm_schema_breaker_preset_integrity_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 
