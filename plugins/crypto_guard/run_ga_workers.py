@@ -278,6 +278,53 @@ def _post_decision_effects(
             LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
             auto_order = {"ok": False, "error": str(exc)}
 
+    # P0-2 (08-02): auto-materialize opportunity watches from the decision's
+    # structured watch + feishu_actions. Runs on the SAME shared pipeline as
+    # the paper-order auto-create, so both the fair-batch and the legacy serial
+    # dispatch paths materialize a watch when the decision says so -- no user
+    # Feishu button click required. Atomic + idempotent via
+    # ``repo.upsert_auto_opportunity_watch`` (one active watch per
+    # symbol+direction; a later batch refreshes it in place).
+    auto_watch = None
+    actions = decision.get("suggested_actions") or []
+    watch = decision.get("opportunity_watch")
+    # P0-3/P0-2 (08-02): "valid structured watch" is the watcher's own
+    # contract (reasoning/watch_conditions.is_structured_watch) — a dict with
+    # a LONG/SHORT direction, EVERY condition a structured dict (kind + usable
+    # level + side), and a structured-or-None invalid_condition. A text
+    # conditions blob (pre-P0-3 LLM shape) fails this check and the wire-in
+    # does NOT fabricate a watch from it (fail-closed, no manufactured
+    # opportunity).
+    from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
+
+    watch_is_structured = is_structured_watch(watch)
+    # Re-check for an open order AFTER the auto-order block above: a S/A
+    # decision that just created a paper order needs no watch (the order IS the
+    # actionable item), while a B-grade / degraded S/A (no plan / risk not ok)
+    # with no open order materializes the watch.
+    if (
+        "create_opportunity_watch" in actions
+        and grade in {"S", "A", "B"}
+        and watch_is_structured
+        and ga_decision_id
+        and not repo.list_open_paper_orders_for_symbol(decision.get("symbol", ""))
+    ):
+        try:
+            watch_id, watch_action = repo.upsert_auto_opportunity_watch(
+                decision.get("symbol", ""),
+                watch,
+                source_signal_id=int(signal_id),
+                ga_decision_id=int(ga_decision_id),
+            )
+            auto_watch = {"ok": True, "watch_id": watch_id, "action": watch_action}
+            LOGGER.info(
+                "auto opportunity watch %s watch_id=%s symbol=%s direction=%s ga_decision_id=%s",
+                watch_action, watch_id, decision.get("symbol"), watch.get("direction"), ga_decision_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("auto opportunity watch failed ga_decision_id=%s error=%s", ga_decision_id, exc)
+            auto_watch = {"ok": False, "error": str(exc)}
+
     # Position-aware analysis: revalidate open positions when GA decision conflicts
     from plugins.crypto_guard.paper.position_conflict_revalidator import run_position_conflict_revalidation
     _pos_result = run_position_conflict_revalidation(
@@ -314,7 +361,7 @@ def _post_decision_effects(
                     priority=5,
                 ).get("sent")
             )
-    result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target, "auto_order": auto_order}
+    result = {"ok": True, "signal_id": signal_id, "decision": decision, "pushed": sent, "target": target, "auto_order": auto_order, "auto_watch": auto_watch}
     LOGGER.info(
         "post_decision_effects done job_id=%s signal_id=%s grade=%s pushed=%s decision=%s",
         job_id,
@@ -1653,6 +1700,13 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
     elif action == "add_to_watchlist":
         result = add_symbol(repo, symbol, validate=False)
     elif action == "create_opportunity_watch":
+        # 08-02 Codex P1 (terminal-review round 2): the manual button path must
+        # re-check the SAME materialization gate as the worker auto path —
+        # ``is_structured_watch`` (which now requires ``needed is True``) — so a
+        # watch with needed=False / non-positive expires / non-str reason / a
+        # non-level condition can never be button-created. Fail-closed.
+        from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
+
         ga_decision = repo.get_ga_decision(int(ga_decision_id)) if ga_decision_id else None
         if ga_decision:
             actions = set(ga_decision.get("feishu_actions") or [])
@@ -1662,6 +1716,8 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
                 result = {"ok": False, "error": "该 GA decision 不允许加入机会监控"}
             elif not watch:
                 result = {"ok": False, "error": "该 GA decision 没有机会监控条件"}
+            elif not is_structured_watch(watch):
+                result = {"ok": False, "error": "该 GA decision 的机会监控未通过结构化校验（需 needed=True 的 structured watch）"}
             else:
                 result = {
                     "ok": True,
@@ -1683,6 +1739,8 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
                 result = {"ok": False, "error": "D/C 级信号不允许加入机会监控"}
             elif not watch:
                 result = {"ok": False, "error": "该 signal 没有机会监控条件"}
+            elif not is_structured_watch(watch):
+                result = {"ok": False, "error": "该 signal 的机会监控未通过结构化校验（需 needed=True 的 structured watch）"}
             else:
                 compat_ga_decision_id = signal.get("ga_decision_id") or _ensure_ga_decision_for_watch_signal(repo, signal, watch)
                 result = {

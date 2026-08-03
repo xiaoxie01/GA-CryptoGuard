@@ -60,13 +60,51 @@
     },
     "opportunity_watch": {
       "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["needed", "direction", "conditions", "invalid_condition"],
       "properties": {
         "needed": {"type": "boolean"},
-        "direction": {"type": ["string", "null"], "enum": ["LONG", "SHORT", null]},
+        "direction": {"type": "string", "enum": ["LONG", "SHORT"]},
         "reason": {"type": ["string", "null"]},
-        "conditions": {"type": "array"},
-        "invalid_condition": {"type": ["object", "string", "null"]},
-        "expires_minutes": {"type": ["integer", "null"]}
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "side"],
+            "properties": {
+              "type": {"type": "string", "enum": ["price_below", "close_below", "price_above", "close_above", "pullback", "breakout", "reclaim"]},
+              "side": {"type": "string", "enum": ["LONG", "SHORT"]},
+              "timeframe": {"type": "string", "enum": ["1m", "5m", "15m", "1h", "4h"]},
+              "level": {"type": "number", "minimum": 0},
+              "price": {"type": "number", "minimum": 0},
+              "tolerance_pct": {"type": "number", "minimum": 0}
+            },
+            "anyOf": [
+              {"required": ["level"]},
+              {"required": ["price"]}
+            ]
+          }
+        },
+        "invalid_condition": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["type", "side"],
+          "properties": {
+            "type": {"type": "string", "enum": ["price_below", "close_below", "price_above", "close_above", "pullback", "breakout", "reclaim"]},
+            "side": {"type": "string", "enum": ["LONG", "SHORT"]},
+            "timeframe": {"type": "string", "enum": ["1m", "5m", "15m", "1h", "4h"]},
+            "level": {"type": "number", "minimum": 0},
+            "price": {"type": "number", "minimum": 0},
+            "tolerance_pct": {"type": "number", "minimum": 0}
+          },
+          "anyOf": [
+            {"required": ["level"]},
+            {"required": ["price"]}
+          ]
+        },
+        "expires_minutes": {"type": ["integer", "null"], "minimum": 1}
       }
     },
     "suggested_actions": {

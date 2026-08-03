@@ -63,6 +63,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     """
     from plugins.crypto_guard.storage.migrations import (
         _ensure_btc9_trade_gate_contract_marker,
+        _ensure_execution_funnel_report_contract_marker,
         _ensure_hourly_decision_context_continuity_contract_marker,
         _ensure_hourly_market_semantic_accuracy_contract_marker,
         _ensure_hourly_report_accuracy_r4_contract_marker,
@@ -92,6 +93,9 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # 07-31 P1-4: schema/breaker/preset-integrity marker. Without it a fresh
     # (release-initialized) schema reports marker_missing instead of clean.
     _ensure_llm_schema_breaker_preset_integrity_marker(cur)
+    # 08-02 P1-3: execution-funnel report-contract marker. Without it a fresh
+    # (release-initialized) schema reports marker_missing instead of clean.
+    _ensure_execution_funnel_report_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 

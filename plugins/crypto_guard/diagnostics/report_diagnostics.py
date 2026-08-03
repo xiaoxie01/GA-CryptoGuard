@@ -17,7 +17,7 @@ Each checker returns a list of issue dicts with:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
@@ -138,6 +138,36 @@ LLM_PROVIDER_TIMEOUT_ENVELOPE_CONTRACT_MARKER_MISSING = (
 # a live runtime invariant, not a historical contract).
 STUCK_PREPARED_SKILL_LOGS = "stuck_prepared_skill_logs"
 
+# 08-02 P1-3: execution-funnel report-contract diagnostics. The hourly report
+# must show the four aspects of the LLM execution funnel SEPARATELY (call
+# succeeded / plan confirmed / risk passed / final executable), and "LLM not
+# confirmed" must come ONLY from immutable synthesis evidence — never inferred
+# from a final trade_plan cleared by later gates. These six codes are the new
+# diagnostics plus their fail-closed marker-missing gate. The five per-decision
+# codes are marker-cutoff-scoped (pre-contract rows demote to legacy_info via
+# _apply_execution_funnel_marker_cutoff); execution_funnel_starvation is an
+# aggregate/live 24h invariant (NOT cut off).
+EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_MISSING = (
+    "execution_funnel_report_contract_marker_missing"
+)
+CONFIRMED_WITHOUT_EXECUTABLE_PLAN = "confirmed_without_executable_plan"
+NO_CANDIDATE_WITH_CANDIDATE_PLAN = "no_candidate_with_candidate_plan"
+EXECUTABLE_STATUS_WITHOUT_PLAN = "executable_status_without_plan"
+OPPORTUNITY_WATCH_NOT_MATERIALIZED = "opportunity_watch_not_materialized"
+OPPORTUNITY_WATCH_UNTRIGGERABLE_CONDITION = "opportunity_watch_untriggerable_condition"
+# 08-02 Finding 5 (P2): companion to OPPORTUNITY_WATCH_NOT_MATERIALIZED — a
+# decision that ADVERTISES create_opportunity_watch but carries NO structured
+# watch can never honor the action (the P0-2 wire-in requires a structured
+# watch). The materialization check skips these (unstructured watch is its
+# "skipped-by-design" path), so this companion owns them: a broken promise at
+# the decision layer. Firing on a current row means a producer path still
+# persists the broken promise (the Finding-2 controller fix strips the action
+# for unstructured watches); pre-marker rows are excluded by the SQL bound.
+OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH = (
+    "opportunity_watch_advertised_without_watch"
+)
+EXECUTION_FUNNEL_STARVATION = "execution_funnel_starvation"
+
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
     """Run all hourly-report-accuracy diagnostics.
@@ -246,6 +276,19 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # recovered. It is NOT historical audit -- every prepared row is in-flight.
     issues.extend(_check_stuck_prepared_skill_logs(repo))
 
+    # 08-02 P1-3: execution-funnel report contract. The marker-missing check
+    # runs FIRST (fail-closed: absent marker = explicit error, not silent
+    # green); then the six per-decision/aggregate funnel checks, each of which
+    # self-skips when the contract marker is absent.
+    issues.extend(_check_execution_funnel_report_contract_marker_missing(repo))
+    issues.extend(_check_confirmed_without_executable_plan(repo))
+    issues.extend(_check_no_candidate_with_candidate_plan(repo))
+    issues.extend(_check_executable_status_without_plan(repo))
+    issues.extend(_check_opportunity_watch_not_materialized(repo))
+    issues.extend(_check_opportunity_watch_advertised_without_watch(repo))
+    issues.extend(_check_opportunity_watch_untriggerable_condition(repo))
+    issues.extend(_check_execution_funnel_starvation(repo))
+
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
     # postconditions (schema health, batch_symbol_status CHECK, etc.) hold.
@@ -283,6 +326,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     # historical audit (legacy_info) — symptom #4: the pre-fix breaker-open
     # batch must not repeat as a current error; post-marker errors stay error.
     _apply_llm_schema_breaker_preset_integrity_marker_cutoff(repo, issues)
+
+    # 08-02 P1-3: apply the independent execution-funnel report-contract marker
+    # cutoff to the five per-decision funnel checks (starvation is aggregate/
+    # live over 24h and is NOT cut off). Decisions/watches created BEFORE the
+    # marker are historical audit (legacy_info) — the four per-decision checks
+    # are SQL-bound so this is a redundant safety net; the untriggerable-watch
+    # scan is NOT SQL-bound so this cutoff is its real demotion path.
+    _apply_execution_funnel_marker_cutoff(repo, issues)
 
     # 07-22 Codex P2: NO _apply_llm_timeout_envelope_marker_cutoff here.
     # Timeout-envelope unique contract is SQL exclude-only (pre-marker rows
@@ -354,6 +405,18 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
         LLM_TIMEOUT_CONFIG_OUT_OF_RANGE: _count(issues, LLM_TIMEOUT_CONFIG_OUT_OF_RANGE),
         LLM_BATCH_DEGRADED_REPORTED_HEALTHY: _count(issues, LLM_BATCH_DEGRADED_REPORTED_HEALTHY),
         LLM_REPAIR_COUNTED_AS_PROVIDER_CALL: _count(issues, LLM_REPAIR_COUNTED_AS_PROVIDER_CALL),
+        EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_MISSING: _count(
+            issues, EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_MISSING
+        ),
+        CONFIRMED_WITHOUT_EXECUTABLE_PLAN: _count(issues, CONFIRMED_WITHOUT_EXECUTABLE_PLAN),
+        NO_CANDIDATE_WITH_CANDIDATE_PLAN: _count(issues, NO_CANDIDATE_WITH_CANDIDATE_PLAN),
+        EXECUTABLE_STATUS_WITHOUT_PLAN: _count(issues, EXECUTABLE_STATUS_WITHOUT_PLAN),
+        OPPORTUNITY_WATCH_NOT_MATERIALIZED: _count(issues, OPPORTUNITY_WATCH_NOT_MATERIALIZED),
+        OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH: _count(
+            issues, OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH
+        ),
+        OPPORTUNITY_WATCH_UNTRIGGERABLE_CONDITION: _count(issues, OPPORTUNITY_WATCH_UNTRIGGERABLE_CONDITION),
+        EXECUTION_FUNNEL_STARVATION: _count(issues, EXECUTION_FUNNEL_STARVATION),
         "error_count": error_count,
         "warning_count": warning_count,
         "legacy_info_count": legacy_info_count,
@@ -448,6 +511,16 @@ LLM_SCHEMA_BREAKER_PRESET_INTEGRITY_MARKER_MISSING = (
     "llm_schema_breaker_preset_integrity_marker_missing"
 )
 
+# 08-02 P1-3: independent execution-funnel report-contract marker. Written by
+# initialize_database via _ensure_execution_funnel_report_contract_marker
+# (release path only — production is NOT written this round). Its applied_at is
+# the cutoff for the five per-decision execution-funnel codes:
+# marker-BEFORE rows demote to legacy_info; marker-AFTER stay current errors;
+# marker-MISSING is fail-closed (marker-missing error + the six execution-funnel
+# checks SKIPPED — no silent green, no false current errors against an
+# undeployed contract).
+EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY = "execution_funnel_report_contract_v1"
+
 # 07-22 Codex P1-1 / P2 exclude-only: independent provider-timeout envelope
 # contract marker. Written by initialize_database via
 # _ensure_llm_provider_timeout_envelope_contract_marker. SQL lower bound for
@@ -498,6 +571,20 @@ _CONTINUITY_ISSUE_TYPES: frozenset[str] = frozenset({
     OVERSIZED_FEATURE_PACK,
     CANDIDATE_EFFECTIVE_PLAN_MISMATCH,
     BATCH_TIME_HEALTH_MISMATCH,
+})
+
+# 08-02 P1-3: the set of issue types that fall under the execution-funnel
+# report contract. Used by _apply_execution_funnel_marker_cutoff to demote
+# pre-contract findings to legacy_info. Excludes the marker-missing code
+# (always error) and execution_funnel_starvation (aggregate/live over a 24h
+# window — recency is already bounded, so it is NOT cut off).
+_EXECUTION_FUNNEL_ISSUE_TYPES: frozenset[str] = frozenset({
+    CONFIRMED_WITHOUT_EXECUTABLE_PLAN,
+    NO_CANDIDATE_WITH_CANDIDATE_PLAN,
+    EXECUTABLE_STATUS_WITHOUT_PLAN,
+    OPPORTUNITY_WATCH_NOT_MATERIALIZED,
+    OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH,
+    OPPORTUNITY_WATCH_UNTRIGGERABLE_CONDITION,
 })
 
 
@@ -687,6 +774,162 @@ def _get_llm_schema_breaker_preset_integrity_marker_ts(
     if row and row["applied_at"]:
         return str(row["applied_at"])
     return None
+
+
+def _get_execution_funnel_report_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """08-02 P1-3: return the execution-funnel report-contract marker's
+    applied_at, or None.
+
+    None means the contract has not been deployed — the six execution-funnel
+    checks skip themselves so an undeployed contract is never evaluated as
+    current, and the marker-missing check
+    (_check_execution_funnel_report_contract_marker_missing) surfaces the
+    absence as a fail-closed error (no silent green).
+    """
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _execution_funnel_check_created_at_lower_bound(repo: CryptoGuardRepository) -> str:
+    """08-02 P1-3: lower bound on ``ga_decisions.created_at`` for the four
+    per-decision execution-funnel checks, applied in SQL BEFORE ``LIMIT``.
+
+    When the execution-funnel report-contract marker is deployed, the bound is
+    the marker's ``applied_at`` — only post-marker rows are current; pre-marker
+    rows are historical audit and MUST NOT be fetched (mirrors
+    ``_semantic_check_created_at_lower_bound``). When the marker is absent
+    (fresh DB / pre-deployment), the bound is ``now_utc - 24h``
+    (``_LLM_DIAGNOSTIC_WINDOW_MS``) so a stale historical row is not fetched and
+    emitted as a current ``error`` against an uninitialized contract.
+
+    Codex P2-1 (terminal-review rework): a CORRUPT/unparseable marker value
+    FAILS CLOSED to ``now`` (nothing is provably post-marker), mirroring
+    ``_execution_funnel_starvation_lower_bound_ts``. The raw string is never
+    interpolated into ``created_at >= %s::timestamptz`` unvalidated (a garbage
+    literal would crash psycopg); the corruption itself is surfaced by
+    ``_check_execution_funnel_report_contract_marker_missing``.
+    """
+    marker_ts = _get_execution_funnel_report_contract_marker_ts(repo)
+    if marker_ts is not None:
+        try:
+            datetime.fromisoformat(str(marker_ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OSError):
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return marker_ts
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - _LLM_DIAGNOSTIC_WINDOW_MS
+    return datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _check_execution_funnel_report_contract_marker_missing(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: fail-closed marker-missing check for the execution-funnel
+    report contract. Runs FIRST (before the six execution-funnel checks) so a
+    missing contract is explicitly surfaced even when the other checks would
+    otherwise pass (or skip).
+
+    Codex P2-1 (terminal-review rework): a PRESENT but CORRUPT/unparseable
+    marker is surfaced too (``issue=marker_corrupt``) — never SILENT GREEN.
+    With a corrupt marker the six funnel checks' lower bound fails closed to
+    ``now`` (evaluate nothing), so without this issue the corruption would be
+    invisible; the fail-closed contract requires it be surfaced.
+    """
+    issues: list[dict[str, Any]] = []
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if not row or not row["applied_at"]:
+        issues.append(_issue(
+            EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_MISSING, "error",
+            {
+                "marker_key": EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY,
+                "contract": "execution-funnel-report-contract",
+                "issue": "marker_absent",
+            },
+            "执行漏斗报告契约 marker 未部署。运行 initialize_database() 写入 "
+            f"{EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY}；marker 缺失时 6 项"
+            "执行漏斗诊断被 SKIP（未部署契约不得评估为当前错误），避免历史行重复成当前错误。",
+        ))
+        return issues
+    try:
+        datetime.fromisoformat(str(row["applied_at"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OSError):
+        issues.append(_issue(
+            EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_MISSING, "error",
+            {
+                "marker_key": EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY,
+                "contract": "execution-funnel-report-contract",
+                "issue": "marker_corrupt",
+                "applied_at": str(row["applied_at"]),
+            },
+            "执行漏斗报告契约 marker 值损坏（不可解析为时间戳）。运行 "
+            "initialize_database() 重写正确的 applied_at；损坏 marker 下 4 项"
+            "逐行执行漏斗诊断与 starvation 的 lower bound 均 fail-closed 到 now，"
+            "不评估任何行（无静默 fail-open）。",
+        ))
+    return issues
+
+
+def _apply_execution_funnel_marker_cutoff(
+    repo: CryptoGuardRepository,
+    issues: list[dict[str, Any]],
+) -> None:
+    """08-02 P1-3: demote pre-contract execution-funnel findings to legacy_info.
+
+    Scoped to the five per-decision execution-funnel codes in
+    ``_EXECUTION_FUNNEL_ISSUE_TYPES`` (starvation is aggregate/live over 24h
+    and is NOT cut off). Per-decision findings carry a ``decision_id`` ->
+    demote via ``_get_decision_created_ts``; the opportunity-watch-untriggerable
+    finding carries NO decision_id -> demote via ``details.watch_created_at``
+    (int ms, from the opportunity_watches.created_at the check emits). With
+    the SQL lower bound in place this is a redundant safety net for the four
+    per-decision checks and the ONLY demotion path for the watch-table scan.
+    """
+    marker_ts = _get_execution_funnel_report_contract_marker_ts(repo)
+    if marker_ts is None:
+        return
+    try:
+        # psycopg TIMESTAMPTZ -> str(datetime) is space- or T-separated ISO;
+        # normalize to a real datetime so the comparison never depends on the
+        # string separator (mirrors the P1-4 cutoff, not a lexicographic str
+        # compare across mixed formats).
+        marker_dt = datetime.fromisoformat(str(marker_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OSError):
+        return
+    for issue in issues:
+        if issue.get("type") not in _EXECUTION_FUNNEL_ISSUE_TYPES:
+            continue
+        decision_id = (issue.get("details") or {}).get("decision_id")
+        if decision_id is None:
+            # Watch-table scan finding: demote via the watch's created_at (int
+            # ms) — the only demotion path for the NOT-SQL-bound scan.
+            at_ms = (issue.get("details") or {}).get("watch_created_at")
+            if at_ms is None:
+                at_ms = (issue.get("details") or {}).get("analysis_time")
+            if at_ms is None:
+                continue
+            try:
+                dt = datetime.fromtimestamp(int(at_ms) / 1000, tz=timezone.utc)
+            except (TypeError, ValueError, OSError, OverflowError):
+                continue
+        else:
+            decision_ts = _get_decision_created_ts(repo, decision_id)
+            if decision_ts is None:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(decision_ts).replace("Z", "+00:00"))
+            except (TypeError, ValueError, OSError):
+                continue
+        if dt < marker_dt:
+            _demote_to_legacy_info(issue)
 
 
 def _apply_llm_schema_breaker_preset_integrity_marker_cutoff(
@@ -3288,6 +3531,620 @@ def _check_deterministic_candidate_reported_as_trade_plan(
             "小时报告必须渲染为 '规则候选计划已生成，LLM 未确认，禁止执行' 而非 '候选计划已生成（LLM 已确认）'。"
             f" (state={state})",
         ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# 08-02 P1-3: execution-funnel report contract (per-decision + aggregate
+# checks). All six checks self-skip when the execution_funnel_report_contract_v1
+# marker is absent (an undeployed contract is never evaluated as current); the
+# marker-missing check surfaces the absence as a fail-closed error instead.
+# The four per-decision checks are SQL-bound by the marker's applied_at (or a
+# 24h fallback when the marker is absent, defense-in-depth); the watch-table
+# scan is NOT SQL-bound and relies on the marker cutoff demotion path.
+# ---------------------------------------------------------------------------
+
+def _is_nonempty_dict(value: Any) -> bool:
+    """True only for a dict that is not empty. ``None``, ``[]``, ``""``, ``{}``
+    and scalar values all return False — mirrors the report renderer's
+    ``trade_plan`` truthiness (a persisted plan must be a non-empty dict).
+    """
+    return isinstance(value, dict) and bool(value)
+
+
+def _is_final_executable(raw: dict[str, Any]) -> bool:
+    """08-02 P1-3: the single locked predicate for "row is a final executable
+    plan". Mirrors ``hourly_report._decision_row.final_executable`` exactly:
+    ``plan_execution_state == "confirmed"`` AND ``plan_status == "executable"``
+    AND ``has_trade_plan`` truthy AND ``trade_plan`` a non-empty dict. Any
+    other combination (state confirmed but no plan, state not confirmed but
+    plan present, etc.) is a report-contract contradiction and NOT executable.
+    """
+    return (
+        raw.get("plan_execution_state") == "confirmed"
+        and raw.get("plan_status") == "executable"
+        and bool(raw.get("has_trade_plan"))
+        and _is_nonempty_dict(raw.get("trade_plan"))
+    )
+
+
+def _condition_is_untriggerable(cond: Any) -> bool:
+    """08-02 P1-3: fail-closed "is this watch condition untriggerable?" —
+    mirrors the watcher's ``_condition_hit`` semantics: a bare string, a
+    non-dict, or an unknown kind can never trigger a structured watch and is
+    therefore a defect (the watch can never fire).
+
+    08-02 R2 P2-3 (fresh reviewer): a SUPPORTED kind with no usable
+    level/price is untriggerable too — every ``_condition_hit`` branch is
+    gated on a numeric level, so the watcher falls through to a permanent
+    silent wait. Mirror ``is_structured_condition`` (level first, then price)
+    and require a positive non-bool number.
+    """
+    from plugins.crypto_guard.reasoning.watch_conditions import SUPPORTED_WATCH_CONDITION_KINDS
+    if isinstance(cond, str) or not isinstance(cond, dict):
+        return True
+    # 08-02 R2 review P2-2 + Finding 1 (brand-new reviewer): the by-design
+    # account_feedback_recheck routing is handled at the CALLER as a row-level
+    # root-dict skip (mirroring opportunity_watcher.py:82). Here the kind
+    # simply falls through to the SUPPORTED-set comparison: account_feedback_
+    # recheck is NOT a SUPPORTED kind, so ANY non-routed variant (root-list
+    # item, kind-only, uppercase) is untriggerable — exactly what the watcher's
+    # ``_condition_hit`` returns for those shapes. The kind is lowercased first
+    # so a SUPPORTED kind spelled "Price_Above" is not a false positive.
+    raw_kind = cond.get("type") or cond.get("kind")
+    kind = str(raw_kind or "").lower()
+    if kind not in SUPPORTED_WATCH_CONDITION_KINDS:
+        return True
+    level = cond.get("level")
+    if level is None:
+        level = cond.get("price")
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or float(level) <= 0:
+        return True
+    return False
+
+
+def _check_confirmed_without_executable_plan(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: decisions rendered "LLM plan confirmed" (``llm_plan_verdict``
+    confirmed / ``plan_execution_state`` confirmed) yet NOT final executable.
+    The report row split shows ``llm_plan_confirmed`` and ``final_executable``
+    as separate columns; a confirmed row with no executable trade plan is the
+    "confirmed without plan" contradiction — the report must NOT imply an
+    executable plan exists.
+    """
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_check_created_at_lower_bound(repo)
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND created_at >= %s::timestamptz
+        ORDER BY id DESC LIMIT 200
+        """,
+        (lower_bound,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("plan_execution_state") != "confirmed":
+            continue
+        if _is_final_executable(raw):
+            continue
+        issues.append(_issue(
+            CONFIRMED_WITHOUT_EXECUTABLE_PLAN, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "plan_status": str(raw.get("plan_status") or ""),
+                "has_trade_plan": bool(raw.get("has_trade_plan")),
+                "trade_plan_present": _is_nonempty_dict(raw.get("trade_plan")),
+                "llm_plan_verdict": str(raw.get("llm_plan_verdict") or ""),
+                "risk_ok": bool((raw.get("risk_check") or {}).get("ok")),
+                "effective_signal_grade": str(raw.get("effective_signal_grade") or r["signal_grade"] or ""),
+            },
+            "计划已确认（plan_execution_state=confirmed）但没有可执行 trade_plan："
+            "小时报告必须把 llm_plan_confirmed 与 final_executable 拆开渲染，"
+            "已确认≠可执行（可能后续风险门清空了计划）。",
+        ))
+    return issues
+
+
+def _check_no_candidate_with_candidate_plan(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: decisions whose lifecycle is ``no_candidate`` yet still carry
+    a candidate/trade plan (``candidate_trade_plan`` non-empty, ``trade_plan``
+    non-empty, or ``has_trade_plan`` truthy). ``no_candidate`` means NO plan was
+    produced — a persisted plan is the inverse contradiction of
+    confirmed_without_executable_plan.
+    """
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_check_created_at_lower_bound(repo)
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND created_at >= %s::timestamptz
+        ORDER BY id DESC LIMIT 200
+        """,
+        (lower_bound,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("plan_execution_state") != "no_candidate":
+            continue
+        if (
+            _is_nonempty_dict(raw.get("candidate_trade_plan"))
+            or _is_nonempty_dict(raw.get("trade_plan"))
+            or bool(raw.get("has_trade_plan"))
+        ):
+            issues.append(_issue(
+                NO_CANDIDATE_WITH_CANDIDATE_PLAN, "error",
+                {
+                    "decision_id": int(r["id"]),
+                    "symbol": r["symbol"],
+                    "plan_status": str(raw.get("plan_status") or ""),
+                    "has_trade_plan": bool(raw.get("has_trade_plan")),
+                    "candidate_trade_plan_present": _is_nonempty_dict(raw.get("candidate_trade_plan")),
+                    "trade_plan_present": _is_nonempty_dict(raw.get("trade_plan")),
+                    "llm_plan_verdict": str(raw.get("llm_plan_verdict") or ""),
+                },
+                "生命周期 no_candidate 却仍带 candidate/trade plan："
+                "no_candidate 表示无任何计划，残留计划是逆反矛盾。",
+            ))
+    return issues
+
+
+def _check_executable_status_without_plan(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: decisions with ``plan_status == "executable"`` that are NOT
+    final executable (missing confirmed state, missing/empty trade_plan, or
+    ``has_trade_plan`` falsy). ``plan_status=executable`` without the full
+    confirmed+plan predicate means the row claims executability the report
+    split cannot render — same contradiction family, different entry field.
+    """
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_check_created_at_lower_bound(repo)
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND created_at >= %s::timestamptz
+        ORDER BY id DESC LIMIT 200
+        """,
+        (lower_bound,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("plan_status") != "executable":
+            continue
+        if raw.get("plan_execution_state") == "confirmed":
+            # Single-emit precedence: a row that is both confirmed AND
+            # executable-status but not final-executable is already claimed by
+            # confirmed_without_executable_plan (the more descriptive
+            # contradiction); do not double-report it here (08-02 review P2-D).
+            continue
+        if _is_final_executable(raw):
+            continue
+        issues.append(_issue(
+            EXECUTABLE_STATUS_WITHOUT_PLAN, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "plan_execution_state": str(raw.get("plan_execution_state") or ""),
+                "has_trade_plan": bool(raw.get("has_trade_plan")),
+                "trade_plan_present": _is_nonempty_dict(raw.get("trade_plan")),
+                "llm_plan_verdict": str(raw.get("llm_plan_verdict") or ""),
+            },
+            "plan_status=executable 但未通过 final-executable 判定："
+            "缺少 confirmed 状态或 trade_plan 为空/缺失，报告不得渲染为可执行。",
+        ))
+    return issues
+
+
+def _persisted_actions(raw: dict[str, Any]) -> list[str]:
+    """Read the persisted suggested-action list from a §8 envelope.
+
+    Controller-produced rows persist actions at TOP level under
+    ``feishu_actions`` (decision_schema.py §8 envelope line 144);
+    ``suggested_actions`` exists only in the nested ``raw_legacy_decision``
+    and in the compat shape (legacy_decision_from_ga_decision line 258).
+    Reading only ``suggested_actions`` silently skipped every controller row
+    (08-02 Finding 5 evidence gap — the P1-3 watch check never fired on
+    production data). Each candidate key is checked in priority order; a
+    non-list value falls through to the next key; returns [] when none is a
+    list. Post-fix rows always carry ``feishu_actions`` (list) at top level.
+    """
+    for key in ("feishu_actions", "suggested_actions"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return value
+    nested = raw.get("raw_legacy_decision")
+    if isinstance(nested, dict):
+        value = nested.get("suggested_actions")
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _check_opportunity_watch_not_materialized(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: decisions that gated the auto opportunity-watch materialization
+    (the P0-2 wire-in: ``create_opportunity_watch`` suggested action, structured
+    watch, effective grade in S/A/B, no open paper order for the symbol) yet no
+    active opportunity_watch row exists. A missing active watch is a broken
+    funnel: the decision promised a watch that was never materialized. Mirrors
+    the wire-in gate conditions exactly so a skipped-by-design decision (open
+    order present, unstructured watch, D/C grade) is NOT flagged.
+    """
+    from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_check_created_at_lower_bound(repo)
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, signal_grade, raw_decision_json, created_at
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND created_at >= %s::timestamptz
+        ORDER BY id DESC LIMIT 200
+        """,
+        (lower_bound,),
+    ).fetchall()
+    symbols = list({r["symbol"] for r in rows if r["symbol"]})
+    open_symbols: set[str] = set()
+    if symbols:
+        open_rows = repo.conn.execute(
+            """
+            SELECT DISTINCT symbol FROM paper_orders
+            WHERE status IN ('pending', 'open', 'needs_recheck')
+              AND symbol = ANY(%s)
+            """,
+            (symbols,),
+        ).fetchall()
+        open_symbols = {r["symbol"] for r in open_rows}
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        actions = _persisted_actions(raw)
+        if "create_opportunity_watch" not in actions:
+            continue
+        watch = raw.get("opportunity_watch")
+        if not is_structured_watch(watch):
+            continue
+        grade = str(raw.get("effective_signal_grade") or r["signal_grade"] or "").upper()
+        if grade not in {"S", "A", "B"}:
+            continue
+        symbol = r["symbol"]
+        if symbol and symbol in open_symbols:
+            continue
+        direction = str((watch or {}).get("direction") or "").upper()
+        # Match the producer's exact key format (repository.upsert_auto_
+        # opportunity_watch writes f"auto:{symbol}:{direction}" — lowercase
+        # ``auto:`` prefix, canonical symbol, uppercase direction). Uppercasing
+        # the whole key would miss the stored row and false-positive an
+        # already-materialized watch (08-02 review P1-A).
+        dedupe_key = f"auto:{symbol}:{direction}"
+        found = None
+        if dedupe_key and symbol:
+            found = repo.conn.execute(
+                """
+                SELECT id FROM opportunity_watches
+                WHERE status = 'active'
+                  AND (dedupe_key = %s OR ga_decision_id = %s)
+                LIMIT 1
+                """,
+                (dedupe_key, int(r["id"])),
+            ).fetchone()
+        if found is None:
+            issues.append(_issue(
+                OPPORTUNITY_WATCH_NOT_MATERIALIZED, "error",
+                {
+                    "decision_id": int(r["id"]),
+                    "symbol": symbol,
+                    "direction": direction,
+                    "effective_signal_grade": grade,
+                    "expected_dedupe_key": dedupe_key,
+                },
+                "决策门控了自动机会 watch 物化（create_opportunity_watch + 结构化 watch "
+                "+ S/A/B + 无未平仓纸面单）但 opportunity_watches 无 active 行："
+                "漏斗断裂，机会 watch 未落地。",
+            ))
+    return issues
+
+
+def _check_opportunity_watch_advertised_without_watch(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 Finding 5 (P2): decisions that ADVERTISE ``create_opportunity_watch``
+    in their persisted actions yet carry NO structured opportunity_watch (None,
+    missing, or an unstructured dict such as ``{"needed": True, "direction":
+    "bidirectional"}``).
+
+    This is the decision-level broken-promise check — the COMPANION to
+    ``_check_opportunity_watch_not_materialized`` (which requires a structured
+    watch and proves materialization happened; unstructured/None watch is its
+    skipped-by-design path). The P0-2 wire-in can only honor the action when a
+    structured watch exists, so an advertised action without one is a permanent
+    funnel dead-end the decision itself promises and can never deliver.
+
+    The Finding-2 controller fix (controller.py) strips ``create_opportunity_watch``
+    from feishu_actions whenever the watch is unstructured, so a row firing this
+    code means either a pre-fix persisted row (historical audit — excluded here
+    by the SQL lower bound) or a non-controller producer path that still writes
+    the broken promise. Firing on EITHER is correct evidence: the invariant
+    must hold across all persisted rows, not just the current code path.
+    Mirrors the sibling per-decision checks: marker-gated, SQL-bound to
+    post-marker rows, one issue per row.
+    """
+    from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_check_created_at_lower_bound(repo)
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, raw_decision_json
+        FROM ga_decisions
+        WHERE raw_decision_json IS NOT NULL
+          AND created_at >= %s::timestamptz
+        ORDER BY id DESC LIMIT 200
+        """,
+        (lower_bound,),
+    ).fetchall()
+    for r in rows:
+        raw = _safe_json(r["raw_decision_json"]) or {}
+        if not isinstance(raw, dict):
+            continue
+        actions = _persisted_actions(raw)
+        if "create_opportunity_watch" not in actions:
+            continue
+        watch = raw.get("opportunity_watch")
+        if is_structured_watch(watch):
+            continue
+        issues.append(_issue(
+            OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH, "error",
+            {
+                "decision_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "opportunity_watch_present": watch is not None,
+            },
+            "决策持久化了 create_opportunity_watch 动作但没有结构化 opportunity_watch"
+            "（None/缺失/非结构化）：P0-2 接线按 fail-closed 语义永远无法物化该动作，"
+            "漏斗在决策层即告断裂（承诺的动作无法兑现）。",
+        ))
+    return issues
+
+
+def _check_opportunity_watch_untriggerable_condition(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3: active opportunity_watches whose conditions can NEVER
+    trigger — a bare string, non-dict, or unknown-kind condition (fail-closed
+    watcher semantics). Such a watch is permanently untriggerable (a silent
+    dead funnel) and MUST be surfaced instead of silently waiting forever.
+    NOT SQL-bound (the marker cutoff demotes pre-contract watches via the
+    ``watch_created_at`` fallback path).
+    """
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    rows = repo.conn.execute(
+        """
+        SELECT id, symbol, direction, watch_condition_json,
+               invalid_condition_json, status, created_at
+        FROM opportunity_watches
+        WHERE status = 'active'
+        ORDER BY id DESC LIMIT 200
+        """,
+    ).fetchall()
+    for r in rows:
+        conditions = r["watch_condition_json"]
+        # 08-02 R2 review Finding 1 (brand-new reviewer): mirror the watcher's
+        # exact routing (opportunity_watcher.py:82) — ONLY a ROOT-DICT
+        # watch_condition_json whose type is exactly "account_feedback_recheck"
+        # routes to _check_account_feedback_recheck (which CAN trigger, so it
+        # is never untriggerable; the manual account-feedback gate at
+        # paper_broker.py:1214 persists exactly this root-dict shape). Every
+        # other shape (root-list item, kind-only, uppercase) falls through to
+        # _condition_hit, where the kind is not SUPPORTED and IS untriggerable.
+        # The row-level skip keeps the by-design gate watch un-flagged while the
+        # per-item check below flags any non-routed account_feedback_recheck
+        # variant.
+        if isinstance(conditions, dict) and conditions.get("type") == "account_feedback_recheck":
+            continue
+        if isinstance(conditions, dict):
+            conditions = [conditions]
+        elif not isinstance(conditions, list):
+            conditions = []
+        untriggerable_conditions: list[dict[str, Any]] = []
+        for idx, cond in enumerate(conditions):
+            if _condition_is_untriggerable(cond):
+                if isinstance(cond, str):
+                    type_name = cond
+                elif not isinstance(cond, dict):
+                    type_name = type(cond).__name__
+                else:
+                    type_name = str(cond.get("type") or cond.get("kind") or "unknown")
+                untriggerable_conditions.append({"index": idx, "type": type_name})
+        invalid_untriggerable = False
+        if r["invalid_condition_json"] is not None:
+            invalid_untriggerable = _condition_is_untriggerable(r["invalid_condition_json"])
+        if not untriggerable_conditions and not invalid_untriggerable:
+            continue
+        # 08-02 R2 review P2-3 (fresh reviewer): the watcher's whole-watch dead
+        # marker is ``all(...)`` — only when EVERY condition is untriggerable is
+        # the watch truly unable to ever fire. For a MIXED watch (one live
+        # structured condition + one dead text/unknown condition) the watch is
+        # NOT dead; the dead sub-condition is a data-quality issue the watcher
+        # keeps waiting past. Split the message accordingly instead of
+        # overclaiming "永远无法触发".
+        all_conditions_untriggerable = (
+            len(conditions) > 0 and len(untriggerable_conditions) == len(conditions)
+        )
+        message = (
+            "机会 watch 存在不可触发条件（裸字符串/非 dict/未知 kind）："
+            "按 fail-closed 语义该 watch 永远无法触发，漏斗静默失效。"
+            if all_conditions_untriggerable else
+            "机会 watch 存在不可触发子条件（裸字符串/非 dict/未知 kind）："
+            "该子条件永远无法触发（数据质量问题），其余结构化条件仍可继续触发。"
+        )
+        watch_created_at = None
+        if r["created_at"] is not None:
+            try:
+                watch_created_at = int(r["created_at"].timestamp() * 1000)
+            except (TypeError, ValueError, OSError):
+                watch_created_at = None
+        issues.append(_issue(
+            OPPORTUNITY_WATCH_UNTRIGGERABLE_CONDITION, "error",
+            {
+                "watch_id": int(r["id"]),
+                "symbol": r["symbol"],
+                "direction": str(r["direction"] or ""),
+                "watch_status": str(r["status"] or ""),
+                "untriggerable_conditions": untriggerable_conditions,
+                "invalid_condition_untriggerable": invalid_untriggerable,
+                "watch_created_at": watch_created_at,
+            },
+            message,
+        ))
+    return issues
+
+
+def _execution_funnel_starvation_lower_bound_ts(repo: CryptoGuardRepository) -> str:
+    """08-02 P1-4 (Codex terminal review): starvation stats lower bound =
+    ``max(now - 24h, marker.applied_at)``.
+
+    Pre-marker raw S/A rows (produced by a codebase that never wrote
+    ``llm_plan_verdict`` / ``risk_check`` / plan evidence) must NOT trigger
+    starvation — the error cohort only exists for rows the contract can
+    actually assess. A corrupt/unparseable marker FAILS CLOSED: the bound
+    becomes ``now`` so nothing is provably post-marker (the marker-missing /
+    corrupt state is surfaced separately, never fail-open to current).
+    """
+    now_dt = datetime.now(timezone.utc)
+    cutoff_dt = now_dt - timedelta(seconds=_LLM_DIAGNOSTIC_WINDOW_MS // 1000)
+    marker_ts = _get_execution_funnel_report_contract_marker_ts(repo)
+    if marker_ts is None:
+        return cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        marker_dt = datetime.fromisoformat(str(marker_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OSError):
+        # Corrupt marker -> fail-closed: nothing is provably post-marker.
+        return now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    lower_dt = max(cutoff_dt, marker_dt)
+    return lower_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Shared SQL for the produced S/A cohort (P1-4): post-marker rows whose LLM
+# synthesis CONFIRMED a plan with real plan evidence, whose risk gate PASSED,
+# and whose EFFECTIVE grade is S/A. ``raw_signal_grade`` is deliberately NOT
+# used: an HTF-grade degradation (raw S/A -> effective B/C) or a
+# risk-rejected / LLM-unconfirmed outcome is a legitimate non-executable, not
+# a starvation contradiction.
+_EXECUTION_FUNNEL_PRODUCED_COHORT_SQL = """
+          AND COALESCE(NULLIF(raw_decision_json->>'effective_signal_grade', ''),
+                       signal_grade::text) IN ('S', 'A')
+          AND raw_decision_json->>'llm_plan_verdict' = 'confirmed'
+          AND (
+                (jsonb_typeof(raw_decision_json->'llm_synthesis_trade_plan') = 'object'
+                 AND raw_decision_json->'llm_synthesis_trade_plan' != '{}'::jsonb)
+               OR
+                (raw_decision_json->>'has_trade_plan' = 'true'
+                 AND jsonb_typeof(raw_decision_json->'trade_plan') = 'object'
+                 AND raw_decision_json->'trade_plan' != '{}'::jsonb)
+              )
+          AND raw_decision_json->'risk_check'->>'ok' = 'true'
+"""
+
+
+def _check_execution_funnel_starvation(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-02 P1-3 / P1-4: aggregate live check — PRODUCED S/A decisions in the
+    post-marker 24h window with ZERO final-executable plans in the same window.
+
+    The produced cohort (``strict_signal_count_24h``) is the REAL execution-
+    funnel contradiction base (P1-4): rows with ``llm_plan_verdict=confirmed``,
+    plan evidence (immutable ``llm_synthesis_trade_plan`` OR top-level
+    ``has_trade_plan`` + non-empty ``trade_plan``), ``risk_check.ok=true`` and
+    an EFFECTIVE grade S/A. A funnel that produces S/A decisions but never an
+    executable plan is starved (gates collapse every candidate). Fires at most
+    ONE error. Marker-gated (skips when the contract marker is absent) and
+    SQL-bound by ``created_at >= max(now-24h, marker.applied_at)`` — pre-marker
+    rows and legitimate non-executables (LLM unconfirmed / risk rejected / HTF
+    grade degradation) never trigger.
+    """
+    issues: list[dict[str, Any]] = []
+    if _get_execution_funnel_report_contract_marker_ts(repo) is None:
+        return issues
+    lower_bound = _execution_funnel_starvation_lower_bound_ts(repo)
+    strict_row = repo.conn.execute(
+        "SELECT COUNT(*) AS n FROM ga_decisions"
+        " WHERE raw_decision_json IS NOT NULL"
+        + _EXECUTION_FUNNEL_PRODUCED_COHORT_SQL +
+        "  AND created_at >= %s::timestamptz",
+        (lower_bound,),
+    ).fetchone()
+    strict_count = int(strict_row["n"] or 0) if strict_row else 0
+    executable_row = repo.conn.execute(
+        "SELECT COUNT(*) AS n FROM ga_decisions"
+        " WHERE raw_decision_json IS NOT NULL"
+        + _EXECUTION_FUNNEL_PRODUCED_COHORT_SQL +
+        """
+          AND raw_decision_json->>'plan_execution_state' = 'confirmed'
+          AND raw_decision_json->>'plan_status' = 'executable'
+          AND raw_decision_json->>'has_trade_plan' = 'true'
+          AND jsonb_typeof(raw_decision_json->'trade_plan') = 'object'
+          AND raw_decision_json->'trade_plan' != '{}'::jsonb
+          AND created_at >= %s::timestamptz
+        """,
+        (lower_bound,),
+    ).fetchone()
+    executable_count = int(executable_row["n"] or 0) if executable_row else 0
+    if strict_count == 0 or executable_count > 0:
+        return issues
+    evidence_rows = repo.conn.execute(
+        "SELECT id, symbol FROM ga_decisions"
+        " WHERE raw_decision_json IS NOT NULL"
+        + _EXECUTION_FUNNEL_PRODUCED_COHORT_SQL +
+        "  AND created_at >= %s::timestamptz"
+        " ORDER BY id DESC LIMIT 5",
+        (lower_bound,),
+    ).fetchall()
+    evidence = [{"decision_id": int(x["id"]), "symbol": x["symbol"]} for x in evidence_rows]
+    issues.append(_issue(
+        EXECUTION_FUNNEL_STARVATION, "error",
+        {
+            "strict_signal_count_24h": strict_count,
+            "final_executable_count_24h": executable_count,
+            "window_ms": _LLM_DIAGNOSTIC_WINDOW_MS,
+            "window_hours": 24,
+            "evidence": evidence,
+        },
+        "执行漏斗饥饿：24h 内 strict S/A 决策 " + str(strict_count) +
+        " 条但 final-executable S/A 计划 0 条：每个 S/A 候选都在门控中被清空，"
+        "没有可达执行路径。",
+    ))
     return issues
 
 

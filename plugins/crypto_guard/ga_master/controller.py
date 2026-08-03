@@ -11,6 +11,7 @@ from plugins.crypto_guard.ga_master.risk_gate import RiskGate
 from plugins.crypto_guard.ga_master.skill_orchestrator import SkillOrchestrator
 from plugins.crypto_guard.reasoning.analysis_state import build_market_analysis_state
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_sop_decision
+from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.strategy.shadow_testing import record_shadow_evaluation
 from plugins.crypto_guard.paper.shadow_virtual_trade_updater import DEFAULT_MAX_PENDING_MINUTES
@@ -399,6 +400,217 @@ def _evaluate_shadow_candidate(
         "score": shadow_score,
         "evidence": evidence,
     }
+
+
+def _ensure_risk_rejected_blocker(legacy: dict, risk: dict) -> None:
+    """Ensure a structured ``risk_rejected`` blocker exists on the legacy dict.
+
+    P1-1 (08-02): preserves an existing upstream risk_rejected blocker (e.g.
+    the one ``apply_risk_to_decision`` wrote with the real RR/HTF reasons) and
+    appends a dict blocker only when absent. Always a dict, never a bare
+    string — the structured shape is what reports/diagnostics key on.
+
+    08-02 Finding 4 (P2): the fallback detail must describe the ACTUAL gate
+    that refused the plan, never a fabricated risk claim.
+    ``_finalize_plan_lifecycle`` routes every LLM-confirmed plan that failed
+    the executable test into the risk_rejected branch — including a grade
+    clamped below S/A (hysteresis / clamp) while the risk engine PASSED. In
+    that case ``risk.reasons`` is empty and the old default
+    ``"风控未通过，禁止开仓"`` was a false 风控 assertion. Derive the detail
+    from the grade gate first (grade_adjustments / effective grade), risk
+    reasons second, and only then the generic risk text.
+    """
+    blockers = legacy.get("plan_blockers")
+    if not isinstance(blockers, list):
+        blockers = []
+    for b in blockers:
+        if isinstance(b, dict) and b.get("code") == "risk_rejected":
+            return
+    reasons = [str(r) for r in (risk.get("reasons") or [])][:6]
+    detail = "；".join(reasons)
+    if not detail:
+        effective_grade = str(
+            legacy.get("effective_signal_grade") or legacy.get("signal_grade") or "D"
+        ).upper()
+        if effective_grade not in {"S", "A"}:
+            # The refusal is a grade-gate decision (clamp/hysteresis), not a
+            # risk decision — say so, with the audit codes so operators can
+            # trace the downgrade in grade_adjustments.
+            adjustment_codes = [
+                str(adj.get("code") or "")
+                for adj in (legacy.get("grade_adjustments") or [])
+                if isinstance(adj, dict) and str(adj.get("code") or "")
+            ]
+            grade_reason = f"有效等级 {effective_grade} 不足 S/A，计划不可执行"
+            if adjustment_codes:
+                grade_reason += f"（{'，'.join(adjustment_codes)}）"
+            detail = grade_reason
+        else:
+            detail = "风控未通过，禁止开仓"
+    blockers.append({
+        "code": "risk_rejected",
+        "stage": "risk_gate",
+        "detail": detail,
+    })
+    legacy["plan_blockers"] = blockers
+
+
+def _finalize_plan_lifecycle(legacy: dict, risk: dict) -> None:
+    """P1-1 (08-02): single final plan-lifecycle normalizer.
+
+    Runs exactly once after all risk/hysteresis/clamp/performance/continuity
+    gates, before the action builder and persistence. Computes the final
+    ``plan_execution_state`` / ``plan_status`` / ``plan_origin`` /
+    ``plan_blockers`` atomically from the final gated state. FORBIDDEN
+    "otherwise keep upstream state": every upstream ``plan_execution_state``
+    is rewritten by exactly one branch. Forbidden combinations:
+    confirmed+withheld, no_candidate+candidate, executable+no-plan.
+
+    States:
+      - confirmed: LLM confirmed AND final has_trade_plan=true AND non-empty
+        trade_plan AND risk_ok=true AND effective grade S/A.
+      - risk_rejected: LLM confirmed a plan that the gates refused (risk /
+        account / grade / perf cleared it) — the plan is preserved as
+        candidate, never silently re-labelled no_candidate or unconfirmed.
+      - invalidated: continuity inverted the prior trigger.
+      - unconfirmed: candidate exists but LLM did not confirm (disabled /
+        failed path).
+      - no_candidate: no candidate and no plan.
+    """
+    _candidate = legacy.get("candidate_trade_plan")
+    has_candidate = isinstance(_candidate, dict) and bool(_candidate)
+    _plan = legacy.get("trade_plan")
+    plan_present = isinstance(_plan, dict) and bool(_plan)
+    has_plan_flag = bool(legacy.get("has_trade_plan"))
+    llm_confirmed = legacy.get("plan_origin") == "llm_confirmed"
+    risk_ok = bool((risk or {}).get("ok"))
+    effective_grade = str(
+        legacy.get("effective_signal_grade") or legacy.get("signal_grade") or "D"
+    ).upper()
+    blockers = legacy.get("plan_blockers") or []
+    if not isinstance(blockers, list):
+        blockers = []
+    continuity_invalidated = any(
+        isinstance(b, dict) and b.get("code") == "continuity_trigger_invalidated"
+        for b in blockers
+    )
+    continuity_unavailable = (
+        str(legacy.get("llm_terminal_reason") or "") == "continuity_unavailable"
+        or any(
+            (b.get("code") if isinstance(b, dict) else str(b)) == "continuity_unavailable"
+            for b in blockers
+        )
+    )
+    # An executable claim only when the decision still asks for an order.
+    _claiming = str(legacy.get("decision") or "") in {
+        "", "create_paper_order", "trade_plan_available",
+    }
+
+    if continuity_invalidated:
+        # Codex P1-2: continuity inverted the prior trigger — the plan is
+        # dead regardless of the LLM/risk outcome. ATOMIC fail-closed, mirror
+        # of the risk_rejected branch: unconditional withheld, preserve the
+        # dead plan under candidate_trade_plan, clear the executable fields,
+        # neutralize a surviving create_paper_order/trade_plan_available
+        # claim, keep the structured blocker. FORBIDDEN setdefault — it would
+        # preserve a surviving ``plan_status="executable"`` on a row we label
+        # invalidated.
+        legacy["plan_execution_state"] = "invalidated"
+        legacy["plan_status"] = "withheld"
+        if plan_present and not has_candidate:
+            legacy["candidate_trade_plan"] = legacy["trade_plan"]
+        legacy["has_trade_plan"] = False
+        legacy["trade_plan"] = None
+        if _claiming:
+            legacy["decision"] = "monitor_only"
+        legacy["plan_blockers"] = blockers
+        return
+
+    executable = (
+        llm_confirmed
+        and has_plan_flag
+        and plan_present
+        and risk_ok
+        and effective_grade in {"S", "A"}
+    )
+    if executable:
+        legacy["plan_execution_state"] = "confirmed"
+        legacy["plan_origin"] = "llm_confirmed"
+        legacy["plan_status"] = "executable"
+        if not has_candidate:
+            # Confirmed rows surface the executable plan as candidate too.
+            legacy["candidate_trade_plan"] = legacy["trade_plan"]
+        legacy["plan_blockers"] = []
+        return
+
+    if llm_confirmed:
+        # The LLM DID confirm a plan, but an executable condition failed
+        # (risk/account refused it, or the grade was clamped below S/A, or a
+        # gate cleared has_trade_plan). This is a rejection — never a silent
+        # no_candidate and never an unconfirmed (the LLM really did confirm).
+        legacy["plan_execution_state"] = "risk_rejected"
+        legacy["plan_status"] = "risk_rejected"
+        if plan_present and not has_candidate:
+            legacy["candidate_trade_plan"] = legacy["trade_plan"]
+        legacy["has_trade_plan"] = False
+        legacy["trade_plan"] = None
+        if _claiming:
+            # A rejected plan must not claim an executable decision. Preserve
+            # a gate decision like ``opportunity_watch`` so watch
+            # materialization still applies to the preserved candidate.
+            legacy["decision"] = "monitor_only"
+        _ensure_risk_rejected_blocker(legacy, risk)
+        return
+
+    if has_candidate:
+        # Candidate exists but the LLM did not confirm it (disabled / failed
+        # path). unconfirmed + withheld, never confirmed.
+        legacy["plan_execution_state"] = "unconfirmed"
+        legacy["plan_status"] = "withheld"
+        if legacy.get("plan_origin") == "deterministic_sop":
+            # The report/renderer "规则候选计划已生成，LLM 未确认" label keys on
+            # deterministic_fallback; deterministic_sop only denotes the raw
+            # SOP. Rewrite so the unconfirmed candidate renders correctly.
+            legacy["plan_origin"] = "deterministic_fallback"
+        if plan_present:
+            # Defensive: a gate (e.g. account pause) may have cleared
+            # has_trade_plan but left the plan dict. Never leave an
+            # executable-looking plan on an unconfirmed row.
+            legacy["candidate_trade_plan"] = legacy["trade_plan"]
+            legacy["has_trade_plan"] = False
+            legacy["trade_plan"] = None
+            if _claiming:
+                legacy["decision"] = "monitor_only"
+        legacy["plan_blockers"] = blockers
+        return
+
+    if plan_present:
+        # Defensive: a plan survived with no candidate and no LLM
+        # confirmation. Treat as unconfirmed + withheld, preserving the plan
+        # as candidate.
+        legacy["candidate_trade_plan"] = legacy["trade_plan"]
+        legacy["has_trade_plan"] = False
+        legacy["trade_plan"] = None
+        legacy["plan_execution_state"] = "unconfirmed"
+        legacy["plan_status"] = "withheld"
+        if legacy.get("plan_origin") == "deterministic_sop":
+            legacy["plan_origin"] = "deterministic_fallback"
+        if _claiming:
+            legacy["decision"] = "monitor_only"
+        legacy["plan_blockers"] = blockers
+        return
+
+    # No candidate and no plan.
+    legacy["plan_execution_state"] = "no_candidate"
+    if continuity_unavailable:
+        # S1 (P0-1) contract: a continuity outage keeps plan_status=withheld
+        # and its structured blocker so the operator sees the outage, not a
+        # generic no_plan.
+        legacy.setdefault("plan_status", "withheld")
+        legacy["plan_blockers"] = blockers
+    else:
+        legacy["plan_status"] = "no_plan"
+        legacy["plan_blockers"] = []
 
 
 class GAMasterController:
@@ -816,36 +1028,31 @@ class GAMasterController:
             })
             legacy["grade_adjustments"] = list(grade_adjustments)
 
-        # Phase C (07-07): override plan_execution_state based on risk_gate /
-        # continuity results per design §6.3. Only override the state label
-        # (not the decision outcome) so risk gates are not weakened. The
-        # fields are set initially in run_agent_sop_decision; here we refine
-        # them after all gates have finalized has_trade_plan / plan_blockers /
-        # candidate_trade_plan.
-        _candidate = legacy.get("candidate_trade_plan")
-        _has_candidate = isinstance(_candidate, dict) and bool(_candidate)
-        _has_plan = bool(legacy.get("has_trade_plan") and legacy.get("trade_plan"))
-        _blockers = legacy.get("plan_blockers") or []
-        _continuity_invalidated = any(
-            isinstance(b, dict) and b.get("code") == "continuity_trigger_invalidated"
-            for b in _blockers
-        )
-        if _continuity_invalidated:
-            legacy["plan_execution_state"] = "invalidated"
-        elif (_has_candidate and not _has_plan and not risk.get("ok")
-              and legacy.get("plan_origin") not in {"deterministic_fallback", "deterministic_sop"}):
-            # Risk gate rejected a plan that was executable before risk but got
-            # downgraded. Only applies when plan_origin is NOT deterministic_*
-            # (LLM-failed candidates are already unconfirmed and must stay so;
-            # overwriting them to risk_rejected would hide the LLM failure).
-            legacy["plan_execution_state"] = "risk_rejected"
-        elif not _has_plan and not _has_candidate:
-            legacy["plan_execution_state"] = "no_candidate"
-        # Otherwise: keep the state set by run_agent_sop_decision (confirmed
-        # for LLM-success path, unconfirmed for LLM-failed path with a
-        # candidate, etc.).
+        # P1-1 (08-02): single final plan-lifecycle normalizer. Computes the
+        # final plan_execution_state / plan_status / plan_origin /
+        # plan_blockers atomically from the final gated state — no "otherwise
+        # keep upstream state". Runs exactly once after all risk/hysteresis/
+        # clamp/performance/continuity gates, before the action builder and
+        # persistence. This replaces the old Phase C (07-07) scattered
+        # override block that only patched 3 cases and left the
+        # disabled-with-plan path at confirmed+withheld (the production
+        # contradiction) and the account-risk-rejected path at no_candidate.
+        _finalize_plan_lifecycle(legacy, risk)
 
         feishu_actions = build_feishu_actions(legacy, risk)
+        # 08-02 Finding 2 (P2): build_feishu_actions returns
+        # ``create_opportunity_watch`` unconditionally for WATCH_GRADES (B) and
+        # PUSH_GRADES (S/A) whether or not a structured opportunity watch was
+        # actually materialized in this decision. A watch-less decision must not
+        # re-advertise a watch the funnel never created -- the action list is
+        # persisted and drives the hourly report funnel. Mirror the P0-2 wire-in
+        # gate: keep ``create_opportunity_watch`` only when a structured watch
+        # is present on the decision.
+        if not is_structured_watch(legacy.get("opportunity_watch")):
+            feishu_actions = [
+                action for action in feishu_actions
+                if action != "create_opportunity_watch"
+            ]
         legacy["suggested_actions"] = feishu_actions
 
         previous_state = context.get("previous_analysis_state")

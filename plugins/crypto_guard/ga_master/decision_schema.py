@@ -136,6 +136,16 @@ def controller_decision_from_legacy(
         "counter_evidence": list(legacy.get("counter_evidence") or legacy.get("risk_notes") or ["缺少反向证据记录"]),
         "risk_check": risk_check,
         "trade_plan": legacy.get("trade_plan") if legacy.get("has_trade_plan") else None,
+        # 08-02 P0 (fresh reviewer): the persisted raw_decision_json MUST carry
+        # top-level ``has_trade_plan`` — ga_decision.schema.json requires it
+        # (line 5), repository.create_ga_decision's docstring declares it, and
+        # three consumers read it (hourly_report._decision_row.final_executable,
+        # report_diagnostics._is_final_executable, execution_funnel_starvation
+        # SQL). The controller was the ONLY producer yet silently dropped it,
+        # so every production row rendered final_executable=False while the
+        # P1-3 fixtures (hand-written True) stayed green. Mirrors the same
+        # derivation as the compat shape legacy_decision_from_ga_decision.
+        "has_trade_plan": bool(legacy.get("has_trade_plan") and legacy.get("trade_plan")),
         "candidate_trade_plan": candidate_plan,
         "plan_status": plan_status,
         "plan_source": legacy.get("plan_source") or "deterministic_sop",
@@ -200,6 +210,20 @@ def controller_decision_from_legacy(
         # Phase B (07-07): plan state model (design §6.1)
         "plan_origin": legacy.get("plan_origin"),
         "plan_execution_state": legacy.get("plan_execution_state"),
+        # 08-02 P1-2: immutable LLM synthesis evidence. Captured by
+        # ``_normalize_llm_decision`` BEFORE any risk gate strips the plan,
+        # so reports/diagnostics can distinguish provider/schema success from
+        # plan confirmation even after the live plan is cleared. MUST reach
+        # top level (and thus raw_decision_json) without requiring descent
+        # into raw_legacy_decision. ``llm_synthesis_trade_plan`` is a
+        # deep-copied snapshot — later in-place mutations of ``trade_plan``
+        # (e.g. account risk_percent injection) must never appear in it.
+        "llm_synthesis_signal_grade": legacy.get("llm_synthesis_signal_grade"),
+        "llm_synthesis_decision": legacy.get("llm_synthesis_decision"),
+        "llm_synthesis_has_trade_plan": legacy.get("llm_synthesis_has_trade_plan"),
+        "llm_synthesis_trade_plan": legacy.get("llm_synthesis_trade_plan"),
+        "llm_plan_verdict": legacy.get("llm_plan_verdict"),
+        "llm_plan_source": legacy.get("llm_plan_source"),
         # Phase B (07-07): 5M bias surfaced by _apply_htf_alignment_caps
         # (market_semantics.py). 5M is data-only in TIMEFRAME_CONTEXT_TFS,
         # so it cannot live under timeframe_context (schema

@@ -1192,6 +1192,12 @@ def _create_opportunity_watch_from_gate(
     Uses dedupe_key + UPSERT (ON CONFLICT) to prevent duplicate active watches
     on retry/re-entry. No manual transaction needed.
 
+    The ON CONFLICT predicate matches the P0-2 partial unique index
+    ``idx_opportunity_watches_dedupe`` (``WHERE dedupe_key IS NOT NULL AND
+    status = 'active'``): a conflict only when an ACTIVE watch holds the key,
+    so a terminal watch (triggered/invalidated/expired) releases it and a
+    fresh active watch can be re-created with the same key.
+
     Stores a structured account_feedback_recheck watch condition so the
     opportunity watcher can evaluate it deterministically.
 
@@ -1230,7 +1236,7 @@ def _create_opportunity_watch_from_gate(
             INSERT INTO opportunity_watches
             (symbol, direction, watch_reason, watch_condition_json, status, ga_decision_id, expires_at, dedupe_key)
             VALUES (%s, %s, %s, %s, 'active', %s, %s, %s)
-            ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
+            ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL AND status = 'active' DO UPDATE SET
                 watch_condition_json = excluded.watch_condition_json,
                 expires_at = excluded.expires_at,
                 watch_reason = excluded.watch_reason,

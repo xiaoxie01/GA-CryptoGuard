@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import multiprocessing as _mp_mod
@@ -15,6 +16,10 @@ from plugins.crypto_guard.reasoning.decision_schema import (
     validate_json_detail,
 )
 from plugins.crypto_guard.reasoning.ga_judge import run_ga_sop_decision
+from plugins.crypto_guard.reasoning.watch_conditions import (
+    is_structured_watch,
+    normalize_opportunity_watch,
+)
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
 from plugins.crypto_guard.utils import _strict_positive_int_ms
@@ -581,6 +586,45 @@ def _try_repair_suggested_actions(
         return decision, [], False
     repaired = dict(decision)
     repaired["suggested_actions"] = normalized
+    return repaired, notes, True
+
+
+def _try_repair_opportunity_watch(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> tuple[dict[str, Any], list[str], bool]:
+    """Repair ``opportunity_watch`` to the structured watcher contract.
+
+    08-02 P0-3: the ga_decision schema now FORBIDS bare-string
+    ``conditions`` (text like "15M 收盘突破上沿或跌破下沿" cannot be
+    evaluated by the watcher — it waited forever and the alert never
+    enqueued). When the raw payload fails schema here, rebuild the watch
+    deterministically from the decision's plan (``trade_plan`` or the
+    preserved ``candidate_trade_plan``) via ``normalize_opportunity_watch``
+    — never translate free text into conditions. Runs BEFORE
+    ``_try_repair_suggested_actions`` so the canonical rebuild sees the
+    corrected (or fail-closed None) watch.
+
+    Returns ``(repaired_decision, audit_notes, changed_flag)``. When the
+    watch is already structured (or None with no buildable plan), returns
+    ``(decision, [], False)`` and the caller falls through. On fail-closed
+    (unbuildable), sets ``opportunity_watch=None`` and drops
+    ``create_opportunity_watch`` from ``suggested_actions`` so the manual
+    button never fires on a watch-less decision.
+    """
+    raw = decision.get("opportunity_watch")
+    if is_structured_watch(raw):
+        return decision, [], False
+    plan = decision.get("trade_plan") or decision.get("candidate_trade_plan")
+    normalized, notes = normalize_opportunity_watch(raw, plan)
+    if normalized is None and not notes:
+        # No watch, no plan — nothing to repair.
+        return decision, [], False
+    repaired = dict(decision)
+    repaired["opportunity_watch"] = normalized
+    if normalized is None:
+        sa = repaired.get("suggested_actions")
+        if isinstance(sa, list) and "create_opportunity_watch" in sa:
+            repaired["suggested_actions"] = [a for a in sa if a != "create_opportunity_watch"]
     return repaired, notes, True
 
 
@@ -1706,6 +1750,7 @@ def _run_single_llm_attempt(
             _try_repair_decision,
             _try_repair_entry_trigger_confirmation,
             _try_repair_take_profits,
+            _try_repair_opportunity_watch,
             _try_repair_suggested_actions,
         )
         working = decision
@@ -1718,6 +1763,8 @@ def _run_single_llm_attempt(
         suggested_actions_changed = False
         original_entry_trigger_note: str | None = None
         original_suggested_actions: Any = None
+        opportunity_watch_changed = False
+        original_opportunity_watch: Any = None
         for _fn in repair_fns:
             working, notes, changed = _fn(working, snapshot)
             if changed:
@@ -1737,6 +1784,11 @@ def _run_single_llm_attempt(
                     orig_tp = decision.get("trade_plan")
                     if isinstance(orig_tp, dict):
                         original_take_profits = orig_tp.get("take_profits")
+                elif _fn is _try_repair_opportunity_watch:
+                    opportunity_watch_changed = True
+                    # Capture the original (pre-repair) opportunity_watch for
+                    # audit before the rebuild overwrote it.
+                    original_opportunity_watch = decision.get("opportunity_watch")
                 elif _fn is _try_repair_suggested_actions:
                     suggested_actions_changed = True
                     # Capture the original (pre-repair) suggested_actions for
@@ -1754,7 +1806,8 @@ def _run_single_llm_attempt(
             # decision actually carries a confirmed trade_plan. When the
             # LLM succeeded (repaired) but produced NO plan, keep the
             # fallback's ``plan_origin`` — nothing was confirmed.
-            if working.get("has_trade_plan") and working.get("trade_plan"):
+            if (working.get("has_trade_plan") and working.get("trade_plan")
+                    and working.get("llm_plan_source") == "llm_provided"):
                 working["plan_origin"] = "llm_confirmed"
                 working["plan_execution_state"] = "confirmed"
             existing_notes = list(working.get("risk_notes") or [])
@@ -1777,6 +1830,10 @@ def _run_single_llm_attempt(
                 parse_meta["suggested_actions_repaired"] = True
                 if original_suggested_actions is not None:
                     parse_meta["original_suggested_actions"] = original_suggested_actions
+            if opportunity_watch_changed:
+                parse_meta["opportunity_watch_repaired"] = True
+                if original_opportunity_watch is not None:
+                    parse_meta["original_opportunity_watch"] = original_opportunity_watch
             working["llm_parse_meta"] = parse_meta
             attempt_meta["llm_status"] = "ok"
             attempt_meta["llm_error_category"] = None
@@ -1820,7 +1877,8 @@ def _run_single_llm_attempt(
     # plan WAS confirmed) and leave ``plan_execution_state`` as normalize left
     # it. The §8 attempt_meta envelope is still merged (it records that the
     # call succeeded regardless of whether a plan was produced).
-    if decision.get("has_trade_plan") and decision.get("trade_plan"):
+    if (decision.get("has_trade_plan") and decision.get("trade_plan")
+            and decision.get("llm_plan_source") == "llm_provided"):
         decision["plan_origin"] = "llm_confirmed"
         decision["plan_execution_state"] = "confirmed"
     attempt_meta["llm_status"] = "ok"
@@ -1832,6 +1890,74 @@ def _run_single_llm_attempt(
     attempt_meta["llm_repair_event"] = repair_event
     decision.update(attempt_meta)
     return decision, attempt_meta
+
+
+# 08-02 P0-1: keys the raw deterministic reference is FORBIDDEN to carry.
+# The old ``run_agent_sop_decision(use_llm=False)`` prompt fallback injected
+# these (llm_status="disabled", llm_disabled blocker, plan_status="withheld",
+# fallback_trade_plan_blocked=True, analysis_source, stale
+# plan_execution_state) so the LLM read "deterministic engine disabled and
+# plan withheld". ``run_ga_sop_decision`` never sets llm_* fields, so the
+# builder below uses it as the source and strips any future drift.
+_RAW_DETERMINISTIC_REFERENCE_FORBIDDEN_KEYS = frozenset({
+    "llm_status",
+    "llm_terminal_reason",
+    "llm_fallback_reason",
+    "llm_attempt_count",
+    "llm_provider_call_count",
+    "llm_latency_ms",
+    "llm_model",
+    "llm_prompt_bytes",
+    "llm_continuity_included",
+    "llm_schedule_round",
+    "llm_schedule_position",
+    "plan_execution_state",
+    "fallback_trade_plan_blocked",
+    "fallback_block_reason",
+    "llm_fallback_blocked",
+    "analysis_source",
+})
+_RAW_DETERMINISTIC_REFERENCE_FORBIDDEN_BLOCKER_CODES = frozenset({
+    "llm_disabled",
+    "llm_failed_fallback",
+    "fallback_blocked",
+})
+
+
+def _build_raw_deterministic_reference(
+        snapshot: dict[str, Any]) -> dict[str, Any]:
+    """08-02 P0-1: build the prompt's ``deterministic_reference`` from the
+    CLEAN raw deterministic SOP instead of the disabled ``use_llm=False``
+    fallback.
+
+    ``run_agent_sop_decision(use_llm=False)`` marks the decision
+    ``llm_status="disabled"`` / ``llm_terminal_reason="llm_disabled"`` and then
+    ``apply_risk_to_decision`` adds an ``llm_disabled`` blocker +
+    ``plan_status="withheld"`` and clears the trade plan (fallback stripping).
+    Feeding that into the prompt makes the LLM read "deterministic engine
+    disabled and plan withheld" — the audit's P0-1 pollution chain.
+
+    ``run_ga_sop_decision`` never touches llm_* fields, so it is the correct
+    source: it preserves the original candidate/trade plan, grade, confidence,
+    direction and structural evidence, and only carries REAL gate blockers
+    (continuity-trigger invalidated / direction-flip without closed-candle
+    confirmation). The reference is normalized so it can never smuggle the
+    forbidden markers even if the raw SOP drifts.
+    """
+    raw = run_ga_sop_decision(snapshot) or {}
+    reference = dict(raw)
+    # Deterministic SOP is the origin; never inherit anything else.
+    reference["plan_origin"] = "deterministic_sop"
+    for key in _RAW_DETERMINISTIC_REFERENCE_FORBIDDEN_KEYS:
+        reference.pop(key, None)
+    blockers = reference.get("plan_blockers") or []
+    if blockers:
+        reference["plan_blockers"] = [
+            b for b in blockers
+            if not (isinstance(b, dict) and str(b.get("code") or "")
+                    in _RAW_DETERMINISTIC_REFERENCE_FORBIDDEN_BLOCKER_CODES)
+        ]
+    return reference
 
 
 def fair_llm_call_adapter(
@@ -1878,12 +2004,13 @@ def fair_llm_call_adapter(
     budget skip not a failure) so the coordinator records a skip and treats
     it as terminal non-retryable.
     """
-    # Build a deterministic fallback for the prompt builder (it needs a
-    # baseline decision for the deterministic-reference section). Use the
-    # SOP fallback path so the prompt is well-formed even when the LLM has
-    # not yet decided. ``run_agent_sop_decision(use_llm=False)`` returns the
-    # deterministic decision WITHOUT touching the breaker / LLM.
-    fallback = run_agent_sop_decision(snapshot, use_llm=False)
+    # 08-02 P0-1: build the deterministic reference for the prompt from the
+    # CLEAN raw SOP. The old ``run_agent_sop_decision(use_llm=False)`` path
+    # injected llm_status="disabled" + an llm_disabled fallback blocker +
+    # plan_status="withheld" and stripped the trade plan, so the LLM read
+    # "deterministic engine disabled and plan withheld". The raw SOP preserves
+    # the original candidate/trade plan, grade, confidence and direction.
+    fallback = _build_raw_deterministic_reference(snapshot)
 
     # Resolve config name + model (cached on breaker, same as the retry
     # wrapper). The adapter does NOT call breaker.record_attempt — the
@@ -3750,6 +3877,19 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     decision.setdefault("strategy_version", fallback.get("strategy_version", "1.0"))
     decision["analysis_source"] = "llm_agent"
     decision["llm_status"] = "ok"
+    # 08-02 P1-2: record whether the LLM itself provided an executable
+    # trade_plan BEFORE the S/A auto-build block below. An S/A grade with no
+    # LLM plan triggers a SYSTEM auto-build; that system-built plan must
+    # never be marked ``plan_origin="llm_confirmed"`` (the caller gates the
+    # confirmed marking on ``llm_plan_source=="llm_provided"``). These are
+    # plain locals that survive the ``decision = normalize_market_semantics(...)``
+    # rebind at the end of this function.
+    _llm_provided_plan = bool(
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("trade_plan"), dict)
+        and bool(candidate.get("trade_plan"))
+    )
+    _auto_built_plan = False
     # Phase-2 P2-1 (07-27): clear/rebuild fallback-only transient fields on
     # LLM success. The ``decision = dict(fallback)`` merge (line 3331) copies
     # the risk-processed disabled fallback's transient fields onto the
@@ -3872,6 +4012,19 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         decision["risk_notes"] = notes
         # Skip the auto-build trade plan block — do NOT fall through to the
         # grade-based auto-build logic below.
+        # 08-02 P1-2: immutable synthesis evidence on the degraded path. Data
+        # degradation is a synthesis-layer fail-closed gate (not a risk gate):
+        # record the FINAL normalized synthesis state so diagnostics never read
+        # a cleared-then-relabelled plan as "LLM confirmed". A degraded row is
+        # additionally identifiable via ``analysis_degraded`` /
+        # ``degraded_reason``, so the lost pre-degradation plan signal is not
+        # a gap.
+        decision["llm_synthesis_signal_grade"] = "C"
+        decision["llm_synthesis_decision"] = "monitor_only"
+        decision["llm_synthesis_has_trade_plan"] = False
+        decision["llm_synthesis_trade_plan"] = None
+        decision["llm_plan_verdict"] = "no_plan"
+        decision["llm_plan_source"] = "none"
         return decision
 
     # 当 LLM 给出 A/S 级但没有 trade_plan 时，自动补建
@@ -3886,6 +4039,9 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
                 decision["has_trade_plan"] = True
                 decision["decision"] = "trade_plan_available"
                 decision.setdefault("risk_notes", []).append("trade_plan 由系统自动补建（LLM 未生成）。")
+                # 08-02 P1-2: this plan was SYSTEM-built (LLM did not provide
+                # it) — it must never be marked llm_confirmed downstream.
+                _auto_built_plan = True
 
     # 评分稳定：LLM 等级不能比确定性评分低超过 1 级
     from plugins.crypto_guard.strategy.grade_config import grade_order_value, grade_from_order_value
@@ -3947,11 +4103,35 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
             decision["risk_notes"] = notes
     if decision.get("decision") == "trade_plan_available":
         decision["has_trade_plan"] = bool(decision.get("trade_plan"))
+    # P0-3 (08-02): normalize the LLM/synthesis watch to the structured
+    # watcher contract. Bare-string conditions are DROPPED (never translated
+    # from free text); if none survive, conditions are built deterministically
+    # from the decision's plan (``trade_plan`` or the preserved
+    # ``candidate_trade_plan``) — pullback/breakout/reclaim + stop
+    # invalidation; if unbuildable, fail-closed to None and the
+    # ``create_opportunity_watch`` action is dropped. When the LLM explicitly
+    # produced NO watch, it stays None (the P0-2 effect layer decides on auto
+    # materialization).
     watch = decision.get("opportunity_watch")
-    if isinstance(watch, dict):
-        watch = dict(watch)
-        watch["direction"] = _normalize_watch_direction(watch.get("direction"), decision.get("trade_plan"))
-        decision["opportunity_watch"] = watch
+    if watch is not None:
+        plan_for_watch = decision.get("trade_plan") or decision.get("candidate_trade_plan")
+        normalized_watch, watch_notes = normalize_opportunity_watch(watch, plan_for_watch)
+        if normalized_watch is None and watch_notes:
+            # Fail-closed: no auto watch -> drop the create action so the
+            # manual button never fires on a watch-less decision.
+            sa = decision.get("suggested_actions")
+            if isinstance(sa, list) and "create_opportunity_watch" in sa:
+                decision["suggested_actions"] = [a for a in sa if a != "create_opportunity_watch"]
+            notes = list(decision.get("risk_notes") or [])
+            notes.extend(watch_notes)
+            decision["risk_notes"] = notes
+            decision["opportunity_watch"] = None
+        else:
+            decision["opportunity_watch"] = normalized_watch
+            if watch_notes:
+                notes = list(decision.get("risk_notes") or [])
+                notes.extend(watch_notes)
+                decision["risk_notes"] = notes
 
     # Deterministic consistency override (P0): strip forbidden executable
     # phrases from final_summary when the structured execution gate is not
@@ -4015,6 +4195,37 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         notes = list(decision.get("risk_notes") or [])
         notes.append("final_summary 已由 canonical deterministic summary 覆盖。")
         decision["risk_notes"] = notes
+    # 08-02 P1-2: immutable LLM synthesis evidence captured BEFORE any risk
+    # gate strips the plan. ``apply_risk_to_decision`` re-validates and may
+    # clear trade_plan / has_trade_plan on fallback-block or risk rejection,
+    # and the controller finalizer then rewrites plan_execution_state — so the
+    # synthesis fields record what the synthesis layer actually produced,
+    # distinguishing provider/schema success (llm_status="ok") from PLAN
+    # CONFIRMATION (llm_plan_verdict). ``llm_synthesis_trade_plan`` is
+    # deep-copied so later in-place gate mutations (e.g. the controller's
+    # risk_percent injection) can never alter the audit record.
+    #
+    # Verdict/source mapping:
+    #   - LLM provided a trade_plan and it survived synthesis  -> confirmed / llm_provided
+    #   - S/A grade but NO LLM plan, system auto-built one      -> auto_built / auto_built
+    #   - no plan at all                                         -> no_plan / none
+    # The caller gates plan_origin="llm_confirmed" on
+    # llm_plan_source=="llm_provided", so auto-built plans are never labelled
+    # as LLM-confirmed.
+    _syn_plan = decision.get("trade_plan")
+    _syn_has_plan = bool(decision.get("has_trade_plan")) and isinstance(_syn_plan, dict)
+    if _auto_built_plan and _syn_has_plan:
+        _llm_verdict, _llm_source = "auto_built", "auto_built"
+    elif _llm_provided_plan and _syn_has_plan:
+        _llm_verdict, _llm_source = "confirmed", "llm_provided"
+    else:
+        _llm_verdict, _llm_source = "no_plan", "none"
+    decision["llm_synthesis_signal_grade"] = str(decision.get("signal_grade") or "D").upper()
+    decision["llm_synthesis_decision"] = str(decision.get("decision") or "")
+    decision["llm_synthesis_has_trade_plan"] = _syn_has_plan
+    decision["llm_synthesis_trade_plan"] = copy.deepcopy(_syn_plan) if _syn_has_plan else None
+    decision["llm_plan_verdict"] = _llm_verdict
+    decision["llm_plan_source"] = _llm_source
     return decision
 
 

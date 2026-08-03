@@ -708,7 +708,12 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         }
 
         decision = _normalize_llm_decision(candidate, snapshot, fallback)
-        self.assertIsNone(decision["opportunity_watch"]["direction"])
+        # P0-3 (08-02): "bidirectional" direction + bare-string conditions
+        # cannot be evaluated by the watcher, and no trade_plan exists to
+        # build deterministic conditions from -> fail-closed to None (no auto
+        # watch), and create_opportunity_watch is dropped.
+        self.assertIsNone(decision["opportunity_watch"])
+        self.assertNotIn("create_opportunity_watch", decision["suggested_actions"])
         ok, err = validate_json("ga_decision.schema.json", decision)
         self.assertTrue(ok, err)
 
@@ -1283,7 +1288,7 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                     "direction": "LONG",
                     "reason": "等待突破确认",
                     "conditions": [{"type": "breakout", "side": "LONG", "level": 101.0, "timeframe": "15m"}],
-                    "invalid_condition": {"type": "close_below", "level": 95.0},
+                    "invalid_condition": {"type": "close_below", "side": "LONG", "level": 95.0},
                     "expires_minutes": 60,
                 },
             },
@@ -1390,10 +1395,16 @@ class CryptoGuardSmokeTest(unittest.TestCase):
                 )
             self.repo.upsert_candles(rows)
         structured_update = update_opportunity_watches(self.repo, analysis_time_utc=base + span * 2 - 1)
-        self.assertEqual(structured_update["triggered"], 3)
+        # 08-02 Codex P0 (terminal-review round 2): cvd_confirmation is REMOVED
+        # (the watcher only compared the condition's OWN persisted
+        # flow_confirmation string — never the real order-flow — so a LONG cvd
+        # watch fired immediately on a static match). An existing cvd watch is
+        # now UNTRIGGERABLE: it must never auto-trigger. Only the two
+        # price-kind watches (pullback + reclaim) trigger.
+        self.assertEqual(structured_update["triggered"], 2)
         self.assertEqual(self.repo.get_opportunity_watch(pullback_id)["status"], "triggered")
         self.assertEqual(self.repo.get_opportunity_watch(reclaim_id)["status"], "triggered")
-        self.assertEqual(self.repo.get_opportunity_watch(cvd_id)["status"], "triggered")
+        self.assertEqual(self.repo.get_opportunity_watch(cvd_id)["status"], "active")
 
         invalid_id = self.repo.create_opportunity_watch(
             "ETHUSDT",
@@ -1430,8 +1441,8 @@ class CryptoGuardSmokeTest(unittest.TestCase):
             "SOLUSDT",
             {
                 "direction": "LONG",
-                "reason": "等待 CVD 确认",
-                "conditions": [{"type": "cvd_confirmation", "side": "LONG", "flow_confirmation": "supports_long"}],
+                "reason": "等待回踩确认",
+                "conditions": [{"type": "pullback", "side": "LONG", "level": 90.0}],
                 "invalid_condition": None,
             },
             expires_at=expired_at,
@@ -37515,9 +37526,11 @@ class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
         """End-to-end: real controller produces llm_status=failed row with
         candidate_trade_plan; delete the candidate; diagnostic must fire.
 
-        This catches the P1-1 defect: with ``and raw.get('has_trade_plan') is False``
-        the diagnostic would NOT fire on real controller rows because
-        controller_decision_from_legacy omits has_trade_plan at top level.
+        Catches the P1-1 defect: the diagnostic MUST NOT depend on top-level
+        has_trade_plan. 08-02 P0 made controller_decision_from_legacy emit
+        has_trade_plan (schema contract), so this test proves independence by
+        deleting candidate_trade_plan AND has_trade_plan and asserting the
+        diagnostic still fires.
         """
         import json as _json
         from unittest.mock import patch
@@ -37575,15 +37588,18 @@ class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
         self.assertEqual(str(raw.get("llm_status") or "").lower(), "failed")
         self.assertIsInstance(raw.get("candidate_trade_plan"), dict)
 
-        # Confirm P1-1 root cause: has_trade_plan is NOT at top level
-        # of raw_decision_json for real controller rows (it lives in
-        # raw_legacy_decision). The old ``and raw.get('has_trade_plan') is False``
-        # condition therefore never matched.
-        self.assertNotIn(
-            "has_trade_plan", raw,
-            "Real controller rows must NOT have has_trade_plan at top level "
-            "(controller_decision_from_legacy omits it); the diagnostic must "
-            "not depend on this field.",
+        # 08-02 P0 (fresh reviewer) contract: the ONLY ga_decision producer
+        # (controller_decision_from_legacy) MUST emit top-level has_trade_plan
+        # (ga_decision.schema.json requires it; three consumers read it — the
+        # pre-fix producer silently dropped it, so every production row rendered
+        # final_executable=False while P1-3 hand-written fixtures stayed green).
+        # On this real llm_status=failed row it must be present and False.
+        self.assertIs(
+            raw.get("has_trade_plan"),
+            False,
+            "Real controller row must carry top-level has_trade_plan=False "
+            "(schema contract; 08-02 P0 producer fix). The old assertion that "
+            "the producer omits has_trade_plan encoded the pre-fix bug.",
         )
 
         # Baseline: diagnostic does NOT fire on healthy real controller row
@@ -37595,22 +37611,26 @@ class TestPhaseH07_05RealControllerDiagnosticPath(unittest.TestCase):
             "the diagnostic.",
         )
 
-        # Inject fault: delete candidate_trade_plan from the persisted row
+        # Inject fault: delete candidate_trade_plan (and has_trade_plan, proving
+        # the diagnostic does NOT depend on that field) from the persisted row
         raw.pop("candidate_trade_plan", None)
+        raw.pop("has_trade_plan", None)
         self.conn.execute(
             "UPDATE ga_decisions SET raw_decision_json = %s WHERE id = %s",
             (_json.dumps(raw), ga_id),
         )
         self.conn.commit()
 
-        # Diagnostic MUST fire on the mutated real-controller row
+        # Diagnostic MUST fire on the mutated real-controller row — with
+        # has_trade_plan ALSO removed, so the diagnostic is proven independent
+        # of that field (the field is now a schema-required producer output).
         result = diagnose_report_accuracy(self.repo)
         codes = [i["type"] for i in result["issues"]]
         self.assertIn(
             MISSING_CANDIDATE_ON_LLM_FAILURE, codes,
-            "After deleting candidate_trade_plan from a real llm_status=failed "
-            "row, the diagnostic MUST fire. Pre-fix (with has_trade_plan guard) "
-            "this would NOT fire because has_trade_plan is absent at top level.",
+            "After deleting candidate_trade_plan AND has_trade_plan from a real "
+            "llm_status=failed row, the diagnostic MUST still fire — it keys on "
+            "llm_status/plan_status/candidate_trade_plan only, never has_trade_plan.",
         )
 
 

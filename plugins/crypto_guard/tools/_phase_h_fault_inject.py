@@ -93,6 +93,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     """
     from plugins.crypto_guard.storage.migrations import (
         _ensure_btc9_trade_gate_contract_marker,
+        _ensure_execution_funnel_report_contract_marker,
         _ensure_hourly_decision_context_continuity_contract_marker,
         _ensure_hourly_market_semantic_accuracy_contract_marker,
         _ensure_hourly_report_accuracy_r4_contract_marker,
@@ -123,6 +124,11 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # LLM diagnostics (_check_llm_failure_rate_high / _check_llm_circuit_breaker_open)
     # fail-closed skip themselves and the breaker-open fault seed cannot fire.
     _ensure_llm_schema_breaker_preset_integrity_marker(cur)
+    # 08-03 Codex P2-4 (terminal-review rework): execution-funnel report-contract
+    # marker. Without it the Phase H scratch-schema report run emits a spurious
+    # execution_funnel_report_contract_marker_missing finding (Phase I's
+    # _ensure_all_contract_markers already seeds it; Phase H now mirrors).
+    _ensure_execution_funnel_report_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 

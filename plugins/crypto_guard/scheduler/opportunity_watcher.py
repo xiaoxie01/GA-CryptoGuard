@@ -6,6 +6,7 @@ from typing import Any
 
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
+from plugins.crypto_guard.reasoning.watch_conditions import SUPPORTED_WATCH_CONDITION_KINDS
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository
 from plugins.crypto_guard.utils import latest_closed_close_time_ms, utc_ms
 
@@ -109,6 +110,29 @@ def evaluate_watch(repo: CryptoGuardRepository, watch: dict[str, Any], *, analys
     if triggered:
         reasons = [item["reason"] for item in hits if item["hit"]]
         return _result(watch, "triggered", "；".join(reasons), condition_results=hits, latest_candle=latest)
+    # P0-3 (08-02): never silently wait forever on conditions the watcher
+    # cannot evaluate (bare-string / unknown-kind from pre-fix rows). Surface
+    # an explicit ``untriggerable`` marker so diagnostics/report can flag the
+    # watch instead of letting it expire silently.
+    #
+    # 08-02 Finding 5 (P2): the marker means the WHOLE watch is dead — every
+    # condition is untriggerable, so nothing can ever fire. That is why this is
+    # ``all(...)``, not ``any(...)``: a MIXED watch (one structured condition
+    # that can still trigger + one pre-fix text/unknown condition) must stay a
+    # normal waiting watch, never declared dead. The dead sub-condition is NOT
+    # hidden — it survives in ``condition_results`` as the per-condition
+    # ``untriggerable`` flag, which is exactly what the P1-3 diagnostic
+    # (_check_opportunity_watch_untriggerable_condition) reads to flag ANY
+    # untriggerable condition (data quality) without contradicting this
+    # whole-watch runtime marker.
+    if all(item.get("untriggerable") for item in hits):
+        result = _result(
+            watch, "waiting",
+            "监控条件为文本/未知/缺少触发值，无法触发，等待人工或后续结构化确认",
+            condition_results=hits, latest_candle=latest,
+        )
+        result["untriggerable"] = True
+        return result
     return _result(watch, "waiting", "尚未满足触发条件", condition_results=hits, latest_candle=latest)
 
 
@@ -299,14 +323,48 @@ def _check_account_feedback_recheck(
 
 
 def _condition_hit(condition: Any, latest: dict[str, Any], previous: dict[str, Any] | None, watch: dict[str, Any]) -> dict[str, Any]:
+    # P0-3 (08-02): bare-string / non-dict / unknown-kind conditions are
+    # UNTRIGGERABLE — the watcher will never be able to evaluate them, so the
+    # ``untriggerable`` marker lets evaluate_watch report that explicitly
+    # instead of silently waiting forever. Known kinds that simply have not
+    # matched yet (e.g. reclaim before a previous candle exists) stay plain
+    # waiting.
     if isinstance(condition, str):
-        return {"hit": False, "reason": f"文本条件等待人工或后续结构化确认：{condition}"}
+        return {"hit": False, "reason": f"文本条件等待人工或后续结构化确认：{condition}", "untriggerable": True}
     if not isinstance(condition, dict):
-        return {"hit": False, "reason": "条件格式不支持"}
+        return {"hit": False, "reason": "条件格式不支持", "untriggerable": True}
 
     kind = str(condition.get("type") or condition.get("kind") or "").lower()
     side = str(condition.get("side") or condition.get("direction") or watch.get("direction") or "").upper()
-    level = _float_or_none(condition.get("level") or condition.get("price"))
+
+    # 08-02 Codex P0 (terminal-review round 2): the cvd_confirmation branch was
+    # REMOVED. It only compared the condition's OWN persisted flow_confirmation
+    # string to supports_long/supports_short (never the real analysis-time
+    # order-flow), so a LONG cvd watch fired immediately on a static match and
+    # every other value never fired — a fake CVD trigger. ``cvd_confirmation``
+    # is no longer a supported kind. The unknown-kind check runs BEFORE level
+    # extraction so an unsupported kind is always reported "未知条件类型"
+    # (untriggerable) regardless of what level/price it carries — a cvd watch can
+    # never auto-trigger and the diagnostic flags it as untriggerable. The
+    # persisted flow_confirmation can never masquerade as live CVD.
+    if kind not in SUPPORTED_WATCH_CONDITION_KINDS:
+        # Unknown condition kind — the watcher cannot evaluate it. Untriggerable.
+        return {"hit": False, "reason": f"未知条件类型：{kind}（等待人工或后续结构化确认）", "untriggerable": True}
+
+    # 08-02 R2 P2-1 (fresh reviewer): strict level/price validation mirroring
+    # ``_condition_is_untriggerable``. The pre-fix coercion helper coerced
+    # True -> 1.0 and "100" -> 100.0, so a supported kind carrying a bool
+    # or numeric-string "level" silently became triggerable — diverging from the
+    # diagnostic's fail-closed contract. A usable trigger level must be a real
+    # positive number; anything else is UNTRIGGERABLE (the watcher can never
+    # evaluate it), never a silent permanent wait.
+    level = condition.get("level")
+    if level is None:
+        level = condition.get("price")
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or float(level) <= 0:
+        return {"hit": False, "reason": f"条件 {kind} 缺少可用的 level/price，无法触发", "untriggerable": True}
+    level = float(level)
+
     close = float(latest["close"])
     high = float(latest["high"])
     low = float(latest["low"])
@@ -336,11 +394,8 @@ def _condition_hit(condition: Any, latest: dict[str, Any], previous: dict[str, A
         if side in {"SHORT", "BEARISH"}:
             hit = previous_close > level and close < level
             return {"hit": hit, "reason": f"从 {level} 上方重新跌回"}
-    if kind == "cvd_confirmation":
-        flow = str(condition.get("flow_confirmation") or condition.get("value") or "").lower()
-        expected = "supports_long" if side in {"LONG", "BULLISH"} else "supports_short"
-        return {"hit": flow == expected, "reason": f"CVD/order-flow 确认为 {flow or 'not_available'}"}
-    return {"hit": False, "reason": f"未知或未满足条件：{condition}"}
+    # Known kind, not yet matched — wait for the next candle.
+    return {"hit": False, "reason": f"未满足条件：{condition}"}
 
 
 def _result(
@@ -394,15 +449,6 @@ def _load_json(raw: Any, default: Any) -> Any:
         return json.loads(raw)
     except Exception:
         return default
-
-
-def _float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
 
 
 def _candle_summary(candle: dict[str, Any] | None) -> dict[str, Any] | None:

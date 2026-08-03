@@ -337,11 +337,13 @@ CREATE TABLE IF NOT EXISTS opportunity_watches (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_opportunity_status_symbol ON opportunity_watches(status, symbol);
--- Unique partial dedupe index: only one active watch per dedupe_key. NULL
--- dedupe_key rows (non-deduplicated watches) are unconstrained.
+-- Unique partial dedupe index: only one ACTIVE watch per dedupe_key. NULL
+-- dedupe_key rows (non-deduplicated watches) are unconstrained. A terminal
+-- watch (triggered/invalidated/expired) releases its dedupe_key so a fresh
+-- active watch can be re-created with the same key (P0-2 dedupe contract).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_watches_dedupe
     ON opportunity_watches(dedupe_key)
-    WHERE dedupe_key IS NOT NULL;
+    WHERE dedupe_key IS NOT NULL AND status = 'active';
 
 -- ── paper_accounts ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS paper_accounts (

@@ -33,6 +33,7 @@ restart, no commit/push/finish-work.
 from __future__ import annotations
 
 import math
+from unittest.mock import patch
 
 import pytest
 
@@ -331,6 +332,44 @@ class TestPgDirectionFlipClosedCandleP1_3:
             assert decision["plan_status"] == "executable"
             codes = [str(b.get("code") or "") for b in (decision.get("plan_blockers") or [])]
             assert "direction_flip_without_closed_candle_confirmation" not in codes
+        finally:
+            handle.close()
+
+    def test_flip_watch_fail_closed_note_is_preserved(self) -> None:
+        """08-02 review P2-B: when the flip-gate branch WANTS a watch but the
+        watch normalizer cannot build structured conditions, the fail-closed
+        note MUST survive into ``risk_notes``.
+
+        RED mechanics: the note was set inside the flip branch and then
+        RE-INITIALIZED to None by a later statement in the same branch, so the
+        decision row shipped without any explanation of why no auto watch was
+        materialized. With the fix the note is initialized once BEFORE the
+        branch and only ever set, so it is appended to ``risk_notes``.
+        """
+        handle = make_repo()
+        try:
+            repo = handle.repo
+            snapshot = _build_snapshot_with_continuity(
+                repo, prev_side="SHORT", prev_analysis_time=_LAST_CLOSE - 20 * _SPAN_15M,
+            )
+            # No BOS injected -> the SHORT->LONG flip is unconfirmed and enters
+            # the flip branch; force _build_sop_watch to fail-closed (None) so
+            # the note path is exercised.
+            with patch(
+                "plugins.crypto_guard.reasoning.ga_judge._build_sop_watch",
+                return_value=None,
+            ):
+                decision = run_ga_sop_decision(snapshot)
+            assert decision["decision"] == "wait_for_pullback"
+            assert decision["has_trade_plan"] is False
+            notes = [str(n) for n in (decision.get("risk_notes") or [])]
+            assert any("fail-closed" in n for n in notes), (
+                "P2-B: the flip-gate fail-closed watch note must be preserved "
+                f"in risk_notes; got {notes}"
+            )
+            assert "create_opportunity_watch" not in (
+                decision.get("suggested_actions") or []
+            ), "P2-B: a watch-less flip must not suggest create_opportunity_watch"
         finally:
             handle.close()
 

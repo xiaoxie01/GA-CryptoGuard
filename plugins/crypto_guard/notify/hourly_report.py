@@ -11,7 +11,10 @@ from plugins.crypto_guard.storage.repository import (
     RELEASE_AUDIT_ERROR_SIGNATURES,
 )
 from plugins.crypto_guard.diagnostics.state_consistency import diagnose_state_consistency
-from plugins.crypto_guard.diagnostics.report_diagnostics import run_for_report
+from plugins.crypto_guard.diagnostics.report_diagnostics import (
+    _get_execution_funnel_report_contract_marker_ts,
+    run_for_report,
+)
 from plugins.crypto_guard.notify.report_consistency import (
     FORBIDDEN_EXECUTABLE_PHRASES, contains_forbidden_phrase, rewrite_inconsistent_summary,
 )
@@ -226,6 +229,16 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     # FR-1: only render ga_decisions whose batch_id matches the expected batch
     ga_decisions = repo.latest_ga_decisions_by_symbol(limit=120, min_analysis_time=min_analysis_time, batch_id=batches_reported)
 
+    # 08-02 P2-3 / P1-4 (fresh reviewer + Codex terminal review): gate the
+    # four-aspect execution-funnel split to rows created after the
+    # report-contract marker deployed. Pre-marker rows were produced before
+    # has_trade_plan / llm_plan_verdict / plan_execution_state were persisted,
+    # so computing the aspects on them is misleading during the batch that
+    # straddles the deploy (every executable row would render
+    # final_executable=False). None (marker absent) FAILS CLOSED to legacy —
+    # _after_execution_funnel_cutoff never fail-opens to current.
+    execution_funnel_cutoff_utc = _get_execution_funnel_report_contract_marker_ts(repo)
+
     # FR-1 (P0 fix): if the batch shows completed symbols but the exact
     # batch_id filter returns zero decisions, the decisions are stale or
     # missing. Rendering the legacy text path would surface unfiltered
@@ -345,7 +358,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
         "batch": batch_state,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc)
             if ga_decisions
             else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
         ),
@@ -880,8 +893,15 @@ def render_ga_hourly_summary(
     batch_state: dict[str, Any] | None = None,
     report_accuracy_diagnostics: dict[str, Any] | None = None,
     market_data_quality: dict[str, Any] | None = None,
+    execution_funnel_cutoff_utc: str | None = None,
 ) -> str:
-    rows = [_decision_row(row) for row in ga_decisions]
+    # 08-02 P2-3 (fresh reviewer): forward the execution-funnel report-contract
+    # marker cutoff so pre-marker rows render the four-aspect split as legacy
+    # (None aspects) instead of a misleading all-False current split.
+    rows = [
+        _decision_row(row, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc)
+        for row in ga_decisions
+    ]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
     for row in rows:
         grade = str(row.get("signal_grade") or "D")
@@ -2331,9 +2351,82 @@ def _count(repo: CryptoGuardRepository, sql: str) -> int:
     return int(row["count"])
 
 
-def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
+def _after_execution_funnel_cutoff(
+    created_at: Any,
+    cutoff_utc: str | None,
+) -> bool:
+    """08-02 P2-3 / P1-4 (Codex terminal review): is a ga_decision row inside
+    the execution-funnel contract window (``created_at >= marker applied_at``)?
+
+    Rows BEFORE the P1-3 marker deployed were produced by a codebase that never
+    wrote the four-aspect evidence fields (top-level ``has_trade_plan``,
+    ``llm_plan_verdict``, ``plan_execution_state``), so computing the four
+    aspects on them is misleading — every genuinely-executable pre-marker row
+    would render ``final_executable=False``. The gate FAILS CLOSED: a ``None``
+    cutoff (marker not yet deployed in this DB) and an unparseable
+    cutoff/created_at all return ``False`` (legacy / aspects blanked), so a
+    missing or malformed marker never fail-opens a report to current — the
+    marker-missing diagnostic surfaces the absent/legacy state."""
+    if not cutoff_utc:
+        return False
+    cutoff = _parse_iso_utc(cutoff_utc)
+    created = (
+        created_at
+        if isinstance(created_at, datetime)
+        else _parse_iso_utc(str(created_at or ""))
+    )
+    if isinstance(created, datetime) and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if cutoff is None or created is None:
+        return False
+    return created >= cutoff
+
+
+def _execution_funnel_four_aspects(
+    raw: dict[str, Any],
+    risk_check: dict[str, Any],
+    scope: str,
+) -> dict[str, Any]:
+    """08-02 P1-3 (+ P2-3): the four immutable execution-funnel aspects, or
+    all-``None`` for legacy (pre-marker) rows whose producers never wrote the
+    contract fields. ``scope`` is ``"current"`` (post-marker, aspects computed)
+    or ``"legacy"`` (pre-marker, aspects blanked)."""
+    if scope != "current":
+        return {
+            "llm_call_succeeded": None,
+            "llm_plan_confirmed": None,
+            "risk_passed": None,
+            "final_executable": None,
+        }
+    return {
+        "llm_call_succeeded": str(raw.get("llm_status") or "") == "ok",
+        "llm_plan_confirmed": str(raw.get("llm_plan_verdict") or "") == "confirmed",
+        "risk_passed": bool((risk_check or {}).get("ok")),
+        "final_executable": (
+            str(raw.get("plan_execution_state") or "") == "confirmed"
+            and str(raw.get("plan_status") or "") == "executable"
+            and bool(raw.get("has_trade_plan"))
+            and isinstance(raw.get("trade_plan"), dict)
+            and bool(raw.get("trade_plan"))
+        ),
+    }
+
+
+def _decision_row(
+    row: dict[str, Any],
+    *,
+    execution_funnel_cutoff_utc: str | None = None,
+) -> dict[str, Any]:
     raw = _safe_json(row.get("raw_decision_json"), {})
     trade_plan = _safe_json(row.get("trade_plan_json"), {})
+    risk_check = _safe_json(row.get("risk_check_json"), {})
+    # 08-02 P2-3: gate the four-aspect execution-funnel split to the
+    # post-marker window (see ``_after_execution_funnel_cutoff``).
+    execution_funnel_scope = (
+        "current"
+        if _after_execution_funnel_cutoff(row.get("created_at"), execution_funnel_cutoff_utc)
+        else "legacy"
+    )
     # P1-9: prefer rendered_summary, fallback to final_summary
     rendered_summary = row.get("rendered_summary")
     final_summary = row.get("final_summary")
@@ -2349,7 +2442,7 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "trend_stage": row.get("trend_stage"),
         "final_summary": summary_to_use,
         "rendered_summary": rendered_summary,
-        "risk_check": _safe_json(row.get("risk_check_json"), {}),
+        "risk_check": risk_check,
         "feishu_actions": _safe_json(row.get("feishu_actions_json"), []),
         "trade_plan": trade_plan,
         # Phase E (07-05): plan lifecycle fields. candidate_trade_plan is
@@ -2393,6 +2486,25 @@ def _decision_row(row: dict[str, Any]) -> dict[str, Any]:
         "alignment": raw.get("alignment"),
         "htf_conflict": raw.get("htf_conflict"),
         "market_reason_codes": raw.get("market_reason_codes") or [],
+        # 08-02 P1-3: four-aspect execution-funnel split. Each aspect is
+        # derived from IMMUTABLE persisted evidence — never inferred from a
+        # final trade_plan cleared by later gates:
+        #   llm_call_succeeded  - the LLM call itself returned ok (llm_status)
+        #   llm_plan_confirmed  - immutable llm_plan_verdict == confirmed
+        #   risk_passed         - the risk gate passed (risk_check.ok)
+        #   final_executable    - confirmed + executable + has_trade_plan
+        #                         + non-empty trade_plan (P1-1 finalizer
+        #                         contract, matches _is_final_executable in
+        #                         report_diagnostics.py)
+        #
+        # 08-02 P2-3 (fresh reviewer): the four aspects only exist for rows
+        # created AFTER the execution-funnel report-contract marker deployed
+        # (``execution_funnel_scope == "current"``). A pre-marker row was
+        # produced by a codebase that never wrote has_trade_plan /
+        # llm_plan_verdict / plan_execution_state, so its aspects are None and
+        # scope is "legacy".
+        "execution_funnel_scope": execution_funnel_scope,
+        **_execution_funnel_four_aspects(raw, risk_check, execution_funnel_scope),
     }
 
 

@@ -54,6 +54,12 @@ EXPECTED_MARKERS = {
     # production here). Gates current-vs-historical split of the two LLM
     # diagnostics (llm_failure_rate_high / llm_circuit_breaker_open).
     "llm_schema_breaker_preset_integrity_v1",
+    # 08-02 P1-3: execution-funnel report-contract split marker. Written ONLY
+    # by initialize_database publish path (release only — NOT written to
+    # production this round). Gates current-vs-historical split of the six
+    # execution-funnel diagnostics + the report row split
+    # (llm_call_succeeded / llm_plan_confirmed / risk_passed / final_executable).
+    "execution_funnel_report_contract_v1",
 }
 
 
@@ -367,6 +373,117 @@ class TestPostgresInitializeDatabase(unittest.TestCase):
         self.assertTrue(
             check_schema_health()["ok"],
             "schema unhealthy after a healthy-skip initialize_database",
+        )
+
+    def test_init_repairs_legacy_dedupe_index_predicate(self) -> None:
+        """08-02 Finding 1 (P1): ``CREATE INDEX IF NOT EXISTS`` is a name-only
+        no-op in PostgreSQL -- it can NOT upgrade an existing
+        ``idx_opportunity_watches_dedupe`` carrying the pre-P0-2 predicate
+        (``WHERE dedupe_key IS NOT NULL``, missing ``status = 'active'``). A
+        schema with that stale index fails the health gate fail-closed, so
+        ``initialize_database()`` must drop the stale-predicate index and let
+        the schema DDL recreate it with the P0-2 predicate. Also proves the
+        P0-2 dedupe contract end-to-end: a terminal watch releases its
+        dedupe_key so a fresh active watch can reuse it.
+
+        Revert-fail: without the drop, the DDL no-ops, the health gate raises
+        RuntimeError, and this test's ``ok=True`` assertion goes RED.
+        """
+        from psycopg import sql as _sql
+
+        from plugins.crypto_guard.storage.migrations import (
+            SCHEMA_PATH,
+            _check_opportunity_watches_dedupe_index,
+        )
+
+        # 1. Apply the full schema, then downgrade the dedupe index to the
+        #    pre-P0-2 predicate exactly as the old baseline shipped it.
+        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        with pg_db.get_conn() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(schema_sql)
+                    cur.execute(
+                        _sql.SQL("DROP INDEX {}.{}").format(
+                            _sql.Identifier(self._repo_handle.schema),
+                            _sql.Identifier("idx_opportunity_watches_dedupe"),
+                        )
+                    )
+                    cur.execute(
+                        "CREATE UNIQUE INDEX idx_opportunity_watches_dedupe "
+                        "ON opportunity_watches(dedupe_key) "
+                        "WHERE dedupe_key IS NOT NULL"
+                    )
+            # Sanity: the stale index must trip the dedupe health check.
+            with conn.cursor() as cur:
+                problems = _check_opportunity_watches_dedupe_index(
+                    cur, self._repo_handle.schema
+                )
+            conn.rollback()
+        self.assertTrue(
+            any("status = 'active'" in p["column"] for p in problems),
+            "precondition: stale index must fail the dedupe health check",
+        )
+
+        # 2. A terminal watch holding the key proves the stale index blocks a
+        #    re-materialization: with the old predicate (no status filter) the
+        #    key is held; the P0-2 predicate must release it.
+        with pg_db.get_conn() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO opportunity_watches
+                            (symbol, direction, watch_condition_json, status,
+                             dedupe_key)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        ("BTCUSDT", "LONG", "{}", "triggered", "auto:BTCUSDT:LONG"),
+                    )
+            conn.rollback()
+
+        # 3. initialize_database() must repair the index and pass the gate.
+        result = initialize_database()
+        self.assertTrue(result["ok"], f"initialize_database not ok: {result}")
+        self.assertTrue(
+            check_schema_health()["ok"],
+            "schema unhealthy after stale-index repair",
+        )
+
+        # 4. The repaired index carries the P0-2 predicate, so a NEW active
+        #    watch re-using the terminal watch's dedupe_key is legal (key
+        #    released). Without the status='active' predicate the INSERT would
+        #    raise a unique-violation (RED).
+        with pg_db.get_conn() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    problems = _check_opportunity_watches_dedupe_index(
+                        cur, self._repo_handle.schema
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO opportunity_watches
+                            (symbol, direction, watch_condition_json, status,
+                             dedupe_key)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        ("BTCUSDT", "LONG", "{}", "active", "auto:BTCUSDT:LONG"),
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM opportunity_watches "
+                        "WHERE dedupe_key = 'auto:BTCUSDT:LONG'"
+                    )
+                    n = int(cur.fetchone()["c"])
+            conn.rollback()
+        self.assertEqual(
+            problems,
+            [],
+            "dedupe index not repaired to the P0-2 predicate",
+        )
+        self.assertEqual(
+            n,
+            2,
+            "re-materialized active watch was blocked by the terminal key",
         )
 
     def test_initialize_failure_rolls_back_atomically(self) -> None:

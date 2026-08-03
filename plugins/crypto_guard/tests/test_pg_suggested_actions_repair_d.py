@@ -151,11 +151,13 @@ def _valid_trade_plan() -> dict:
 
 
 def _valid_opportunity_watch() -> dict:
+    # P0-3 (08-02): conditions must be the structured objects the opportunity
+    # watcher actually supports (bare-string conditions now fail schema).
     return {
         "needed": True,
         "direction": "LONG",
         "reason": "等待回踩",
-        "conditions": ["price>2450"],
+        "conditions": [{"type": "pullback", "side": "LONG", "timeframe": "15m", "level": 2450.0}],
         "invalid_condition": None,
         "expires_minutes": 60,
     }

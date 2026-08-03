@@ -6,6 +6,7 @@ from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES, score_market_regime
+from plugins.crypto_guard.reasoning.watch_conditions import normalize_opportunity_watch
 from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
 from plugins.crypto_guard.utils import _strict_positive_int_ms
 
@@ -209,7 +210,22 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
     if fallback_blocked and "create_paper_order" in result["suggested_actions"]:
         result["suggested_actions"] = [a for a in result["suggested_actions"] if a != "create_paper_order"]
     if "create_opportunity_watch" in result["suggested_actions"] and not result.get("opportunity_watch"):
-        result["opportunity_watch"] = default_watch_from_decision(result, risk)
+        # P0-3 (08-02): the watch is now built deterministically from the
+        # decision's plan via the shared normalizer. On fail-closed (None),
+        # drop create_opportunity_watch so the manual button never fires on
+        # a watch-less decision.
+        watch = default_watch_from_decision(result, risk)
+        if watch is None:
+            result["suggested_actions"] = [
+                a for a in result["suggested_actions"] if a != "create_opportunity_watch"
+            ]
+            if not result["suggested_actions"]:
+                result["suggested_actions"] = ["add_to_watchlist", "ignore"]
+            notes = list(result.get("risk_notes") or [])
+            notes.append("机会监控条件无法结构化（无可用交易计划），fail-closed：不自动创建机会监控。")
+            result["risk_notes"] = notes
+        else:
+            result["opportunity_watch"] = watch
     # R1-1 / R2-5 (07-03 final review): final idempotent semantic gate. Re-run
     # normalize_market_semantics so any bias+stage/HTF/closed drift induced
     # by risk adjustments is caught and the structured fields stay
@@ -554,28 +570,35 @@ def suggested_actions(decision: dict[str, Any], risk: dict[str, Any] | None = No
     return out
 
 
-def default_watch_from_decision(decision: dict[str, Any], risk: dict[str, Any] | None = None) -> dict[str, Any]:
-    reasons = list((risk or {}).get("reasons") or [])
-    if not reasons:
-        reasons = list(decision.get("counter_evidence") or decision.get("risk_notes") or ["等待 5m 触发与高周期方向重新确认"])
-    side = ((decision.get("trade_plan") or {}).get("side") or decision.get("market_bias") or "neutral")
-    cfg = load_config().trading_mode
-    risk_cfg = cfg.get("risk", {})
-    min_rr = risk_cfg.get("min_rr", 1.5)
-    min_conf = risk_cfg.get("min_confidence", 0.72)
-    return {
-        "needed": True,
-        "direction": side,
-        "reason": "未达到直接模拟盘风控门槛，转为机会监控。",
-        "conditions": [
-            "4H 已收盘方向支持",
-            "1H/15M 结构重新确认",
-            "5M 出现入场或反转触发",
-            f"RR >= {min_rr} 且置信度达到 {min_conf}",
-        ],
-        "invalid_condition": {"type": "risk_rejected", "reasons": reasons[:4]},
-        "expires_minutes": 240,
-    }
+def default_watch_from_decision(decision: dict[str, Any], risk: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """P0-3 (08-02): build a structured opportunity watch for a decision that
+    fell short of the direct paper-order risk gate.
+
+    Conditions are built deterministically from the decision's plan
+    (``trade_plan`` or the preserved ``candidate_trade_plan``) via the shared
+    normalizer — pullback/breakout/reclaim + stop invalidation. Text
+    conditions are NEVER authored here, and the pseudo-kind ``risk_rejected``
+    is eliminated: risk reasons ride in ``risk_notes`` (already appended by
+    ``apply_risk_to_decision``) and the watch's ``reason`` instead of an
+    un-triggerable condition object.
+
+    Returns None on fail-closed (no usable plan structure / no direction);
+    callers MUST then drop ``create_opportunity_watch`` from
+    ``suggested_actions`` so the manual button never fires on a watch-less
+    decision.
+    """
+    plan = decision.get("trade_plan") or decision.get("candidate_trade_plan")
+    plan_side = str((plan or {}).get("side") or "").upper() if isinstance(plan, dict) else ""
+    watch, _notes = normalize_opportunity_watch(
+        {
+            "needed": True,
+            "direction": plan_side,
+            "reason": "未达到直接模拟盘风控门槛，转为机会监控。",
+            "expires_minutes": 240,
+        },
+        plan,
+    )
+    return watch
 
 
 def _safe_float(value: Any) -> float | None:

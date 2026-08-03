@@ -5,6 +5,7 @@ from typing import Any
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision, validate_json
+from plugins.crypto_guard.reasoning.watch_conditions import normalize_opportunity_watch
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
 from plugins.crypto_guard.utils import _strict_positive_int_ms
 
@@ -628,6 +629,23 @@ def _build_trade_plan(snapshot: dict[str, Any], side: str) -> dict[str, Any] | N
         }
 
 
+def _build_sop_watch(side: str, plan: dict[str, Any] | None, *, reason: str) -> dict[str, Any] | None:
+    """P0-3 (08-02): deterministic SOP opportunity-watch builder.
+
+    Builds a structured watch — the exact shape the opportunity watcher
+    (``opportunity_watcher._condition_hit``) can evaluate — from the
+    candidate plan via the shared normalizer. Text conditions are NEVER
+    authored here; the normalizer either keeps structured conditions or
+    builds them deterministically from the plan
+    (pullback/breakout/reclaim + stop invalidation). Returns None on
+    fail-closed (no usable side/plan structure); callers MUST then drop
+    ``create_opportunity_watch`` from ``suggested_actions``.
+    """
+    base = {"needed": True, "direction": side, "reason": reason, "expires_minutes": 240}
+    watch, _notes = normalize_opportunity_watch(base, plan)
+    return watch
+
+
 def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0.0) -> dict[str, Any]:
     """Run deterministic SOP decision.
 
@@ -764,6 +782,12 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
             if side_str == "SHORT" and ttype in {"breakdown_confirm", "momentum_confirm"}:
                 side_invalidated = True
                 break
+    # P0-3 (08-02): fail-closed diagnostics. When a branch WANTED a watch but
+    # the normalizer could not build structured conditions, record a note so
+    # the decision row surfaces why no auto watch was materialized. Initialized
+    # BEFORE the side_invalidated / direction-flip branches so their notes are
+    # not overwritten by a later re-initialization (08-02 review P2-B).
+    result_watch_fail_closed_note = None
     if side_invalidated:
         # Downgrade to wait_for_pullback but preserve the candidate plan dict
         # for audit (Phase E: candidate_trade_plan). Set structured
@@ -778,12 +802,12 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         # Re-route to wait_for_pullback so the watch list still tracks it.
         decision = "wait_for_pullback"
         suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
-        watch = {
-            "needed": True, "direction": side_str,
-            "reason": "前次触发已被反转，等待结构重新确认",
-            "conditions": ["等待回踩或突破后重新确认", "5m/15m 动能与结构同向"],
-            "invalid_condition": "结构反向突破", "expires_minutes": 240,
-        }
+        watch = _build_sop_watch(side_str, invalidated_plan, reason="前次触发已被反转，等待结构重新确认")
+        if watch is None:
+            # Fail-closed: no usable structure -> no auto watch, and the
+            # manual button must not fire on a watch-less decision.
+            suggested = [a for a in suggested if a != "create_opportunity_watch"]
+            result_watch_fail_closed_note = "机会监控条件无法结构化，fail-closed：不自动创建机会监控。"
         # Stash the invalidated candidate so the result carries it as
         # candidate_trade_plan (Phase E contract).
         result_invalidated_candidate = invalidated_plan
@@ -843,20 +867,20 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
                 result_invalidated_plan_source = "deterministic_sop"
                 decision = "wait_for_pullback"
                 suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
-                watch = {
-                    "needed": True, "direction": withheld_flip_side,
-                    "reason": "方向翻转缺已收盘突破确认，继续观察等待结构确认",
-                    "conditions": ["等待该方向已收盘 K 线突破/失败后重新确认", "5m/15m 动能与结构同向"],
-                    "invalid_condition": "结构反向突破", "expires_minutes": 240,
-                }
+                watch = _build_sop_watch(withheld_flip_side, withheld_flip_plan, reason="方向翻转缺已收盘突破确认，继续观察等待结构确认")
+                if watch is None:
+                    suggested = [a for a in suggested if a != "create_opportunity_watch"]
+                    result_watch_fail_closed_note = "机会监控条件无法结构化，fail-closed：不自动创建机会监控。"
     # Track whether the flip gate fired so the decision-routing block below
     # can branch on it (the side_invalidated branch already routed via pass).
     _flip_gate_routed = direction_flip_withheld
-
     if trade_plan:
         decision = "trade_plan_available"
         suggested = ["create_paper_order", "create_opportunity_watch", "add_to_watchlist", "ignore"]
-        watch = {"needed": True, "direction": trade_plan["side"], "reason": "若限价未成交，可继续观察回踩条件", "conditions": [trade_plan["invalid_condition"]], "invalid_condition": trade_plan["invalid_condition"], "expires_minutes": 240}
+        watch = _build_sop_watch(trade_plan["side"], trade_plan, reason="若限价未成交，可继续观察回踩条件")
+        if watch is None:
+            suggested = [a for a in suggested if a != "create_opportunity_watch"]
+            result_watch_fail_closed_note = "机会监控条件无法结构化，fail-closed：不自动创建机会监控。"
     elif result_invalidated_candidate is not None and _flip_gate_routed:
         # P1-3 flip-gate branch already set decision/suggested/watch above.
         pass
@@ -865,8 +889,16 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         pass
     elif scoring["score"] >= 0.65 and side:
         decision = "wait_for_pullback" if bias in ("bullish", "bearish") else "monitor_only"
-        suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
-        watch = {"needed": True, "direction": side, "reason": "方向有倾向但交易计划不完整，等待结构确认", "conditions": ["等待回踩或突破后重新确认", "5m/15m 动能与结构同向"], "invalid_condition": "结构反向突破", "expires_minutes": 240}
+        # P0-3: no candidate plan exists here (score in [0.65, 0.72) did not
+        # produce a trade_plan), so a watch is unbuildable -> fail-closed to
+        # None and drop create_opportunity_watch. Pre-fix this branch emitted
+        # a text-condition watch that could never trigger.
+        watch = _build_sop_watch(side, None, reason="方向有倾向但交易计划不完整，等待结构确认")
+        if watch is None:
+            suggested = ["add_to_watchlist", "ignore"]
+            result_watch_fail_closed_note = "机会监控条件无法结构化（无交易计划），fail-closed：不自动创建机会监控。"
+        else:
+            suggested = ["create_opportunity_watch", "add_to_watchlist", "ignore"]
     elif scoring["score"] >= 0.50:
         decision = "monitor_only"
         suggested = ["add_to_watchlist", "ignore"]
@@ -891,7 +923,9 @@ def run_ga_sop_decision(snapshot: dict[str, Any], *, score_adjustment: float = 0
         "summary": _summary(symbol, decision, grade, bias, trend_stage),
         "evidence": scoring.get("evidence", []),
         "counter_evidence": scoring.get("counter_evidence", []),
-        "risk_notes": scoring.get("counter_evidence", []) + ["不构成实盘建议，仅用于模拟盘与策略研究。"],
+        "risk_notes": scoring.get("counter_evidence", []) + ["不构成实盘建议，仅用于模拟盘与策略研究。"] + (
+            [result_watch_fail_closed_note] if result_watch_fail_closed_note else []
+        ),
         "has_trade_plan": bool(trade_plan),
         "trade_plan": trade_plan,
         "opportunity_watch": watch,

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 
 from plugins.crypto_guard.config.loader import PLUGIN_ROOT, CryptoGuardConfig, load_config
@@ -224,6 +225,17 @@ def initialize_database(
                         # never fires on the greenfield init path.
                         from psycopg.errors import Error as _PsycopgDBError
                         try:
+                            # 08-02 Finding 1 (P1): ``CREATE INDEX IF NOT EXISTS``
+                            # is a name-only no-op in PostgreSQL -- it can NOT
+                            # upgrade an existing ``idx_opportunity_watches_dedupe``
+                            # that still carries the pre-P0-2 predicate
+                            # ``WHERE dedupe_key IS NOT NULL``. Without the
+                            # ``status = 'active'`` predicate, a terminal watch
+                            # holds its dedupe_key and the health gate below
+                            # fails hard. Drop the stale-predicate index first so
+                            # the schema DDL recreates it with the P0-2 predicate
+                            # (safe: the table has zero rows in production).
+                            _drop_legacy_opportunity_watches_dedupe_index(cur)
                             cur.execute(schema_sql)
                         except _PsycopgDBError as exc:
                             raise RuntimeError(
@@ -249,6 +261,7 @@ def initialize_database(
                     _ensure_stop_loss_adjustment_dedup_marker(cur)
                     _ensure_llm_failed_direction_fail_closed_marker(cur)
                     _ensure_llm_schema_breaker_preset_integrity_marker(cur)
+                    _ensure_execution_funnel_report_contract_marker(cur)
 
                     # 4. Health gate - fail-closed BEFORE commit. If the schema
                     # is wrong, ROLLBACK everything (no marker survives).
@@ -464,6 +477,38 @@ def _ensure_llm_schema_breaker_preset_integrity_marker(cur: psycopg.Cursor) -> N
     production service is untouched.
     """
     _ensure_marker(cur, "llm_schema_breaker_preset_integrity_v1")
+
+
+def _ensure_execution_funnel_report_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-02 P1-3: execution-funnel report-contract split marker.
+
+    Production baseline (2026-08-02 audit): 190 decisions/24h; deterministic
+    raw S/A=76 but final executable raw-S/A=0; has_trade_plan=0;
+    llm_not_confirmed=67; confirmed_without_plan=30; no_candidate_with_
+    candidate=16; opportunity_watch payload=158 with conditions array=121 all
+    text (structured=0); 92 decisions declared create_opportunity_watch but
+    nothing materialized. The six P1-3 execution-funnel diagnostics surface
+    the inverse contradictions on the CURRENT contract only; pre-fix rows
+    must NOT repeat as current errors. This marker's ``applied_at`` is the
+    cutoff:
+
+      - marker-AFTER row (created_at >= applied_at): current ``error`` /
+        ``warning`` — a real post-deployment breach of the execution-funnel
+        contract.
+      - marker-BEFORE (created_at < applied_at): historical audit only
+        (``legacy_info``), NEVER a current error (the 190-row/24h pre-fix
+        baseline must not recur as current noise).
+      - marker-MISSING: fail-closed — the diagnostic emits a marker-missing
+        ``error`` and the six execution-funnel checks SKIP (an undeployed
+        contract must not be evaluated as current; no silent green).
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "execution_funnel_report_contract_v1")
 
 
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:
@@ -721,7 +766,7 @@ _REQUIRED_TABLES: list[str] = [
 # nullability, identity/default), every table constraint, every non-primary
 # index, and application triggers/functions. Update only after deliberately
 # changing the canonical DDL and regenerating it from a fresh scratch schema.
-_EXPECTED_SCHEMA_FINGERPRINT = "22648daf3dd7f60af3271e0d6bafbefe8f5cebcc4fedb88742b749d321060849"
+_EXPECTED_SCHEMA_FINGERPRINT = "f6e0ddaeb1197fdc8393b50ae181082b24e59cc8c0146c02aab260ce5e71b259"
 
 
 def _normalize_catalog_text(value: Any, schema: str) -> str:
@@ -897,6 +942,9 @@ def _introspect_schema_health(cur: psycopg.Cursor) -> dict[str, Any]:
     # ── paper_trade_logs dedupe_key partial unique index ───────────────────
     missing.extend(_check_dedupe_key_partial_unique_index(cur, schema))
 
+    # ── opportunity_watches dedupe_key partial unique index ────────────────
+    missing.extend(_check_opportunity_watches_dedupe_index(cur, schema))
+
     # ── backfill_progress composite primary key (symbol, interval) ─────────
     missing.extend(_check_backfill_progress_primary_key(cur, schema))
 
@@ -1010,6 +1058,122 @@ def _check_dedupe_key_partial_unique_index(cur: psycopg.Cursor, schema: str) -> 
             }
         )
     return problems
+
+
+def _check_opportunity_watches_dedupe_index(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:
+    """Verify idx_opportunity_watches_dedupe is a UNIQUE PARTIAL index on
+    ``dedupe_key`` with the P0-2 predicate ``WHERE dedupe_key IS NOT NULL AND
+    status = 'active'``.
+
+    The predicate is the whole point: a terminal watch (triggered/invalidated/
+    expired) must NOT hold its dedupe_key, or a later B/S-A batch could never
+    re-create an active watch for the same symbol+direction (the pre-P0-2
+    ``WHERE dedupe_key IS NOT NULL`` defect). Introspected via ``pg_indexes`` +
+    ``pg_index`` (``indisunique`` + the partial predicate), not SQL text.
+    """
+    cur.execute(
+        """
+        SELECT i.indexname, i.indexdef
+        FROM pg_indexes i
+        WHERE i.schemaname = %s AND i.tablename = 'opportunity_watches'
+          AND i.indexname = 'idx_opportunity_watches_dedupe'
+        """,
+        (schema,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return [
+            {
+                "table": "opportunity_watches",
+                "column": "idx_opportunity_watches_dedupe (missing)",
+            }
+        ]
+    defn = (row["indexdef"] or "").lower()
+    problems = []
+    if "unique" not in defn:
+        problems.append(
+            {
+                "table": "opportunity_watches",
+                "column": "idx_opportunity_watches_dedupe UNIQUE",
+            }
+        )
+    if "dedupe_key is not null" not in defn:
+        problems.append(
+            {
+                "table": "opportunity_watches",
+                "column": "idx_opportunity_watches_dedupe WHERE dedupe_key IS NOT NULL",
+            }
+        )
+    if "status" not in defn or "'active'" not in defn:
+        problems.append(
+            {
+                "table": "opportunity_watches",
+                "column": "idx_opportunity_watches_dedupe WHERE status = 'active'",
+            }
+        )
+    # Verify the indexed column is exactly dedupe_key via pg_index.
+    cur.execute(
+        """
+        SELECT pg_get_indexdef(ix.indexrelid) AS def
+        FROM pg_index ix
+        JOIN pg_class c ON ix.indexrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = %s AND c.relname = 'idx_opportunity_watches_dedupe'
+        """,
+        (schema,),
+    )
+    idx_row = cur.fetchone()
+    indexed_ok = False
+    if idx_row:
+        def_text = (idx_row["def"] or "").lower()
+        if "(dedupe_key)" in def_text.replace(" ", ""):
+            indexed_ok = True
+    if not indexed_ok:
+        problems.append(
+            {
+                "table": "opportunity_watches",
+                "column": "idx_opportunity_watches_dedupe column=dedupe_key",
+            }
+        )
+    return problems
+
+
+def _drop_legacy_opportunity_watches_dedupe_index(cur: psycopg.Cursor) -> None:
+    """Drop a stale-predicate ``idx_opportunity_watches_dedupe`` so DDL can recreate it.
+
+    PostgreSQL ``CREATE INDEX IF NOT EXISTS`` is a name-only no-op: it never
+    upgrades an index that already exists with an old definition. An
+    ``opportunity_watches`` table carrying the pre-P0-2 predicate
+    (``WHERE dedupe_key IS NOT NULL``, without ``status = 'active'``) passes
+    through init DDL unchanged and then trips the health gate fail-closed. This
+    helper introspects ``pg_indexes`` for the actual predicate and, only when it
+    lacks ``status = 'active'``, drops the index schema-scoped (via
+    ``current_schema()``, so per-test scratch schemas resolve correctly). The
+    subsequent schema DDL recreates it with the P0-2 predicate. Safe: the
+    opportunity_watches table is empty in the production baseline.
+    """
+    cur.execute("SELECT current_schema() AS s")
+    schema = cur.fetchone()["s"]
+    cur.execute(
+        """
+        SELECT i.indexdef
+        FROM pg_indexes i
+        WHERE i.schemaname = %s AND i.tablename = 'opportunity_watches'
+          AND i.indexname = 'idx_opportunity_watches_dedupe'
+        """,
+        (schema,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+    defn = (row["indexdef"] or "").lower()
+    if "status" not in defn or "'active'" not in defn:
+        cur.execute(
+            sql.SQL("DROP INDEX IF EXISTS {}.{}").format(
+                sql.Identifier(schema),
+                sql.Identifier("idx_opportunity_watches_dedupe"),
+            )
+        )
 
 
 def _check_backfill_progress_primary_key(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:

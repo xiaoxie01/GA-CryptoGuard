@@ -1505,10 +1505,19 @@ class CryptoGuardRepository:
         created_by_user_action: bool = False,
         source_button_action: str | None = None,
     ) -> int:
-        if expires_at is None and watch.get("expires_minutes"):
+        if expires_at is None:
+            # 08-02 R2 P2-4 (fresh reviewer): a manual watch with
+            # ``expires_minutes`` None (or a non-positive-int garbage value)
+            # persisted a PERMANENT watch (expires_at NULL) on the manual path,
+            # while the auto path defaults to 240. Fail-closed to 240 so every
+            # materialized watch is bounded. Note int(bool) is 0/1, so bool must
+            # be rejected explicitly (matching is_structured_watch).
+            expires_minutes = watch.get("expires_minutes")
+            if not isinstance(expires_minutes, int) or isinstance(expires_minutes, bool) or expires_minutes <= 0:
+                expires_minutes = 240
             expires_at = (
                 datetime.now(timezone.utc)
-                + timedelta(minutes=int(watch.get("expires_minutes") or 0))
+                + timedelta(minutes=expires_minutes)
             ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         conditions = watch.get("conditions", [])
         if isinstance(conditions, dict):
@@ -1539,6 +1548,97 @@ class CryptoGuardRepository:
                 )
                 new_id = int(cur.fetchone()["id"])
         return new_id
+
+    def upsert_auto_opportunity_watch(
+        self,
+        symbol: str,
+        watch: dict[str, Any],
+        source_signal_id: int | None = None,
+        *,
+        ga_decision_id: int | None = None,
+    ) -> tuple[int, str]:
+        """P0-2: atomic, idempotent auto-materialization of an opportunity watch.
+
+        The decision pipeline (``_post_decision_effects``) calls this for every
+        B-grade / safety-gate-degraded S/A decision whose feishu_actions carry
+        ``create_opportunity_watch`` and whose watch is structurally valid. Only
+        ONE active auto watch per ``symbol + direction`` may exist at a time;
+        a later batch refreshes that watch's conditions / TTL / ga_decision_id
+        in place instead of inserting a duplicate.
+
+        ``dedupe_key = auto:{symbol}:{DIR}`` and the partial UNIQUE index
+        ``idx_opportunity_watches_dedupe`` (``WHERE dedupe_key IS NOT NULL AND
+        status = 'active'``) enforce the single-active contract atomically; a
+        terminal watch (triggered/invalidated/expired) releases its key so a
+        fresh active watch can be re-created. Manual button watches keep
+        ``dedupe_key`` NULL so they never collide with auto watches.
+
+        Returns ``(watch_id, "created" | "refreshed")``. Fail-closed: a watch
+        without a resolvable LONG/SHORT direction raises ValueError.
+        """
+        direction = str(watch.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            raise ValueError(f"auto opportunity watch requires LONG/SHORT direction, got {direction!r}")
+        dedupe_key = f"auto:{symbol}:{direction}"
+        # 08-02 R2 P2-3 (fresh reviewer): the pre-fix ``or 240`` + ``int(...)``
+        # diverged from the manual path (create_opportunity_watch): a bool
+        # ``expires_minutes=True`` became 1 minute and a numeric string "60"
+        # became 60 minutes, while the manual path fails closed to 240. Match the
+        # strict positive-int normalization so auto and manual TTLs are literally
+        # identical. int(bool) is 0/1, so bool is rejected explicitly.
+        expires_minutes = watch.get("expires_minutes")
+        if not isinstance(expires_minutes, int) or isinstance(expires_minutes, bool) or expires_minutes <= 0:
+            expires_minutes = 240
+        expires_at = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=expires_minutes)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        conditions = watch.get("conditions", [])
+        if isinstance(conditions, dict):
+            conditions = [conditions]
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO opportunity_watches(
+                        symbol, direction, watch_reason, watch_condition_json, invalid_condition_json,
+                        source_signal_id, expires_at, ga_decision_id, created_by_user_action, dedupe_key
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s)
+                    ON CONFLICT (dedupe_key)
+                    WHERE dedupe_key IS NOT NULL AND status = 'active'
+                    DO UPDATE SET
+                        watch_reason = EXCLUDED.watch_reason,
+                        watch_condition_json = EXCLUDED.watch_condition_json,
+                        invalid_condition_json = EXCLUDED.invalid_condition_json,
+                        source_signal_id = EXCLUDED.source_signal_id,
+                        expires_at = EXCLUDED.expires_at,
+                        ga_decision_id = EXCLUDED.ga_decision_id,
+                        status = 'active',
+                        triggered_at = NULL,
+                        invalidated_reason = NULL,
+                        updated_at = NOW()
+                    RETURNING id, (created_at = updated_at) AS fresh
+                    """,
+                    (
+                        symbol,
+                        direction,
+                        watch.get("reason"),
+                        _json_dumps_payload(conditions),
+                        _json_dumps_payload(watch.get("invalid_condition")),
+                        source_signal_id,
+                        expires_at,
+                        ga_decision_id,
+                        dedupe_key,
+                    ),
+                )
+                row = cur.fetchone()
+                new_id = int(row["id"])
+                # ``created_at = updated_at`` is exact: on INSERT both use the
+                # transaction's NOW(); on DO UPDATE only updated_at advances, so
+                # a surviving row always reads fresh=false.
+                action = "created" if bool(row["fresh"]) else "refreshed"
+        return new_id, action
 
     def get_opportunity_watch(self, watch_id: int) -> dict[str, Any] | None:
         with self.conn.cursor() as cur:
