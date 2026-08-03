@@ -52,6 +52,44 @@ class CryptoGuardCommandGuardTest(unittest.TestCase):
             {"service-control"},
         )
 
+    def test_pytest_segment_cannot_exempt_sibling_mutation(self) -> None:
+        """08-02 review P2-C: the pytest exemption is per-segment.
+
+        A ``python -m pytest`` segment in a compound command must NOT exempt
+        a sibling ``python -c "initialize_database()"`` segment — the whole
+        command line stays guarded for the mutation. Quoted semicolons are
+        NOT shell separators, so a single ``python -c`` with ``;`` inside
+        still classifies as one mutation.
+        """
+        self.assertEqual(
+            guard.classify_command(
+                'python -m pytest plugins/crypto_guard/tests/test_x.py '
+                '&& python -c "from plugins.crypto_guard.storage.migrations '
+                'import initialize_database; initialize_database()"'
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "python -m pytest plugins/crypto_guard/tests/test_x.py "
+                '; python -c "from plugins.crypto_guard.storage.migrations '
+                'import initialize_database; initialize_database()"'
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                'python -m pytest test_x.py | python -c "initialize_database()"'
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                'python -c "import x; initialize_database()"'
+            ),
+            {"database-mutation"},
+        )
+
     def test_postgresql_admin_and_restore_commands_are_sensitive(self) -> None:
         commands = (
             "createdb crypto_guard",
@@ -212,6 +250,137 @@ class CryptoGuardCommandGuardTest(unittest.TestCase):
                 "Remove-Item E:\\data\\crypto_guard.sqlite3"
             ),
             {"database-mutation"},
+        )
+
+    def test_pytest_repair_commands_are_not_production_mutations(self) -> None:
+        """Pytest command lines may contain ``repair_`` test names; running the
+        test suite is never a production mutation."""
+        self.assertEqual(
+            guard.classify_command(
+                "python -m pytest plugins/crypto_guard/tests/"
+                "test_pg_decision_array_repair_p1_1.py -q"
+            ),
+            set(),
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "python -m pytest plugins/crypto_guard/tests/"
+                "test_pg_llm_breaker_category_contract_p0_2.py "
+                "test_pg_llm_preset_breaker_order_p0_1.py -q"
+            ),
+            set(),
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "pytest plugins/crypto_guard/tests/ "
+                "-k repair_ --collect-only"
+            ),
+            set(),
+        )
+
+    def test_comment_pytest_spoof_does_not_exempt_production_mutation(
+            self) -> None:
+        """Finding 3 (P2): a trailing ``# pytest`` shell comment must not
+        exempt an inline production mutation.
+
+        ``_classify_segment``'s pytest matcher previously accepted any
+        whitespace before ``pytest`` (``(?:^|[;&|\\s])pytest``), so the inert
+        comment ``# pytest`` flipped ``runs_pytest`` to True and the whole
+        ``python -c ... repair_agent_jobs()`` command escaped classification as
+        a database mutation. The comment is dead shell syntax; only a real
+        pytest command (segment start, ``;`` / ``&&`` / ``||`` / ``|``
+        separator, or ``python -m pytest``) is a test run.
+        """
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"from plugins.crypto_guard.storage import "
+                "repair_agent_jobs; repair_agent_jobs()\" # pytest"
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"from plugins.crypto_guard.storage.migrations "
+                "import initialize_database; initialize_database()\" "
+                "# pytest -- not a real test run"
+            ),
+            {"database-mutation"},
+        )
+        # Real pytest invocations stay exempt (regression guard).
+        self.assertEqual(
+            guard.classify_command(
+                "python -m pytest plugins/crypto_guard/tests/ "
+                "-k repair_ --collect-only"
+            ),
+            set(),
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "cd plugins/crypto_guard/tests "
+                "&& pytest -k repair_ --collect-only"
+            ),
+            set(),
+        )
+
+    def test_quoted_semicolon_pytest_does_not_exempt_mutation(self) -> None:
+        """Fresh-reviewer P2: ``;pytest`` INSIDE a quoted ``python -c "...";``
+        string is python code, not a shell separator — it must not flip
+        ``runs_pytest`` and exempt the sibling mutation.
+
+        ``_split_segments`` keeps a quoted ``;`` inside the segment (quote-aware
+        splitting), so the segment is ``python -c "initialize_database();pytest"``.
+        The pytest matcher ``(?:^|[;&|])pytest`` matched the in-string
+        ``;pytest`` and set runs_pytest=True, letting the mutation escape
+        classification. The matcher must be segment-start-anchored
+        (``^pytest``) because real separators were already split into their own
+        segments.
+        """
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"from plugins.crypto_guard.storage.migrations "
+                "import initialize_database; initialize_database();pytest\""
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"from plugins.crypto_guard.storage import "
+                "repair_agent_jobs; repair_agent_jobs(); pytest --collect-only\""
+            ),
+            {"database-mutation"},
+        )
+        # Real shell-separated pytest still exempts its OWN segment; the
+        # mutation segment stays blocked (regression guard).
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"initialize_database()\"; pytest --collect-only"
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "pytest --collect-only"
+            ),
+            set(),
+        )
+
+    def test_production_repair_command_still_requires_token(self) -> None:
+        """Non-pytest production ``repair_`` python commands stay guarded."""
+        self.assertEqual(
+            guard.classify_command(
+                "python -c \"from plugins.crypto_guard.storage import "
+                "repair_agent_jobs; repair_agent_jobs()\""
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                "$env:CRYPTO_GUARD_DB='C:\\Temp\\cg-repro.sqlite3'; "
+                "python -c \"from plugins.crypto_guard.storage import "
+                "repair_agent_jobs; repair_agent_jobs()\" "
+                "# crypto-guard-non-production-db:C:\\Temp\\cg-repro.sqlite3"
+            ),
+            set(),
         )
 
     def test_production_migration_requires_token(self) -> None:

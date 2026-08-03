@@ -73,18 +73,118 @@ def _declares_non_production_db(command: str) -> bool:
     return raw_path.lower() in command.lower()
 
 
+def _split_segments(command: str) -> list[str]:
+    """Split a command line on shell separators that sit OUTSIDE quotes.
+
+    Separators: ``&&``, ``||``, ``;``, ``|`` and newlines. Quotes (single,
+    double, backtick, and PowerShell here-string openers ``@'``/``@\"``) are
+    respected so ``python -c "import x; initialize_database()"`` stays one
+    segment — splitting inside a quoted string would drop the mutation token
+    and open a bypass (08-02 review P2-C).
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch == "`" and i + 1 < n:
+                # PowerShell backtick escape inside double quotes.
+                current.append(command[i + 1])
+                i += 1
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "@" and nxt in ("'", '"'):
+            # PowerShell here-string opener.
+            quote = nxt
+            current.append(ch)
+            current.append(nxt)
+            i += 2
+            continue
+        if ch in "\r\n":
+            if current:
+                segments.append("".join(current))
+                current = []
+            i += 1
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            if current:
+                segments.append("".join(current))
+                current = []
+            i += 2
+            continue
+        if ch in ";|":
+            if current:
+                segments.append("".join(current))
+                current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        segments.append("".join(current))
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
 def classify_command(command: str) -> set[str]:
-    """Return operation classes requiring a guard."""
+    """Return operation classes requiring a guard.
+
+    Compound commands (``&&``, ``||``, ``;``, ``|``, newline) are split into
+    independently-classified segments and the union decides blocking. This
+    prevents a ``pytest`` or read-only segment from exempting a sibling
+    ``python -c "initialize_database()"`` segment in the same command line
+    (08-02 review P2-C).
+    """
     if any(pattern.search(command) for pattern in _DANGEROUS_GIT):
         return {"dangerous-git"}
 
-    lower = command.lower()
+    operations: set[str] = set()
+    for segment in _split_segments(command):
+        operations |= _classify_segment(segment, command)
+    return operations
+
+
+def _classify_segment(segment: str, full_command: str) -> set[str]:
+    """Classify one shell segment; ``full_command`` carries the temp-DB marker."""
+    if _is_read_only_command(segment):
+        return set()
+
+    lower = segment.lower()
     operations: set[str] = set()
 
     runs_python = bool(re.search(r"\bpython(?:w|3)?(?:\.exe)?\b", lower))
+    # 08-02 Finding 3 (P2): the bare-``pytest`` matcher previously accepted any
+    # whitespace separator (``\s``), so an inert trailing shell comment
+    # ``# pytest`` flipped ``runs_pytest`` to True and exempted the whole
+    # inline ``python -c ...`` mutation from classification. Only a real test
+    # run matches now: segment start, or an actual shell separator (``;``,
+    # ``&&``, ``||``, ``|``) — a whitespace-only ``# pytest`` comment is dead
+    # shell syntax and must NOT count. ``python -m pytest`` (first branch) is
+    # unaffected. ``_split_segments`` already strips each segment, so a lone
+    # ``pytest`` at segment start is covered by ``^``.
+    #
+    # 08-02 fresh-reviewer P2: the ``(?:^|[;&|])pytest`` branch ALSO matched a
+    # ``;pytest`` INSIDE a quoted ``python -c "..."`` string (quote-aware
+    # ``_split_segments`` keeps the in-string ``;`` inside the segment, so it is
+    # python code, not a shell separator). That flipped ``runs_pytest`` and let
+    # an inline mutation escape classification. Real separators were already
+    # split into their own segments, so segment-start ``^pytest`` is the exact
+    # and only correct anchor — an in-string ``;pytest`` no longer exempts the
+    # sibling mutation.
     runs_pytest = bool(
         re.search(r"\bpython(?:3)?(?:\.exe)?\s+-m\s+pytest\b", lower)
-        or re.search(r"(?:^|[;&|\s])pytest(?:\.exe)?\b", lower)
+        or re.search(r"^pytest(?:\.exe)?\b", lower)
     )
     production_db = "crypto_guard.sqlite3" in lower or "crypto_guard.db" in lower
     mutating_sql = bool(
@@ -95,7 +195,7 @@ def classify_command(command: str) -> set[str]:
             lower,
         )
     )
-    non_production_db = _declares_non_production_db(command)
+    non_production_db = _declares_non_production_db(full_command)
 
     if (
         runs_python
@@ -106,6 +206,7 @@ def classify_command(command: str) -> set[str]:
         operations.add("database-mutation")
     if (
         runs_python
+        and not runs_pytest
         and "repair_" in lower
         and "crypto_guard" in lower
         and not non_production_db
