@@ -1,0 +1,4 @@
+interface:
+  display_name: "CryptoGuard Final Seal"
+  short_description: "Audit and close high-risk CryptoGuard changes"
+  default_prompt: "Run the CryptoGuard final-seal workflow for the active Trellis task."
