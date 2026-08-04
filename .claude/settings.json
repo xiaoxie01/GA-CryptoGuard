@@ -61,7 +61,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/crypto-guard-command-guard.py\"",
+            "command": "python .claude/hooks/crypto-guard-command-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/crypto-guard-command-guard.py",
             "timeout": 10
           }
         ]

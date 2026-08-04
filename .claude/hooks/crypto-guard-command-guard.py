@@ -323,8 +323,24 @@ def _classify_segment(segment: str, full_command: str) -> set[str]:
         or re.search(r"\bsc(?:\.exe)?\s+(?:start|stop)\b", lower)
     )
     explicit_service_launch = bool(re.search(r"\bstart-process\b", lower))
+    # Scheduled-task control — the CryptoGuard-PhaseB-Runtime-Smoke launcher is a
+    # scheduled task, so Start/Stop/Register/Unregister-ScheduledTask and the
+    # equivalent ``schtasks`` verbs are production service control. Query verbs
+    # (Get-ScheduledTask, Get-ScheduledTaskInfo, ``schtasks /Query``) are
+    # read-only evidence and must stay unguarded (PowerShell coverage fix).
+    scheduled_task_control = bool(
+        re.search(
+            r"\b(?:start|stop|register|unregister)-scheduledtask\b",
+            lower,
+        )
+        or re.search(
+            r"\bschtasks(?:\.exe)?\b[^\r\n]*/(?:run|end|create|delete)\b",
+            lower,
+        )
+    )
     if (
         service_stop
+        or scheduled_task_control
         or (service_target and (service_start or service_manager))
         or (
             postgres_service_name

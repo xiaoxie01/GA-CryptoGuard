@@ -16,6 +16,13 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
 
+def _load_settings() -> dict:
+    """Read the live .claude/settings.json (repo root = parents[2])."""
+    settings_path = Path(__file__).resolve().parents[2] / ".claude" / "settings.json"
+    with settings_path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
 class CryptoGuardCommandGuardTest(unittest.TestCase):
     def test_read_only_commands_are_allowed(self) -> None:
         self.assertEqual(guard.classify_command("git status --short"), set())
@@ -493,6 +500,197 @@ class CryptoGuardCommandGuardTest(unittest.TestCase):
             )
             self.assertFalse(allowed)
             self.assertIn("different Trellis task", reason)
+
+    # ---- PowerShell coverage (08-02 command-guard gap fix) ----
+    # The command guard was previously mounted to Bash only. These tests are
+    # RED-first: they pin the PowerShell PreToolUse matcher in settings.json and
+    # the scheduled-task service-control classification in the guard.
+
+    def test_settings_registers_both_bash_and_powershell_matchers(self) -> None:
+        """PreToolUse must register a PowerShell matcher alongside Bash, once each."""
+        settings = _load_settings()
+        matchers = [entry.get("matcher") for entry in settings["hooks"]["PreToolUse"]]
+        self.assertEqual(matchers.count("Bash"), 1)
+        self.assertEqual(matchers.count("PowerShell"), 1)
+
+    def test_settings_bash_and_powershell_share_identical_guard_command(self) -> None:
+        """Both matchers call the SAME guard script with the SAME timeout.
+
+        The plain relative command (NOT Bash-only ``$CLAUDE_PROJECT_DIR``
+        expansion) is the contract the settings pinning test enforces.
+        """
+        settings = _load_settings()
+        guard_entries = [
+            entry
+            for entry in settings["hooks"]["PreToolUse"]
+            if entry.get("matcher") in ("Bash", "PowerShell")
+        ]
+        self.assertEqual(len(guard_entries), 2)
+        bash, powershell = guard_entries
+        self.assertEqual(
+            bash["hooks"][0]["command"],
+            "python .claude/hooks/crypto-guard-command-guard.py",
+        )
+        self.assertEqual(
+            powershell["hooks"][0]["command"],
+            bash["hooks"][0]["command"],
+        )
+        self.assertEqual(
+            powershell["hooks"][0]["timeout"],
+            bash["hooks"][0]["timeout"],
+        )
+
+    def test_powershell_tool_event_is_classified_by_evaluate_hook(self) -> None:
+        """A PowerShell-shaped PreToolUse event reaches evaluate_hook and denies
+        an unguarded scheduled-task launch."""
+        allowed, reason = guard.evaluate_hook(
+            {
+                "tool_name": "PowerShell",
+                "tool_input": {
+                    "command": (
+                        "Start-ScheduledTask -TaskName "
+                        "CryptoGuard-PhaseB-Runtime-Smoke"
+                    )
+                },
+            }
+        )
+        self.assertFalse(allowed)
+        self.assertIn("service-control", reason)
+
+    def test_unguarded_powershell_initialize_database_is_denied(self) -> None:
+        allowed, reason = guard.evaluate_hook(
+            {
+                "tool_name": "PowerShell",
+                "tool_input": {
+                    "command": (
+                        "python -c \"from plugins.crypto_guard.storage.migrations "
+                        "import initialize_database; initialize_database()\""
+                    )
+                },
+            }
+        )
+        self.assertFalse(allowed)
+        self.assertIn("database-mutation", reason)
+
+    def test_unguarded_powershell_stop_process_is_denied(self) -> None:
+        allowed, reason = guard.evaluate_hook(
+            {
+                "tool_name": "PowerShell",
+                "tool_input": {"command": "Stop-Process -Id 1234"},
+            }
+        )
+        self.assertFalse(allowed)
+        self.assertIn("service-control", reason)
+
+    def test_unguarded_powershell_start_scheduled_task_is_denied(self) -> None:
+        for command in (
+            "Start-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+            "Stop-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+            "Register-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+            "Unregister-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    guard.classify_command(command),
+                    {"service-control"},
+                )
+
+    def test_unguarded_powershell_schtasks_run_is_denied(self) -> None:
+        for command in (
+            "schtasks /Run /TN CryptoGuard-PhaseB-Runtime-Smoke",
+            "schtasks /End /TN CryptoGuard-PhaseB-Runtime-Smoke",
+            "schtasks /Create /TN CryptoGuard-PhaseB-Runtime-Smoke /TR x /SC ONCE",
+            "schtasks /Delete /TN CryptoGuard-PhaseB-Runtime-Smoke /F",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    guard.classify_command(command),
+                    {"service-control"},
+                )
+
+    def test_service_control_token_allows_scheduled_task_once_and_auto_expires(
+            self) -> None:
+        """A correct service-control token allows one scheduled-task launch,
+        consumes the use, and (uses=1) auto-revokes the approval file."""
+        with tempfile.TemporaryDirectory() as directory:
+            approval_path = Path(directory) / "approval.json"
+            token = guard.authorize(
+                ["service-control"],
+                ".trellis/tasks/example",
+                15,
+                1,
+                approval_path,
+            )
+            command = (
+                "Start-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke "
+                f"# crypto-guard-approval:{token}"
+            )
+            allowed, reason = guard._approval_allows(
+                command,
+                {"service-control"},
+                expected_task=".trellis/tasks/example",
+                path=approval_path,
+            )
+            self.assertTrue(allowed, reason)
+            self.assertFalse(approval_path.exists())  # uses=1 => auto-revoked
+            allowed_again, _ = guard._approval_allows(
+                command,
+                {"service-control"},
+                expected_task=".trellis/tasks/example",
+                path=approval_path,
+            )
+            self.assertFalse(allowed_again)
+
+    def test_scheduled_task_query_commands_stay_read_only(self) -> None:
+        """Query verbs and plain PowerShell output are never guarded."""
+        for command in (
+            "Get-ScheduledTask -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+            "Get-ScheduledTaskInfo -TaskName CryptoGuard-PhaseB-Runtime-Smoke",
+            "schtasks /Query /TN CryptoGuard-PhaseB-Runtime-Smoke",
+            "Write-Output 'hello'",
+            "Get-Date",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify_command(command), set())
+
+    def test_bash_contracts_have_no_regression(self) -> None:
+        """All pre-existing Bash classifications must be unchanged."""
+        self.assertEqual(
+            guard.classify_command("python frontends/fsapp.py"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("pythonw hub.pyw"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Stop-Process -Id 1234"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Start-Service postgresql-x64-17"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Stop-Service postgresql"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command("Start-Process postgres"),
+            {"service-control"},
+        )
+        self.assertEqual(
+            guard.classify_command(
+                'python -c "import psycopg; '
+                "conn.execute('CREATE DATABASE crypto_guard')\""
+            ),
+            {"database-mutation"},
+        )
+        self.assertEqual(
+            guard.classify_command("pg_restore -d crypto_guard backup.dump"),
+            {"database-mutation"},
+        )
+        self.assertEqual(guard.classify_command("git status --short"), set())
 
 
 if __name__ == "__main__":
