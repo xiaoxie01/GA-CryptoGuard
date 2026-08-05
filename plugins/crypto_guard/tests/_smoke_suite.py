@@ -1263,9 +1263,16 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         skill_count = self.conn.execute("SELECT COUNT(*) FROM skill_execution_logs").fetchone()["count"]
         self.assertGreaterEqual(skill_count, 5 * len(DEFAULT_TIMEFRAMES))
         root = Path("plugins/crypto_guard/skills")
-        for name in ("chanlun_skill", "price_action_skill", "smc_orderflow_skill", "momentum_skill", "trend_stage_skill"):
+        # 08-04 contract E1/E2: the runtime keeps a single canonical skill
+        # contract. The canonical dirs must all resolve; the *_skill duplicate
+        # dirs must be deleted and never reappear.
+        for name in ("price_action", "momentum", "trend_stage", "smc_orderflow", "chanlun"):
             for filename in ("skill.yaml", "prompt.md", "tools.py", "schema.json", "feedback_rules.yaml"):
                 self.assertTrue((root / name / filename).exists(), f"{name}/{filename}")
+        self.assertFalse(
+            [d.name for d in root.iterdir() if d.is_dir() and d.name.endswith("_skill")],
+            "no *_skill duplicate dirs may remain (contract E1/E2)",
+        )
 
     def test_phase04_opportunity_watch_state_machine_and_button(self) -> None:
         from datetime import datetime, timedelta, timezone
@@ -1337,8 +1344,14 @@ class CryptoGuardSmokeTest(unittest.TestCase):
         self.assertEqual(update["triggered"], 1)
         triggered_watch = self.repo.get_opportunity_watch(button["watch_id"])
         self.assertEqual(triggered_watch["status"], "triggered")
-        alerts = self.conn.execute("SELECT * FROM agent_jobs WHERE job_type='opportunity_watch_alert'").fetchall()
-        self.assertEqual(len(alerts), 1)
+        # 08-04 contract A: triggered watch is INTERNAL-ONLY — enqueues a silent
+        # recheck job, never a legacy alert job, and writes no alert_outbox row.
+        rechecks = self.conn.execute("SELECT * FROM agent_jobs WHERE job_type='opportunity_watch_recheck'").fetchall()
+        self.assertEqual(len(rechecks), 1)
+        legacy_alerts = self.conn.execute("SELECT * FROM agent_jobs WHERE job_type='opportunity_watch_alert'").fetchall()
+        self.assertEqual(legacy_alerts, [])
+        outbox = self.conn.execute("SELECT * FROM alert_outbox WHERE alert_type='opportunity_triggered'").fetchall()
+        self.assertEqual(outbox, [])
         second = update_opportunity_watches(self.repo, analysis_time_utc=base + span * 2 - 1)
         self.assertEqual(second["triggered"], 0)
 
@@ -17602,7 +17615,10 @@ class ShadowVTLifecycleTest(unittest.TestCase):
         text = captured["paper_order_filled"][0]
         self.assertEqual(text.count("成交价："), 1, text)
         self.assertIn("- 成交价：7.2260", text)
-        self.assertIn("- 时间：2026-06-29 23:06:09 (UTC+8)", text)
+        # 08-04 contract A5: fills render an explicit compact "成交时间" line (no
+        # seconds) inside the fill branch instead of the generic seconds-precision
+        # "时间" line, so price and time stay on separate, non-collapsed lines.
+        self.assertIn("- 成交时间：2026-06-29 23:06 (UTC+8)", text)
         self.assertNotIn("成交价：7.226时间", text)
 
     def test_handle_paper_drawdown_alert_has_current_time(self) -> None:
@@ -28437,23 +28453,19 @@ def _extract_continuity_block_from_prompt(prompt: str) -> "dict | None":
     """Parse a captured LLM decision prompt and return the
     ``market_snapshot.analysis_continuity`` block.
 
-    ``build_llm_decision_prompt`` emits ``SYSTEM_PROMPT + "\n\n输入：\n"
-    + json.dumps(payload)``. The continuity block lives at
-    ``payload["market_snapshot"]["analysis_continuity"]``. This helper strips
-    the system-prompt prefix (splitting on the first ``输入：``), parses the
-    JSON payload, and returns the continuity dict (or ``None`` if absent /
-    unparseable). Used by S1 (P0 #1) to prove the fair path injected the REAL
-    strict cross-batch previous analysis before the LLM call."""
+    08-04 Codex-P2 (D4): ``build_llm_decision_prompt`` returns the structured
+    JSON payload ALONE (``json.dumps(payload)`` — the system prompt lives only
+    in ``session.system``, never in the user text). The continuity block lives
+    at ``payload["market_snapshot"]["analysis_continuity"]``. This helper
+    parses the JSON payload (with a brace-scan fallback for robustness) and
+    returns the continuity dict (or ``None`` if absent / unparseable). Used by
+    S1 (P0 #1) to prove the fair path injected the REAL strict cross-batch
+    previous analysis before the LLM call."""
     import json as _json
     if not isinstance(prompt, str) or not prompt:
         return None
-    marker = "输入："  # "输入：" (colon form used by the builder)
-    idx = prompt.find(marker)
-    if idx < 0:
-        idx = prompt.find("{")
-        body = prompt[idx:] if idx >= 0 else ""
-    else:
-        body = prompt[idx + len(marker):]
+    idx = prompt.find("{")
+    body = prompt[idx:] if idx >= 0 else ""
     body = body.strip()
     try:
         payload = _json.loads(body)
@@ -38489,6 +38501,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         blow past 48 KiB.
         """
         from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            SYSTEM_PROMPT,
             _compact_snapshot,
             build_llm_decision_prompt,
         )
@@ -38526,11 +38539,14 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         prompt = build_llm_decision_prompt(
             snapshot, deterministic_decision, context=None,
         )
-        prompt_bytes = len(prompt.encode("utf-8"))
+        prompt_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8"))
         self.assertLess(
             prompt_bytes, 48 * 1024,
-            f"R5 P1-2: prompt must be bounded by 48 KiB (got {prompt_bytes} bytes). "
-            "Pre-R5 the budget only constrained the feature pack, not the final prompt.",
+            f"R5 P1-2: provider total context (system + user) must be bounded by "
+            f"48 KiB (got {prompt_bytes} bytes). D4: the builder returns the user "
+            "body alone, so the system-prompt bytes are added back to bound the "
+            "real provider total. Pre-R5 the budget only constrained the feature "
+            "pack, not the final prompt.",
         )
 
         # (3) Revert-fail: large historical_memory trimmed to budget.
@@ -38553,7 +38569,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             snapshot, deterministic_decision,
             context={"skill_feedback_memory": big_memory_items},
         )
-        prompt_big_bytes = len(prompt_big.encode("utf-8"))
+        prompt_big_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt_big.encode("utf-8"))
         self.assertLess(
             prompt_big_bytes, 48 * 1024,
             f"R5 P1-2: oversized prompt must be trimmed to 48 KiB "
@@ -38573,7 +38589,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         prompt_modules = build_llm_decision_prompt(
             big_modules_snapshot, deterministic_decision, context=None,
         )
-        prompt_modules_bytes = len(prompt_modules.encode("utf-8"))
+        prompt_modules_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt_modules.encode("utf-8"))
         self.assertLess(
             prompt_modules_bytes, 48 * 1024,
             f"R6 REC-R6-1: oversized modules dict must trigger the "
@@ -38814,6 +38830,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         and the LLM context window.
         """
         from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            SYSTEM_PROMPT,
             build_llm_decision_prompt,
         )
 
@@ -38857,7 +38874,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         prompt = build_llm_decision_prompt(
             snapshot, deterministic_decision, context=None,
         )
-        prompt_bytes = len(prompt.encode("utf-8"))
+        prompt_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8"))
         self.assertLess(
             prompt_bytes, 48 * 1024,
             f"R7 P1: oversized feature pack (100KB) must be stubbed by the "
@@ -39461,6 +39478,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
            oversized prompt as a last resort.
         """
         from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            SYSTEM_PROMPT,
             build_llm_decision_prompt,
         )
 
@@ -39496,7 +39514,7 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         prompt = build_llm_decision_prompt(
             snapshot, deterministic_decision, context=None,
         )
-        prompt_bytes = len(prompt.encode("utf-8"))
+        prompt_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8"))
         self.assertLess(
             prompt_bytes, 48 * 1024,
             f"R8 P1: oversized feature pack (100KB) must be stubbed and stay "
@@ -39636,10 +39654,10 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             prompt_c = build_llm_decision_prompt(
                 snapshot_c, deterministic_decision_c, context=None,
             )
-        prompt_c_bytes = len(prompt_c.encode("utf-8"))
-        # The safe_payload is still prefixed by SYSTEM_PROMPT (which is
-        # much larger than 10 bytes), so the prompt will NOT be under 10
-        # bytes — but it will be the minimal safe_payload (no modules,
+        # D4: the safe_payload is the pure JSON user body (no SYSTEM_PROMPT
+        # prefix — the system prompt lives only in session.system). The body
+        # is still far larger than 10 bytes, so the prompt will NOT be under
+        # 10 bytes — but it will be the minimal safe_payload (no modules,
         # no market_snapshot, no historical_memory, etc.).
         # Assert the safe_payload marker is in the prompt (behavioral
         # evidence that the fallback fired — not just a source string
@@ -39679,15 +39697,10 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
         # existing assertion ``'"symbol":"BTCUSDT"' in prompt_c`` passes
         # vacuously because ``deterministic_reference.symbol`` serializes
         # to the same string. A stricter JSON parse catches the bug.
-        # Extract the JSON payload from the prompt (after the SYSTEM_PROMPT
-        # header and ``输入：`` separator).
-        json_start = prompt_c.find("\n输入：\n")
-        self.assertGreater(
-            json_start, -1,
-            "R10 P1: prompt must contain the ``输入：`` separator before the JSON payload.",
-        )
-        json_str = prompt_c[json_start + len("\n输入：\n"):]
-        safe_payload_parsed = json.loads(json_str)
+        # 08-04 Codex-P2 (D4): the market builders return the JSON payload
+        # ALONE (no SYSTEM_PROMPT header / ``输入：`` separator — the system
+        # prompt lives only in session.system). Parse the payload directly.
+        safe_payload_parsed = json.loads(prompt_c)
         self.assertEqual(
             safe_payload_parsed.get("symbol"), "BTCUSDT",
             "R10 P1: safe_payload top-level symbol must be 'BTCUSDT' (not null). "
@@ -39885,11 +39898,10 @@ class TestPhaseH07_05RealControllerContentContracts(unittest.TestCase):
             prompt_stub = build_llm_decision_prompt(
                 snapshot_stub, deterministic_decision, context=None,
             )
-        # Parse the safe_payload JSON and assert continuity is surfaced.
-        idx = prompt_stub.find("\n输入：\n")
-        self.assertGreater(idx, -1, "R3-2: prompt must contain 输入 separator.")
-        json_str = prompt_stub[idx + len("\n输入：\n"):]
-        safe_parsed = json.loads(json_str)
+        # 08-04 Codex-P2 (D4): the market builder returns the JSON payload
+        # ALONE (no ``输入：`` separator — the system prompt lives only in
+        # session.system). Parse the payload directly.
+        safe_parsed = json.loads(prompt_stub)
         self.assertIn(
             "_trim_note", safe_parsed,
             "R3-2: safe_payload fallback must have engaged (MAX_PROMPT_BYTES=10).",
@@ -40110,10 +40122,17 @@ class TestPhaseB07_07LLMRetryAndBreaker(unittest.TestCase):
         ctx = self._ctx_with(breaker, retry_budget, wall_budget)
         snapshot = self._decision_snapshot()
 
-        prompts_seen: list[str] = []
+        prompts_seen: list[tuple[str, str | None]] = []
 
         def fake_call(prompt: str) -> str:
-            prompts_seen.append(prompt)
+            # 08-04 Codex-P2 (D4): the retry tier's system prompt is selected
+            # via the one-shot thread-local ``system_override`` (the builder
+            # stashed it; the REAL _call_ga_llm consumes it into
+            # session.system). Record it alongside the user message.
+            from plugins.crypto_guard.reasoning.llm_agent_judge import _llm_call_state
+            prompts_seen.append(
+                (prompt, getattr(_llm_call_state, "system_override", None)),
+            )
             # Always return malformed JSON so all 3 attempts fail.
             return "{not valid json"
 
@@ -40130,11 +40149,27 @@ class TestPhaseB07_07LLMRetryAndBreaker(unittest.TestCase):
             len(prompts_seen), 2,
             "AC3: malformed JSON must trigger at least strict-JSON retry",
         )
-        # The strict JSON prompt should appear (contains the strict system prompt).
+        # 08-04 Codex-P2 (D4): retry Attempt 2+ must select
+        # SYSTEM_PROMPT_STRICT_JSON via the one-shot system_override, and the
+        # user message must be the pure JSON payload (the strict prompt is NOT
+        # embedded in the user text anymore — it goes to session.system).
         from plugins.crypto_guard.reasoning.llm_agent_judge import SYSTEM_PROMPT_STRICT_JSON
         self.assertTrue(
-            any(SYSTEM_PROMPT_STRICT_JSON in p for p in prompts_seen[1:]),
-            "AC3: retry Attempt 2+ must use SYSTEM_PROMPT_STRICT_JSON",
+            any(
+                (override == SYSTEM_PROMPT_STRICT_JSON)
+                for _user, override in prompts_seen[1:]
+            ),
+            "AC3: retry Attempt 2+ must select SYSTEM_PROMPT_STRICT_JSON "
+            "via system_override (D4: session.system only, not user text)",
+        )
+        self.assertTrue(
+            all(
+                (SYSTEM_PROMPT_STRICT_JSON not in user)
+                and (user.lstrip().startswith("{"))
+                for user, _override in prompts_seen
+            ),
+            "AC3: every attempt's user message must be the pure JSON payload "
+            "(D4: never embed the system prompt in the user text)",
         )
         self.assertEqual(decision["llm_status"], "failed")
         self.assertEqual(
@@ -44078,7 +44113,9 @@ class TestPhaseA07_10LLMFairSchedulingRepro(unittest.TestCase):
         prompt = build_llm_decision_prompt(
             snapshot, deterministic_decision={}, context=None,
         )
-        prompt_bytes = len(prompt.encode("utf-8"))
+        # D4: the builder returns the user body alone; add the system-prompt
+        # bytes so the measured value bounds the REAL provider total context.
+        prompt_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8"))
 
         # --- Baseline facts: continuity section present, no raw candles. ---
         self.assertIn(
@@ -46659,7 +46696,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         _SLOW_CONTROL = {"sleep": 5.0}
 
         def _slow_provider_wrapper(prompt, *, provider_timeout_seconds,
-                                   cfg_name, effective_out):
+                                   cfg_name, effective_out, system_prompt=None):
             # Delegate to the generic runner with the module-level test target.
             # The runner spawns + reaps + raises ``llm_subprocess_hard_timeout``
             # exactly like the production wrapper does on a wedged call -- so the
@@ -51009,7 +51046,7 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         _CLEANUP_FAIL_CONTROL = {"response": "valid-but-unreapable"}
 
         def _cleanup_fail_provider_wrapper(prompt, *, provider_timeout_seconds,
-                                           cfg_name, effective_out):
+                                           cfg_name, effective_out, system_prompt=None):
             _payload = _laj._run_subprocess_with_target(
                 _laj._test_subprocess_target,
                 (_CLEANUP_FAIL_CONTROL,),
@@ -57518,6 +57555,7 @@ class TestPhaseD07_10PromptContinuityMetadata(TestPhaseA07_10LLMFairSchedulingRe
         analysis_continuity -> modules -> minimal stub) enforces this even
         when the feature pack + continuity would otherwise exceed it."""
         from plugins.crypto_guard.reasoning.llm_agent_judge import (
+            SYSTEM_PROMPT,
             build_llm_decision_prompt,
         )
 
@@ -57525,7 +57563,9 @@ class TestPhaseD07_10PromptContinuityMetadata(TestPhaseA07_10LLMFairSchedulingRe
         snapshot = self._build_snapshot(symbol=sym, analysis_time_ms=self._PROD_BATCH_MS)
         deterministic = {"symbol": sym, "decision": "monitor_only", "signal_grade": "B"}
         prompt = build_llm_decision_prompt(snapshot, deterministic)
-        prompt_bytes = len(prompt.encode("utf-8"))
+        # D4: the builder returns the user body alone; add the system-prompt
+        # bytes to bound the REAL provider total context.
+        prompt_bytes = len(SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8"))
         # Hard cap: 48 KiB. Production payloads (5 TF x 7 modules + continuity
         # + memory) commonly land 8-30 KiB; the cap leaves headroom.
         self.assertLessEqual(
@@ -57561,11 +57601,15 @@ class TestPhaseD07_10PromptContinuityMetadata(TestPhaseA07_10LLMFairSchedulingRe
         with patch.object(llm_agent_judge, "MAX_PROMPT_BYTES", 4 * 1024):
             prompt = llm_agent_judge.build_llm_decision_prompt(snapshot, deterministic)
         # The minimal-stub fallback guarantees a bounded prompt. The stub
-        # payload is < 4 KiB by construction.
+        # payload is < 4 KiB by construction; add the system-prompt bytes to
+        # bound the REAL provider total context (session.system + user body),
+        # matching the other D4 byte-budget sites.
         self.assertLessEqual(
-            len(prompt.encode("utf-8")), 48 * 1024,
-            "Phase D D1: even under an aggressive trim, the prompt must not "
-            "exceed the 48 KiB absolute ceiling.",
+            len(llm_agent_judge.SYSTEM_PROMPT.encode("utf-8")) + len(prompt.encode("utf-8")),
+            48 * 1024,
+            "Phase D D1: even under an aggressive trim, the real provider total "
+            "(system prompt + user body) must not exceed the 48 KiB absolute "
+            "ceiling.",
         )
 
     # ------------------------------------------------------------------

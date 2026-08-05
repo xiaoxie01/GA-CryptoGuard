@@ -214,7 +214,8 @@ feishu:
       - take_profit_hit
       - stop_loss_hit
       - risk_alert
-      - opportunity_triggered
+      # 08-04 contract A: the watch-lifecycle alert_type is removed here —
+      # watch lifecycle is internal-only, stays silenceable.
       - paper_order_filled
       - paper_order_expired
       - conflict_cancelled

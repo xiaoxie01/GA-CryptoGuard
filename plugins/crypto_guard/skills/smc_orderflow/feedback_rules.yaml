@@ -3,3 +3,9 @@ feedback_rules:
     action: require_order_flow_confirmation
   - when: liquidity_sweep_failed
     action: reduce_sweep_confidence
+  # 08-04 contract E1/E2: single canonical contract. Rules formerly carried by
+  # the deleted smc_orderflow_skill dir are merged here as the one source of truth.
+  - when: sweep_without_reclaim_failed
+    action: require_reclaim_confirmation
+  - when: cvd_divergence_ignored
+    action: raise_divergence_penalty

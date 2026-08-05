@@ -1098,12 +1098,11 @@ def render_ga_hourly_summary(
     for row in observation[:20]:
         lines.append(_format_opportunity_row(row, open_by_symbol, tier_label="观察候选", market_data_degraded=md_degraded))
 
-    lines.extend(["", "**五、当前机会监控**"])
-    if not active_watches:
-        lines.append("- 暂无 active 机会监控")
-    for watch in active_watches[:10]:
-        condition = _compact_items(_safe_json(watch.get("watch_condition_json"), []), max_items=2)
-        lines.append(f"- #{watch['id']} {watch['symbol']} {watch.get('direction') or '-'}：{condition or watch.get('watch_reason') or '-'}")
+    # 08-04 contract A: opportunity watches are INTERNAL-ONLY context. The
+    # hourly summary shows only an aggregate count line - never per-watch lines
+    # and never raw watch dicts/condition JSON.
+    lines.extend(["", "**五、内部观察上下文**"])
+    lines.append(f"- 内部观察上下文 {len(active_watches)} 条（内部证据，非交易机会）")
 
     lines.extend(["", "**六、无优势品种汇总（C/D）**"])
     # P1-1 (2026-07-24): the "等级分布" line MUST report the CURRENT batch's

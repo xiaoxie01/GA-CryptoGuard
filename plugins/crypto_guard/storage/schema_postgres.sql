@@ -333,6 +333,13 @@ CREATE TABLE IF NOT EXISTS opportunity_watches (
     created_by_user_action BOOLEAN DEFAULT FALSE,
     source_button_action TEXT,
     dedupe_key TEXT,
+    -- 08-04 contract B: recheck outcome bookkeeping. recheck_status records
+    -- the last fresh re-analysis outcome for the watch (order_created /
+    -- recheck_rejected / empty); recheck_order_id links to the created
+    -- paper_orders.id.
+    recheck_status TEXT,
+    recheck_order_id BIGINT,
+    last_recheck_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -388,9 +395,20 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     cancelled_at TIMESTAMPTZ,
     cancel_reason TEXT,
     invalidated_by_ga_decision_id BIGINT,
+    -- 08-04 contract B: the watch -> order bridge link. One triggered
+    -- opportunity_watch may produce at most one live paper order.
+    trigger_watch_id BIGINT,
     UNIQUE(signal_id),
     FOREIGN KEY(signal_id) REFERENCES signals(id)
 );
+-- 08-04 contract B: at most ONE live paper order per trigger_watch_id. A
+-- pending/open/needs_recheck order holds the link; once the order is terminal
+-- (filled/expired/cancelled) the same watch can never re-create (idempotent
+-- bridge). NULL trigger_watch_id rows (signal-originated orders) are
+-- unconstrained.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_trigger_watch_once
+    ON paper_orders(trigger_watch_id)
+    WHERE trigger_watch_id IS NOT NULL AND status IN ('pending','open','needs_recheck');
 
 -- ── paper_trades ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS paper_trades (

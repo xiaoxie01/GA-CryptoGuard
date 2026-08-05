@@ -11,17 +11,23 @@ from typing import Any, Callable
 
 from plugins.crypto_guard.config.loader import load_config
 from plugins.crypto_guard.logging_utils import get_logger
-from plugins.crypto_guard.notify.alert_delivery import process_alert_outbox, send_markdown_alert
+from plugins.crypto_guard.notify.alert_delivery import (
+    DEFAULT_NEVER_SILENCE,
+    process_alert_outbox,
+    send_markdown_alert,
+)
 from plugins.crypto_guard.notify.hourly_report import build_hourly_report, resolve_report_target
 from plugins.crypto_guard.notify.feishu_cards import build_analysis_card_json, render_text
 from plugins.crypto_guard.notify.signal_policy import should_push_signal
 from plugins.crypto_guard.ga_master import GAAnalysisRequest, GAMasterController
 from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy
+from plugins.crypto_guard.reasoning.market_state_builder import build_market_state_snapshot
+from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
 from plugins.crypto_guard.ga_master.feishu_action_builder import build_feishu_actions
 from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
 from plugins.crypto_guard.review.daily_reviewer import run_daily_review
 from plugins.crypto_guard.review.trade_reviewer import review_trade
-from plugins.crypto_guard.scheduler.opportunity_watcher import render_watch_alert_text, update_opportunity_watches
+from plugins.crypto_guard.scheduler.opportunity_watcher import update_opportunity_watches
 from plugins.crypto_guard.storage.migrations import initialize_database
 from plugins.crypto_guard.storage.repository import CryptoGuardRepository, validate_job_identity, _decode_json
 from plugins.crypto_guard.storage.redis_adapter import RedisAdapter, should_use_redis_for_path
@@ -200,6 +206,66 @@ def _parse_db_ts_ms(ts: str | None) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
+def _broker_verifier_allows(
+    repo: CryptoGuardRepository,
+    *,
+    symbol: str,
+    timeframe: str,
+    analysis_time_utc: int | None,
+    deterministic_risk_ok: bool,
+) -> tuple[bool, dict[str, Any]]:
+    """08-04 contract E8 production wiring (fresh reviewer P1): run the
+    read-only ``AnalysisToolBroker`` verifier round for an order candidate.
+
+    The verifier is VETO-ONLY: ``order_allowed`` requires the candidate, an
+    approving verifier AND the deterministic risk gate open (E8), so it can
+    block an order but can never grant eligibility on its own. It vetoes when
+    deterministic risk is blocked, evidence is unavailable (market summary /
+    skill evidence / account state), or concentration exceeds 5 open orders.
+
+    FAIL-OPEN by design: if the broker's five read seams are absent (e.g. a
+    repository shim), the module is unavailable, or the round raises, this
+    returns ``(True, ...)`` so the existing deterministic gates (risk engine,
+    account guard, recheck gate) remain the authoritative order decision. The
+    broker is an additional advisory veto, never a silent order blocker.
+    """
+    try:
+        from plugins.crypto_guard.tools.analysis_tool_broker import (
+            AnalysisToolBroker,
+            run_analysis_rounds,
+        )
+        seams = (
+            getattr(repo, "get_candles", None),
+            getattr(repo, "latest_skill_result_refs", None),
+            getattr(repo, "latest_analysis_states", None),
+            getattr(repo, "list_active_opportunity_watches_for_symbol", None),
+            getattr(repo, "list_open_paper_orders", None),
+        )
+        if not all(seams):
+            return True, {"reason": "broker_seams_missing_skip", "order_allowed": True}
+        broker = AnalysisToolBroker(repo)
+        result = run_analysis_rounds(
+            broker,
+            symbol=str(symbol),
+            timeframe=str(timeframe or "15m"),
+            analysis_time_utc=int(analysis_time_utc or utc_ms()),
+            conflict=False,
+            watch_hit=False,
+            order_candidate=True,
+            deterministic_risk_ok=bool(deterministic_risk_ok),
+        )
+        order_allowed = bool(result.get("order_allowed"))
+        verifier = result.get("verifier") or {}
+        return order_allowed, {
+            "reason": "broker_verifier",
+            "order_allowed": order_allowed,
+            "verdict": verifier.get("verdict"),
+        }
+    except Exception as exc:  # noqa: BLE001 — advisory gate must fail open
+        LOGGER.warning("broker verifier skipped (fail-open): %s", exc)
+        return True, {"reason": "broker_verifier_exception_skip", "order_allowed": True}
+
+
 def _post_decision_effects(
     repo: CryptoGuardRepository,
     decision: dict[str, Any],
@@ -235,48 +301,73 @@ def _post_decision_effects(
     # Don't auto-create if there's already an open order for this symbol
     existing_orders = repo.list_open_paper_orders_for_symbol(decision.get("symbol", ""))
     if grade in {"S", "A"} and has_plan and risk_ok and ga_decision_id and not existing_orders:
-        try:
-            from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
-            auto_order = create_paper_order_from_ga_decision(repo, int(ga_decision_id))
-            LOGGER.info("auto paper order created ga_decision_id=%s result=%s", ga_decision_id, auto_order)
-            # Send notification when order is newly created (not idempotent)
-            if auto_order.get("ok") and auto_order.get("created"):
-                _target = resolve_report_target(repo, payload)
-                if _target and send_message:
-                    plan = decision.get("trade_plan") or {}
-                    tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
-                    side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
-                    entry_type = str(plan.get("entry_type") or "limit")
-                    status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
-                    entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
-                    from plugins.crypto_guard.notify.time_utils import format_event_time_cst
-                    event_time = format_event_time_cst(datetime.now(timezone.utc))
-                    order_text = "\n".join([
-                        "**CryptoGuard 已自动创建模拟盘订单**",
-                        "",
-                        f"- 时间：{event_time}",
-                        f"- 产品：{decision.get('symbol')}",
-                        f"- 方向：{side_cn}",
-                        f"- 状态：{status_cn}",
-                        f"- 入场价：{entry_price}",
-                        f"- 止损价：{plan.get('stop_loss')}",
-                        f"- 止盈价：{tps}",
-                        f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
-                        "",
-                        "不构成实盘建议，仅用于模拟盘与策略研究。",
-                    ])
-                    send_markdown_alert(
-                        repo, send_message,
-                        receive_id=_target["receive_id"],
-                        receive_id_type=_target.get("receive_id_type", "chat_id"),
-                        text=order_text,
-                        alert_type="paper_order_filled",
-                        symbol=decision.get("symbol"),
-                        priority=3,
-                    )
-        except Exception as exc:
-            LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
-            auto_order = {"ok": False, "error": str(exc)}
+        # 08-04 contract E8 production wiring (fresh reviewer P1): the read-only
+        # analysis broker runs a VETO-ONLY verifier round before an order may be
+        # auto-created. Fail-open (see _broker_verifier_allows) so the
+        # deterministic gates above stay authoritative; the broker can veto but
+        # never grant eligibility.
+        verifier_ok, _verifier = _broker_verifier_allows(
+            repo,
+            symbol=decision.get("symbol", ""),
+            timeframe="15m",
+            analysis_time_utc=int(decision.get("analysis_time_utc") or utc_ms()),
+            deterministic_risk_ok=bool(risk_ok),
+        )
+        if verifier_ok:
+            try:
+                from plugins.crypto_guard.paper.paper_broker import create_paper_order_from_ga_decision
+                auto_order = create_paper_order_from_ga_decision(repo, int(ga_decision_id))
+                LOGGER.info("auto paper order created ga_decision_id=%s result=%s", ga_decision_id, auto_order)
+                # Send notification when order is newly created (not idempotent)
+                if auto_order.get("ok") and auto_order.get("created"):
+                    _target = resolve_report_target(repo, payload)
+                    if _target and send_message:
+                        plan = decision.get("trade_plan") or {}
+                        tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
+                        side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
+                        entry_type = str(plan.get("entry_type") or "limit")
+                        status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
+                        entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
+                        # 08-04 contract A: the create/pending push must carry the
+                        # mandated fields — order_id, side, entry, SL/TP,
+                        # quantity-or-risk, expiry, and the source decision id.
+                        order_id = auto_order.get("order_id")
+                        risk_percent = (decision.get("risk_check") or {}).get("risk_percent") or plan.get("risk_percent")
+                        quantity = plan.get("quantity") or plan.get("position_size")
+                        quantity_text = f"{quantity} 张" if quantity else f"{risk_percent}% 风险" if risk_percent else "-"
+                        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+                        from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
+                        event_time = format_event_time_cst(datetime.now(timezone.utc))
+                        order_text = "\n".join([
+                            "**CryptoGuard 已自动创建模拟盘订单**",
+                            "",
+                            f"- 时间：{event_time}",
+                            f"- 产品：{decision.get('symbol')}",
+                            f"- 订单号：{order_id}",
+                            f"- 方向：{side_cn}",
+                            f"- 状态：{status_cn}",
+                            f"- 入场价：{entry_price}",
+                            f"- 止损价：{plan.get('stop_loss')}",
+                            f"- 止盈价：{tps}",
+                            f"- 数量/风险：{quantity_text}",
+                            f"- 有效期：{compute_expires_at(entry_type)}",
+                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
+                            f"- 决策ID：{ga_decision_id}",
+                            "",
+                            "不构成实盘建议，仅用于模拟盘与策略研究。",
+                        ])
+                        send_markdown_alert(
+                            repo, send_message,
+                            receive_id=_target["receive_id"],
+                            receive_id_type=_target.get("receive_id_type", "chat_id"),
+                            text=order_text,
+                            alert_type="paper_order_filled",
+                            symbol=decision.get("symbol"),
+                            priority=3,
+                        )
+            except Exception as exc:
+                LOGGER.warning("auto paper order failed ga_decision_id=%s error=%s", ga_decision_id, exc)
+                auto_order = {"ok": False, "error": str(exc)}
 
     # P0-2 (08-02): auto-materialize opportunity watches from the decision's
     # structured watch + feishu_actions. Runs on the SAME shared pipeline as
@@ -1500,8 +1591,11 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         result = update_opportunity_watches(repo, analysis_time_utc=payload.get("analysis_time_utc"))
         LOGGER.info("process_job done id=%s type=%s ok=%s triggered=%s", job.get("id"), job_type, result.get("ok"), result.get("triggered"))
         return result
-    if job_type == "opportunity_watch_alert":
-        result = handle_opportunity_watch_alert(repo, payload, send_message=send_message)
+    if job_type in ("opportunity_watch_alert", "opportunity_watch_recheck"):
+        # 08-04 contract A: legacy opportunity_watch_alert jobs (if any still
+        # queued) are replayed as a silent internal-only recheck — never a
+        # feishu push. Both job types dispatch to the same handler.
+        result = handle_opportunity_watch_recheck(repo, payload, send_message=send_message)
         LOGGER.info("process_job done id=%s type=%s ok=%s sent=%s", job.get("id"), job_type, result.get("ok"), result.get("sent"))
         return result
     if job_type == "trade_review":
@@ -1830,16 +1924,193 @@ def handle_button_callback(repo: CryptoGuardRepository, payload: dict[str, Any],
     return result
 
 
-def handle_opportunity_watch_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
+def _run_recheck_analysis(
+    repo: CryptoGuardRepository,
+    *,
+    symbol: str,
+    analysis_time_utc: int,
+    snapshot_id: int | None,
+) -> dict[str, Any]:
+    """08-04 contract B: fresh recheck decision from the LATEST closed candle.
+
+    ``build_market_state_snapshot`` always rebuilds from the latest closed
+    candle (never a stored/stale snapshot), then the real controller pipeline
+    runs and persists the decision. This is the default ``_analyze`` seam.
+    """
+    snapshot = build_market_state_snapshot(
+        repo,
+        symbol=symbol,
+        analysis_time_utc=analysis_time_utc,
+        mode="opportunity_watch",
+    )
+    controller = GAMasterController(repo)
+    request = GAAnalysisRequest(
+        symbol=symbol,
+        decision_type="opportunity_watch_recheck",
+        analysis_time_utc=int(snapshot.get("analysis_time_utc") or analysis_time_utc),
+        mode="opportunity_watch",
+        snapshot=snapshot,
+        snapshot_id=snapshot_id,
+        requested_by="opportunity_watch_recheck",
+        request_text="opportunity watch recheck",
+    )
+    return controller.analyze_symbol(request)
+
+
+def _recheck_order_gate(repo: CryptoGuardRepository, watch: dict[str, Any], decision: dict[str, Any]) -> tuple[bool, str]:
+    """08-04 contract B gate: an order is created ONLY when S/A + llm ok +
+    LLM confirmed + risk_ok + valid final trade_plan + account not paused +
+    direction valid. Anything else rejects the order (B/C/D grades,
+    llm-unconfirmed, risk-rejected, continuity-invalidated, candidate-only).
+
+    ``plan_execution_state == "confirmed"`` already encodes the finalizer
+    contract (llm confirmed AND has_trade_plan AND non-empty plan AND risk_ok
+    AND effective grade S/A) — see ``_finalize_plan_lifecycle``. We re-check
+    the individual fields here so a malformed/stale decision cannot slip through
+    on that one flag alone.
+    """
+    sym = str(watch.get("symbol") or "")
+    state = decision.get("plan_execution_state")
+    if state != "confirmed":
+        return False, f"plan_execution_state={state!r} (need confirmed)"
+    grade = str(decision.get("effective_signal_grade") or decision.get("signal_grade") or "")
+    if grade not in ("S", "A"):
+        return False, f"grade={grade!r} (need S/A)"
+    if decision.get("llm_status") != "ok":
+        return False, f"llm_status={decision.get('llm_status')!r} (need ok)"
+    if decision.get("plan_origin") != "llm_confirmed":
+        return False, f"plan_origin={decision.get('plan_origin')!r} (need llm_confirmed)"
+    risk = decision.get("risk_check") or {}
+    if not risk.get("risk_ok"):
+        return False, "risk_ok=false"
+    tp = decision.get("trade_plan")
+    if not isinstance(tp, dict) or not tp:
+        return False, "no final trade_plan"
+    side = str(tp.get("side") or "").upper()
+    if side not in ("LONG", "SHORT"):
+        return False, f"invalid side {side!r}"
+    # Direction valid: the order side must match the watch's intended direction.
+    wdir = str(watch.get("direction") or "").upper()
+    if wdir and wdir != side:
+        return False, f"direction mismatch watch={wdir!r} plan={side!r}"
+    entry = tp.get("entry_price")
+    stop = tp.get("stop_loss")
+    if entry is None or stop is None:
+        return False, "missing entry_price/stop_loss"
+    try:
+        if abs(float(entry) - float(stop)) < 1e-9:
+            return False, "entry_price==stop_loss invalid"
+    except (TypeError, ValueError):
+        return False, "non-numeric entry_price/stop_loss"
+    acct = AccountRiskGuard(repo).check(symbol=sym, side=side)
+    if acct.get("pause_active"):
+        return False, "account risk paused"
+    return True, "ok"
+
+
+def handle_opportunity_watch_recheck(
+    repo: CryptoGuardRepository,
+    payload: dict[str, Any],
+    *,
+    send_message: Callable[..., Any] | None = None,
+    _analyze: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """08-04 contract A/B: a triggered watch's follow-up is INTERNAL-ONLY.
+
+    No feishu alert is produced and no alert_outbox row is written. The job
+    runs a FRESH re-analysis from the latest closed candle (contract B). When
+    the recheck clears the order gate (S/A + llm confirmed + risk_ok + account
+    ok + direction valid) it bridges the decision into ONE paper order via
+    ``create_paper_order(trigger_watch_id=...)``; the partial unique index
+    ``idx_paper_orders_trigger_watch_once`` + a task lock make the bridge
+    idempotent (single analysis, single order, no duplicate). Otherwise the
+    watch's ``recheck_status`` records the rejection and nothing is ordered.
+
+    Legacy ``opportunity_watch_alert`` jobs are replayed through this same
+    silent path, so a stale queued job degrades to a harmless no-op instead of
+    a user-facing push.
+    """
     watch = repo.get_opportunity_watch(int(payload["watch_id"]))
     if not watch:
-        return {"ok": False, "error": "opportunity_watch 不存在", "sent": False}
-    target = resolve_report_target(repo, payload)
-    text = render_watch_alert_text(watch, payload.get("result") or {})
-    sent = False
-    if target and send_message:
-        sent = bool(send_markdown_alert(repo, send_message, receive_id=target["receive_id"], receive_id_type=target.get("receive_id_type", "chat_id"), text=text, alert_type="opportunity_triggered", symbol=watch.get("symbol"), priority=3).get("sent"))
-    return {"ok": True, "watch_id": watch["id"], "sent": sent, "target": target, "text": text}
+        return {"ok": False, "error": "opportunity_watch 不存在", "sent": False, "internal_only": True}
+    watch_id = int(watch["id"])
+    # Task lock: only ONE recheck may run per watch at a time. A duplicate /
+    # repeated trigger that slips through dedup is a no-op here.
+    lock_name = f"opportunity_watch_recheck:{watch_id}"
+    if not repo.acquire_lock(lock_name, "opportunity_watch_recheck", 600):
+        return {
+            "ok": False, "error": "recheck_already_in_progress",
+            "sent": False, "internal_only": True, "watch_id": watch_id,
+        }
+    try:
+        # Idempotency: a live paper order already bridged for this watch must
+        # never produce a second order.
+        existing = repo.get_paper_order_by_trigger_watch(watch_id)
+        if existing is not None:
+            repo.touch_opportunity_watch(watch_id)
+            return {
+                "ok": True, "watch_id": watch_id, "internal_only": True,
+                "sent": False, "duplicate": True,
+                "paper_order_id": int(existing["id"]),
+                "text": "内部观察上下文已归档（已有订单，不重复下单）",
+            }
+        repo.touch_opportunity_watch(watch_id)
+        sym = str(watch.get("symbol") or "")
+        analysis_time_utc = utc_ms()
+        analyzer = _analyze or _run_recheck_analysis
+        decision = analyzer(
+            repo, symbol=sym, analysis_time_utc=analysis_time_utc, snapshot_id=None,
+        )
+        ok, reason = _recheck_order_gate(repo, watch, decision)
+        if not ok:
+            repo.set_opportunity_watch_recheck_status(watch_id, "recheck_rejected")
+            return {
+                "ok": True, "watch_id": watch_id, "internal_only": True,
+                "sent": False, "rejected": True, "reason": reason,
+                "text": "内部观察上下文已归档（不推送）",
+            }
+        # 08-04 contract E8 production wiring (fresh reviewer P1): a VETO-ONLY
+        # broker verifier round runs before the watch->order bridge. Fail-open
+        # (see _broker_verifier_allows); the deterministic recheck gate above
+        # stays authoritative — the broker can veto but never grant eligibility.
+        verifier_ok, _verifier = _broker_verifier_allows(
+            repo,
+            symbol=sym,
+            timeframe="15m",
+            analysis_time_utc=analysis_time_utc,
+            deterministic_risk_ok=True,
+        )
+        if not verifier_ok:
+            repo.set_opportunity_watch_recheck_status(watch_id, "recheck_rejected")
+            return {
+                "ok": True, "watch_id": watch_id, "internal_only": True,
+                "sent": False, "rejected": True, "reason": "broker_verifier_veto",
+                "text": "内部观察上下文已归档（不推送）",
+            }
+        tp = decision.get("trade_plan")
+        signal = {
+            "symbol": sym,
+            "side": str(tp.get("side") or "").upper(),
+            "grade": decision.get("effective_signal_grade"),
+        }
+        ga_id = int(decision.get("ga_decision_id") or 0)
+        order_id, created = repo.create_paper_order(
+            decision.get("signal_id"),
+            signal,
+            tp,
+            ga_decision_id=ga_id if ga_id else None,
+            source="watch_recheck",
+            risk_check_passed=True,
+            trigger_watch_id=watch_id,
+        )
+        repo.set_opportunity_watch_recheck_status(watch_id, "order_created", order_id=order_id)
+        return {
+            "ok": True, "watch_id": watch_id, "internal_only": True,
+            "sent": False, "paper_order_id": order_id, "created": created,
+            "ga_decision_id": ga_id, "text": "内部观察上下文已归档（不推送）",
+        }
+    finally:
+        repo.release_lock(lock_name, "opportunity_watch_recheck")
 
 
 def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any], *, send_message: Callable[..., Any] | None = None) -> dict[str, Any]:
@@ -1903,10 +2174,13 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
     event_time = payload.get("event_time") or payload.get("closed_at")
     if event_type == "paper_order_filled":
         event_time = event_time or payload.get("filled_at")
-    if event_time:
-        detail_lines.append(f"- {format_event_time_cst_for_line(event_time)}")
-    else:
-        detail_lines.append(f"- {format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat())}")
+    # 08-04 contract A: fills render an explicit "成交时间" line inside the fill
+    # branch, so skip the generic time line here to avoid a duplicated field.
+    if event_type != "paper_order_filled":
+        if event_time:
+            detail_lines.append(f"- {format_event_time_cst_for_line(event_time)}")
+        else:
+            detail_lines.append(f"- {format_event_time_cst_for_line(datetime.now(timezone.utc).isoformat())}")
 
     if event_type == "stop_loss_adjustment":
         new_stop = payload.get("new_stop_loss")
@@ -1973,6 +2247,23 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
     elif event_type == "paper_order_filled":
         if fill_method_cn:
             detail_lines.append(f"- 成交方式：{fill_method_cn}")
+        # 08-04 contract A: the fill push must carry fill price, fill time,
+        # slippage and the resulting position.
+        fill_time = payload.get("filled_at") or payload.get("event_time")
+        if fill_time:
+            filled_cn = format_event_time_cst_compact(fill_time)
+            detail_lines.append(f"- 成交时间：{filled_cn if filled_cn != '不可用' else fill_time}")
+        slippage = payload.get("slippage")
+        if slippage is not None:
+            detail_lines.append(f"- 滑点：{float(slippage):+.4f}")
+        position = payload.get("position")
+        if isinstance(position, dict) and position.get("quantity"):
+            pos_side = {"LONG": "多单", "SHORT": "空单"}.get(str(position.get("side") or "").upper(), position.get("side") or "仓位")
+            avg_price = position.get("avg_price") or position.get("avg_entry_price")
+            pos_text = f"{pos_side} {position.get('quantity')} 张"
+            if avg_price is not None:
+                pos_text += f" @ {float(avg_price):.4f}"
+            detail_lines.append(f"- 持仓：{pos_text}")
         stop_loss = payload.get("stop_loss")
         if stop_loss:
             detail_lines.append(f"- 止损价：{float(stop_loss):.4f}")
@@ -2017,6 +2308,11 @@ def handle_paper_event_alert(repo: CryptoGuardRepository, payload: dict[str, Any
         f"- 方向：{side_cn}",
         f"- 订单：#{payload.get('order_id', '-')}",
     ]
+    # 08-04 contract A: paper lifecycle pushes carry the source decision id so
+    # the push is traceable to the GA decision that created the order.
+    source_decision_id = payload.get("source_decision_id") or payload.get("ga_decision_id")
+    if source_decision_id is not None:
+        lines.append(f"- 决策ID：{source_decision_id}")
     if price_label and display_price:
         lines.append(f"- {price_label}：{display_price}")
     lines = lines + detail_lines + [
@@ -2752,7 +3048,7 @@ def _send_interactive_alert(
 ) -> dict[str, Any]:
     quiet_cfg = ((load_config().trading_mode.get("feishu") or {}).get("quiet_period") or {})
     quiet_minutes = int(quiet_cfg.get("normal_duplicate_alert_minutes", 5))
-    never_silence = set(quiet_cfg.get("never_silence") or [])
+    never_silence = set(quiet_cfg.get("never_silence") or DEFAULT_NEVER_SILENCE)
     redis = RedisAdapter() if should_use_redis_for_path(None) else None
     redis_quiet_symbol = symbol or "-"
     if alert_type not in never_silence and redis and redis.is_quiet(redis_quiet_symbol, alert_type):

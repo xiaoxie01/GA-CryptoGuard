@@ -948,6 +948,9 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
     last_price = float(market["close"])
     high = float(market["high"])
     low = float(market["low"])
+    # 08-04 contract A5: reference candle open for the fill push's slippage
+    # field (price-level slippage, not the market-order slippage pct).
+    open_price_ref = float(market.get("open", last_price))
     order_type = order["order_type"]
     side = order["side"]
     should_fill = False
@@ -1029,6 +1032,20 @@ def fill_order_if_triggered(repo: CryptoGuardRepository, order: dict[str, Any], 
             "event_time": fill_event_time,
             "quantity": order.get("quantity"),
             "order_type": order.get("order_type"),
+            # 08-04 contract A5: the fill push must carry the source decision
+            # id, the price-level slippage (signed cost; positive = worse) and
+            # the resulting position so the push is traceable and complete.
+            "source_decision_id": order.get("ga_decision_id"),
+            "slippage": round(
+                (float(entry_price) - open_price_ref)
+                * (1 if str(side).upper() == "LONG" else -1),
+                8,
+            ),
+            "position": {
+                "side": side,
+                "quantity": order.get("quantity"),
+                "avg_price": float(entry_price),
+            },
         },
     )
     return {"ok": True, "filled": True, "trade_id": trade_id, "entry_price": float(entry_price), "fill_method": fill_method}

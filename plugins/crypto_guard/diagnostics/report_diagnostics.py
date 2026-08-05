@@ -3789,10 +3789,13 @@ def _check_opportunity_watch_not_materialized(
     """08-02 P1-3: decisions that gated the auto opportunity-watch materialization
     (the P0-2 wire-in: ``create_opportunity_watch`` suggested action, structured
     watch, effective grade in S/A/B, no open paper order for the symbol) yet no
-    active opportunity_watch row exists. A missing active watch is a broken
-    funnel: the decision promised a watch that was never materialized. Mirrors
-    the wire-in gate conditions exactly so a skipped-by-design decision (open
-    order present, unstructured watch, D/C grade) is NOT flagged.
+    matching opportunity_watch row exists. ANY watch row for the decision's
+    dedupe_key / ga_decision_id proves the funnel completed — including
+    terminal states ('triggered', 'invalidated', 'expired') the watcher moved a
+    materialized watch into (08-04 Phase 6 residual P1 fix). A missing watch is
+    a broken funnel: the decision promised a watch that was never materialized.
+    Mirrors the wire-in gate conditions exactly so a skipped-by-design decision
+    (open order present, unstructured watch, D/C grade) is NOT flagged.
     """
     from plugins.crypto_guard.reasoning.watch_conditions import is_structured_watch
     issues: list[dict[str, Any]] = []
@@ -3846,11 +3849,17 @@ def _check_opportunity_watch_not_materialized(
         dedupe_key = f"auto:{symbol}:{direction}"
         found = None
         if dedupe_key and symbol:
+            # 08-04 Phase 6: ANY matching watch row proves materialization, not
+            # only rows still `status = 'active'`. The watcher moves a
+            # materialized watch to 'triggered' (condition hit -> recheck
+            # enqueued), 'invalidated' (continuity broken) or 'expired' (TTL
+            # elapsed) — a terminal watch is still proof the P0-2 wire-in DID
+            # land, so it must NOT be flagged as a broken funnel. Pre-fix the
+            # `status = 'active'` guard false-positived every completed watch.
             found = repo.conn.execute(
                 """
                 SELECT id FROM opportunity_watches
-                WHERE status = 'active'
-                  AND (dedupe_key = %s OR ga_decision_id = %s)
+                WHERE dedupe_key = %s OR ga_decision_id = %s
                 LIMIT 1
                 """,
                 (dedupe_key, int(r["id"])),

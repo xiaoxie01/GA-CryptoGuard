@@ -43,14 +43,17 @@ def update_opportunity_watches(repo: CryptoGuardRepository, *, analysis_time_utc
         elif status == "triggered":
             triggered_at = _utc_iso_from_ms(analysis_time)
             if repo.update_opportunity_watch_status(watch["id"], "triggered", triggered_at=triggered_at):
-                alert_job_id = repo.enqueue_job(
-                    "opportunity_watch_alert",
+                # 08-04 contract A/B: a watch condition hit is INTERNAL-ONLY. It
+                # enqueues a silent fresh re-analysis job (opportunity_watch_recheck,
+                # contract B bridge) — never a feishu opportunity_watch_alert.
+                recheck_job_id = repo.enqueue_job(
+                    "opportunity_watch_recheck",
                     3,
                     "opportunity_watcher",
                     f"system:opportunity_watch:{watch['id']}",
                     {"watch_id": watch["id"], "result": result, "analysis_time_utc": analysis_time},
                 )
-                result["alert_job_id"] = alert_job_id
+                result["recheck_job_id"] = recheck_job_id
                 triggered += 1
         else:
             repo.touch_opportunity_watch(watch["id"])
@@ -136,22 +139,6 @@ def evaluate_watch(repo: CryptoGuardRepository, watch: dict[str, Any], *, analys
     return _result(watch, "waiting", "尚未满足触发条件", condition_results=hits, latest_candle=latest)
 
 
-def render_watch_alert_text(watch: dict[str, Any], result: dict[str, Any]) -> str:
-    agent_reason = ((result.get("agent_review") or {}).get("summary") if isinstance(result.get("agent_review"), dict) else None) or result.get("reason")
-    return "\n".join(
-        [
-            "**CryptoGuard 机会监控触发**",
-            "",
-            f"- 监控：#{watch['id']} {watch['symbol']} {watch.get('direction') or '-'}",
-            f"- 原因：{watch.get('watch_reason') or '-'}",
-            f"- GA/LLM 触发研判：{agent_reason or '-'}",
-            f"- 分析时间 UTC：{result.get('analysis_time_utc') or '-'}",
-            "",
-            "不构成实盘建议，仅用于模拟盘与策略研究。",
-        ]
-    )
-
-
 def _agent_review_watch_result(watch: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     fallback = {
         "summary": result.get("reason") or "机会监控状态已更新。",
@@ -169,9 +156,11 @@ def _agent_review_watch_result(watch: dict[str, Any], result: dict[str, Any]) ->
         ],
     )
     enriched = dict(result)
+    # 08-04 contract C7: the deterministic ``reason`` (from the rule engine) is
+    # authoritative and is NEVER overwritten by the LLM summary. The LLM summary
+    # is kept separately in ``agent_review`` as untrusted display text only.
     enriched["agent_review"] = agent
-    if agent.get("summary"):
-        enriched["reason"] = str(agent["summary"])
+    enriched["reason_source"] = "deterministic"
     return enriched
 
 

@@ -109,12 +109,11 @@ def _deterministic() -> dict:
 def _payload(prompt: str) -> dict:
     """Parse the REAL builder output back into its JSON payload.
 
-    Every prompt tier is ``SYSTEM_PROMPT... + "\\n\\n输入：\\n" +
-    json.dumps(payload)``; the payload is the part after that separator.
+    08-04 Codex-P2 (D4): every market tier returns the structured JSON payload
+    ALONE (``json.dumps(payload)``, no ``SYSTEM_PROMPT... + "\\n\\n输入：\\n"``
+    prefix — the system prompt lives only in ``session.system``).
     """
-    assert "\n\n输入：\n" in prompt, "prompt must carry the 输入： payload separator"
-    raw = prompt.split("\n\n输入：\n", 1)[1]
-    return json.loads(raw)
+    return json.loads(prompt)
 
 
 def _hard_rules_text(prompt: str) -> str:

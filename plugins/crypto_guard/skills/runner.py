@@ -160,10 +160,12 @@ def _run_skill(
         "geometry_source": "deterministic_tool",
         "memory_policy": "daily_review_updates_skill_feedback_memory",
         "skill_contract": contract,
+        # 08-04 contract E3: prompt.md is free text (audit-only). It must NOT be
+        # embedded as a high-trust LLM instruction (ga_interpretation['prompt']).
+        # Contract free text stays inside skill_contract and is tagged
+        # untrusted_data so downstream LLM payload trimming drops it.
+        "untrusted_data": True,
     }
-    # Include prompt.md content for GA interpretation
-    if contract.get("prompt_md"):
-        interpretation["prompt"] = contract["prompt_md"]
 
     final = dict(tool_result)
     final["skill"] = log_name or skill_name
@@ -230,21 +232,24 @@ def _run_skill(
 
 
 def _normalize_skill_contract(result: dict[str, Any], skill_name: str) -> None:
-    if skill_name in {"price_action", "price_action_skill"}:
+    # 08-04 contract E1/E2: the *_skill duplicate dirs are gone; the runner
+    # keeps a single canonical skill name set. Legacy *_skill aliases no longer
+    # trigger normalization (they are never produced by the canonical loader).
+    if skill_name == "price_action":
         levels = result.get("key_levels") or {}
         result.setdefault("pattern", result.get("range_status") or result.get("last_event"))
         result.setdefault("key_support", levels.get("support") or [])
         result.setdefault("key_resistance", levels.get("resistance") or [])
-    elif skill_name in {"momentum", "momentum_skill"}:
+    elif skill_name == "momentum":
         result.setdefault("volume_price_alignment", bool(result.get("volume_confirmed")))
         result.setdefault("indicator_divergence", bool(result.get("divergence")))
-    elif skill_name in {"trend_stage", "trend_stage_skill"}:
+    elif skill_name == "trend_stage":
         result.setdefault("stage", result.get("trend_stage"))
         result.setdefault("clarity", result.get("confidence"))
         result.setdefault("features", result.get("stage_scores") or [])
         result.setdefault("late_stage_risk", result.get("trend_stage") == "late")
         result.setdefault("next_evolution", "观察 5M 是否能生长为 15M/1H 结构确认")
-    elif skill_name in {"smc_orderflow", "smc_orderflow_skill"}:
+    elif skill_name == "smc_orderflow":
         if "order_flow" not in result and result.get("module") == "order_flow":
             result["order_flow"] = {
                 "cvd_slope": result.get("cvd_slope"),
@@ -252,7 +257,7 @@ def _normalize_skill_contract(result: dict[str, Any], skill_name: str) -> None:
                 "delta_divergence": result.get("delta_divergence"),
             }
         result.setdefault("setup", result.get("entry_context") or result.get("confirmation") or "monitor")
-    elif skill_name in {"chanlun", "chanlun_skill"}:
+    elif skill_name == "chanlun":
         result.setdefault("trend_structure", result.get("structure") or result.get("trend") or "unknown")
         result.setdefault("current_bi_direction", result.get("bi_direction") or result.get("current_bi_direction") or "unknown")
         result.setdefault("zhongshu", result.get("central_zone") or {"exists": False})
@@ -337,13 +342,13 @@ def _collect_skill_feedback(
         findings.append(f"schema_validation_errors: {'; '.join(schema_errors[:3])}")
 
     # Specific anomaly patterns per skill
-    if skill_name in {"price_action", "price_action_skill"}:
+    if skill_name == "price_action":
         if result.get("market_structure") == "range" and confidence and confidence > 0.6:
             findings.append("range_with_high_confidence_possible_misclassification")
-    elif skill_name in {"momentum", "momentum_skill"}:
+    elif skill_name == "momentum":
         if result.get("divergence") and result.get("quality") == "exhausted":
             findings.append("exhausted_divergence_detected")
-    elif skill_name in {"trend_stage", "trend_stage_skill"}:
+    elif skill_name == "trend_stage":
         if result.get("trend_stage") == "late":
             findings.append("late_stage_risk_active")
 

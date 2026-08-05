@@ -17,7 +17,9 @@ DEFAULT_NEVER_SILENCE = {
     "take_profit_hit",
     "stop_loss_hit",
     "risk_alert",
-    "opportunity_triggered",
+    # 08-04 contract A: opportunity_triggered is removed. A watch lifecycle
+    # event is internal-only evidence and must remain silenceable, so a stray
+    # legacy push can be deduped/suppressed.
     "paper_order_filled",
     "paper_order_expired",
     "evolution_trigger",

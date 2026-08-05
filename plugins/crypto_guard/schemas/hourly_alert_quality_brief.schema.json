@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HourlyAlertQualityBrief",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "focus_symbols", "why_no_opportunity", "next_checks"],
+  "properties": {
+    "summary": {"type": "string"},
+    "focus_symbols": {"type": "array", "items": {"type": "string"}},
+    "why_no_opportunity": {"type": ["string", "array", "null"]},
+    "next_checks": {"type": "array", "items": {"type": "object"}}
+  }
+}

@@ -551,6 +551,31 @@ def apply_r6f_service_ownership_migration(conn: psycopg.Connection) -> None:
         _add_column(cur, "_service_ownership", "owner_token", "TEXT")
 
 
+def apply_08_04_watch_order_bridge_migration(conn: psycopg.Connection) -> None:
+    """08-04 contract B: watch -> order bridge columns + partial unique index.
+
+    Adds (idempotently) ``paper_orders.trigger_watch_id``, the partial unique
+    index ``idx_paper_orders_trigger_watch_once`` (one live order per triggered
+    watch), and the ``opportunity_watches.recheck_status`` /
+    ``recheck_order_id`` / ``last_recheck_at`` bookkeeping columns. Pure
+    additive upgrade for existing DBs; a greenfield ``initialize_database``
+    already creates these via ``schema_postgres.sql``, so this is a guarded
+    no-op there. The caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        _add_column(cur, "paper_orders", "trigger_watch_id", "BIGINT")
+        _add_column(cur, "opportunity_watches", "recheck_status", "TEXT")
+        _add_column(cur, "opportunity_watches", "recheck_order_id", "BIGINT")
+        _add_column(cur, "opportunity_watches", "last_recheck_at", "TIMESTAMPTZ")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_trigger_watch_once
+                ON paper_orders(trigger_watch_id)
+                WHERE trigger_watch_id IS NOT NULL AND status IN ('pending','open','needs_recheck')
+            """
+        )
+
+
 def apply_r10_attempt_counter_migration(conn: psycopg.Connection) -> None:
     """Ensure the ``_analysis_attempt_counter`` table exists (R10-P2).
 
@@ -671,7 +696,12 @@ _REQUIRED_COLUMNS: dict[str, list[str]] = {
         "previous_grade",
         "rendered_summary",
     ],
-    "opportunity_watches": ["dedupe_key"],
+    "opportunity_watches": [
+        "dedupe_key",
+        "recheck_status",
+        "recheck_order_id",
+        "last_recheck_at",
+    ],
     "paper_positions": ["updated_at"],
     "strategy_evaluations": [
         "ga_decision_id",
@@ -679,7 +709,11 @@ _REQUIRED_COLUMNS: dict[str, list[str]] = {
         "outcome_source",
         "shadow_virtual_trade_id",
     ],
-    "paper_orders": ["initial_stop_loss", "last_processed_candle_time"],
+    "paper_orders": [
+        "initial_stop_loss",
+        "last_processed_candle_time",
+        "trigger_watch_id",
+    ],
     "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
     "paper_trade_logs": ["dedupe_key"],
     "shadow_virtual_trades": [
@@ -709,6 +743,7 @@ _REQUIRED_INDEXES: list[str] = [
     "idx_strategy_evals_shadow_unique",
     "idx_alert_outbox_dedupe_unique",
     "idx_paper_trade_logs_dedupe_key",
+    "idx_paper_orders_trigger_watch_once",
 ]
 
 # Required tables (must exist by name).
@@ -766,7 +801,7 @@ _REQUIRED_TABLES: list[str] = [
 # nullability, identity/default), every table constraint, every non-primary
 # index, and application triggers/functions. Update only after deliberately
 # changing the canonical DDL and regenerating it from a fresh scratch schema.
-_EXPECTED_SCHEMA_FINGERPRINT = "f6e0ddaeb1197fdc8393b50ae181082b24e59cc8c0146c02aab260ce5e71b259"
+_EXPECTED_SCHEMA_FINGERPRINT = "a08bea68f1a5e93f3e12d0607759a0d0512936f1a099b85ad6b56f250923c545"
 
 
 def _normalize_catalog_text(value: Any, schema: str) -> str:
@@ -1209,4 +1244,5 @@ __all__ = [
     "check_schema_health",
     "apply_r6f_service_ownership_migration",
     "apply_r10_attempt_counter_migration",
+    "apply_08_04_watch_order_bridge_migration",
 ]

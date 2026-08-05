@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HigherTimeframeKlineSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "trend_context", "key_levels", "risk_notes"],
+  "properties": {
+    "summary": {"type": "string"},
+    "trend_context": {"type": "string"},
+    "key_levels": {"type": "array", "items": {"type": "object"}},
+    "risk_notes": {"type": "array", "items": {"type": "object"}}
+  }
+}

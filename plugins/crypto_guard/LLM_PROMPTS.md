@@ -234,9 +234,10 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 
 ### 4.1 公共动态模板
 
-```text
-{SYSTEM_PROMPT}
+08-04 契约 D2/D4：通用 JSON 任务**不再**前置拼接市场决策用的全局 `SYSTEM_PROMPT`，也不在 user 消息里重复系统提示。每个 `task_name` 有独立的 `TASK_SYSTEM_PROMPTS[task_name]`，由 `run_agent_json_task` 通过线程局部 `system_override` 放入 `session.system`（`_call_ga_llm` 读取），user 消息只承载 JSON 任务体：
 
+```text
+// session.system = TASK_SYSTEM_PROMPTS[task_name]（非 GADecision，非全局 SYSTEM_PROMPT）
 {
   "task_name": "...",
   "task": "基于结构化证据执行 GA/LLM SOP 任务，并只输出一个 JSON 对象。",
@@ -261,7 +262,11 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 
 ### 4.2 任务清单
 
+08-04 契约 D1/D3：11 个 `task_name` 全部拥有独立的 `TASK_SYSTEM_PROMPTS[task_name]`（任一都不含 `GADecision` 标记）和 `schemas/<task_name>.schema.json`（根 `additionalProperties: false`）。`run_agent_json_task` 在每次 LLM 候选上做 schema 校验（未知顶层键/类型错误 → fail-closed 到 `deterministic_fallback`），并按任务注册的语义钩子做一致性校验。每个任务下方标注对应 Schema。
+
 #### `historical_replay_backtest_analysis`
+
+- Schema：`historical_replay_backtest_analysis.schema.json`。
 
 - 位置：`backtest/historical_replay.py`
 - 输入：产品、周期、起止时间、统计、策略对比、最多 80 条信号和交易、no-lookahead 结果。
@@ -277,7 +282,7 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 
 - 位置：`review/trade_reviewer.py`
 - 输入：交易、确定性复盘、快照上下文。
-- 输出：`trade_review.schema.json`；这是通用任务中唯一显式传入独立 Schema 的调用。
+- Schema：`trade_review.schema.json`；调用方显式传入该 Schema，并在合并后以完整 `required` 重新校验。
 
 ```text
 复盘昨日或单笔模拟盘交易，判断亏损/盈利是否来自方向、入场、趋势阶段、反向证据、执行质量或止盈止损设计。
@@ -290,6 +295,7 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 - 位置：`paper/paper_position_updater.py`
 - 触发：存在模拟盘执行事件或回撤预警时。
 - 输入：执行事件、权益快照。
+- Schema：`paper_execution_quality_update.schema.json`。
 - 输出参考：`summary`、`quality_findings`、`risk_actions`。
 
 ```text
@@ -301,6 +307,7 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 
 - 位置：`review/daily_reviewer.py`
 - 输入：UTC 窗口、最多 50 笔交易与新复盘、错误、策略记忆、自进化状态、确定性模拟盘摘要。
+- Schema：`daily_paper_review_summary.schema.json`。
 - 输出参考：`summary_text`、`key_findings`、`strategy_actions`、`risk_focus`。
 
 ```text
@@ -314,6 +321,7 @@ suggested_actions 必须是扁平字符串数组，仅取以下 5 个值之一�
 
 - 位置：`notify/hourly_report.py`
 - 输入：启用产品、最多 30 条紧凑信号、最多 20 个订单、过滤后的当前失败任务、队列统计。
+- Schema：`hourly_alert_quality_brief.schema.json`。
 - 输出参考：`summary`、`focus_symbols`、`why_no_opportunity`、`next_checks`。
 
 ```text
@@ -326,7 +334,8 @@ summary 字段应适合放在飞书简报顶部。
 
 - 位置：`scheduler/cron_scheduler.py`
 - 触发：1d、4h、1h K 线更新后。
-- 输入：产品、周期、分析时间、最近 40 根已收盘 K 线。
+- 输入：产品、周期、分析时间、紧凑 K 线摘要（08-04 契约 C8：只传 count/最后收盘时间/最近收盘价/末根 OHLC，不嵌入原始蜡烛数组）。
+- Schema：`higher_timeframe_kline_summary.schema.json`。
 - 输出参考：`summary`、`trend_context`、`key_levels`、`risk_notes`。
 
 ```text
@@ -338,7 +347,8 @@ summary 字段应适合放在飞书简报顶部。
 
 - 位置：`scheduler/opportunity_watcher.py`
 - 输入：机会监控记录、确定性规则结果。
-- 输出参考：`summary`、`status`、`action`、`risk_notes`。
+- Schema：`opportunity_watch_review.schema.json`。
+- 输出参考：`summary`、`status`、`action`、`risk_notes`。08-04 契约 C7：确定性 `reason` 为权威字段，LLM 摘要只进入 `agent_review`（非信任显示文本）。
 
 ```text
 复核机会监控条件是否真的值得提醒，解释触发/失效/继续等待原因。
@@ -349,6 +359,7 @@ summary 字段应适合放在飞书简报顶部。
 
 - 位置：`strategy/self_evolution.py`
 - 输入：策略名、复盘聚合、最多 50 条近期复盘、样本门禁。
+- Schema：`self_evolution_candidate_patch.schema.json` + 语义钩子（`needs_patch=True` 而 `patch` 非 object → fail-closed）。
 - 输出参考：`patch`、`rationale`、`needs_patch`。
 - 后置门禁：patch Schema、candidate 数量、配置许可、回测和 shadow 流程仍由确定性代码控制。
 
@@ -362,6 +373,7 @@ patch 字段为空表示当前不应生成补丁。
 
 - 位置：`strategy/shadow_testing.py`
 - 输入：active/candidate 版本、样本数、回测状态和两侧统计。
+- Schema：`shadow_test_strategy_verdict.schema.json`（只允许 `explanation`/`notes`）。
 - 用途：LLM 只补充 `llm_explanation` 与 `llm_notes`；最终 verdict 由确定性硬门禁决定。
 
 ```text
@@ -373,6 +385,7 @@ patch 字段为空表示当前不应生成补丁。
 
 - 位置：`strategy/version_manager.py`
 - 输入：策略名、版本列表。
+- Schema：`strategy_version_management_summary.schema.json`。
 - 输出参考：`summary`、`risks`、`next_actions`。
 
 ```text
@@ -384,6 +397,7 @@ patch 字段为空表示当前不应生成补丁。
 
 - 位置：`strategy/version_manager.py`
 - 输入：策略 patch、生成后的 candidate 配置。
+- Schema：`candidate_strategy_config_review.schema.json`。
 - 输出参考：`summary`、`config_notes`、`risk_controls`。
 
 ```text
@@ -395,7 +409,10 @@ patch 字段为空表示当前不应生成补丁。
 
 `_call_ga_llm` 在每次调用时统一执行以下设置：
 
-- `session.system = SYSTEM_PROMPT`。
+- `session.system` 恒为系统提示词；user 消息恒为结构化输入载荷（08-04 契约 D4，system prompt 只放 `session.system`，绝不在 user 消息重复）：
+  - 通用 JSON 任务：`run_agent_json_task` 通过线程局部 `system_override` 覆盖为 `TASK_SYSTEM_PROMPTS[task_name]`（调用窗口内 try/finally 清理，避免泄漏进后续市场决策调用）。
+  - 市场决策三层：`build_llm_decision_prompt`（attempt 1）选择 `SYSTEM_PROMPT`；`build_llm_strict_json_prompt` / `build_llm_minimal_safe_prompt`（attempt 2/3）选择 `SYSTEM_PROMPT_STRICT_JSON`。三个 builder 均由线程局部 `system_override` 一次性选中本轮系统提示，返回的 user 消息是纯 JSON 载荷（不再拼 `SYSTEM_PROMPT... + "\n\n输入：\n"` 前缀，也不做字符串前缀替换）。`_call_ga_llm` 在 in-process 与 3 链接子进程路径都透传该 override 到 `session.system`；`system_override` 为一次性，预算跳过 / 截止准入跳过 / 异常 / 被 mock 的 `_call_ga_llm` 路径都在所属 attempt 边界清理（`_llm_call_input_state_reset`），不会泄漏进下一个符号。
+- `prompt_bytes` / `max_prompt_bytes` 计算的是 provider 真实总上下文 = 系统提示词字节数 + user 载荷字节数（D4 拆分后不减记，见 `_market_total_context_bytes`）。
 - 清空 `session.tools`，并设置 `tools_optional=True`；JSON 任务不提供工具，避免模型转向 tool call 后不输出文本。
 - 生产配置默认 `max_output_tokens=8192`、`thinking_budget_tokens=2048`、`min_structured_answer_tokens=4096`、`temperature=0.2`。
 - 公平调度默认最多 4 并发；每产品总截止 300 秒，每次 provider 调用最多 180 秒。
@@ -403,16 +420,17 @@ patch 字段为空表示当前不应生成补丁。
 - 可使用子进程隔离实现硬超时，超时后可终止 provider 子进程。
 - 提示词硬上限 48 KiB，目标 32 KiB；裁剪顺序优先移除历史记忆、持仓/监控和详细模块，不静默删除连续性。
 
-需要注意：完整 prompt 文本已经包含 `SYSTEM_PROMPT`，同时 `session.system` 也设置为 `SYSTEM_PROMPT`，因此 provider 看到的系统约束和用户消息前缀存在重复。这是当前实现，不是本文档另行推荐的结构。
+**D4 结论（08-04 Codex-P2 修复后）：** 通用 JSON 任务与市场决策三层均严格"系统提示词只在 `session.system`、user 消息只承载结构化载荷"。provider 不会再看到系统约束与用户消息前缀重复。
 
 ## 6. 维护注意事项
 
-1. **通用任务的系统提示词存在语义漂移。** `run_agent_json_task` 的 docstring 明确是“non-market-decision JSON task”，但它仍复用要求输出 `GADecision schema` 的 `SYSTEM_PROMPT`。回测、日报、策略版本摘要等任务的 fallback 字段并不属于 `GADecision`。这可能造成模型遵循系统提示而忽略任务自己的输出形状。若后续调整，建议拆出独立的 `GENERIC_JSON_TASK_SYSTEM_PROMPT`，并用行为测试锁定两条链路。
-2. **大多数通用任务没有独立 JSON Schema。** 目前只有 `trade_review_attribution` 显式使用 `trade_review.schema.json`；其余任务依赖 fallback 合并和调用方读取字段。新增任务时应优先提供独立 Schema 或至少做显式字段校验。
+1. **通用任务系统提示词已独立（08-04 契约 D2/D4）。** `run_agent_json_task` 的 11 个 `task_name` 使用各自的 `TASK_SYSTEM_PROMPTS[task_name]`（均不含 `GADecision`），不再复用市场决策的全局 `SYSTEM_PROMPT`。新增通用任务时必须同步新增 `TASK_SYSTEM_PROMPTS` 项，并在 §4.2 与 Schema 中登记（行为由 `test_pg_08_04_prompt_audit_d.py` D7 锁定）。
+2. **通用任务均有独立 JSON Schema（08-04 契约 D3）。** 11 个 `task_name` 全部映射 `schemas/<task_name>.schema.json`（根 `additionalProperties: false`），`run_agent_json_task` 每次在 LLM 候选上做校验（未知顶层键/类型错误 → fail-closed 到 `deterministic_fallback`），并按 `TASK_SEMANTIC_VALIDATORS` 注册的钩子做一致性校验。新增任务时应同时提供 Schema 与语义钩子。
 3. **不要把确定性计算转回 LLM。** 价格几何、风控、评级门禁、shadow 样本门禁、active 切换和真实执行权限均必须继续由代码控制。
 4. **连续性是生产契约。** 修改提示词裁剪、最小重试或上下文构造时，必须验证真实上一轮记录仍进入 `analysis_continuity.previous`，不能只验证字段名存在。
 5. **修改枚举时同步四处。** 至少同步提示词 `schema_contract`、硬规则、JSON Schema 和 normalize/repair 逻辑，并补 revert-fail 测试。
 6. **禁止把密钥、DSN、Header 或完整 provider 错误写进提示词/日志。** 当前错误文本按 300 字符截断；整理和调试时也应保持这一边界。
+7. **市场决策三层系统提示词只在 `session.system`（08-04 契约 D4）。** `build_llm_decision_prompt` / `build_llm_strict_json_prompt` / `build_llm_minimal_safe_prompt` 返回纯 JSON 用户载荷，通过线程局部 `system_override` 一次性选中本轮系统提示；`_call_ga_llm`（含 3 链接子进程路径）透传它到 `session.system`，并在所属 attempt 边界清理。新增/修改市场提示词构造时，保持"系统提示词只在 `session.system`、user 消息只承载结构化载荷、`system_override` 一次性、`prompt_bytes` 计系统+用户总字节"约束（行为由 `test_pg_08_04_reviewer_fixes_h.py` R1-R10 锁定）。
 
 ## 7. 快速源码索引
 

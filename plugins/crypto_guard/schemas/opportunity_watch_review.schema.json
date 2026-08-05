@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpportunityWatchReview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "status", "action", "risk_notes"],
+  "properties": {
+    "summary": {"type": "string"},
+    "status": {"type": ["string", "null"]},
+    "action": {"type": "string"},
+    "risk_notes": {"type": "array", "items": {"type": "object"}}
+  }
+}

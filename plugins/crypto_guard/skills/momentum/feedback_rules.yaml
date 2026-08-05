@@ -3,3 +3,9 @@ feedback_rules:
     action: require_order_flow_confirmation
   - when: late_chase_loss
     action: lower_late_stage_confidence
+  # 08-04 contract E1/E2: single canonical contract. Rules formerly carried by
+  # the deleted momentum_skill dir are merged here as the one source of truth.
+  - when: momentum_failed_after_entry
+    action: require_order_flow_confirmation
+  - when: overextended_chase_loss
+    action: downgrade_late_entry

@@ -51,13 +51,25 @@ def summarize_higher_timeframe(repo: CryptoGuardRepository, symbol: str, interva
         "key_levels": [],
         "risk_notes": [],
     }
+    # 08-04 contract C8: do NOT embed raw candle arrays into the LLM payload.
+    # Pass a compact bounded summary (recent closes + last OHLC) instead; the
+    # full candle history stays in the DB (deterministic source of truth).
+    compact = {
+        "count": len(candles),
+        "last_close_time": candles[-1]["close_time"] if candles else None,
+        "recent_closes": [float(c["close"]) for c in candles[-10:]],
+        "last_ohlc": {
+            "open": candles[-1]["open"], "high": candles[-1]["high"],
+            "low": candles[-1]["low"], "close": candles[-1]["close"],
+        } if candles else None,
+    }
     agent = run_agent_json_task(
         task_name="higher_timeframe_kline_summary",
         payload={
             "symbol": symbol,
             "interval": interval,
             "analysis_time_utc": int(analysis_time_utc),
-            "recent_candles": candles[-40:],
+            "compact_kline": compact,
         },
         fallback=fallback,
         instructions=[

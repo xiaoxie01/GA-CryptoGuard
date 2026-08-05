@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TradeReview",
   "type": "object",
+  "additionalProperties": false,
   "required": ["trade_id", "result", "primary_reason", "summary", "improvement_suggestion"],
   "properties": {
     "trade_id": {"type": "integer"},
@@ -37,7 +38,14 @@
     "secondary_reasons": {"type": "array", "items": {"type": "string"}},
     "summary": {"type": "string"},
     "metrics": {"type": "object"},
+    "source_snapshot": {"type": "object"},
+    "evidence_checklist": {"type": "array", "items": {"type": "object"}},
     "improvement_suggestion": {"type": "object"},
-    "strategy_patch_candidate": {"type": ["object", "null"]}
+    "strategy_patch_candidate": {"type": ["object", "null"]},
+    "market_regime_at_loss": {"type": ["object", "string"]},
+    "evolution_trigger_allowed": {"type": "boolean"},
+    "agent_source": {"type": "string"},
+    "llm_status": {"type": "string"},
+    "llm_error": {"type": "string"}
   }
 }

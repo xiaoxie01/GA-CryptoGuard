@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StrategyVersionManagementSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "risks", "next_actions"],
+  "properties": {
+    "summary": {"type": "string"},
+    "risks": {"type": "array", "items": {"type": "object"}},
+    "next_actions": {"type": "array", "items": {"type": "object"}}
+  }
+}

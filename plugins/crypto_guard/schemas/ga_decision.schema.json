@@ -41,6 +41,11 @@
         "risk_percent": {"type": "number"},
         "invalid_condition": {"type": "string"},
         "reason": {"type": "string"},
+        "evidence_refs": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "08-04 D6: LLM-claimed evidence ids (format <module>:<symbol>:<timeframe>:<as_of>). Must be backed by the snapshot's deterministic evidence set, else the plan is neutralized."
+        },
         "entry_trigger_confirmation": {
           "type": ["object", "null"],
           "additionalProperties": false,

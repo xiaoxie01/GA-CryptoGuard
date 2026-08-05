@@ -3,3 +3,9 @@ feedback_rules:
     action: increase_transition_weight
   - when: chop_as_trend
     action: strengthen_range_filter
+  # 08-04 contract E1/E2: single canonical contract. Rules formerly carried by
+  # the deleted trend_stage_skill dir are merged here as the one source of truth.
+  - when: late_stage_misclassified
+    action: raise_late_stage_penalty
+  - when: range_breakout_success
+    action: increase_transition_weight

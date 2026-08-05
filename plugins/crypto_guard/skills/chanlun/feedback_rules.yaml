@@ -3,3 +3,9 @@ feedback_rules:
     action: require_price_action_confirmation
   - when: zhongshu_break_false
     action: increase_breakout_confirmation
+  # 08-04 contract E1/E2: single canonical contract. Rules formerly carried by
+  # the deleted chanlun_skill dir are merged here as the one source of truth.
+  - when: buy_point_failed
+    action: require_momentum_alignment
+  - when: zhongshu_breakout_failed
+    action: add_retest_requirement

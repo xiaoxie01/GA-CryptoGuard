@@ -1,5 +1,0 @@
-feedback_rules:
-  - when: momentum_failed_after_entry
-    action: require_order_flow_confirmation
-  - when: overextended_chase_loss
-    action: downgrade_late_entry

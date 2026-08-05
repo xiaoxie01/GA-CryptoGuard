@@ -9,7 +9,10 @@ import re
 import time
 from typing import Any, Callable
 
+import jsonschema
+
 from plugins.crypto_guard.reasoning.decision_schema import (
+    load_schema,
     normalize_entry_trigger_confirmation,
     normalize_suggested_actions,
     validate_json,
@@ -42,6 +45,90 @@ SYSTEM_PROMPT_STRICT_JSON = """你是 GA CryptoGuard 的市场研究 Agent。
 禁止 Markdown。禁止代码块。禁止自然语言解释。禁止前导文字。
 第一个字符必须是 {。最后一个字符必须是 }。
 """
+
+# ---------------------------------------------------------------------------
+# 08-04 contract D (PRD): per-task system prompts for every
+# ``run_agent_json_task`` task_name. The market-decision path keeps
+# ``SYSTEM_PROMPT`` / ``SYSTEM_PROMPT_STRICT_JSON`` (GADecision marker) and is
+# intentionally NOT part of this map — generic SOP tasks must never inherit the
+# market-decision framing. ``build_agent_json_task_prompt`` returns the JSON
+# body ALONE (the user-message text); ``run_agent_json_task`` stashes the
+# per-task prompt as the thread-local ``system_override`` and ``_call_ga_llm``
+# routes it into ``session.system`` (and forwards it to the subprocess child),
+# so the user message never repeats the system text (reviewer round-2 G1/P1-1).
+# ---------------------------------------------------------------------------
+TASK_SYSTEM_PROMPTS: dict[str, str] = {
+    "historical_replay_backtest_analysis": """你是 GA CryptoGuard 的历史回放/回测分析 Agent。
+基于确定性回放统计（stats、strategy_comparison、no_lookahead、regime_distribution）评估行情状态、策略版本表现、过拟合风险与下一步 shadow/candidate 建议。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，禁止实盘交易建议。""",
+    "daily_paper_review_summary": """你是 GA CryptoGuard 的模拟盘日报总结 Agent。
+基于昨日闭仓交易、复盘条目、策略记忆与演化聚合，输出适合直接推送飞书的模拟盘表现总结。
+只输出一个符合本任务 schema 的 JSON 对象（summary_text 为摘要正文），禁止 Markdown，禁止实盘交易建议。""",
+    "trade_review_attribution": """你是 GA CryptoGuard 的交易归因复盘 Agent。
+基于单笔模拟盘交易与确定性快照上下文，判断亏损/盈利来自方向、入场、趋势阶段、反向证据、执行质量还是止盈止损设计。
+只输出一个符合 trade_review schema 的 JSON 对象，禁止 Markdown，禁止实盘交易建议；策略补丁只能进入 candidate。""",
+    "opportunity_watch_review": """你是 GA CryptoGuard 的机会监控复核 Agent。
+复核机会监控条件是否真的值得提醒，解释触发/失效/继续等待原因。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，只允许观察/提醒/失效等模拟盘研究建议。""",
+    "higher_timeframe_kline_summary": """你是 GA CryptoGuard 的高周期 K 线总结 Agent。
+基于已收盘高周期 K 线背景（compact_kline）提取趋势状态、关键区域与风险，供低周期巡航复用。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，禁止未来函数，禁止实盘交易建议。""",
+    "hourly_alert_quality_brief": """你是 GA CryptoGuard 的小时简报 Agent。
+总结本小时各产品趋势状态、为什么有/没有机会、下一小时应重点观察什么，summary 字段适合放在简报顶部。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，禁止实盘交易建议。""",
+    "paper_execution_quality_update": """你是 GA CryptoGuard 的模拟盘执行质量 Agent。
+总结模拟盘成交、止盈止损、MFE/MAE、回撤与执行质量。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，只允许模拟盘/复盘建议，禁止实盘下单建议。""",
+    "strategy_version_management_summary": """你是 GA CryptoGuard 的策略版本管理 Agent。
+总结 active/candidate/deprecated 策略版本状态、风险与下一步 shadow/review 动作。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，不得绕过 candidate/shadow 流程。""",
+    "candidate_strategy_config_review": """你是 GA CryptoGuard 的候选策略配置复核 Agent。
+复核候选策略配置是否保守、是否需要补充风控说明。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown，只能补充说明字段，不能将 candidate 改为 active。""",
+    "shadow_test_strategy_verdict": """你是 GA CryptoGuard 的影子测试复核 Agent。
+复核影子测试结果，判断候选策略是否样本不足、拒绝、或可进入人工确认升级；必须保守处理过拟合风险。
+只输出一个符合本任务 schema 的 JSON 对象（仅 explanation 与 notes 字段），禁止 Markdown；不能绕过人工确认或配置门禁。""",
+    "self_evolution_candidate_patch": """你是 GA CryptoGuard 的自进化候选补丁 Agent。
+基于复盘聚合提出策略 candidate patch；必须避免单品种过拟合；只能输出 candidate patch，不能直接 active。
+只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown；patch 字段为空表示当前不应生成补丁。""",
+}
+
+# Every generic task has a per-task schema under ``schemas/<name>.schema.json``
+# with root ``additionalProperties: false``. ``trade_review_attribution`` reuses
+# the existing ``trade_review.schema.json`` (the reviewer additionally
+# re-validates the merged result at its call site). ``run_agent_json_task``
+# resolves the schema when the caller did not pass one explicitly.
+TASK_SCHEMAS: dict[str, str] = {
+    "historical_replay_backtest_analysis": "historical_replay_backtest_analysis.schema.json",
+    "daily_paper_review_summary": "daily_paper_review_summary.schema.json",
+    "trade_review_attribution": "trade_review.schema.json",
+    "opportunity_watch_review": "opportunity_watch_review.schema.json",
+    "higher_timeframe_kline_summary": "higher_timeframe_kline_summary.schema.json",
+    "hourly_alert_quality_brief": "hourly_alert_quality_brief.schema.json",
+    "paper_execution_quality_update": "paper_execution_quality_update.schema.json",
+    "strategy_version_management_summary": "strategy_version_management_summary.schema.json",
+    "candidate_strategy_config_review": "candidate_strategy_config_review.schema.json",
+    "shadow_test_strategy_verdict": "shadow_test_strategy_verdict.schema.json",
+    "self_evolution_candidate_patch": "self_evolution_candidate_patch.schema.json",
+}
+
+
+def _semantic_self_evolution_candidate_patch(result: dict[str, Any]) -> tuple[bool, str | None]:
+    """D3 semantic hook: ``needs_patch=True`` without a dict ``patch`` is
+    schema-valid but semantically inconsistent (a self-evolution run that wants
+    a patch must actually supply one). Fail closed to the deterministic
+    fallback."""
+    if bool(result.get("needs_patch")) and not isinstance(result.get("patch"), dict):
+        return False, "needs_patch=True 但 patch 缺失或非对象，语义不一致"
+    return True, None
+
+
+# Per-task semantic validation hooks applied to the MERGED result (fallback +
+# LLM candidate) after schema validation. Absent entries mean no extra hook.
+TASK_SEMANTIC_VALIDATORS: dict[str, Callable[[dict[str, Any]], tuple[bool, str | None]]] = {
+    "self_evolution_candidate_patch": _semantic_self_evolution_candidate_patch,
+}
+
 
 # LLM error taxonomy (design §3.1, §3.2)
 LLM_ERROR_CATEGORIES = (
@@ -715,16 +802,54 @@ def run_agent_json_task(
         return result
     try:
         prompt = build_agent_json_task_prompt(task_name=task_name, payload=payload, fallback=fallback, instructions=instructions)
-        raw = _call_ga_llm(prompt)
+        # 08-04 contract D4: route the per-task system prompt into
+        # ``session.system`` via the thread-local ``system_override`` (read by
+        # ``_call_ga_llm`` BEFORE ``_llm_call_state_reset``). Scoped to this
+        # call window with a ``finally`` cleanup so a patched/stubbed
+        # ``_call_ga_llm`` cannot leak a stale override into a later
+        # market-decision call on the same worker thread.
+        _llm_call_state.system_override = TASK_SYSTEM_PROMPTS.get(task_name) or SYSTEM_PROMPT
+        try:
+            raw = _call_ga_llm(prompt)
+        finally:
+            if hasattr(_llm_call_state, "system_override"):
+                delattr(_llm_call_state, "system_override")
         candidate = _parse_json_object(raw)
+        # 08-04 contract D3: strip internal ``_``-prefixed keys (e.g. the
+        # ``_llm_parse_meta`` marker attached by ``_parse_json_object``) from
+        # the candidate BEFORE merge + schema validation so the strict
+        # ``additionalProperties: false`` schemas accept the LLM output. The
+        # LLM has no business writing internal marker fields.
+        candidate_clean = {
+            k: v for k, v in candidate.items()
+            if not (isinstance(k, str) and k.startswith("_"))
+        }
         result = dict(fallback)
-        result.update(candidate)
+        result.update(candidate_clean)
         result["agent_source"] = "llm_agent"
         result["llm_status"] = "ok"
-        if schema_name:
-            ok, err = validate_json(schema_name, result)
+        # D3: resolve the per-task schema when the caller did not pass one, and
+        # ALWAYS validate the LLM CANDIDATE against it (root
+        # ``additionalProperties: false`` + present-field types). Top-level
+        # ``required`` is satisfied by the deterministic fallback merge, so the
+        # candidate is validated with ``required`` stripped — a valid candidate
+        # that omits a fallback-only key (e.g. ``trade_id`` on the review path)
+        # must not be spuriously rejected. Unknown top-level keys / wrong types
+        # fail closed to ``deterministic_fallback``.
+        resolved_schema = schema_name or TASK_SCHEMAS.get(task_name)
+        if resolved_schema:
+            schema = load_schema(resolved_schema)
+            loose = dict(schema)
+            loose["required"] = []
+            try:
+                jsonschema.validate(candidate_clean, loose)
+            except Exception as exc:
+                raise ValueError(f"{resolved_schema} 候选校验失败: {exc}") from exc
+        semantic = TASK_SEMANTIC_VALIDATORS.get(task_name)
+        if semantic is not None:
+            ok, err = semantic(result)
             if not ok:
-                raise ValueError(err or "schema validation failed")
+                raise ValueError(err or "semantic validation failed")
         return result
     except Exception as exc:
         result = dict(fallback)
@@ -890,6 +1015,31 @@ from plugins.crypto_guard.reasoning.llm_breaker import (
 # B3: Strict JSON and minimal safe prompt builders (design §8.2, §8.3)
 # ---------------------------------------------------------------------------
 
+def _market_user_body(payload: dict[str, Any]) -> str:
+    """Serialize a market-decision payload into the user message body.
+
+    08-04 Codex-P2 (D4): the three market builders return the user message
+    ALONE — the structured JSON input payload — and select this round's system
+    prompt by stashing a one-shot ``system_override`` on the thread-local.
+    ``_call_ga_llm`` consumes that override to set ``session.system`` and sends
+    this body verbatim as the user text (never duplicating the system prompt).
+    """
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _market_total_context_bytes(system_text: str, user_body: str) -> int:
+    """Real provider total context bytes = system bytes + user bytes.
+
+    08-04 Codex-P2 (D4): after the D4 split the prompt-builder budget must
+    still account for the FULL context the provider sees (``session.system``
+    plus the user message), NOT under-report to the user body alone. The old
+    measurement summed system + 10-byte separator + body; the new one is the
+    strict system+user total and is therefore a slightly tighter but never
+    under-reported ceiling.
+    """
+    return len(system_text.encode("utf-8")) + len(user_body.encode("utf-8"))
+
+
 def build_llm_strict_json_prompt(
     snapshot: dict[str, Any],
     deterministic_decision: dict[str, Any],
@@ -898,27 +1048,31 @@ def build_llm_strict_json_prompt(
 ) -> str:
     """Build a strict JSON-only prompt for retry attempt 2.
 
-    Reuses build_llm_decision_prompt's payload but overrides SYSTEM_PROMPT
-    with SYSTEM_PROMPT_STRICT_JSON to force pure JSON output.
+    Reuses build_llm_decision_prompt's payload but overrides the selected
+    system prompt with SYSTEM_PROMPT_STRICT_JSON to force pure JSON output.
+    08-04 Codex-P2 (D4): the builder returns the user payload ALONE (NOT the
+    system prompt + separator + payload) and selects this round's system
+    prompt via a one-shot ``system_override`` on the thread-local. The strict
+    tier shares the main tier's payload verbatim — no string-prefix
+    replacement, so the three tiers can never drift on payload shape.
     """
-    # Build the normal prompt first to get the payload, then replace
-    # the system prompt prefix. ``build_llm_decision_prompt`` stashes the
-    # prompt metadata (bytes + continuity_included) into the thread-local.
+    # Build the main tier's payload. ``build_llm_decision_prompt`` stashes the
+    # prompt metadata (bytes + continuity_included) into the thread-local; its
+    # byte measurement used SYSTEM_PROMPT, so we re-stash with the STRICT
+    # system text below.
     normal_prompt = build_llm_decision_prompt(snapshot, deterministic_decision, context=context)
-    # The normal prompt is: SYSTEM_PROMPT + "\n\n输入：\n" + json_payload
-    # Replace the system prompt prefix
-    if normal_prompt.startswith(SYSTEM_PROMPT):
-        json_part = normal_prompt[len(SYSTEM_PROMPT):]
-        strict_prompt = SYSTEM_PROMPT_STRICT_JSON + json_part
-    else:
-        # Fallback: just prepend strict prompt
-        strict_prompt = SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + normal_prompt
-    # Phase D §8: re-stash the FINAL (strict) prompt byte size. The strict
-    # system prompt differs in length from SYSTEM_PROMPT, so the bytes
-    # stashed by build_llm_decision_prompt are stale. Continuity inclusion
-    # is unchanged (same payload).
-    _llm_call_state.prompt_bytes = len(strict_prompt.encode("utf-8"))
-    return strict_prompt
+    _cont = getattr(_llm_call_state, "continuity_included", False)
+    # Phase D §8: re-stash the FINAL (strict) prompt byte size as the REAL
+    # provider total context = strict system bytes + user body bytes. The
+    # strict system prompt differs in length from SYSTEM_PROMPT, so the bytes
+    # stashed by build_llm_decision_prompt are stale. Continuity inclusion is
+    # unchanged (same payload).
+    _llm_call_state.system_override = SYSTEM_PROMPT_STRICT_JSON
+    _llm_call_state.prompt_bytes = _market_total_context_bytes(
+        SYSTEM_PROMPT_STRICT_JSON, normal_prompt
+    )
+    _llm_call_state.continuity_included = _cont
+    return normal_prompt
 
 
 def build_llm_minimal_safe_prompt(
@@ -987,19 +1141,25 @@ def build_llm_minimal_safe_prompt(
         },
         "_trim_note": "prompt_over_budget_minimal_fallback",
     }
-    prompt = SYSTEM_PROMPT_STRICT_JSON + "\n\n输入：\n" + json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":"),
-    )
-    # Phase D §8: stash prompt metadata for the retry wrapper. The
+    # 08-04 Codex-P2 (D4): the builder returns the user payload ALONE and
+    # selects this round's system prompt (SYSTEM_PROMPT_STRICT_JSON) via a
+    # one-shot ``system_override`` on the thread-local — never embedding the
+    # system prompt or the legacy ``输入：`` separator into the user message.
+    _user_body = _market_user_body(payload)
+    # Phase D §8: stash prompt metadata for the retry wrapper as the REAL
+    # provider total context = strict system bytes + user body bytes. The
     # minimal-safe tier surfaces continuity as a TOP-LEVEL payload key (not
     # under ``market_snapshot``), so check both locations.
     _cont = payload.get("analysis_continuity")
     if _cont is None:
         _ms = payload.get("market_snapshot")
         _cont = _ms.get("analysis_continuity") if isinstance(_ms, dict) else None
-    _llm_call_state.prompt_bytes = len(prompt.encode("utf-8"))
+    _llm_call_state.system_override = SYSTEM_PROMPT_STRICT_JSON
+    _llm_call_state.prompt_bytes = _market_total_context_bytes(
+        SYSTEM_PROMPT_STRICT_JSON, _user_body
+    )
     _llm_call_state.continuity_included = _cont is not None
-    return prompt
+    return _user_body
 
 
 # ---------------------------------------------------------------------------
@@ -1499,6 +1659,11 @@ def _run_single_llm_attempt(
         )
         attempt_meta["llm_provider_call_count"] = 0
         attempt_meta["llm_latency_ms"] = None
+        # 08-04 Codex-P2 (D4): the builder stashed a one-shot
+        # ``system_override``; a budget skip suppresses the provider call, so
+        # the override was never consumed. Clear it so it cannot leak into the
+        # next symbol on this worker thread.
+        _llm_call_input_state_reset()
         return None, attempt_meta
 
     # Phase B P1-1 (07-22): provider admission AFTER prompt build, BEFORE the
@@ -1544,6 +1709,10 @@ def _run_single_llm_attempt(
             attempt_meta["llm_provider_call_count"] = 0
             attempt_meta["llm_provider_timeout_ms"] = 0
             attempt_meta["llm_latency_ms"] = None
+            # 08-04 Codex-P2 (D4): deadline admission skip suppresses the
+            # provider call, so the builder's one-shot ``system_override`` was
+            # never consumed. Clear it so it cannot leak into the next symbol.
+            _llm_call_input_state_reset()
             return None, attempt_meta
         # Immutable positive timeout for socket/subprocess/envelope. Do NOT
         # re-read the deadline after the call (post-call remaining may be 0
@@ -2162,8 +2331,14 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
         # Inject active opportunity watches
         watches = context.get("active_opportunity_watches") or []
         if watches:
+            # 08-04 contract C7 (reviewer round-2 P2-1): the repository returns
+            # ``SELECT *`` rows keyed ``watch_reason`` (schema
+            # ``opportunity_watches.watch_reason``); the deterministic reason is
+            # authoritative and MUST reach the prompt. Fall back to the legacy
+            # ``reason`` key for any hand-built context dicts that still use it.
             payload["active_watches"] = [
-                {"symbol": w.get("symbol"), "direction": w.get("direction"), "reason": w.get("reason")}
+                {"symbol": w.get("symbol"), "direction": w.get("direction"),
+                 "reason": w.get("watch_reason") or w.get("reason")}
                 for w in watches[:5]
             ]
 
@@ -2203,14 +2378,11 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
     # R9 P2-2 fix: ``MAX_PROMPT_BYTES`` is now a module-level constant
     # so the safe_payload fallback can be exercised behaviorally in
     # tests via ``unittest.mock.patch``.
-    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+    if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
         payload.pop("historical_memory", None)
-        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
             payload.pop("open_positions", None)
             payload.pop("active_watches", None)
-            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             # 07-10 R3-1 (design §5.1): ``analysis_continuity`` is PROTECTED
             # across EVERY prompt tier - it carries the cross-round grade/
             # bias/trigger state the LLM needs to keep decisions consistent
@@ -2222,7 +2394,7 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
             # (minimal stub WITH continuity) still exceeds the budget, the
             # minimal-stub tier below emits a ``prompt_budget_contract_violation``
             # fail-closed rather than dropping continuity.
-            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
                 market_snapshot = payload.get("market_snapshot")
                 # Last-resort trim: drop primary-TF modules. The
                 # multi_timeframe_feature_pack already carries per-TF
@@ -2234,7 +2406,6 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
                 # oversized prompt leaked past the budget.
                 if isinstance(market_snapshot, dict):
                     market_snapshot.pop("modules", None)
-                prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                 # R7 P1 fix: final hard cap. If the prompt is STILL over
                 # budget after every trim tier, the oversized payload is
                 # ``market_snapshot.multi_timeframe_feature_pack`` or
@@ -2248,7 +2419,7 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
                 # function just returned the oversized prompt - a 100KB
                 # feature pack produced a 103KB prompt, blowing past
                 # the 48KB cap.
-                if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
                     if isinstance(market_snapshot, dict):
                         mtfp = market_snapshot.get("multi_timeframe_feature_pack")
                         if isinstance(mtfp, dict):
@@ -2291,20 +2462,18 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
                             )
                             if k in dr
                         }
-                    prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                     # Final assertion: if STILL over, drop historical_memory
                     # was already tried - drop deterministic_reference
                     # entirely (LLM still has market_snapshot + hard_rules).
-                    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                    if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
                         payload.pop("deterministic_reference", None)
-                        prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                         # R8 P1 fix: final hard assertion. If EVERY
                         # trim tier failed, replace the payload with
                         # a minimal safe fallback (decision-critical
                         # fields only) so the prompt is guaranteed
                         # under budget. Pre-R8 the function returned
                         # the oversized prompt as a last resort.
-                        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                        if _market_total_context_bytes(SYSTEM_PROMPT, _market_user_body(payload)) > MAX_PROMPT_BYTES:
                             safe_dr = deterministic_decision or {}
                             # R10 P1 fix: read symbol/analysis_time_utc
                             # from ``market_snapshot`` (the actual
@@ -2377,9 +2546,11 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
                             # reads continuity_included=True even here
                             # (not False as pre-R3).
                             payload = safe_payload
-                            prompt = SYSTEM_PROMPT + "\n\n输入：\n" + json.dumps(
-                                safe_payload, ensure_ascii=False, separators=(",", ":"),
-                            )
+    # 08-04 Codex-P2 (D4): the market builder returns the user payload ALONE
+    # (the structured JSON input) and selects this round's system prompt via a
+    # one-shot ``system_override`` on the thread-local — ``_call_ga_llm`` sets
+    # ``session.system`` from it and sends the body verbatim as user text,
+    # never duplicating the system prompt.
     # 07-10 Phase D §5.1/§8: stash prompt byte size + whether
     # ``analysis_continuity`` survived the trim ladder. The retry wrapper
     # reads this via ``_prompt_meta_snapshot()`` to persist
@@ -2396,9 +2567,13 @@ def build_llm_decision_prompt(snapshot: dict[str, Any], deterministic_decision: 
     if _cont is None:
         _ms = payload.get("market_snapshot")
         _cont = _ms.get("analysis_continuity") if isinstance(_ms, dict) else None
-    _llm_call_state.prompt_bytes = len(prompt.encode("utf-8"))
+    # D4 R7: prompt_bytes is the REAL provider total context = system bytes +
+    # user body bytes (NOT under-reported to the body alone).
+    _user_body = _market_user_body(payload)
+    _llm_call_state.system_override = SYSTEM_PROMPT
+    _llm_call_state.prompt_bytes = _market_total_context_bytes(SYSTEM_PROMPT, _user_body)
     _llm_call_state.continuity_included = _cont is not None
-    return prompt
+    return _user_body
 
 
 def _build_memory_section(context: dict[str, Any]) -> dict[str, Any] | None:
@@ -2433,10 +2608,16 @@ def _build_memory_section(context: dict[str, Any]) -> dict[str, Any] | None:
     if not by_skill:
         return None
 
+    # 08-04 contract C6: historical memory must NOT directly grant confidence,
+    # S/A grade or order eligibility. The old ``instruction`` told the model to
+    # adjust confidence +/-0.05~0.15 from memory — removed. Memory is now
+    # untrusted background context only; the deterministic score/grade pipeline
+    # is the only confidence/eligibility source.
     return {
-        "description": "历史分析反馈记忆。当同类行情/结构出现时，应参考这些经验调整置信度和决策。",
+        "description": "历史分析反馈记忆（非权威参考，不得直接据此调整置信度或评级）。",
         "skills": {skill: items[:3] for skill, items in by_skill.items()},  # max 3 per skill
-        "instruction": "如果当前行情结构与记忆中的模式相似，适当调整 confidence（+/-0.05~0.15）并在 risk_notes 中说明参考了哪条历史经验。",
+        "untrusted_data": True,
+        "instruction": "历史记忆仅作为背景参考（untrusted_data），不得依据记忆调整评级或下单资格。",
     }
 
 
@@ -2465,7 +2646,14 @@ def build_agent_json_task_prompt(
             "preserve_required_ids": True,
         },
     }
-    return SYSTEM_PROMPT + "\n\n" + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    # 08-04 contract D2 + D4 (reviewer round-2 G1/P1-1): the returned string is
+    # the USER-MESSAGE text sent to the model. The per-task system prompt is
+    # routed to ``session.system`` ONLY (``run_agent_json_task`` stashes it as
+    # the thread-local ``system_override`` read by ``_call_ga_llm``) — it must
+    # NOT be prepended here, or the model receives the same prompt text twice
+    # (once in ``session.system`` and once at the head of the user message).
+    # Return the JSON body alone; the caller resolves the system prompt.
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -2505,14 +2693,26 @@ def _llm_call_state_reset() -> None:
         "provider_timeout_seconds",
         "subprocess_hard_timeout",
         "stop_reason",
+        "system_override",
     ):
         if hasattr(_llm_call_state, attr):
             delattr(_llm_call_state, attr)
 
 
 def _llm_call_input_state_reset() -> None:
-    """Clear one-shot provider-call controls without erasing output metadata."""
-    for attr in ("provider_timeout_seconds", "subprocess_hard_timeout"):
+    """Clear one-shot provider-call controls without erasing output metadata.
+
+    08-04 Codex-P2 (D4): ``system_override`` is one-shot input state — the
+    builders stash it, ``_call_ga_llm`` consumes it. Clearing it here (called
+    at the owning attempt boundary in ``_run_single_llm_attempt``'s finally)
+    guarantees a stale override cannot leak into the next symbol on the same
+    worker thread even when ``_call_ga_llm`` is replaced/mocked.
+    """
+    for attr in (
+        "provider_timeout_seconds",
+        "subprocess_hard_timeout",
+        "system_override",
+    ):
         if hasattr(_llm_call_state, attr):
             delattr(_llm_call_state, attr)
 
@@ -2901,6 +3101,7 @@ def _llm_subprocess_target(
     prompt: str,
     cfg_name: str,
     provider_timeout_seconds: float,
+    system_prompt: str,
     child_conn: Any,
 ) -> None:
     """Module-level (picklable) child-process body for the PRODUCTION provider
@@ -2943,7 +3144,13 @@ def _llm_subprocess_target(
         import llmcore  # local import; the child re-imports the package
         gen = _resolve_generation_config()
         session = llmcore.resolve_session(cfg_name)
-        session.system = SYSTEM_PROMPT
+        # 08-04 contract D4 (reviewer round-2 G1/P1-1): the per-task system
+        # prompt is supplied by the parent (``_call_ga_llm`` forwards the
+        # resolved ``system_override or SYSTEM_PROMPT``), because the child
+        # process cannot read the parent's thread-local override. This keeps
+        # the subprocess session.system identical to the in-process path now
+        # that the prompt no longer embeds the system text in the user message.
+        session.system = system_prompt
         if gen["thinking_budget_tokens"] <= 0:
             if hasattr(session, "thinking_type"):
                 try:
@@ -3373,6 +3580,7 @@ def _run_provider_call_in_subprocess(
     provider_timeout_seconds: float,
     cfg_name: str,
     effective_out: dict[str, Any],
+    system_prompt: str | None = None,
 ) -> str:
     """07-10 S4 (P0 #3) + R3-P1-2/P1-3: run ``session.raw_ask`` in a child
     process with a HARD wall-clock bound via the generic runner
@@ -3401,7 +3609,8 @@ def _run_provider_call_in_subprocess(
     """
     _payload = _run_subprocess_with_target(
         _llm_subprocess_target,
-        (prompt, cfg_name, float(provider_timeout_seconds)),
+        (prompt, cfg_name, float(provider_timeout_seconds),
+         system_prompt or SYSTEM_PROMPT),
         provider_timeout_seconds=provider_timeout_seconds,
     )
     tag = _payload[0]
@@ -3464,10 +3673,15 @@ def _call_ga_llm(prompt: str) -> str:
     _subprocess_hard_timeout = bool(getattr(
         _llm_call_state, "subprocess_hard_timeout", False,
     ))
+    # 08-04 contract D4: ``run_agent_json_task`` stashes the per-task system
+    # prompt here; the market-decision path leaves it unset and falls back to
+    # ``SYSTEM_PROMPT``. Consume BEFORE ``_llm_call_state_reset`` (which clears
+    # it) exactly like the provider-timeout inputs above.
+    _system_override = getattr(_llm_call_state, "system_override", None)
     _llm_call_state_reset()
     gen = _resolve_generation_config()
     session = llmcore.resolve_session(cfg_name)
-    session.system = SYSTEM_PROMPT
+    session.system = _system_override or SYSTEM_PROMPT
     # Thinking control. ``thinking_budget_tokens=0`` disables extended
     # thinking entirely (forces a bounded non-thinking JSON synthesis call).
     # A non-zero budget pins the budget so adaptive-mode drift cannot starve
@@ -3603,6 +3817,11 @@ def _call_ga_llm(prompt: str) -> str:
                 provider_timeout_seconds=provider_timeout_seconds,
                 cfg_name=cfg_name,
                 effective_out=_effective_out,
+                # 08-04 contract D4 (reviewer round-2 G1/P1-1): forward the
+                # resolved per-task system prompt so the child session.system
+                # matches the in-process path (the child cannot read the
+                # parent's thread-local override).
+                system_prompt=_system_override or SYSTEM_PROMPT,
             )
             # Relay the child's effective generation settings so the §8
             # envelope is complete (the in-process path reads them off the
@@ -3819,6 +4038,40 @@ def _attach_parse_meta(
     }
 
 
+def _build_allowed_evidence_ids(snapshot: dict[str, Any]) -> set[str]:
+    """08-04 contract D6: deterministic set of evidence_ids that can ground an
+    LLM-provided trade_plan. Built from the snapshot's deterministic modules
+    (``<module>:<symbol>:<timeframe>:<as_of>``) plus any explicit
+    ``evidence_id`` on the context envelope's trusted_facts / derived_evidence.
+    An empty set means the snapshot is ungrounded and can ground NOTHING."""
+    allowed: set[str] = set()
+    symbol = str(snapshot.get("symbol") or "")
+    modules = snapshot.get("modules") or {}
+    if not isinstance(modules, dict):
+        modules = {}
+    snap_as_of = snapshot.get("analysis_time_utc")
+    for mod_name, mod in modules.items():
+        if not isinstance(mod, dict):
+            continue
+        tf = str(mod.get("timeframe") or mod.get("timeframe_label") or "")
+        as_of = mod.get("as_of") if mod.get("as_of") is not None else snap_as_of
+        if symbol and tf and as_of is not None:
+            try:
+                allowed.add(f"{mod_name}:{symbol}:{tf}:{int(as_of)}")
+            except (TypeError, ValueError):
+                pass
+    env = snapshot.get("context_envelope")
+    if isinstance(env, dict):
+        for group in ("trusted_facts", "derived_evidence"):
+            items = env.get(group)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict) and item.get("evidence_id"):
+                    allowed.add(str(item["evidence_id"]))
+    return allowed
+
+
 def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     decision = dict(fallback)
     # Phase F (07-05): capture raw_signal_grade / raw_score from the
@@ -3890,6 +4143,38 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
         and bool(candidate.get("trade_plan"))
     )
     _auto_built_plan = False
+    # 08-04 contract D6: evidence_id fail-closed (anti-hallucination). An
+    # LLM-provided trade_plan that explicitly claims ``evidence_refs`` which
+    # are NOT backed by the snapshot's deterministic evidence set is neutralized
+    # to monitor_only / no-plan / grade C — never order-eligible. System
+    # auto-built plans and plans without explicit refs on a grounded snapshot
+    # are preserved (backward compatibility).
+    if _llm_provided_plan and isinstance(candidate, dict):
+        _tp = candidate.get("trade_plan")
+        if isinstance(_tp, dict):
+            _refs = _tp.get("evidence_refs")
+            if isinstance(_refs, list) and _refs:
+                _allowed = _build_allowed_evidence_ids(snapshot)
+                _missing = [str(r) for r in _refs if str(r) not in _allowed]
+                if _missing:
+                    decision["has_trade_plan"] = False
+                    decision["trade_plan"] = None
+                    decision["decision"] = "monitor_only"
+                    decision["signal_grade"] = "C"
+                    _actions = decision.get("suggested_actions") or []
+                    decision["suggested_actions"] = [
+                        a for a in _actions if a != "create_paper_order"
+                    ]
+                    decision["evidence_fail_closed"] = True
+                    _notes = list(decision.get("risk_notes") or [])
+                    _notes.append({
+                        "code": "evidence_ungrounded",
+                        "message": (
+                            "evidence fail-closed: LLM trade_plan 引用未受支持的 "
+                            f"evidence_id {_missing}，已中立化为观察（不具下单资格）"
+                        ),
+                    })
+                    decision["risk_notes"] = _notes
     # Phase-2 P2-1 (07-27): clear/rebuild fallback-only transient fields on
     # LLM success. The ``decision = dict(fallback)`` merge (line 3331) copies
     # the risk-processed disabled fallback's transient fields onto the
@@ -4047,7 +4332,9 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
     from plugins.crypto_guard.strategy.grade_config import grade_order_value, grade_from_order_value
     det_grade_val = grade_order_value(str(fallback.get("signal_grade") or "D").upper())
     llm_grade_val = grade_order_value(grade)
-    if llm_grade_val < det_grade_val - 1:
+    # 08-04 D6: a D6 evidence-fail-closed neutralization (grade C) must NOT be
+    # re-bumped by the stabilization block — the fail-closed verdict is final.
+    if not decision.get("evidence_fail_closed") and llm_grade_val < det_grade_val - 1:
         stabilized_grade = grade_from_order_value(det_grade_val - 1)
         decision["signal_grade"] = stabilized_grade
         decision.setdefault("risk_notes", []).append(
@@ -4244,13 +4531,30 @@ def _normalize_watch_direction(value: Any, trade_plan: Any = None) -> str | None
     return None
 
 
+def _strip_skill_instruction_text(value: Any) -> Any:
+    """08-04 contract C8: recursively strip prompt.md / skill_yaml_text /
+    skill_contract / ga_interpretation free text from a skill module so
+    Markdown/system-prompt instructions never reach the LLM as high-trust
+    content. Deterministic numeric/string facts are preserved."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k in ("prompt", "prompt_md", "skill_yaml_text", "skill_contract", "ga_interpretation"):
+                continue
+            out[k] = _strip_skill_instruction_text(v)
+        return out
+    if isinstance(value, list):
+        return [_strip_skill_instruction_text(x) for x in value]
+    return value
+
+
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     modules = snapshot.get("modules") or {}
     keep_modules = {}
     for name in ("price_action", "momentum", "trend_stage", "smc", "order_flow", "chanlun"):
         value = modules.get(name)
         if isinstance(value, dict):
-            keep_modules[name] = value
+            keep_modules[name] = _strip_skill_instruction_text(value)
     # Phase C (07-05): surface a bounded MultiTimeframeFeaturePack so the LLM
     # sees per-TF compact modules (sample_count, data_as_of, bias, structure,
     # momentum, key_levels) for ALL 5 timeframes — not just the primary TF.

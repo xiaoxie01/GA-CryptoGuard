@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HistoricalReplayBacktestAnalysis",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "regime_findings", "strategy_findings", "recommended_next_steps"],
+  "properties": {
+    "summary": {"type": "string"},
+    "regime_findings": {"type": "array", "items": {"type": "object"}},
+    "strategy_findings": {"type": "array", "items": {"type": "object"}},
+    "recommended_next_steps": {"type": "array", "items": {"type": "string"}}
+  }
+}

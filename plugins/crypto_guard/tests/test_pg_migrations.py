@@ -276,6 +276,7 @@ class TestPostgresInitializeDatabase(unittest.TestCase):
             "(revert-fail trigger)",
         )
 
+    @pytest.mark.serial
     def test_healthy_initialize_skips_ddl_does_not_block_concurrent_dml(self) -> None:
         """RED-first: on a HEALTHY schema, initialize_database() must NOT re-run
         the schema DDL. CREATE TABLE/INDEX IF NOT EXISTS still takes

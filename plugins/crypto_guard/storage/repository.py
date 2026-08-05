@@ -1370,6 +1370,48 @@ class CryptoGuardRepository:
                 new_id = int(cur.fetchone()["id"])
         return new_id
 
+    def get_skill_feedback_memory(
+        self,
+        symbol: str,
+        *,
+        statuses: tuple[str, ...] = ("candidate", "active"),
+        recency_hours: int = 24 * 7,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """08-04 contract C5: skill_feedback_memory filtered by symbol / status /
+        recency — NO global-latest-50.
+
+        Returns only rows whose ``affected_symbols`` JSON array contains the
+        requested symbol (or whose ``affected_symbols`` is empty/unset, which
+        historically means "all symbols" but is excluded here for context
+        hygiene), in one of ``statuses``, updated within the recency window,
+        newest-first, capped at ``limit``.
+        """
+        import json as _json
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM skill_feedback_memory
+                WHERE status = ANY(%(statuses)s::text[])
+                  AND updated_at > NOW() - make_interval(hours => %(recency_hours)s)
+                  AND affected_symbols IS NOT NULL
+                  AND affected_symbols::jsonb @> %(sym_json)s::jsonb
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %(limit)s
+                """,
+                {
+                    "symbol": symbol,
+                    "statuses": list(statuses),
+                    "recency_hours": int(recency_hours),
+                    "sym_json": _json.dumps([symbol], ensure_ascii=False),
+                    "limit": int(limit),
+                },
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
     def create_signal(self, decision: dict[str, Any], snapshot_id: int | None = None, *, ga_decision_id: int | None = None) -> int:
         trade_plan = decision.get("trade_plan") if decision.get("has_trade_plan") else None
         watch = decision.get("opportunity_watch")
@@ -2731,8 +2773,19 @@ class CryptoGuardRepository:
         ga_decision_id: int | None = None,
         source: str = "signal_compat",
         risk_check_passed: bool = False,
+        trigger_watch_id: int | None = None,
     ) -> tuple[int, bool]:
         from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
+
+        # 08-04 contract B: idempotent bridge. If a live paper order already
+        # exists for this trigger_watch_id (pending/open/needs_recheck), return
+        # it — a triggered watch must never create a second order. The partial
+        # unique index is the DB-level backstop; the pre-check SELECT is the
+        # cheap, clear guard (matches the handler's get_paper_order_by_trigger_watch).
+        if trigger_watch_id is not None:
+            existing = self.get_paper_order_by_trigger_watch(int(trigger_watch_id))
+            if existing is not None:
+                return int(existing["id"]), False
 
         expires_at = compute_expires_at(trade_plan.get("entry_type"))
         # 07-16 cutover: ``paper_orders`` has ``UNIQUE(signal_id)`` (no unique on
@@ -2752,9 +2805,9 @@ class CryptoGuardRepository:
                     INSERT INTO paper_orders(
                         signal_id, ga_decision_id, symbol, side, order_type, entry_price, trigger_price,
                         stop_loss, initial_stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed,
-                        expires_at
+                        expires_at, trigger_watch_id
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (signal_id) DO NOTHING
                     RETURNING id
                     """,
@@ -2776,6 +2829,7 @@ class CryptoGuardRepository:
                         source,
                         bool(risk_check_passed),
                         expires_at,
+                        int(trigger_watch_id) if trigger_watch_id is not None else None,
                     ),
                 )
                 row = cur.fetchone()
@@ -2815,6 +2869,44 @@ class CryptoGuardRepository:
             )
             rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+    def get_paper_order_by_trigger_watch(self, watch_id: int) -> dict[str, Any] | None:
+        """08-04 contract B: the live paper order linked to a trigger_watch_id.
+
+        Returns the order only while it is live (pending/open/needs_recheck) —
+        a terminal order means the bridge already produced its one order and a
+        recheck must NOT create a second one. Mirrors the partial unique index
+        ``idx_paper_orders_trigger_watch_once`` predicate.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM paper_orders WHERE trigger_watch_id=%s "
+                "AND status IN ('pending','open','needs_recheck') ORDER BY id LIMIT 1",
+                (int(watch_id),),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def set_opportunity_watch_recheck_status(self, watch_id: int, status: str, *, order_id: int | None = None) -> None:
+        """08-04 contract B: record the watch's last recheck outcome.
+
+        ``status`` is ``order_created`` or ``recheck_rejected``; ``order_id``
+        links the created paper_orders.id when one was made.
+        """
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE opportunity_watches
+                    SET recheck_status=%s,
+                        recheck_order_id=COALESCE(%s, recheck_order_id),
+                        last_recheck_at=NOW(),
+                        last_checked_at=NOW(),
+                        updated_at=NOW()
+                    WHERE id=%s
+                    """,
+                    (status, int(order_id) if order_id is not None else None, int(watch_id)),
+                )
 
     def update_paper_order_status(self, order_id: int, status: str, *, filled_at: str | None = None, closed_at: str | None = None) -> None:
         with self.conn.transaction():

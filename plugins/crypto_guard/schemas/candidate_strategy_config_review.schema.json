@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CandidateStrategyConfigReview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "config_notes", "risk_controls"],
+  "properties": {
+    "summary": {"type": "string"},
+    "config_notes": {"type": "array", "items": {"type": "object"}},
+    "risk_controls": {"type": "array", "items": {"type": "string"}}
+  }
+}

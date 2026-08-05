@@ -1079,10 +1079,21 @@ class TestE2EStructuredWatchFunnel:
             assert update["triggered"] == 1, f"watch must trigger; {update}"
             triggered_watch = repo.get_opportunity_watch(button["watch_id"])
             assert triggered_watch["status"] == "triggered"
-            alerts = conn.execute(
+            # 08-04 contract A: a triggered watch is INTERNAL-ONLY — it enqueues
+            # a silent opportunity_watch_recheck job, never a legacy
+            # opportunity_watch_alert, and writes no alert_outbox row.
+            rechecks = conn.execute(
+                "SELECT * FROM agent_jobs WHERE job_type='opportunity_watch_recheck'"
+            ).fetchall()
+            assert len(rechecks) == 1, "triggered watch must enqueue one recheck job"
+            legacy_alerts = conn.execute(
                 "SELECT * FROM agent_jobs WHERE job_type='opportunity_watch_alert'"
             ).fetchall()
-            assert len(alerts) == 1, "triggered watch must enqueue one alert job"
+            assert legacy_alerts == [], "triggered watch must NOT enqueue an opportunity_watch_alert job"
+            outbox = conn.execute(
+                "SELECT * FROM alert_outbox WHERE alert_type='opportunity_triggered'"
+            ).fetchall()
+            assert outbox == [], "triggered watch must NOT write an opportunity_triggered alert_outbox row"
             second = update_opportunity_watches(repo, analysis_time_utc=base + span * 2 - 1)
             assert second["triggered"] == 0, "next batch must be idempotent"
         finally:

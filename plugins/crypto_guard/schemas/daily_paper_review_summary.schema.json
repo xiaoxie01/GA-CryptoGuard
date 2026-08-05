@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DailyPaperReviewSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary_text", "key_findings", "strategy_actions", "risk_focus"],
+  "properties": {
+    "summary_text": {"type": "string"},
+    "key_findings": {"type": "array", "items": {"type": "object"}},
+    "strategy_actions": {"type": "array", "items": {"type": "object"}},
+    "risk_focus": {"type": "array", "items": {"type": "object"}}
+  }
+}
