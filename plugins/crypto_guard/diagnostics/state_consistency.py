@@ -165,6 +165,16 @@ def _llm_fair_scheduling_contract_cutoff(repo: CryptoGuardRepository) -> str | N
 # only — it is NOT the deployment-contract boundary.
 LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY = "llm_failed_direction_fail_closed_v1"
 
+# 08-06 P2 (release-blocker rework): watch -> order bridge contract marker key.
+# ``initialize_database`` writes it ONLY after the 08-04 bridge schema (4
+# columns + ``idx_paper_orders_trigger_watch_once``) is complete AND the schema
+# health gate passes, inside the SAME transaction as the schema change.
+# Absence is fail-closed: ``_check_watch_order_bridge_contract_marker_missing``
+# emits an ``error`` so an undeployed bridge contract cannot present as healthy
+# (an operator who skipped the auto-upgrade sees the marker-missing error and
+# release-ready blocks instead of silently passing).
+WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY = "watch_order_bridge_contract_v1"
+
 
 def _llm_failed_direction_fail_closed_cutoff(repo: CryptoGuardRepository) -> datetime | None:
     """Phase-2 P2-1 (07-27) requirement F: cutoff timestamp for the
@@ -271,6 +281,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         _check_llm_fair_scheduling_contract_marker_missing,
         _check_llm_failed_direction_fail_closed_marker_missing,
         _check_batch_claim_ownership_integrity,
+        _check_watch_order_bridge_contract_marker_missing,
     )
     for check in checks:
         issues.extend(_run_check(repo, check))
@@ -308,6 +319,7 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "llm_failed_direction_fail_closed_marker_missing": len([i for i in issues if i["type"] == "llm_failed_direction_fail_closed_marker_missing"]),
         "deterministic_direction_from_failed_llm_historical": len([i for i in issues if i["type"] == "deterministic_direction_from_failed_llm_historical"]),
         "batch_claim_ownership_integrity": len([i for i in issues if i["type"] == "batch_claim_ownership_integrity"]),
+        "watch_order_bridge_contract_marker_missing": len([i for i in issues if i["type"] == "watch_order_bridge_contract_marker_missing"]),
     }
 
     # Section 八: Separate counts for error/warning/legacy_info
@@ -3152,6 +3164,49 @@ def _check_llm_failed_direction_fail_closed_marker_missing(repo: CryptoGuardRepo
                 "运行 initialize_database() 部署 marker（release 路径，需 /trellis:crypto-guard-release 授权）；"
                 "marker 缺失时 deterministic_direction_from_failed_llm 诊断被跳过，"
                 "可能导致 fail-closed 修复（requirement C）失效而报告假绿。"
+            ),
+        })
+    return issues
+
+
+def _check_watch_order_bridge_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-06 P2 (release-blocker rework): flag a missing watch -> order bridge
+    contract marker. Mirrors ``_check_llm_failed_direction_fail_closed_marker_missing``.
+
+    The marker ``watch_order_bridge_contract_v1`` must exist in
+    ``_migration_state``. When absent, emit an ``error`` (fail-closed) so
+    callers detect the undeployed 08-04 bridge contract rather than receiving a
+    silently-healthy report. The marker is written by ``initialize_database``
+    only AFTER the bridge schema (4 columns + the partial unique index) is
+    complete AND the schema health gate passes, inside the same transaction as
+    the schema change -- so presence proves the upgrade actually ran, and a
+    mid-bridge rollback leaves no residue (the marker row is part of the rolled
+    back transaction).
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
+            (WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "watch_order_bridge_contract_marker", exc,
+        )
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "watch_order_bridge_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "watch -> order bridge 契约 marker 缺失：旧生产 schema 尚未升级到 "
+                "08-04 bridge 契约（4 列 + idx_paper_orders_trigger_watch_once）。"
+                "运行 initialize_database(allow_ddl=True)（release 路径，需 "
+                "/trellis:crypto-guard-release 授权）自动完成升级并写入 marker；"
+                "marker 缺失时 release-ready 门禁必须阻塞，不得静默放行。"
             ),
         })
     return issues

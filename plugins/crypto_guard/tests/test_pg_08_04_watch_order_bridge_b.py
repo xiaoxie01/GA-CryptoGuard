@@ -396,10 +396,16 @@ class TestWatchOrderLinkPersisted:
             assert int(linked["trigger_watch_id"]) == watch_id, linked
             assert str(linked["side"]) == "LONG", linked
 
-            # A terminal order no longer holds the link -> bridge can't re-create.
+            # 08-06 once-ever: a TERMINAL order STILL holds the once-ever link,
+            # so a delayed-retry recheck is judged duplicate (never a 2nd order).
+            # The live-only view is separate.
             repo.update_paper_order_status(int(order_id), "filled")
-            assert repo.get_paper_order_by_trigger_watch(watch_id) is None, (
-                "B6: a terminal order must not satisfy the live-link lookup"
+            still = repo.get_paper_order_by_trigger_watch(watch_id)
+            assert still is not None and int(still["id"]) == int(order_id), (
+                "B6: a terminal order must still satisfy the once-ever lookup"
+            )
+            assert repo.get_live_paper_order_by_trigger_watch(watch_id) is None, (
+                "B6: the live-only lookup must return None after the order is terminal"
             )
         finally:
             handle.close()
@@ -412,7 +418,8 @@ class TestWatchOrderBridgeMigrationIdempotent:
     """B7: ``apply_08_04_watch_order_bridge_migration`` must run as a guarded
     no-op against the already-migrated schema (release path on an existing DB)
     and stay idempotent when applied twice: no error, columns kept, the partial
-    unique index preserved and still enforcing one live order per watch."""
+    unique index preserved and still enforcing the ONCE-EVER order per watch
+    (one paper order over the watch's entire lifetime, terminal orders included)."""
 
     def test_migration_applied_twice_is_noop_and_preserves_index(self) -> None:
         from plugins.crypto_guard.storage.migrations import (
@@ -446,8 +453,8 @@ class TestWatchOrderBridgeMigrationIdempotent:
                     "B7: idx_paper_orders_trigger_watch_once must exist after migration"
                 )
 
-            # The partial unique index still enforces one live order per watch:
-            # a second order for the same trigger_watch_id must be rejected.
+            # The partial unique index still enforces the once-ever order per
+            # watch: a second order for the same trigger_watch_id must be rejected.
             repo = handle.repo
             watch = repo.get_opportunity_watch(_materialize_breakout_watch(repo)["watch_id"])
             watch_id = int(watch["id"])

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -236,6 +237,27 @@ def initialize_database(
                             # the schema DDL recreates it with the P0-2 predicate
                             # (safe: the table has zero rows in production).
                             _drop_legacy_opportunity_watches_dedupe_index(cur)
+                            # 08-06 P1 (release-blocker): a real pre-08-04
+                            # production schema already HAS ``paper_orders`` /
+                            # ``opportunity_watches`` (created by the greenfield
+                            # cutover), so the schema DDL's ``CREATE TABLE IF NOT
+                            # EXISTS`` no-ops on them and the standalone
+                            # ``CREATE UNIQUE INDEX IF NOT EXISTS
+                            # idx_paper_orders_trigger_watch_once ... WHERE
+                            # trigger_watch_id ...`` below raises
+                            # UndefinedColumn (42703) -- the column does not
+                            # exist yet. The release operation must therefore NOT
+                            # require a separate manual call to
+                            # ``apply_08_04_watch_order_bridge_migration``:
+                            # ``initialize_database`` itself runs the additive
+                            # bridge migration FIRST, inside this same advisory-
+                            # lock-guarded transaction, before the schema DDL
+                            # (which then recreates the already-present index as
+                            # an ``IF NOT EXISTS`` no-op). On a fresh greenfield
+                            # schema ``_apply_08_04_watch_order_bridge_migration``
+                            # safe no-ops (no ``paper_orders`` table yet) and
+                            # ``schema_postgres.sql`` creates the full structure.
+                            _apply_08_04_watch_order_bridge_migration(cur)
                             cur.execute(schema_sql)
                         except _PsycopgDBError as exc:
                             raise RuntimeError(
@@ -271,6 +293,15 @@ def initialize_database(
                             "schema health check failed after init: "
                             f"{health.get('missing_columns')}"
                         )
+
+                    # 5. 08-06 P2: watch -> order bridge contract marker - the
+                    # LAST step, written ONLY after the bridge schema is complete
+                    # AND the health gate passes, still inside the same
+                    # transaction. If the bridge migration or any later DDL
+                    # failed, the health gate above already raised and the whole
+                    # transaction (columns + index + this marker row) rolls back
+                    # together - no residue.
+                    _ensure_watch_order_bridge_contract_marker(cur)
                 conn.commit()
                 from plugins.crypto_guard.storage.pg_db import database_identity
                 return {"ok": True, "database": database_identity(cfg.database_url)}
@@ -511,6 +542,39 @@ def _ensure_execution_funnel_report_contract_marker(cur: psycopg.Cursor) -> None
     _ensure_marker(cur, "execution_funnel_report_contract_v1")
 
 
+def _ensure_watch_order_bridge_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-06 P2: watch -> order bridge contract marker (release-blocker rework).
+
+    ``watch_order_bridge_contract_v1`` proves the legacy pre-08-04 production
+    schema was actually upgraded to the 08-04 watch -> order bridge contract:
+    the four bridge columns (``paper_orders.trigger_watch_id`` +
+    ``opportunity_watches.recheck_status`` / ``recheck_order_id`` /
+    ``last_recheck_at``) AND the ONCE-EVER partial unique index
+    ``idx_paper_orders_trigger_watch_once`` (one paper order per watch for its
+    ENTIRE lifetime, ``WHERE trigger_watch_id IS NOT NULL`` with no status
+    filter) all exist and passed the schema health gate. ``initialize_database``
+    writes it AFTER the health gate passes
+    and BEFORE commit -- inside the SAME advisory-lock-guarded transaction as
+    the schema change -- so:
+
+      - marker-MISSING: fail-closed -- ``diagnose_state_consistency`` emits a
+        marker-missing ``error`` and the release-ready gate blocks (an
+        undeployed bridge contract must not present as healthy).
+      - marker present but health gate failed earlier: impossible, because the
+        marker is written only after the health check returns ``ok``; a
+        mid-bridge failure rolls back the whole transaction and the marker row
+        (which is a plain ``INSERT`` in the same txn) vanishes with it -- no
+        residue.
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here -- it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "watch_order_bridge_contract_v1")
+
+
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:
     """Marker for the historical stop-loss dedup migration.
 
@@ -551,29 +615,213 @@ def apply_r6f_service_ownership_migration(conn: psycopg.Connection) -> None:
         _add_column(cur, "_service_ownership", "owner_token", "TEXT")
 
 
-def apply_08_04_watch_order_bridge_migration(conn: psycopg.Connection) -> None:
-    """08-04 contract B: watch -> order bridge columns + partial unique index.
+# ── 08-06 P2: precise once-ever index introspection (pg_index/pg_attribute/pg_get_expr) ──
+
+
+ONCE_EVER_INDEX_NAME = "idx_paper_orders_trigger_watch_once"
+ONCE_EVER_INDEX_PREDICATE = "trigger_watch_id IS NOT NULL"
+
+
+def _normalize_predicate(expr: str | None) -> str | None:
+    """Normalize a ``pg_get_expr`` predicate for EXACT comparison.
+
+    Strips balanced outer parentheses and collapses whitespace so the catalog
+    text ``(trigger_watch_id IS NOT NULL)`` (PG 16.14) compares equal to the
+    canonical ``trigger_watch_id IS NOT NULL`` regardless of cosmetic
+    parenthesization. Returns None for a NULL predicate.
+    """
+    if expr is None:
+        return None
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        outer = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    outer = False
+                    break
+        if not outer or depth != 0:
+            break
+        s = s[1:-1].strip()
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _introspect_once_ever_index(cur: psycopg.Cursor, schema: str) -> dict[str, Any] | None:
+    """Precise catalog facts for ``idx_paper_orders_trigger_watch_once``.
+
+    Reads ``pg_index`` flags (``indisunique`` / ``indisvalid`` / ``indisready``),
+    the key column via ``pg_attribute``, expression / INCLUDE-key detection, and
+    the FULL partial predicate via ``pg_get_expr``. Returns None when the index
+    is absent. This is the single source of truth shared by the migration
+    rebuild-detection, the schema-health gate, and the marker spy -- never a
+    loose ``indexdef`` string-substring guess.
+    """
+    cur.execute(
+        """
+        SELECT
+            ix.indisunique, ix.indisvalid, ix.indisready,
+            ix.indpred IS NOT NULL AS has_pred,
+            pg_get_expr(ix.indpred, ix.indrelid) AS pred_expr,
+            ix.indnkeyatts AS nkeyatts, ix.indnatts AS natts,
+            ix.indexprs IS NOT NULL AS has_expr_keys,
+            a.attname AS key_attname
+        FROM pg_index ix
+        JOIN pg_class c ON ix.indexrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ix.indkey[0]
+        WHERE n.nspname = %s AND c.relname = %s
+        """,
+        (schema, ONCE_EVER_INDEX_NAME),
+    )
+    return cur.fetchone()
+
+
+def _once_ever_index_is_exact(facts: dict[str, Any] | None) -> tuple[bool, str]:
+    """EXACT once-ever contract check over catalog facts.
+
+    Returns ``(ok, reason)``. ``ok`` is True only when the index is:
+      - UNIQUE, valid, ready;
+      - exactly ONE key column, and it is ``paper_orders.trigger_watch_id``;
+      - no expression keys, no INCLUDE columns;
+      - partial (``indpred`` non-NULL);
+      - normalized full predicate EXACTLY ``trigger_watch_id IS NOT NULL``.
+
+    Any deviation -- an extra ``AND trigger_watch_id > 0``, an OR/AND clause,
+    the old status-filtered live-only predicate, a non-unique / wrong-column /
+    composite / expression index, or a missing predicate -- is judged UNHEALTHY.
+    """
+    if facts is None:
+        return False, "index absent"
+    if not facts["indisunique"]:
+        return False, "index is not UNIQUE"
+    if not facts["indisvalid"]:
+        return False, "index is not valid"
+    if not facts["indisready"]:
+        return False, "index is not ready"
+    if facts["has_expr_keys"]:
+        return False, "index has an expression key"
+    if facts["nkeyatts"] != 1 or facts["natts"] != 1:
+        return False, (
+            f"expected exactly one key column and no INCLUDE "
+            f"(nkeyatts={facts['nkeyatts']}, natts={facts['natts']})"
+        )
+    if facts["key_attname"] != "trigger_watch_id":
+        return False, (
+            f"key column is {facts['key_attname']!r}, expected 'trigger_watch_id'"
+        )
+    if not facts["has_pred"]:
+        return False, "index is NOT partial (indpred is NULL)"
+    norm = _normalize_predicate(facts["pred_expr"])
+    if norm != ONCE_EVER_INDEX_PREDICATE:
+        return False, (
+            f"predicate {facts['pred_expr']!r} normalized to {norm!r}; "
+            f"expected exactly {ONCE_EVER_INDEX_PREDICATE!r}"
+        )
+    return True, "exact once-ever index"
+
+
+def _apply_08_04_watch_order_bridge_migration(cur: psycopg.Cursor) -> None:
+    """08-04 contract B + 08-06 once-ever: watch -> order bridge columns + index.
 
     Adds (idempotently) ``paper_orders.trigger_watch_id``, the partial unique
-    index ``idx_paper_orders_trigger_watch_once`` (one live order per triggered
-    watch), and the ``opportunity_watches.recheck_status`` /
-    ``recheck_order_id`` / ``last_recheck_at`` bookkeeping columns. Pure
-    additive upgrade for existing DBs; a greenfield ``initialize_database``
-    already creates these via ``schema_postgres.sql``, so this is a guarded
-    no-op there. The caller owns the transaction.
+    index ``idx_paper_orders_trigger_watch_once`` (ONE paper order per triggered
+    watch over its ENTIRE lifetime - never released by status), and the
+    ``opportunity_watches.recheck_status`` / ``recheck_order_id`` /
+    ``last_recheck_at`` bookkeeping columns. Pure additive upgrade for existing
+    DBs; on a fresh greenfield schema the ``paper_orders`` table does not exist
+    yet, so this safe no-ops and lets ``schema_postgres.sql`` create the full
+    structure. The caller owns the transaction (the auto-wiring in
+    ``initialize_database`` runs this inside the SAME advisory-lock-guarded
+    transaction as the schema DDL).
+
+    08-06 once-ever rework (Codex P1): the index predicate is
+    ``WHERE trigger_watch_id IS NOT NULL`` with NO status filter, so a terminal
+    order still holds the once-ever link and a delayed-retry recheck can never
+    produce a second order. ``CREATE UNIQUE INDEX IF NOT EXISTS`` is a name-only
+    no-op, so a same-name index is introspected via ``pg_index`` /
+    ``pg_attribute`` / ``pg_get_expr`` and REBUILT to the exact once-ever form in
+    this same transaction whenever it deviates in ANY way (legacy status filter,
+    extra AND/OR clause, non-unique, wrong column, composite, expression key, or
+    missing predicate). Before any create/rebuild, duplicate non-NULL
+    ``trigger_watch_id`` rows fail-closed (RuntimeError) - business rows are
+    NEVER auto-deleted.
+    """
+    if not _table_exists(cur, "paper_orders"):
+        return
+    _add_column(cur, "paper_orders", "trigger_watch_id", "BIGINT")
+    # 08-06 R-2: fail-closed with a controlled error if the bridge target table is
+    # absent while paper_orders exists (a partial/inconsistent schema) -- never
+    # surface a raw UndefinedTable to the release operator.
+    if not _table_exists(cur, "opportunity_watches"):
+        raise RuntimeError(
+            "apply_08_04_watch_order_bridge_migration: paper_orders exists but "
+            "opportunity_watches does not; partial/inconsistent schema - refusing "
+            "to apply the watch->order bridge bookkeeping columns"
+        )
+    _add_column(cur, "opportunity_watches", "recheck_status", "TEXT")
+    _add_column(cur, "opportunity_watches", "recheck_order_id", "BIGINT")
+    _add_column(cur, "opportunity_watches", "last_recheck_at", "TIMESTAMPTZ")
+
+    # 08-06 once-ever: fail-closed on pre-existing duplicate non-NULL
+    # trigger_watch_id. The once-ever index cannot be built over duplicates, and
+    # we must NEVER auto-delete business rows to make it fit.
+    cur.execute(
+        """
+        SELECT trigger_watch_id, COUNT(*) AS c
+        FROM paper_orders
+        WHERE trigger_watch_id IS NOT NULL
+        GROUP BY trigger_watch_id HAVING COUNT(*) > 1
+        """
+    )
+    dup = cur.fetchone()
+    if dup is not None:
+        raise RuntimeError(
+            "idx_paper_orders_trigger_watch_once cannot be built: "
+            f"trigger_watch_id={dup['trigger_watch_id']} has {dup['c']} rows; "
+            "refusing to auto-delete business data (once-ever contract)"
+        )
+
+    # Detect a same-name index and REBUILD it unless it is EXACTLY the once-ever
+    # contract -- precise pg_index/pg_attribute/pg_get_expr introspection, not a
+    # loose indexdef-string "contains status" guess. The legacy live-only
+    # (status-filtered) predicate, a non-unique index, a wrong-column / composite
+    # / expression-key index, a non-partial index, and ANY predicate other than
+    # exactly ``trigger_watch_id IS NOT NULL`` are all rebuilt in this same
+    # transaction. ``CREATE UNIQUE INDEX IF NOT EXISTS`` is a name-only no-op, so
+    # without this the rebuild would be silently skipped.
+    cur.execute("SELECT current_schema() AS s")
+    schema = cur.fetchone()["s"]
+    facts = _introspect_once_ever_index(cur, schema)
+    ok, _reason = _once_ever_index_is_exact(facts)
+    if ok:
+        return
+    if facts is not None:
+        cur.execute(f"DROP INDEX {ONCE_EVER_INDEX_NAME}")
+    cur.execute(
+        f"""
+        CREATE UNIQUE INDEX {ONCE_EVER_INDEX_NAME}
+            ON paper_orders(trigger_watch_id)
+            WHERE trigger_watch_id IS NOT NULL
+        """
+    )
+
+
+def apply_08_04_watch_order_bridge_migration(conn: psycopg.Connection) -> None:
+    """Public wrapper: 08-04 contract B watch -> order bridge (see the
+    cursor-based ``_apply_08_04_watch_order_bridge_migration``).
+
+    Kept for callers that still explicitly invoke the additive migration on an
+    existing connection (e.g. the B7 idempotency test). Since 08-06 the
+    release path performs this automatically inside ``initialize_database``;
+    the helper stays idempotent so an extra explicit call is a no-op. The
+    caller owns the transaction.
     """
     with conn.cursor() as cur:
-        _add_column(cur, "paper_orders", "trigger_watch_id", "BIGINT")
-        _add_column(cur, "opportunity_watches", "recheck_status", "TEXT")
-        _add_column(cur, "opportunity_watches", "recheck_order_id", "BIGINT")
-        _add_column(cur, "opportunity_watches", "last_recheck_at", "TIMESTAMPTZ")
-        cur.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_trigger_watch_once
-                ON paper_orders(trigger_watch_id)
-                WHERE trigger_watch_id IS NOT NULL AND status IN ('pending','open','needs_recheck')
-            """
-        )
+        _apply_08_04_watch_order_bridge_migration(cur)
 
 
 def apply_r10_attempt_counter_migration(conn: psycopg.Connection) -> None:
@@ -603,6 +851,27 @@ def _column_exists(cur: psycopg.Cursor, table: str, column: str) -> bool:
         WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s
         """,
         (table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def _table_exists(cur: psycopg.Cursor, table: str) -> bool:
+    """Return whether ``table`` exists in the current schema.
+
+    Resolves the target schema the same way unqualified DDL does
+    (``current_schema()``), so under per-test scratch-schema isolation a
+    greenfield scratch schema correctly reports the tables absent and the
+    additive 08-04 bridge migration safe no-ops there (letting
+    ``schema_postgres.sql`` create the full structure). Under a legacy
+    pre-08-04 production schema the ``paper_orders`` table exists, so the
+    bridge helper proceeds to add its columns + partial unique index.
+    """
+    cur.execute(
+        """
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = current_schema() AND table_name = %s
+        """,
+        (table,),
     )
     return cur.fetchone() is not None
 
@@ -801,7 +1070,15 @@ _REQUIRED_TABLES: list[str] = [
 # nullability, identity/default), every table constraint, every non-primary
 # index, and application triggers/functions. Update only after deliberately
 # changing the canonical DDL and regenerating it from a fresh scratch schema.
-_EXPECTED_SCHEMA_FINGERPRINT = "a08bea68f1a5e93f3e12d0607759a0d0512936f1a099b85ad6b56f250923c545"
+#
+# 08-06 (release-blocker rework): the fingerprint is column-ORDER-insensitive
+# (columns are keyed by (table, column) name, not ``ordinal_position``). A real
+# legacy pre-08-04 DB upgraded via ``ALTER TABLE ADD COLUMN`` appends the four
+# bridge columns AFTER ``created_at``/``updated_at``, whereas greenfield
+# declares them mid-table; the two paths yield the identical logical catalog,
+# and only an order-insensitive fingerprint lets an upgraded legacy schema pass
+# the health gate (its SHA-256 must equal this greenfield value).
+_EXPECTED_SCHEMA_FINGERPRINT = "c937a91931256296e2eee02dd34956aa6be0ed0b1dacd4b5386a144f264d39bf"
 
 
 def _normalize_catalog_text(value: Any, schema: str) -> str:
@@ -819,11 +1096,11 @@ def _schema_catalog_fingerprint(cur: psycopg.Cursor, schema: str) -> str:
     }
     cur.execute(
         """
-        SELECT table_name, ordinal_position, column_name, data_type, udt_name,
+        SELECT table_name, column_name, data_type, udt_name,
                is_nullable, is_identity, identity_generation, column_default
         FROM information_schema.columns
         WHERE table_schema=%s AND table_name = ANY(%s)
-        ORDER BY table_name, ordinal_position
+        ORDER BY table_name, column_name
         """,
         (schema, _REQUIRED_TABLES),
     )
@@ -979,6 +1256,9 @@ def _introspect_schema_health(cur: psycopg.Cursor) -> dict[str, Any]:
 
     # ── opportunity_watches dedupe_key partial unique index ────────────────
     missing.extend(_check_opportunity_watches_dedupe_index(cur, schema))
+
+    # ── paper_orders trigger_watch_id partial unique index (08-04 contract B) ─
+    missing.extend(_check_paper_orders_trigger_watch_index(cur, schema))
 
     # ── backfill_progress composite primary key (symbol, interval) ─────────
     missing.extend(_check_backfill_progress_primary_key(cur, schema))
@@ -1171,6 +1451,44 @@ def _check_opportunity_watches_dedupe_index(cur: psycopg.Cursor, schema: str) ->
             }
         )
     return problems
+
+
+def _check_paper_orders_trigger_watch_index(cur: psycopg.Cursor, schema: str) -> list[dict[str, str]]:
+    """Verify idx_paper_orders_trigger_watch_once is a UNIQUE PARTIAL index on
+    ``trigger_watch_id`` with the 08-06 ONCE-EVER predicate ``WHERE
+    trigger_watch_id IS NOT NULL`` (NO status filter).
+
+    The predicate is the whole point: one ``opportunity_watch`` creates at most
+    ONE ``paper_order`` over its entire lifetime; a terminal
+    (filled/expired/cancelled) order STILL holds the watch link, so a delayed
+    retry recheck can never create a second order. NULL ``trigger_watch_id``
+    rows (signal-originated orders) are unconstrained. ANY deviation from the
+    exact once-ever contract is REJECTED -- the old 08-04 live-only predicate
+    released terminal orders from the constraint, which was the Codex P1 (a
+    retry could mint a second order). A wrong predicate, a non-unique index, a
+    wrong-column/composite/expression index, or a non-partial index would
+    silently break the bridge idempotency, so this is a precise ``pg_index`` /
+    ``pg_attribute`` / ``pg_get_expr`` introspection (shared with the migration
+    rebuild-detection and the marker spy), never a loose ``indexdef`` string
+    guess.
+    """
+    facts = _introspect_once_ever_index(cur, schema)
+    ok, reason = _once_ever_index_is_exact(facts)
+    if ok:
+        return []
+    if facts is None:
+        return [
+            {
+                "table": "paper_orders",
+                "column": "idx_paper_orders_trigger_watch_once (missing)",
+            }
+        ]
+    return [
+        {
+            "table": "paper_orders",
+            "column": f"idx_paper_orders_trigger_watch_once {reason}",
+        }
+    ]
 
 
 def _drop_legacy_opportunity_watches_dedupe_index(cur: psycopg.Cursor) -> None:

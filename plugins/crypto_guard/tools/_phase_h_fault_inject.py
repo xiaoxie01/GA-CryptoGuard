@@ -73,6 +73,18 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
     LLM_BATCH_DEGRADED_REPORTED_HEALTHY,
     LLM_REPAIR_COUNTED_AS_PROVIDER_CALL,
 )
+from plugins.crypto_guard.diagnostics.state_consistency import (
+    diagnose_state_consistency,
+    WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,
+)
+
+# 08-06 (release-blocker rework): issue code emitted by
+# diagnose_state_consistency when the watch->order bridge contract marker row
+# is missing. Kept as an explicit constant (state_consistency emits the type
+# as a literal string, unlike report_diagnostics which exports code constants).
+WATCH_ORDER_BRIDGE_CONTRACT_MARKER_MISSING = (
+    "watch_order_bridge_contract_marker_missing"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +116,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_market_data_contract_marker,
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
+        _ensure_watch_order_bridge_contract_marker,
     )
 
     _ensure_profit_protection_cutoff_marker(cur)
@@ -129,6 +142,11 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # execution_funnel_report_contract_marker_missing finding (Phase I's
     # _ensure_all_contract_markers already seeds it; Phase H now mirrors).
     _ensure_execution_funnel_report_contract_marker(cur)
+    # 08-06 P2 (release-blocker rework): watch -> order bridge contract marker
+    # (full-set mirror of _phase_i_fresh_verify; state_consistency is not run
+    # here, but the fresh-schema marker set must stay in lockstep so Phase I's
+    # marker-missing checks fire at their real severity).
+    _ensure_watch_order_bridge_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 
@@ -257,6 +275,20 @@ def _run_one(name, fn):
         conn = repo.conn
         fn(conn)
         result = diagnose_report_accuracy(repo)
+        codes = [i["type"] for i in result["issues"]]
+        return {"name": name, "codes": codes, "issues": result["issues"]}
+
+
+def _run_one_state(name, fn):
+    """Build a fresh scratch schema, run fn to seed fault, run
+    ``diagnose_state_consistency`` (not ``diagnose_report_accuracy``), return
+    result dict. Used for faults whose diagnostic lives in state_consistency
+    (e.g. the 08-06 watch->order bridge contract marker). The scratch schema
+    is dropped on exit."""
+    with _scratch_fault_repo() as repo:
+        conn = repo.conn
+        fn(conn)
+        result = diagnose_state_consistency(repo)
         codes = [i["type"] for i in result["issues"]]
         return {"name": name, "codes": codes, "issues": result["issues"]}
 
@@ -1188,6 +1220,24 @@ def assert_not_caught(result, expected_code):
     return False, f"FAIL: {expected_code} should NOT fire but is in {result['codes']}"
 
 
+def fault_watch_order_bridge_marker_missing(conn):
+    """Fault: the watch->order bridge contract marker row is deleted from
+    ``_migration_state``.
+
+    The scratch schema seeds the marker via ``_ensure_all_contract_markers``
+    (``_ensure_watch_order_bridge_contract_marker``), so deleting the row makes
+    ``diagnose_state_consistency`` emit
+    ``watch_order_bridge_contract_marker_missing`` at error severity. Schema
+    health must still pass (the health checks do not cover the bridge marker).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM _migration_state WHERE key = %s",
+            (WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,),
+        )
+    conn.commit()
+
+
 def main():
     print("=" * 70)
     print("Phase H (07-05) Fault Injection Verification")
@@ -1305,6 +1355,22 @@ def main():
             passed, msg = assert_not_caught(result, expected_code)
         else:
             raise ValueError(f"unknown mode: {mode}")
+        results.append((name, passed, msg))
+        print(f"[{name}]")
+        print(f"  {msg}")
+        print(f"  codes: {result['codes']}")
+        print()
+
+    # ── 08-06 (release-blocker rework): watch->order bridge contract marker ──
+    # This fault runs through diagnose_state_consistency (the report
+    # diagnostic does not include the bridge marker check).
+    for name, fn, expected_code in [
+        ("watch_order_bridge_contract_marker_missing",
+         fault_watch_order_bridge_marker_missing,
+         WATCH_ORDER_BRIDGE_CONTRACT_MARKER_MISSING),
+    ]:
+        result = _run_one_state(name, fn)
+        passed, msg = assert_caught(result, expected_code)
         results.append((name, passed, msg))
         print(f"[{name}]")
         print(f"  {msg}")

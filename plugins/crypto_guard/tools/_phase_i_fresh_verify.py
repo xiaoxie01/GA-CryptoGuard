@@ -74,6 +74,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_market_data_contract_marker,
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
+        _ensure_watch_order_bridge_contract_marker,
     )
 
     _ensure_profit_protection_cutoff_marker(cur)
@@ -96,6 +97,10 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # 08-02 P1-3: execution-funnel report-contract marker. Without it a fresh
     # (release-initialized) schema reports marker_missing instead of clean.
     _ensure_execution_funnel_report_contract_marker(cur)
+    # 08-06 P2 (release-blocker rework): watch -> order bridge contract marker.
+    # Without it a fresh (release-initialized) schema reports
+    # watch_order_bridge_contract_marker_missing instead of clean.
+    _ensure_watch_order_bridge_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 

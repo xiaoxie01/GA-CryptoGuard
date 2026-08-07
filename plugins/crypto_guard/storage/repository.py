@@ -2777,28 +2777,40 @@ class CryptoGuardRepository:
     ) -> tuple[int, bool]:
         from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
 
-        # 08-04 contract B: idempotent bridge. If a live paper order already
-        # exists for this trigger_watch_id (pending/open/needs_recheck), return
-        # it — a triggered watch must never create a second order. The partial
-        # unique index is the DB-level backstop; the pre-check SELECT is the
-        # cheap, clear guard (matches the handler's get_paper_order_by_trigger_watch).
-        if trigger_watch_id is not None:
-            existing = self.get_paper_order_by_trigger_watch(int(trigger_watch_id))
-            if existing is not None:
-                return int(existing["id"]), False
-
         expires_at = compute_expires_at(trade_plan.get("entry_type"))
-        # 07-16 cutover: ``paper_orders`` has ``UNIQUE(signal_id)`` (no unique on
-        # ga_decision_id). The SQLite ``try INSERT / except IntegrityError ->
-        # SELECT existing`` pattern relied on autocommit; on psycopg a
-        # UNIQUE-violating INSERT would ABORT the caller's outer transaction
-        # (user hard rule: no catch-UniqueViolation-then-rollback). So use
-        # ``ON CONFLICT (signal_id) DO NOTHING ... RETURNING id`` (design §6):
-        # RETURNING yields the new id on success; 0 rows means signal_id already
-        # had an order (the conflict target) -> SELECT the existing id then. A
-        # NULL signal_id never conflicts (PG UNIQUE treats NULLs as distinct),
-        # matching SQLite. ``risk_check_passed`` is a raw bool (PG BOOLEAN).
+        # 07-16 cutover + 08-06 once-ever: ``paper_orders`` has ``UNIQUE(signal_id)``
+        # AND the partial unique index ``idx_paper_orders_trigger_watch_once``
+        # (no unique on ga_decision_id). The SQLite ``try INSERT / except
+        # IntegrityError -> SELECT existing`` pattern relied on autocommit; on
+        # psycopg a UNIQUE-violating INSERT would ABORT the caller's outer
+        # transaction (user hard rule: no catch-UniqueViolation-then-rollback).
+        # So use ``ON CONFLICT DO NOTHING ... RETURNING id`` -- the no-target
+        # form (design §6) catches EVERY unique violation, including the
+        # partial unique index on ``trigger_watch_id``, and never aborts the
+        # transaction. RETURNING yields the new id on success; 0 rows means some
+        # unique constraint already had a matching row -> resolve to the existing
+        # order, preferring the once-ever trigger_watch_id link (when present),
+        # then the more specific ga_decision_id, else the signal_id match (the
+        # conflict target, guaranteed to exist). A NULL signal_id never conflicts
+        # on the UNIQUE(signal_id) constraint (PG UNIQUE treats NULLs as
+        # distinct), matching SQLite. ``risk_check_passed`` is a raw bool.
         with self.conn.transaction():
+            # 08-04 contract B + 08-06 once-ever: idempotent bridge. If a paper
+            # order of ANY status already exists for this trigger_watch_id, return
+            # it -- one watch creates at most ONE order over its entire lifetime; a
+            # terminal order still holds the link, so a delayed retry must not mint
+            # a second one. The once-ever partial unique index is the DB-level
+            # backstop; the pre-check SELECT is the cheap, clear guard (matches the
+            # handler's get_paper_order_by_trigger_watch). The pre-check runs
+            # INSIDE the transaction: if it ran before the `with` block, the SELECT
+            # would open an implicit txn and `with self.conn.transaction():` would
+            # become a nested SAVEPOINT that never commits -- leaving the unique
+            # index lock held and deadlocking a concurrent second writer (08-06
+            # concurrency test).
+            if trigger_watch_id is not None:
+                existing = self.get_paper_order_by_trigger_watch(int(trigger_watch_id))
+                if existing is not None:
+                    return int(existing["id"]), False
             with self.conn.cursor() as cur:
                 cur.execute(
                     """
@@ -2808,7 +2820,7 @@ class CryptoGuardRepository:
                         expires_at, trigger_watch_id
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (signal_id) DO NOTHING
+                    ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
                     (
@@ -2835,9 +2847,34 @@ class CryptoGuardRepository:
                 row = cur.fetchone()
                 if row is not None:
                     return int(row["id"]), True
-                # Conflict: signal_id already had an order. Prefer the more
-                # specific ga_decision_id match if provided, else the signal_id
-                # match (the actual conflict target, guaranteed to exist).
+                # Conflict: some unique constraint already had a row. Resolve to
+                # the existing order. When a trigger_watch_id is set, the once-ever
+                # watch bridge is TERMINAL: the ONLY acceptable resolution is an
+                # existing order whose trigger_watch_id EXACTLY equals this watch.
+                # If none exists, fail closed -- never fall through to a
+                # ga_decision_id/signal_id match that could return an order bound
+                # to a DIFFERENT watch (08-06 P1: no masquerade, no auto-rebind,
+                # no deleting business data). The pre-check SELECT above already
+                # returned the watch-linked order if one existed, so reaching here
+                # with trigger_watch_id set means the watch has no order yet and
+                # the conflict is a foreign signal_id/ga_decision_id collision.
+                if trigger_watch_id is not None:
+                    cur.execute(
+                        "SELECT id FROM paper_orders WHERE trigger_watch_id=%s "
+                        "ORDER BY id LIMIT 1",
+                        (int(trigger_watch_id),),
+                    )
+                    existing = cur.fetchone()
+                    if existing:
+                        return int(existing["id"]), False
+                    raise RuntimeError(
+                        "create_paper_order conflict for trigger_watch_id="
+                        f"{trigger_watch_id}: no existing paper_order is linked to "
+                        "this watch; refusing to resolve via ga_decision_id/signal_id"
+                    )
+                # trigger_watch_id IS NULL (ordinary signal/decision order path):
+                # fall back to the more specific ga_decision_id, else the signal_id
+                # match (the conflict target, guaranteed to exist).
                 if ga_decision_id is not None:
                     cur.execute(
                         "SELECT id FROM paper_orders WHERE ga_decision_id=%s",
@@ -2846,12 +2883,20 @@ class CryptoGuardRepository:
                     existing = cur.fetchone()
                     if existing:
                         return int(existing["id"]), False
-                cur.execute(
-                    "SELECT id FROM paper_orders WHERE signal_id=%s",
-                    (int(signal_id),),
+                if signal_id is not None:
+                    cur.execute(
+                        "SELECT id FROM paper_orders WHERE signal_id=%s",
+                        (int(signal_id),),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        return int(existing["id"]), False
+                # No known conflict target matched: the no-target form swallowed
+                # some other unique/exclusion violation we did not anticipate.
+                raise RuntimeError(
+                    "create_paper_order conflict on an unknown paper_orders unique "
+                    "constraint; no trigger_watch_id/ga_decision_id/signal_id match"
                 )
-                existing = cur.fetchone()
-                return int(existing["id"]), False
 
     def list_open_paper_orders(self) -> list[dict[str, Any]]:
         with self.conn.cursor() as cur:
@@ -2871,12 +2916,33 @@ class CryptoGuardRepository:
         return [dict(r) for r in rows]
 
     def get_paper_order_by_trigger_watch(self, watch_id: int) -> dict[str, Any] | None:
-        """08-04 contract B: the live paper order linked to a trigger_watch_id.
+        """08-04 contract B + 08-06 once-ever: the paper order linked to a
+        ``trigger_watch_id``, of ANY status.
+
+        One ``opportunity_watch`` creates at most ONE ``paper_order`` over its
+        entire lifetime; a TERMINAL (filled/expired/cancelled) order still holds
+        the once-ever link, so a delayed-retry recheck is judged duplicate and
+        never mints a second order. Mirrors the once-ever partial unique index
+        ``idx_paper_orders_trigger_watch_once`` (``WHERE trigger_watch_id IS
+        NOT NULL``, no status filter). Callers that need the LIVE order only
+        should use ``get_live_paper_order_by_trigger_watch``.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM paper_orders WHERE trigger_watch_id=%s ORDER BY id LIMIT 1",
+                (int(watch_id),),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_live_paper_order_by_trigger_watch(self, watch_id: int) -> dict[str, Any] | None:
+        """08-06 once-ever: the LIVE paper order linked to a ``trigger_watch_id``.
 
         Returns the order only while it is live (pending/open/needs_recheck) —
-        a terminal order means the bridge already produced its one order and a
-        recheck must NOT create a second one. Mirrors the partial unique index
-        ``idx_paper_orders_trigger_watch_once`` predicate.
+        the live-only complement to ``get_paper_order_by_trigger_watch`` (which
+        returns any status, because a terminal order still holds the once-ever
+        link). Use this when a caller genuinely needs the live order and must
+        NOT be satisfied by a terminal one.
         """
         with self.conn.cursor() as cur:
             cur.execute(

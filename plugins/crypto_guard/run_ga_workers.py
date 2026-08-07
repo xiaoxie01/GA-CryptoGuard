@@ -2015,16 +2015,21 @@ def handle_opportunity_watch_recheck(
     send_message: Callable[..., Any] | None = None,
     _analyze: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """08-04 contract A/B: a triggered watch's follow-up is INTERNAL-ONLY.
+    """08-04 contract A/B + 08-06 once-ever: triggered-watch follow-up is
+    INTERNAL-ONLY and ONCE-EVER.
 
     No feishu alert is produced and no alert_outbox row is written. The job
     runs a FRESH re-analysis from the latest closed candle (contract B). When
     the recheck clears the order gate (S/A + llm confirmed + risk_ok + account
     ok + direction valid) it bridges the decision into ONE paper order via
     ``create_paper_order(trigger_watch_id=...)``; the partial unique index
-    ``idx_paper_orders_trigger_watch_once`` + a task lock make the bridge
-    idempotent (single analysis, single order, no duplicate). Otherwise the
-    watch's ``recheck_status`` records the rejection and nothing is ordered.
+    ``idx_paper_orders_trigger_watch_once`` (once-ever: one order per watch over
+    its ENTIRE lifetime, ``WHERE trigger_watch_id IS NOT NULL``) + a task lock
+    make the bridge idempotent (single analysis, single order, no duplicate).
+    A terminal (filled/expired/cancelled) order STILL holds the link: a delayed
+    retry recheck that fires afterwards is judged duplicate and never
+    re-analyzes nor mints a second order. Otherwise the watch's ``recheck_status``
+    records the rejection and nothing is ordered.
 
     Legacy ``opportunity_watch_alert`` jobs are replayed through this same
     silent path, so a stale queued job degrades to a harmless no-op instead of
@@ -2043,8 +2048,9 @@ def handle_opportunity_watch_recheck(
             "sent": False, "internal_only": True, "watch_id": watch_id,
         }
     try:
-        # Idempotency: a live paper order already bridged for this watch must
-        # never produce a second order.
+        # Idempotency (once-ever): a paper order of ANY status already bridged
+        # for this watch must never produce a second order -- a terminal order
+        # still holds the link, so a delayed retry is a duplicate, not a new order.
         existing = repo.get_paper_order_by_trigger_watch(watch_id)
         if existing is not None:
             repo.touch_opportunity_watch(watch_id)

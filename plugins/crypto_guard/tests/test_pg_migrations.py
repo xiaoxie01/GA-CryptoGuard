@@ -60,6 +60,12 @@ EXPECTED_MARKERS = {
     # execution-funnel diagnostics + the report row split
     # (llm_call_succeeded / llm_plan_confirmed / risk_passed / final_executable).
     "execution_funnel_report_contract_v1",
+    # 08-06 P2 (release-blocker rework): watch -> order bridge contract marker.
+    # Written by initialize_database only AFTER the bridge schema is complete
+    # AND the health gate passes (same transaction as the schema change).
+    # Its absence is fail-closed in diagnose_state_consistency (marker-missing
+    # error) so an undeployed bridge contract cannot present as healthy.
+    "watch_order_bridge_contract_v1",
 }
 
 
