@@ -175,6 +175,17 @@ LLM_FAILED_DIRECTION_FAIL_CLOSED_MARKER_KEY = "llm_failed_direction_fail_closed_
 # release-ready blocks instead of silently passing).
 WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY = "watch_order_bridge_contract_v1"
 
+# 08-08 Step 7: three watch-recheck contract marker keys. Each is written by
+# ``initialize_database`` inside the same advisory-lock-guarded txn as the
+# schema, and each absence is fail-closed: the corresponding
+# ``_check_*_marker_missing`` emits an ``error`` so an undeployed contract
+# cannot present as healthy. The report-side checks self-skip when the marker
+# is absent (exclude-only ``created_at >= marker.applied_at``), so the
+# marker-missing error is the ONLY signal for an undeployed contract.
+WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY = "watch_recheck_risk_shape_contract_v1"
+WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY = "watch_review_payload_serialization_contract_v1"
+WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY = "watch_recheck_funnel_contract_v1"
+
 
 def _llm_failed_direction_fail_closed_cutoff(repo: CryptoGuardRepository) -> datetime | None:
     """Phase-2 P2-1 (07-27) requirement F: cutoff timestamp for the
@@ -282,6 +293,9 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         _check_llm_failed_direction_fail_closed_marker_missing,
         _check_batch_claim_ownership_integrity,
         _check_watch_order_bridge_contract_marker_missing,
+        _check_watch_recheck_risk_shape_contract_marker_missing,
+        _check_watch_review_payload_serialization_contract_marker_missing,
+        _check_watch_recheck_funnel_contract_marker_missing,
     )
     for check in checks:
         issues.extend(_run_check(repo, check))
@@ -320,6 +334,9 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "deterministic_direction_from_failed_llm_historical": len([i for i in issues if i["type"] == "deterministic_direction_from_failed_llm_historical"]),
         "batch_claim_ownership_integrity": len([i for i in issues if i["type"] == "batch_claim_ownership_integrity"]),
         "watch_order_bridge_contract_marker_missing": len([i for i in issues if i["type"] == "watch_order_bridge_contract_marker_missing"]),
+        "watch_recheck_risk_shape_contract_marker_missing": len([i for i in issues if i["type"] == "watch_recheck_risk_shape_contract_marker_missing"]),
+        "watch_review_payload_serialization_contract_marker_missing": len([i for i in issues if i["type"] == "watch_review_payload_serialization_contract_marker_missing"]),
+        "watch_recheck_funnel_contract_marker_missing": len([i for i in issues if i["type"] == "watch_recheck_funnel_contract_marker_missing"]),
     }
 
     # Section 八: Separate counts for error/warning/legacy_info
@@ -3207,6 +3224,109 @@ def _check_watch_order_bridge_contract_marker_missing(repo: CryptoGuardRepositor
                 "运行 initialize_database(allow_ddl=True)（release 路径，需 "
                 "/trellis:crypto-guard-release 授权）自动完成升级并写入 marker；"
                 "marker 缺失时 release-ready 门禁必须阻塞，不得静默放行。"
+            ),
+        })
+    return issues
+
+
+def _check_watch_recheck_risk_shape_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-08 Step 7: flag a missing watch-recheck risk-shape contract marker.
+
+    The marker ``watch_recheck_risk_shape_contract_v1`` must exist in
+    ``_migration_state``. When absent, emit an ``error`` (fail-closed) so
+    callers detect the undeployed 08-08 risk-shape contract rather than
+    receiving a silently-healthy report. Mirrors
+    ``_check_watch_order_bridge_contract_marker_missing``.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
+            (WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "watch_recheck_risk_shape_contract_marker", exc,
+        )
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "watch_recheck_risk_shape_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "watch-recheck risk-shape 契约 marker 缺失：08-08 risk-shape 诊断尚未部署。"
+                "运行 initialize_database(allow_ddl=True)（release 路径，需 "
+                "/trellis:crypto-guard-release 授权）自动写入 marker；marker 缺失时 "
+                "release-ready 门禁必须阻塞，不得静默放行。"
+            ),
+        })
+    return issues
+
+
+def _check_watch_review_payload_serialization_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-08 Step 7: flag a missing watch-review payload-serialization contract
+    marker. The marker ``watch_review_payload_serialization_contract_v1`` must
+    exist; absence is an ``error`` (fail-closed). Mirrors the risk-shape check.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
+            (WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "watch_review_payload_serialization_contract_marker", exc,
+        )
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "watch_review_payload_serialization_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "watch-review payload-serialization 契约 marker 缺失：08-08 序列化诊断尚未部署。"
+                "运行 initialize_database(allow_ddl=True)（release 路径，需 "
+                "/trellis:crypto-guard-release 授权）自动写入 marker；marker 缺失时 "
+                "release-ready 门禁必须阻塞，不得静默放行。"
+            ),
+        })
+    return issues
+
+
+def _check_watch_recheck_funnel_contract_marker_missing(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-08 Step 7: flag a missing watch-recheck funnel-contract marker. The
+    marker ``watch_recheck_funnel_contract_v1`` must exist; absence is an
+    ``error`` (fail-closed). Mirrors the risk-shape check.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key = %s LIMIT 1",
+            (WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY,),
+        ).fetchone()
+    except Exception as exc:
+        return _diagnostic_query_failure(
+            repo, "watch_recheck_funnel_contract_marker", exc,
+        )
+    if not row or not row["applied_at"]:
+        issues.append({
+            "type": "watch_recheck_funnel_contract_marker_missing",
+            "severity": "error",
+            "details": {
+                "marker_key": WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY,
+                "issue": "marker_absent",
+            },
+            "suggested_action": (
+                "watch-recheck funnel 契约 marker 缺失：08-08 funnel 诊断尚未部署。"
+                "运行 initialize_database(allow_ddl=True)（release 路径，需 "
+                "/trellis:crypto-guard-release 授权）自动写入 marker；marker 缺失时 "
+                "release-ready 门禁必须阻塞，不得静默放行。"
             ),
         })
     return issues

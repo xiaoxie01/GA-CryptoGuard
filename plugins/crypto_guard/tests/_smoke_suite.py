@@ -44540,19 +44540,24 @@ class TestPhaseE07_10LLMAccountingAndReport(TestPhaseA07_10LLMFairSchedulingRepr
     # (price_rejection) that the repair normalizes, so validate_json FAILS
     # first (line 195) and the code reaches line 205 -> ok2=True -> line 223.
     # ------------------------------------------------------------------
-    def test_p1_1_schema_alias_repair_records_physical_success(self) -> None:
-        """A decision with an alias ``entry_trigger_confirmation.type``
-        (price_rejection) that ``_try_repair_entry_trigger_confirmation``
-        normalizes to ``closed_candle_confirmation`` reaches the E2 path
-        (line 223): the physical success is recorded AND the repairable
-        event. One physical call -> total_attempts=1, successful=1,
-        repairable_count=1.
+    def test_p1_1_llm_alias_confirmation_fail_closed_ignored(self) -> None:
+        """08-08 P1-2 fail-closed: an LLM-provided alias
+        ``entry_trigger_confirmation.type`` (price_rejection) is
+        UNCONDITIONALLY IGNORED. ``_bind_trusted_entry_confirmation`` clears
+        it to None (no trusted candidate_trade_plan), so the decision
+        validates as a raw success (null is schema-valid) and NO alias repair
+        fires.
 
-        Revert-fail: removing line 223 (``breaker.record_attempt(category=
-        None, ok=True)``) leaves total_attempts=0 / successful=0 because
-        this decision does NOT pass the line-195 schema check - it only
-        validates AFTER the alias repair. The pre-existing test_e2 could
-        not catch this because its candidate was schema-valid on its own.
+        The E2 path (line 223) still records the physical success: one
+        physical call -> total_attempts=1, successful=1. But repairable_count=0
+        and llm_terminal_reason=None (raw success, not schema_repaired)
+        because the LLM's fabricated confirmation never reaches the repair.
+
+        Revert-fail (P1-1): removing line 223 (``breaker.record_attempt(
+        category=None, ok=True)``) leaves total_attempts=0 / successful=0.
+        Revert-fail (P1-2): removing the ``_bind_trusted_entry_confirmation``
+        call (line 4534) lets the alias confirmation reach the repair and this
+        test fails on repairable_count==0 / llm_terminal_reason is None.
         """
         from unittest.mock import patch
         from plugins.crypto_guard.reasoning import llm_agent_judge
@@ -44628,8 +44633,8 @@ class TestPhaseE07_10LLMAccountingAndReport(TestPhaseA07_10LLMFairSchedulingRepr
             decision = run_agent_sop_decision(snapshot, context=context)
 
         snap = breaker.snapshot()
-        # The physical success drove the breaker (line 223), and the
-        # repairable event was recorded separately (line 224).
+        # The physical success still drove the breaker (line 223) — the E2
+        # path is exercised because the decision validates as a raw success.
         self.assertEqual(
             snap["total_attempts"], 1,
             "P1-1: one physical provider call was made and recorded.",
@@ -44638,13 +44643,26 @@ class TestPhaseE07_10LLMAccountingAndReport(TestPhaseA07_10LLMFairSchedulingRepr
             snap["successful"], 1,
             "P1-1: the physical call succeeded; successful must be 1.",
         )
+        # P1-2 fail-closed: the LLM's alias confirmation is unconditionally
+        # ignored — no repair fires, so no repairable event is recorded.
         self.assertEqual(
-            snap["repairable_count"], 1,
-            "P1-1: the alias repair is one repairable event.",
+            snap["repairable_count"], 0,
+            "P1-2: the LLM alias confirmation is unconditionally ignored; "
+            "no repairable event may be recorded.",
         )
-        # The repaired decision carries the schema_repaired terminal reason
-        # (line 251) - distinct from the None a raw success carries.
-        self.assertEqual(decision.get("llm_terminal_reason"), "schema_repaired")
+        # The decision is a raw success (null confirmation is schema-valid),
+        # so it carries NO schema_repaired terminal reason.
+        self.assertIsNone(
+            decision.get("llm_terminal_reason"),
+            "P1-2: a raw success must not carry the schema_repaired "
+            "terminal reason.",
+        )
+        # The LLM's fabricated confirmation was cleared to None (fail-closed).
+        tp = decision.get("trade_plan")
+        self.assertIsNone(
+            tp.get("entry_trigger_confirmation") if isinstance(tp, dict) else None,
+            "P1-2: the LLM alias confirmation must be cleared to None.",
+        )
 
     # ------------------------------------------------------------------
     # P2-4: end-to-end through get_batch_llm_health. The aggregate function

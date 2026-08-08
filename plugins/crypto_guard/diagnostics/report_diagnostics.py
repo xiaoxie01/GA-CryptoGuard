@@ -168,6 +168,35 @@ OPPORTUNITY_WATCH_ADVERTISED_WITHOUT_WATCH = (
 )
 EXECUTION_FUNNEL_STARVATION = "execution_funnel_starvation"
 
+# 08-08 Step 7: three watch-recheck diagnostics, each with an independent
+# contract marker. Each check is marker-gated (self-skips when its marker is
+# absent) and queries ONLY rows with ``created_at >= marker.applied_at``
+# (exclude-only — pre-marker history never triggers, not even as legacy_info).
+# The marker-missing fail-closed checks live in state_consistency.py.
+WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY = "watch_recheck_risk_shape_contract_v1"
+WATCH_RECHECK_RISK_SHAPE_MISMATCH = "watch_recheck_risk_shape_mismatch"
+WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_MISSING = (
+    "watch_recheck_risk_shape_contract_marker_missing"
+)
+WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY = (
+    "watch_review_payload_serialization_contract_v1"
+)
+WATCH_REVIEW_PAYLOAD_SERIALIZATION_FAILURE = (
+    "watch_review_payload_serialization_failure"
+)
+WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_MISSING = (
+    "watch_review_payload_serialization_contract_marker_missing"
+)
+WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY = "watch_recheck_funnel_contract_v1"
+WATCH_RECHECK_FUNNEL_STARVATION = "watch_recheck_funnel_starvation"
+WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_MISSING = (
+    "watch_recheck_funnel_contract_marker_missing"
+)
+# The funnel-starvation warning fires only on a run of >= this many consecutive
+# post-marker recheck rejections with zero orders (weak markets produce short
+# runs and are normal).
+_WATCH_RECHECK_REJECTION_STREAK_MIN = 3
+
 
 def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | None = None) -> dict[str, Any]:
     """Run all hourly-report-accuracy diagnostics.
@@ -288,6 +317,14 @@ def diagnose_report_accuracy(repo: CryptoGuardRepository, *, batch_id: str | Non
     issues.extend(_check_opportunity_watch_advertised_without_watch(repo))
     issues.extend(_check_opportunity_watch_untriggerable_condition(repo))
     issues.extend(_check_execution_funnel_starvation(repo))
+
+    # 08-08 Step 7: three watch-recheck diagnostics. Each is marker-gated
+    # (self-skips when its independent contract marker is absent) and queries
+    # ONLY rows with ``created_at >= marker.applied_at`` (exclude-only). The
+    # marker-missing fail-closed checks live in diagnose_state_consistency.
+    issues.extend(_check_watch_recheck_risk_shape_mismatch(repo))
+    issues.extend(_check_watch_review_payload_serialization_failure(repo))
+    issues.extend(_check_watch_recheck_funnel_starvation(repo))
 
     # FS-5: re-classify pre-marker issues as legacy_info. The marker is the
     # R4 contract version timestamp written by the migration once the R4
@@ -4154,6 +4191,292 @@ def _check_execution_funnel_starvation(
         " 条但 final-executable S/A 计划 0 条：每个 S/A 候选都在门控中被清空，"
         "没有可达执行路径。",
     ))
+    return issues
+
+
+# ── 08-08 Step 7: three watch-recheck diagnostics ─────────────────────────
+#
+# Each diagnostic is marker-gated (self-skips when its independent contract
+# marker is absent) and queries ONLY rows with ``created_at >= marker.applied_at``
+# (exclude-only, so pre-marker history never triggers). The marker-missing
+# fail-closed checks live in diagnose_state_consistency.
+
+
+def _get_watch_recheck_risk_shape_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """08-08 Step 7: return the watch-recheck risk-shape contract marker's
+    applied_at, or None. None means the contract is not deployed — the
+    risk-shape check self-skips and the marker-missing check surfaces the
+    absence as a fail-closed error."""
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _get_watch_review_payload_serialization_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """08-08 Step 7: return the watch-review payload-serialization contract
+    marker's applied_at, or None (self-skip + fail-closed marker-missing)."""
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _get_watch_recheck_funnel_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """08-08 Step 7: return the watch-recheck funnel-contract marker's
+    applied_at, or None (self-skip + fail-closed marker-missing)."""
+    row = repo.conn.execute(
+        "SELECT applied_at FROM _migration_state WHERE key=%s",
+        (WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY,),
+    ).fetchone()
+    if row and row["applied_at"]:
+        return str(row["applied_at"])
+    return None
+
+
+def _check_watch_recheck_risk_shape_mismatch(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-08 Step 7: a post-marker ``opportunity_watch_recheck`` decision whose
+    ``risk_check_json`` is NULL / JSON-null, or whose ``risk_check_json->'ok'``
+    is not a boolean (wrong shape / non-bool / missing ok), is a contract
+    violation: the watch-recheck risk gate must always carry a boolean ``ok``.
+    Fires at most ONE error. Marker-gated + exclude-only (``created_at >=
+    marker.applied_at``)."""
+    issues: list[dict[str, Any]] = []
+    marker_ts = _get_watch_recheck_risk_shape_contract_marker_ts(repo)
+    if marker_ts is None:
+        return issues
+    row = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM ga_decisions
+        WHERE decision_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+          AND (
+                risk_check_json IS NULL
+                OR jsonb_typeof(risk_check_json) = 'null'
+                OR jsonb_typeof(risk_check_json->'ok') IS DISTINCT FROM 'boolean'
+              )
+        """,
+        (marker_ts,),
+    ).fetchone()
+    count = int(row["n"] or 0) if row else 0
+    if count == 0:
+        return issues
+    evidence_rows = repo.conn.execute(
+        """
+        SELECT id, symbol FROM ga_decisions
+        WHERE decision_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+          AND (
+                risk_check_json IS NULL
+                OR jsonb_typeof(risk_check_json) = 'null'
+                OR jsonb_typeof(risk_check_json->'ok') IS DISTINCT FROM 'boolean'
+              )
+        ORDER BY id DESC LIMIT 5
+        """,
+        (marker_ts,),
+    ).fetchall()
+    evidence = [{"decision_id": int(x["id"]), "symbol": x["symbol"]} for x in evidence_rows]
+    issues.append(_issue(
+        WATCH_RECHECK_RISK_SHAPE_MISMATCH, "error",
+        {
+            "count": count,
+            "evidence": evidence,
+        },
+        "watch-recheck 风险门控形状错误：" + str(count) +
+        " 条 post-marker 决策的 risk_check 缺失或 ok 非布尔：风险门控契约被破坏，"
+        "必须携带布尔 ok。",
+    ))
+    return issues
+
+
+def _check_watch_review_payload_serialization_failure(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-08 Step 7: a post-marker ``opportunity_watch_recheck`` agent_job whose
+    structured ``payload_json->'result'->'agent_review'->>'llm_failure_category'``
+    equals ``payload_serialization_failed`` — the watch-review payload could not
+    be serialized (a structured field, no string matching). Fires at most ONE
+    error. Marker-gated + exclude-only."""
+    issues: list[dict[str, Any]] = []
+    marker_ts = _get_watch_review_payload_serialization_contract_marker_ts(repo)
+    if marker_ts is None:
+        return issues
+    row = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM agent_jobs
+        WHERE job_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+          AND payload_json->'result'->'agent_review'->>'llm_failure_category'
+              = 'payload_serialization_failed'
+        """,
+        (marker_ts,),
+    ).fetchone()
+    count = int(row["n"] or 0) if row else 0
+    if count == 0:
+        return issues
+    evidence_rows = repo.conn.execute(
+        """
+        SELECT id, source, session_id FROM agent_jobs
+        WHERE job_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+          AND payload_json->'result'->'agent_review'->>'llm_failure_category'
+              = 'payload_serialization_failed'
+        ORDER BY id DESC LIMIT 5
+        """,
+        (marker_ts,),
+    ).fetchall()
+    evidence = [
+        {"job_id": int(x["id"]), "source": x["source"], "session_id": x["session_id"]}
+        for x in evidence_rows
+    ]
+    issues.append(_issue(
+        WATCH_REVIEW_PAYLOAD_SERIALIZATION_FAILURE, "error",
+        {
+            "count": count,
+            "evidence": evidence,
+        },
+        "watch-review payload 序列化失败：" + str(count) +
+        " 条 post-marker 任务的结构化 llm_failure_category 为 "
+        "payload_serialization_failed：payload 无法序列化，审查结果丢失。",
+    ))
+    return issues
+
+
+def _check_watch_recheck_funnel_starvation(
+    repo: CryptoGuardRepository,
+) -> list[dict[str, Any]]:
+    """08-08 Step 7: watch-recheck funnel starvation.
+
+    ERROR: a post-marker ``opportunity_watch_recheck`` decision satisfying ALL
+    persisted spec gates (``plan_execution_state='confirmed'``,
+    ``plan_status='executable'``, ``has_trade_plan='true'``, ``risk_check.ok``
+    boolean true, effective grade S/A) with NO ``paper_orders`` row linked by
+    ``ga_decision_id`` — an executable recheck never bridged to an order.
+
+    WARNING: a run of >= ``_WATCH_RECHECK_REJECTION_STREAK_MIN`` consecutive
+    post-marker recheck REJECTIONS (``result_json->>'rejected' = 'true'``) with
+    zero orders, ordered by ``created_at`` with no intervening ``created`` row
+    (the producer's success shape carries ``"created": <bool>`` — NOT an
+    ``order_created`` key, which is only the watch ``recheck_status`` column) —
+    a persistent rejection streak with no execution.
+
+    A pure zero-order state with no executable decision and no rejection streak
+    is NOT an error (weak-market safe). Fires at most ONE error and at most ONE
+    warning. Marker-gated + exclude-only."""
+    issues: list[dict[str, Any]] = []
+    marker_ts = _get_watch_recheck_funnel_contract_marker_ts(repo)
+    if marker_ts is None:
+        return issues
+
+    # ERROR: executable recheck decision with no bridged paper_orders row.
+    error_row = repo.conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM ga_decisions
+        WHERE decision_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+          AND raw_decision_json->>'plan_execution_state' = 'confirmed'
+          AND raw_decision_json->>'plan_status' = 'executable'
+          AND raw_decision_json->>'has_trade_plan' = 'true'
+          AND jsonb_typeof(raw_decision_json->'risk_check'->'ok') = 'boolean'
+          AND raw_decision_json->'risk_check'->>'ok' = 'true'
+          AND COALESCE(NULLIF(raw_decision_json->>'effective_signal_grade', ''),
+                       signal_grade::text) IN ('S', 'A')
+          AND NOT EXISTS (
+                SELECT 1 FROM paper_orders po
+                WHERE po.ga_decision_id = ga_decisions.id
+              )
+        """,
+        (marker_ts,),
+    ).fetchone()
+    error_count = int(error_row["n"] or 0) if error_row else 0
+    if error_count > 0:
+        evidence_rows = repo.conn.execute(
+            """
+            SELECT id, symbol FROM ga_decisions
+            WHERE decision_type = 'opportunity_watch_recheck'
+              AND created_at >= %s::timestamptz
+              AND raw_decision_json->>'plan_execution_state' = 'confirmed'
+              AND raw_decision_json->>'plan_status' = 'executable'
+              AND raw_decision_json->>'has_trade_plan' = 'true'
+              AND jsonb_typeof(raw_decision_json->'risk_check'->'ok') = 'boolean'
+              AND raw_decision_json->'risk_check'->>'ok' = 'true'
+              AND COALESCE(NULLIF(raw_decision_json->>'effective_signal_grade', ''),
+                           signal_grade::text) IN ('S', 'A')
+              AND NOT EXISTS (
+                    SELECT 1 FROM paper_orders po
+                    WHERE po.ga_decision_id = ga_decisions.id
+                  )
+            ORDER BY id DESC LIMIT 5
+            """,
+            (marker_ts,),
+        ).fetchall()
+        evidence = [
+            {"decision_id": int(x["id"]), "symbol": x["symbol"]} for x in evidence_rows
+        ]
+        issues.append(_issue(
+            WATCH_RECHECK_FUNNEL_STARVATION, "error",
+            {
+                "count": error_count,
+                "evidence": evidence,
+            },
+            "watch-recheck 执行漏斗饥饿：" + str(error_count) +
+            " 条 post-marker 可执行 recheck 决策（全部门控通过）未桥接到任何 "
+            "paper_orders：可执行路径被清空。",
+        ))
+
+    # WARNING: consecutive post-marker recheck rejection streak with zero orders.
+    job_rows = repo.conn.execute(
+        """
+        SELECT id, result_json, created_at FROM agent_jobs
+        WHERE job_type = 'opportunity_watch_recheck'
+          AND created_at >= %s::timestamptz
+        ORDER BY created_at ASC, id ASC
+        """,
+        (marker_ts,),
+    ).fetchall()
+    max_streak = 0
+    current_streak = 0
+    reason_counts: dict[str, int] = {}
+    for j in job_rows:
+        result = j["result_json"]
+        if result is None:
+            continue
+        if result.get("created") is True:
+            current_streak = 0
+            continue
+        if result.get("rejected") is True:
+            current_streak += 1
+            reason = str(result.get("reason") or "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+        else:
+            current_streak = 0
+    if max_streak >= _WATCH_RECHECK_REJECTION_STREAK_MIN:
+        issues.append(_issue(
+            WATCH_RECHECK_FUNNEL_STARVATION, "warning",
+            {
+                "max_rejection_streak": max_streak,
+                "rejection_streak_min": _WATCH_RECHECK_REJECTION_STREAK_MIN,
+                "rejection_reason_distribution": reason_counts,
+            },
+            "watch-recheck 连续拒绝：" + str(max_streak) +
+            " 条连续 post-marker recheck 拒绝且零订单：执行漏斗持续被拒绝清空。",
+        ))
     return issues
 
 

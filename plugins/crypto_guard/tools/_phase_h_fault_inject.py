@@ -76,6 +76,9 @@ from plugins.crypto_guard.diagnostics.report_diagnostics import (
 from plugins.crypto_guard.diagnostics.state_consistency import (
     diagnose_state_consistency,
     WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,
+    WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY,
+    WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY,
+    WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY,
 )
 
 # 08-06 (release-blocker rework): issue code emitted by
@@ -84,6 +87,19 @@ from plugins.crypto_guard.diagnostics.state_consistency import (
 # as a literal string, unlike report_diagnostics which exports code constants).
 WATCH_ORDER_BRIDGE_CONTRACT_MARKER_MISSING = (
     "watch_order_bridge_contract_marker_missing"
+)
+
+# 08-08 Step 7: issue codes emitted by diagnose_state_consistency when each
+# watch-recheck contract marker row is missing (fail-closed). Kept as explicit
+# constants (state_consistency emits the types as literal strings).
+WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_MISSING = (
+    "watch_recheck_risk_shape_contract_marker_missing"
+)
+WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_MISSING = (
+    "watch_review_payload_serialization_contract_marker_missing"
+)
+WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_MISSING = (
+    "watch_recheck_funnel_contract_marker_missing"
 )
 
 
@@ -117,6 +133,9 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
         _ensure_watch_order_bridge_contract_marker,
+        _ensure_watch_recheck_risk_shape_contract_marker,
+        _ensure_watch_review_payload_serialization_contract_marker,
+        _ensure_watch_recheck_funnel_contract_marker,
     )
 
     _ensure_profit_protection_cutoff_marker(cur)
@@ -147,6 +166,12 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # here, but the fresh-schema marker set must stay in lockstep so Phase I's
     # marker-missing checks fire at their real severity).
     _ensure_watch_order_bridge_contract_marker(cur)
+    # 08-08 Step 7: three watch-recheck contract markers (full-set mirror of
+    # _phase_i_fresh_verify; the fresh-schema marker set must stay in lockstep
+    # so the marker-missing checks fire at their real severity).
+    _ensure_watch_recheck_risk_shape_contract_marker(cur)
+    _ensure_watch_review_payload_serialization_contract_marker(cur)
+    _ensure_watch_recheck_funnel_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 
@@ -1238,6 +1263,49 @@ def fault_watch_order_bridge_marker_missing(conn):
     conn.commit()
 
 
+def fault_watch_recheck_risk_shape_contract_marker_missing(conn):
+    """Fault: the watch-recheck risk-shape contract marker row is deleted from
+    ``_migration_state``.
+
+    The scratch schema seeds the marker via ``_ensure_all_contract_markers``
+    (``_ensure_watch_recheck_risk_shape_contract_marker``), so deleting the row
+    makes ``diagnose_state_consistency`` emit
+    ``watch_recheck_risk_shape_contract_marker_missing`` at error severity.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM _migration_state WHERE key = %s",
+            (WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_KEY,),
+        )
+    conn.commit()
+
+
+def fault_watch_review_payload_serialization_contract_marker_missing(conn):
+    """Fault: the watch-review payload-serialization contract marker row is
+    deleted from ``_migration_state``, making ``diagnose_state_consistency``
+    emit ``watch_review_payload_serialization_contract_marker_missing``.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM _migration_state WHERE key = %s",
+            (WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_KEY,),
+        )
+    conn.commit()
+
+
+def fault_watch_recheck_funnel_contract_marker_missing(conn):
+    """Fault: the watch-recheck funnel-contract marker row is deleted from
+    ``_migration_state``, making ``diagnose_state_consistency`` emit
+    ``watch_recheck_funnel_contract_marker_missing``.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM _migration_state WHERE key = %s",
+            (WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_KEY,),
+        )
+    conn.commit()
+
+
 def main():
     print("=" * 70)
     print("Phase H (07-05) Fault Injection Verification")
@@ -1368,6 +1436,16 @@ def main():
         ("watch_order_bridge_contract_marker_missing",
          fault_watch_order_bridge_marker_missing,
          WATCH_ORDER_BRIDGE_CONTRACT_MARKER_MISSING),
+        # 08-08 Step 7: three watch-recheck contract markers (fail-closed).
+        ("watch_recheck_risk_shape_contract_marker_missing",
+         fault_watch_recheck_risk_shape_contract_marker_missing,
+         WATCH_RECHECK_RISK_SHAPE_CONTRACT_MARKER_MISSING),
+        ("watch_review_payload_serialization_contract_marker_missing",
+         fault_watch_review_payload_serialization_contract_marker_missing,
+         WATCH_REVIEW_PAYLOAD_SERIALIZATION_CONTRACT_MARKER_MISSING),
+        ("watch_recheck_funnel_contract_marker_missing",
+         fault_watch_recheck_funnel_contract_marker_missing,
+         WATCH_RECHECK_FUNNEL_CONTRACT_MARKER_MISSING),
     ]:
         result = _run_one_state(name, fn)
         passed, msg = assert_caught(result, expected_code)

@@ -284,6 +284,9 @@ def initialize_database(
                     _ensure_llm_failed_direction_fail_closed_marker(cur)
                     _ensure_llm_schema_breaker_preset_integrity_marker(cur)
                     _ensure_execution_funnel_report_contract_marker(cur)
+                    _ensure_watch_recheck_risk_shape_contract_marker(cur)
+                    _ensure_watch_review_payload_serialization_contract_marker(cur)
+                    _ensure_watch_recheck_funnel_contract_marker(cur)
 
                     # 4. Health gate - fail-closed BEFORE commit. If the schema
                     # is wrong, ROLLBACK everything (no marker survives).
@@ -573,6 +576,85 @@ def _ensure_watch_order_bridge_contract_marker(cur: psycopg.Cursor) -> None:
     production service is untouched.
     """
     _ensure_marker(cur, "watch_order_bridge_contract_v1")
+
+
+def _ensure_watch_recheck_risk_shape_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-08 Step 7: watch-recheck risk-shape contract split marker.
+
+    ``watch_recheck_risk_shape_contract_v1`` is the cutoff for
+    ``watch_recheck_risk_shape_mismatch``. Production rows written BEFORE this
+    fix's deployment may carry a ``risk_check_json`` of the old/wrong shape
+    (string ``ok``, missing key, JSON null); those are historical audit, not a
+    current contract breach. This marker's ``applied_at`` is the SQL lower
+    bound (exclude-only — pre-marker rows never enter current issues, not even
+    as ``legacy_info``):
+
+      - marker-AFTER recheck decision (created_at >= applied_at) with
+        ``risk_check_json`` NULL/JSON-null or ``risk_check_json->'ok'`` not a
+        boolean: current ``error``.
+      - marker-MISSING: fail-closed — ``diagnose_state_consistency`` emits
+        ``watch_recheck_risk_shape_contract_marker_missing`` and the
+        report-accuracy check self-skips (an undeployed contract must not be
+        evaluated as current; no silent green).
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "watch_recheck_risk_shape_contract_v1")
+
+
+def _ensure_watch_review_payload_serialization_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-08 Step 7: watch-review payload-serialization contract split marker.
+
+    ``watch_review_payload_serialization_contract_v1`` is the cutoff for
+    ``watch_review_payload_serialization_failure``. Pre-fix production
+    ``opportunity_watch_recheck`` jobs that failed to serialize the LLM review
+    payload are historical; only post-marker jobs whose structured field
+    ``payload_json->'result'->'agent_review'->>'llm_failure_category'`` equals
+    ``payload_serialization_failed`` are a current breach. This marker's
+    ``applied_at`` is the SQL lower bound (exclude-only).
+
+      - marker-AFTER job (created_at >= applied_at): current ``error``.
+      - marker-MISSING: fail-closed — ``diagnose_state_consistency`` emits
+        ``watch_review_payload_serialization_contract_marker_missing`` and the
+        report-accuracy check self-skips.
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "watch_review_payload_serialization_contract_v1")
+
+
+def _ensure_watch_recheck_funnel_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-08 Step 7: watch-recheck funnel-contract split marker.
+
+    ``watch_recheck_funnel_contract_v1`` is the cutoff for
+    ``watch_recheck_funnel_starvation`` (error = executable recheck decision
+    never bridged to a paper order; warning = run of >= N consecutive recheck
+    rejections with zero orders). Pre-fix production rows are historical; only
+    post-marker rows are current. This marker's ``applied_at`` is the SQL lower
+    bound (exclude-only — pre-marker history never triggers, not even as
+    ``legacy_info``).
+
+      - marker-AFTER row (created_at >= applied_at): current ``error`` /
+        ``warning``.
+      - marker-MISSING: fail-closed — ``diagnose_state_consistency`` emits
+        ``watch_recheck_funnel_contract_marker_missing`` and the report-accuracy
+        check self-skips.
+
+    ``ON CONFLICT DO NOTHING`` keeps ``applied_at`` immutable on re-init. The
+    marker is NOT written to production here — it is written only when
+    ``initialize_database`` runs on the release path (gated on
+    /trellis:crypto-guard-release + user authorization). The running
+    production service is untouched.
+    """
+    _ensure_marker(cur, "watch_recheck_funnel_contract_v1")
 
 
 def _ensure_stop_loss_adjustment_dedup_marker(cur: psycopg.Cursor) -> None:

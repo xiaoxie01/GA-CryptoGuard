@@ -37,9 +37,14 @@ pytestmark = pytest.mark.unit
 # manifest by exactly one object, so the count baseline moves 1220 -> 1219 and
 # the manifest SHA is recomputed. This is a compliance baseline update - no
 # production behavior, no test semantics, no coverage loss.
+# 08-08 P1-2: renamed
+# ``TestPhaseE07_10LLMAccountingAndReport::test_p1_1_schema_alias_repair_records_physical_success``
+# -> ``...::test_p1_1_llm_alias_confirmation_fail_closed_ignored``
+# (count unchanged; SHA updated). The LLM-provided alias confirmation is now
+# unconditionally ignored, so the test asserts repairable_count=0 instead of 1.
 BASELINE_TEST_DEFINITION_COUNT = 1219
 BASELINE_TEST_DEFINITION_SHA256 = (
-    "e01364b21f82d1dc10f1dfa1375786e3acfbc271052ba3f4f24c071df7d50c15"
+    "640be7d646570780fa516a051c208ec70113364da5a5df4ad736bb93a89f4988"
 )
 BASELINE_CLASS_RENAMES = {
     "Btc9RegressionChainTest": "TradeGateRegressionChainTest",

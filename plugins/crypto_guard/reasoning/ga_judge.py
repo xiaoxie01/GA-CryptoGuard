@@ -137,6 +137,10 @@ def _extract_structured_entry_confirmation(
         return None
 
     modules = snapshot.get("modules") or {}
+    # 08-08 P1-3: also read the 15m/5m entry periods from ``timeframe_modules``
+    # (in addition to the primary ``modules``), so a legal closed-candle
+    # confirmation that lives only in a lower-timeframe entry period is found.
+    tf_modules = snapshot.get("timeframe_modules") or {}
     # R11-5: snapshot.analysis_time_utc must be strict positive int
     analysis_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
     if analysis_time is None:
@@ -164,6 +168,20 @@ def _extract_structured_entry_confirmation(
                 continue
             if "_source" not in event:
                 candidates.append({**event, "_source": "smc"})
+
+    # 08-08 P1-3: collect from the 15m/5m entry periods of ``timeframe_modules``.
+    # ``_source`` records the timeframe provenance (e.g. "15m:price_action").
+    for tf in ("15m", "5m"):
+        tf_module = tf_modules.get(tf) or {}
+        for module_key in ("price_action", "smc"):
+            sub = tf_module.get(module_key) or {}
+            events = sub.get("structure_events")
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                candidates.append({**event, "_source": f"{tf}:{module_key}"})
 
     if not candidates:
         return None

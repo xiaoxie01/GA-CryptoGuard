@@ -329,6 +329,32 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
     state_consistency = _fetch_state_consistency(repo)
     report_accuracy_diagnostics = run_for_report(repo, batch_id=batches_reported)
     market_data_quality = _fetch_market_data_quality(repo, analysis_time_utc=batch_state.get("analysis_time"))
+    # 08-08 P2: execution-funnel stats. Gated to the report-contract marker
+    # existing — a missing marker fail-closes (no funnel section, matching the
+    # decision-side ``_after_execution_funnel_cutoff`` legacy split). The
+    # decision-side counters come from the current-scope rows; the watch-side
+    # counters come from real PostgreSQL aggregates over the last hour AND
+    # ``created_at >= cutoff`` (exclude-only). If the watch-side aggregate
+    # fails (ok=False), the decision-side stats still render with the watch
+    # counters zeroed — never a raised exception on the report path.
+    execution_funnel_stats: dict[str, Any] | None = None
+    if execution_funnel_cutoff_utc:
+        execution_funnel_stats = _aggregate_execution_funnel(
+            [_decision_row(row, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc) for row in ga_decisions]
+        )
+        _watch_stats = _pg_execution_funnel_watch_stats(
+            repo,
+            generated_at_utc=now,
+            execution_funnel_cutoff_utc=execution_funnel_cutoff_utc,
+        )
+        if _watch_stats.get("ok"):
+            execution_funnel_stats.update(
+                watches_triggered=int(_watch_stats.get("watches_triggered") or 0),
+                recheck_rejected_by_reason=_watch_stats.get("recheck_rejected_by_reason") or {},
+                orders_created=int(_watch_stats.get("orders_created") or 0),
+            )
+        else:
+            LOGGER.warning("hourly_report: %s", _watch_stats.get("error") or "watch funnel stats unavailable")
     # P2 (07-09 R4): ``_agent_hourly_brief`` applies the legacy schema-fail
     # split internally so the LLM brief context never receives archived
     # legacy jobs. Pass raw ``failed_jobs`` here - the function filters.
@@ -358,7 +384,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
         "batch": batch_state,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc, execution_funnel_stats=execution_funnel_stats)
             if ga_decisions
             else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
         ),
@@ -873,6 +899,23 @@ def _append_market_data_quality_section(
         lines.append(f"- 延迟分析：{len(deferred)} 项")
 
 
+def _issue_short_reason(details: Any) -> str:
+    """08-08 P2: build a compact ``k=v, k=v`` short reason from an issue's
+    ``details`` dict, keeping only scalar values (str/int/float/bool). Non-scalar
+    values (nested dicts/lists) are skipped so a burst of identical issues never
+    bloats the report with huge payloads. Returns ``-`` when there is nothing
+    scalar to show."""
+    if not isinstance(details, dict):
+        return "-"
+    parts: list[str] = []
+    for key, value in details.items():
+        if isinstance(value, (str, int, float, bool)) and not isinstance(value, bool):
+            parts.append(f"{key}={value}")
+        elif isinstance(value, bool):
+            parts.append(f"{key}={str(value).lower()}")
+    return ", ".join(parts) if parts else "-"
+
+
 def render_ga_hourly_summary(
     generated_at_utc: str,
     active_symbols: list[str],
@@ -894,6 +937,7 @@ def render_ga_hourly_summary(
     report_accuracy_diagnostics: dict[str, Any] | None = None,
     market_data_quality: dict[str, Any] | None = None,
     execution_funnel_cutoff_utc: str | None = None,
+    execution_funnel_stats: dict[str, Any] | None = None,
 ) -> str:
     # 08-02 P2-3 (fresh reviewer): forward the execution-funnel report-contract
     # marker cutoff so pre-marker rows render the four-aspect split as legacy
@@ -1405,6 +1449,37 @@ def render_ga_hourly_summary(
                 )
             lines.append(f"- {sym}：{cat} · {err or '-'}")
 
+    # 08-08 P2: execution-funnel section. Rendered only when the caller
+    # supplies ``execution_funnel_stats`` (degraded path omits it → no section).
+    if execution_funnel_stats and not execution_funnel_stats.get("error"):
+        lines.extend(["", "**执行漏斗（本小时）**"])
+        lines.append(
+            "- 候选计划 {candidate} · LLM 确认 {llm_confirmed} · 入场确认可用 "
+            "{confirmation_available} · 风控通过 {risk_passed} · 最终可执行 "
+            "{final_executable}".format(
+                candidate=int(execution_funnel_stats.get("candidate") or 0),
+                llm_confirmed=int(execution_funnel_stats.get("llm_confirmed") or 0),
+                confirmation_available=int(
+                    execution_funnel_stats.get("confirmation_available") or 0
+                ),
+                risk_passed=int(execution_funnel_stats.get("risk_passed") or 0),
+                final_executable=int(
+                    execution_funnel_stats.get("final_executable") or 0
+                ),
+            )
+        )
+        rejected = execution_funnel_stats.get("recheck_rejected_by_reason") or {}
+        rejected_txt = ", ".join(
+            f"{k}={int(v)}" for k, v in sorted(rejected.items())
+        )
+        lines.append(
+            "- 观察触发 {watches} · 复核拒绝 {rejected} · 生成订单 {orders}".format(
+                watches=int(execution_funnel_stats.get("watches_triggered") or 0),
+                rejected=rejected_txt or "-",
+                orders=int(execution_funnel_stats.get("orders_created") or 0),
+            )
+        )
+
     # P2: 报告准确性诊断 (research 00 P2 diagnostics)
     if report_accuracy_diagnostics and not report_accuracy_diagnostics.get("error"):
         lines.extend(["", "**十、报告准确性诊断**"])
@@ -1418,6 +1493,29 @@ def render_ga_hourly_summary(
             lines.append(f"- 当前异常 {errors} 项 · 提醒 {warnings} 项")
             if legacy:
                 lines.append(f"- 历史审计记录 {legacy} 条（不计入当前异常）")
+            # 08-08 P2: per-issue type + short reason (not just the count),
+            # DEDUPE identical (type, reason) pairs, cap the detail lines at 10,
+            # and emit "另有 N 项" for the remainder so a burst of identical
+            # issues never bloats the report.
+            issues = report_accuracy_diagnostics.get("issues") or []
+            seen: set[tuple[str, str]] = set()
+            detail_lines: list[str] = []
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                itype = str(issue.get("type") or "unknown")
+                reason = _issue_short_reason(issue.get("details"))
+                key = (itype, reason)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sev = str(issue.get("severity") or "warning")
+                sev_label = "异常" if sev == "error" else "提醒"
+                detail_lines.append(f"  - [{sev_label}] {itype} | {reason}")
+            for line in detail_lines[:10]:
+                lines.append(line)
+            if len(detail_lines) > 10:
+                lines.append(f"  - 另有 {len(detail_lines) - 10} 项")
     lines.append("")
     lines.append("不构成实盘建议，仅用于模拟盘与策略研究。")
     return "\n".join(lines)
@@ -2386,16 +2484,26 @@ def _execution_funnel_four_aspects(
     risk_check: dict[str, Any],
     scope: str,
 ) -> dict[str, Any]:
-    """08-02 P1-3 (+ P2-3): the four immutable execution-funnel aspects, or
-    all-``None`` for legacy (pre-marker) rows whose producers never wrote the
+    """08-02 P1-3 (+ P2-3) + 08-08 P2: the immutable execution-funnel aspects,
+    or all-``None`` for legacy (pre-marker) rows whose producers never wrote the
     contract fields. ``scope`` is ``"current"`` (post-marker, aspects computed)
-    or ``"legacy"`` (pre-marker, aspects blanked)."""
+    or ``"legacy"`` (pre-marker, aspects blanked).
+
+    08-08 P2 adds two decision-side funnel counters alongside the original four
+    (the four-aspect split is kept intact):
+      - ``candidate``: a deterministic ``candidate_trade_plan`` was produced.
+      - ``confirmation_available``: the trade_plan carries a trusted
+        ``entry_trigger_confirmation`` (P1-2 binding) — the deterministic
+        candidate already had a legal closed-candle confirmation.
+    """
     if scope != "current":
         return {
             "llm_call_succeeded": None,
             "llm_plan_confirmed": None,
             "risk_passed": None,
             "final_executable": None,
+            "candidate": None,
+            "confirmation_available": None,
         }
     return {
         "llm_call_succeeded": str(raw.get("llm_status") or "") == "ok",
@@ -2407,6 +2515,13 @@ def _execution_funnel_four_aspects(
             and bool(raw.get("has_trade_plan"))
             and isinstance(raw.get("trade_plan"), dict)
             and bool(raw.get("trade_plan"))
+        ),
+        "candidate": (
+            isinstance(raw.get("candidate_trade_plan"), dict)
+            and bool(raw.get("candidate_trade_plan"))
+        ),
+        "confirmation_available": isinstance(
+            (raw.get("trade_plan") or {}).get("entry_trigger_confirmation"), dict
         ),
     }
 
@@ -2505,6 +2620,122 @@ def _decision_row(
         "execution_funnel_scope": execution_funnel_scope,
         **_execution_funnel_four_aspects(raw, risk_check, execution_funnel_scope),
     }
+
+
+# 08-08 P2: map each decision-side execution-funnel stat to the per-row aspect
+# key produced by ``_decision_row``. ``llm_plan_confirmed`` is the persisted
+# immutable aspect; the funnel stat is reported as ``llm_confirmed``.
+_FUNNEL_ASPECT_TO_STAT: dict[str, str] = {
+    "candidate": "candidate",
+    "llm_plan_confirmed": "llm_confirmed",
+    "confirmation_available": "confirmation_available",
+    "risk_passed": "risk_passed",
+    "final_executable": "final_executable",
+}
+
+
+def _aggregate_execution_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """08-08 P2: sum the five decision-side execution-funnel counters over ONLY
+    the ``execution_funnel_scope == "current"`` rows (post-marker).
+
+    Legacy (pre-marker) rows carry ``None`` aspects and never contribute —
+    mirroring the decision-side gate ``_after_execution_funnel_cutoff`` so a
+    missing/malformed marker never fail-opens the funnel to current. All five
+    keys are always present (zero when there are no current rows).
+    """
+    stats: dict[str, int] = {stat: 0 for stat in _FUNNEL_ASPECT_TO_STAT.values()}
+    for row in rows:
+        if row.get("execution_funnel_scope") != "current":
+            continue
+        for aspect, stat in _FUNNEL_ASPECT_TO_STAT.items():
+            if row.get(aspect) is True:
+                stats[stat] += 1
+    return stats
+
+
+def _pg_execution_funnel_watch_stats(
+    repo: CryptoGuardRepository,
+    *,
+    generated_at_utc: str,
+    execution_funnel_cutoff_utc: str | None,
+) -> dict[str, Any]:
+    """08-08 P2: real PostgreSQL aggregate of the three watch-side
+    execution-funnel counters over the last hour AND ``created_at >=
+    execution_funnel_cutoff_utc`` (exclude-only: pre-marker history never
+    counts, mirroring the decision-side ``_after_execution_funnel_cutoff``).
+
+      - ``watches_triggered``: ``ga_decisions`` with
+        ``decision_type='opportunity_watch_recheck'``.
+      - ``recheck_rejected_by_reason``: ``agent_jobs`` with
+        ``job_type='opportunity_watch_recheck'`` and
+        ``result_json->>'rejected'='true'``, grouped by ``result_json->>'reason'``.
+      - ``orders_created``: ``paper_orders`` with ``source='watch_recheck'``.
+
+    The effective lower bound is ``max(cutoff, start_of_last_hour)`` (parsed as
+    aware UTC datetimes, so the TIMESTAMPTZ-backed marker and the ``...Z``
+    window compare correctly), so a marker deployed mid-hour never lets
+    pre-marker rows into the window. Never raises: returns ``ok=False`` on error
+    (fail-closed) with a rolled-back connection.
+    """
+    try:
+        end = datetime.fromisoformat(generated_at_utc.replace("Z", "+00:00"))
+        start = end - timedelta(hours=1)
+        start_utc = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        end_utc = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        lower = start_utc
+        cutoff_dt = _parse_iso_utc(execution_funnel_cutoff_utc)
+        if cutoff_dt is not None and cutoff_dt > start:
+            # Marker applied mid-window: never let pre-marker rows into the
+            # window — clamp the lower bound UP to the cutoff.
+            lower = execution_funnel_cutoff_utc  # type: ignore[assignment]
+        with repo.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n FROM ga_decisions
+                WHERE decision_type = 'opportunity_watch_recheck'
+                  AND created_at >= %s AND created_at < %s
+                """,
+                (lower, end_utc),
+            )
+            watches_triggered = int(cur.fetchone()["n"])
+            cur.execute(
+                """
+                SELECT result_json->>'reason' AS reason, COUNT(*) AS n
+                FROM agent_jobs
+                WHERE job_type = 'opportunity_watch_recheck'
+                  AND result_json->>'rejected' = 'true'
+                  AND created_at >= %s AND created_at < %s
+                GROUP BY 1
+                """,
+                (lower, end_utc),
+            )
+            rejected: dict[str, int] = {}
+            for row in cur.fetchall():
+                rejected[str(row["reason"] or "unknown")] = int(row["n"])
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n FROM paper_orders
+                WHERE source = 'watch_recheck'
+                  AND created_at >= %s AND created_at < %s
+                """,
+                (lower, end_utc),
+            )
+            orders_created = int(cur.fetchone()["n"])
+        return {
+            "ok": True,
+            "watches_triggered": watches_triggered,
+            "recheck_rejected_by_reason": rejected,
+            "orders_created": orders_created,
+        }
+    except Exception as exc:
+        try:
+            repo.conn.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": f"watch funnel stats failed ({type(exc).__name__})",
+        }
 
 
 def _opportunity_classifier(row: dict[str, Any]) -> dict[str, Any]:

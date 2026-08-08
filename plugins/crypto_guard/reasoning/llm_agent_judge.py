@@ -7,6 +7,7 @@ import multiprocessing as _mp_mod
 import os
 import re
 import time
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 import jsonschema
@@ -856,6 +857,10 @@ def run_agent_json_task(
         result["agent_source"] = "deterministic_fallback"
         result["llm_status"] = "failed"
         result["llm_error"] = str(exc)[:300]
+        # 08-08 P1-1: structured failure category so diagnostics never rely on
+        # string-matching ``llm_error``.
+        if isinstance(exc, _PayloadSerializationError):
+            result["llm_failure_category"] = "payload_serialization_failed"
         return result
 
 
@@ -2621,6 +2626,66 @@ def _build_memory_section(context: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+class _PayloadSerializationError(ValueError):
+    """Structured failure category for non-serializable payload objects.
+
+    08-08 P1-1: ``run_agent_json_task`` records
+    ``llm_failure_category="payload_serialization_failed"`` when this is raised
+    during prompt building. Diagnostics read that structured field; they NEVER
+    string-match the free-text ``llm_error``.
+    """
+
+
+def _json_safe_payload(obj: Any, _seen: set[int] | None = None, _depth: int = 0) -> Any:
+    """08-08 P1-1: non-destructive JSON-safe payload normalizer.
+
+    datetime/date -> timezone-aware UTC ISO-8601 (naive datetimes treated as
+    UTC); dict/list/tuple recurse; str/int/float/bool/None pass through. FAILS
+    CLOSED (raises ``_PayloadSerializationError``) on unknown object types,
+    non-finite floats, non-string dict keys, and cyclic structures — it never
+    silently stringifies (no ``default=str``). This is the single serialization
+    gate for ``build_agent_json_task_prompt``.
+    """
+    if _depth > 200:
+        raise _PayloadSerializationError("payload depth exceeds limit")
+    if isinstance(obj, datetime):
+        dt = obj if getattr(obj, "tzinfo", None) else obj.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        if not all(isinstance(k, str) for k in obj):
+            raise _PayloadSerializationError("non-string dict key")
+        if _seen is None:
+            _seen = set()
+        oid = id(obj)
+        if oid in _seen:
+            raise _PayloadSerializationError("cyclic structure")
+        _seen.add(oid)
+        try:
+            return {k: _json_safe_payload(v, _seen, _depth + 1) for k, v in obj.items()}
+        finally:
+            _seen.discard(oid)
+    if isinstance(obj, (list, tuple)):
+        if _seen is None:
+            _seen = set()
+        oid = id(obj)
+        if oid in _seen:
+            raise _PayloadSerializationError("cyclic structure")
+        _seen.add(oid)
+        try:
+            return [_json_safe_payload(v, _seen, _depth + 1) for v in obj]
+        finally:
+            _seen.discard(oid)
+    if isinstance(obj, (str, int, bool)) or obj is None:
+        return obj
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise _PayloadSerializationError("non-finite float")
+        return obj
+    raise _PayloadSerializationError(f"unsupported type {type(obj).__name__}")
+
+
 def build_agent_json_task_prompt(
     *,
     task_name: str,
@@ -2653,7 +2718,10 @@ def build_agent_json_task_prompt(
     # NOT be prepended here, or the model receives the same prompt text twice
     # (once in ``session.system`` and once at the head of the user message).
     # Return the JSON body alone; the caller resolves the system prompt.
-    return json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    # 08-08 P1-1: the normalizer is the single serialization gate — no
+    # ``default=`` on ``json.dumps`` (a non-serializable object must fail
+    # closed, never be silently stringified).
+    return json.dumps(_json_safe_payload(body), ensure_ascii=False, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -4072,6 +4140,134 @@ def _build_allowed_evidence_ids(snapshot: dict[str, Any]) -> set[str]:
     return allowed
 
 
+# 08-08 P1-2: the trusted closed-candle confirmation is only bound when the
+# candidate confirmation's price is geometrically compatible with the LLM
+# plan's entry/trigger zone. 10% relative divergence (confirmation price vs.
+# entry/trigger price) is the deterministic boundary — a pullback entry stays
+# within it, a wild misaligned level does not.
+_EC_GEOMETRY_TOLERANCE = 0.10
+
+
+def _is_positive_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def _validate_trusted_entry_confirmation(
+    decision: dict[str, Any],
+    snapshot: dict[str, Any],
+    trade_plan: dict[str, Any],
+    trusted: dict[str, Any],
+) -> bool:
+    """08-08 P1-2: validate a trusted deterministic ``entry_trigger_confirmation``
+    before binding it into an LLM-confirmed plan.
+
+    Returns True only when ALL of the following hold:
+    - symbol/side consistency: ``trusted.symbol == decision.symbol`` and
+      ``trusted.direction`` matches the plan's side (LONG→bullish, SHORT→bearish).
+    - entry/trigger geometry compatibility: the confirmation price and the
+      plan's entry/trigger prices are within ``_EC_GEOMETRY_TOLERANCE``.
+    - real snapshot/module provenance: ``_extract_structured_entry_confirmation``
+      re-derived from the SAME snapshot returns a confirmation with identical
+      ``candle_close_time`` / ``price`` / ``source`` — the value is genuinely
+      derived from the snapshot modules, not fabricated.
+
+    The LLM's own ``entry_trigger_confirmation`` output is NEVER consulted
+    here — it is unconditionally ignored by the caller.
+    """
+    decision_symbol = decision.get("symbol") or snapshot.get("symbol")
+    if not isinstance(decision_symbol, str) or not decision_symbol:
+        return False
+    if trusted.get("symbol") != decision_symbol:
+        return False
+    side = str(trade_plan.get("side") or "").upper()
+    expected_dir = "bullish" if side == "LONG" else "bearish" if side == "SHORT" else None
+    if expected_dir is None:
+        return False
+    if str(trusted.get("direction") or "").lower() != expected_dir:
+        return False
+    conf_price = trusted.get("price")
+    if not _is_positive_number(conf_price):
+        return False
+    conf_f = float(conf_price)
+    entry_price = trade_plan.get("entry_price")
+    if not _is_positive_number(entry_price):
+        return False
+    if abs(conf_f - float(entry_price)) / float(entry_price) > _EC_GEOMETRY_TOLERANCE:
+        return False
+    trigger_price = trade_plan.get("trigger_price")
+    if _is_positive_number(trigger_price) and abs(conf_f - float(trigger_price)) / float(trigger_price) > _EC_GEOMETRY_TOLERANCE:
+        return False
+    # Real snapshot/module provenance: re-derive from the SAME snapshot and
+    # require an identical confirmation (close_time/price/source). A forged
+    # candidate value (wrong source, future close, fabricated price) is not
+    # re-derivable and fails closed.
+    from plugins.crypto_guard.reasoning.ga_judge import _extract_structured_entry_confirmation
+    rederived = _extract_structured_entry_confirmation(snapshot, side, float(entry_price))
+    if not isinstance(rederived, dict):
+        return False
+    return (
+        rederived.get("candle_close_time") == trusted.get("candle_close_time")
+        and rederived.get("price") == trusted.get("price")
+        and rederived.get("source") == trusted.get("source")
+    )
+
+
+def _bind_trusted_entry_confirmation(
+    decision: dict[str, Any], snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    """08-08 P1-2: bind the trusted deterministic ``entry_trigger_confirmation``
+    into an LLM-confirmed same-direction plan BEFORE schema/risk validation.
+
+    The LLM must never generate/overwrite/forge ``entry_trigger_confirmation``.
+    When the LLM confirms a same-direction plan and the deterministic candidate
+    already has a legal closed-candle confirmation, this binds the TRUSTED
+    confirmation — but ONLY after symbol/side consistency, entry/trigger
+    geometry compatibility, and real snapshot/module provenance all pass (see
+    ``_validate_trusted_entry_confirmation``). The LLM's own confirmation output
+    is unconditionally ignored.
+
+    Fail-closed: when no trusted confirmation survives the checks, ANY value on
+    the LLM plan (a bare string OR a forged object) is cleared to None so the
+    risk gate correctly reports "缺少入场确认" instead of trusting a fabricated
+    value. Returns a new decision dict when a change is made, else the input.
+    """
+    trade_plan = decision.get("trade_plan")
+    if not isinstance(trade_plan, dict):
+        return decision
+    candidate_plan = decision.get("candidate_trade_plan")
+    trusted = candidate_plan.get("entry_trigger_confirmation") if isinstance(candidate_plan, dict) else None
+    if not isinstance(trusted, dict):
+        trusted = None
+    bound = bool(trusted is not None and _validate_trusted_entry_confirmation(decision, snapshot, trade_plan, trusted))
+
+    current = trade_plan.get("entry_trigger_confirmation")
+    if bound:
+        if current is not trusted:
+            repaired = dict(decision)
+            repaired_tp = dict(trade_plan)
+            repaired_tp["entry_trigger_confirmation"] = trusted
+            repaired["trade_plan"] = repaired_tp
+            notes = list(decision.get("risk_notes") or [])
+            notes.append("entry_trigger_confirmation 由确定性候选计划绑定（LLM 未提供/提供无效，已用受信确认）。")
+            repaired["risk_notes"] = notes
+            return repaired
+        return decision
+    if current is not None:
+        repaired = dict(decision)
+        repaired_tp = dict(trade_plan)
+        repaired_tp["entry_trigger_confirmation"] = None
+        repaired["trade_plan"] = repaired_tp
+        notes = list(decision.get("risk_notes") or [])
+        notes.append("entry_trigger_confirmation 非确定性受信确认，已清空为 null（需结构化受信对象）。")
+        repaired["risk_notes"] = notes
+        return repaired
+    return decision
+
+
 def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     decision = dict(fallback)
     # Phase F (07-05): capture raw_signal_grade / raw_score from the
@@ -4327,6 +4523,15 @@ def _normalize_llm_decision(candidate: dict[str, Any], snapshot: dict[str, Any],
                 # 08-02 P1-2: this plan was SYSTEM-built (LLM did not provide
                 # it) — it must never be marked llm_confirmed downstream.
                 _auto_built_plan = True
+
+    # 08-08 P1-2: bind the trusted deterministic entry_trigger_confirmation
+    # into an LLM-confirmed same-direction plan BEFORE schema/risk validation.
+    # Runs AFTER the auto-build block so an auto-built plan (which already
+    # carries the extracted confirmation) is a no-op. Symbol/side consistency,
+    # entry/trigger geometry compatibility, and real snapshot/module provenance
+    # are all validated; the LLM's own confirmation output is unconditionally
+    # ignored and cleared when nothing trusted survives.
+    decision = _bind_trusted_entry_confirmation(decision, snapshot)
 
     # 评分稳定：LLM 等级不能比确定性评分低超过 1 级
     from plugins.crypto_guard.strategy.grade_config import grade_order_value, grade_from_order_value

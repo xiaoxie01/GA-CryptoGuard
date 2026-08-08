@@ -75,6 +75,9 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_profit_protection_cutoff_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
         _ensure_watch_order_bridge_contract_marker,
+        _ensure_watch_recheck_risk_shape_contract_marker,
+        _ensure_watch_review_payload_serialization_contract_marker,
+        _ensure_watch_recheck_funnel_contract_marker,
     )
 
     _ensure_profit_protection_cutoff_marker(cur)
@@ -101,6 +104,12 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     # Without it a fresh (release-initialized) schema reports
     # watch_order_bridge_contract_marker_missing instead of clean.
     _ensure_watch_order_bridge_contract_marker(cur)
+    # 08-08 Step 7: three watch-recheck contract markers. Without them a fresh
+    # (release-initialized) schema reports the corresponding marker_missing
+    # instead of clean.
+    _ensure_watch_recheck_risk_shape_contract_marker(cur)
+    _ensure_watch_review_payload_serialization_contract_marker(cur)
+    _ensure_watch_recheck_funnel_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
 
 

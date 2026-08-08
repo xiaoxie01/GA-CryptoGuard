@@ -66,6 +66,14 @@ EXPECTED_MARKERS = {
     # Its absence is fail-closed in diagnose_state_consistency (marker-missing
     # error) so an undeployed bridge contract cannot present as healthy.
     "watch_order_bridge_contract_v1",
+    # 08-08: watch-recheck diagnostics split markers. Written by
+    # initialize_database. Each gates current-vs-historical split of exactly one
+    # watch-recheck diagnostic (risk-shape mismatch / payload-serialization
+    # failure / funnel starvation); absence is fail-closed in
+    # diagnose_state_consistency (marker-missing error).
+    "watch_recheck_risk_shape_contract_v1",
+    "watch_review_payload_serialization_contract_v1",
+    "watch_recheck_funnel_contract_v1",
 }
 
 

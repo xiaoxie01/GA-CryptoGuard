@@ -1981,7 +1981,7 @@ def _recheck_order_gate(repo: CryptoGuardRepository, watch: dict[str, Any], deci
     if decision.get("plan_origin") != "llm_confirmed":
         return False, f"plan_origin={decision.get('plan_origin')!r} (need llm_confirmed)"
     risk = decision.get("risk_check") or {}
-    if not risk.get("risk_ok"):
+    if risk.get("ok") is not True:
         return False, "risk_ok=false"
     tp = decision.get("trade_plan")
     if not isinstance(tp, dict) or not tp:

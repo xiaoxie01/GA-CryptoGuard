@@ -126,7 +126,7 @@ def _confirmed_decision(symbol: str = _SYMBOL, **overrides: dict) -> dict:
         "llm_status": "ok",
         "effective_signal_grade": "A",
         "signal_grade": "A",
-        "risk_check": {"risk_ok": True},
+        "risk_check": {"ok": True},
         "trade_plan": {
             "side": "LONG",
             "entry_type": "market",
