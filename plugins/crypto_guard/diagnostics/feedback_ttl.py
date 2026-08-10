@@ -48,8 +48,14 @@ def apply_feedback_ttl(repo: CryptoGuardRepository) -> dict[str, Any]:
             summary: {fresh, decayed, archived, total},
         }
     """
-    # Check schema health first
-    schema = check_schema_health()
+    # Check schema health first. Introspect the SAME connection the UPDATEs
+    # below will write through: a no-arg ``check_schema_health()`` opens a
+    # separate global-pool connection whose search_path may point at a
+    # different schema (e.g. the test DB's stale ``public`` under
+    # rollback_isolation, or any non-default ``repo.conn`` binding), which
+    # would report a false ``schema_unhealthy`` even though the repo's schema
+    # is complete.
+    schema = check_schema_health(conn=repo.conn)
     if not schema["ok"]:
         return {
             "ok": False,

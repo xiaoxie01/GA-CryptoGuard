@@ -62,7 +62,13 @@ from unittest import mock
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+# 5.4: all classes are data-only single-connection tests verified SAFE for the
+# shared per-worker rollback schema (no DDL, no explicit commit, no second
+# connection). The P1-3 contract marker is seeded once per worker by
+# initialize_database; per-test marker DELETEs roll back at close() so the next
+# test sees the seeded baseline. Schema init once per worker instead of per
+# test (~52x).
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.diagnostics import report_diagnostics
 from plugins.crypto_guard.diagnostics.report_diagnostics import (

@@ -39,7 +39,7 @@ from unittest import mock
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.reasoning.decision_schema import validate_json
 from plugins.crypto_guard.reasoning.watch_conditions import (

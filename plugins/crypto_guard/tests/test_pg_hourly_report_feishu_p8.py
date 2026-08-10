@@ -465,6 +465,7 @@ def _decision_dict(symbol: str, analysis_time: int, *, grade: str, batch_id: str
     }
 
 
+@pytest.mark.rollback_isolation  # 5.4 SAFE: data-only single-conn (audited)
 class TestPgHourlyReportDistributionP1(unittest.TestCase):
     """P1-1: current-batch grade distribution must NOT be hijacked by the
     last-1-hour DuckDB aggregation (4 batches x 10 symbols = 40 rows).
@@ -603,6 +604,7 @@ class TestPgHourlyReportDistributionP1(unittest.TestCase):
         self.assertNotIn("最近1小时", text)
 
 
+@pytest.mark.rollback_isolation  # 5.4 SAFE: data-only single-conn (audited)
 class TestPgHourlyReportExpressionP2(unittest.TestCase):
     """P2 (report expression):
 
@@ -761,6 +763,7 @@ class TestPgHourlyReportExpressionP2(unittest.TestCase):
         self.assertNotIn("暂无失败模式记录", text)
 
 
+@pytest.mark.rollback_isolation  # 5.4 SAFE: data-only single-conn (audited)
 class TestPgStateConsistencyWarningsVerification(unittest.TestCase):
     """#35: verify and record the two production state-consistency warnings.
 
@@ -919,6 +922,10 @@ class TestPgStateConsistencyWarningsVerification(unittest.TestCase):
         self.assertIn("deterministic_direction_from_failed_llm", types)
 
 
+# UNSAFE for rollback_isolation: the ad-hoc snapshot build reads candles via a
+# SECOND production connection (market_state_builder), which cannot see the
+# uncommitted outer-transaction seeding writes (data_quality=insufficient,
+# total_count=0). Keeps DEFAULT fresh-schema isolation.
 class TestPgAdHocAnalysisFullTimeframesP1(unittest.TestCase):
     """#31 P1-2: ad-hoc analysis must NEVER false-degrade.
 
@@ -1079,6 +1086,9 @@ class TestPgAdHocAnalysisFullTimeframesP1(unittest.TestCase):
         self.assertEqual(decision.get("display_timeframes"), ["15m", "5m"], decision.get("display_timeframes"))
 
 
+# UNSAFE for rollback_isolation: same second-connection candle reads as
+# TestPgAdHocAnalysisFullTimeframesP1 (data_quality=insufficient). Keeps
+# DEFAULT fresh-schema isolation.
 class TestPgAdHocAnalysisDisplayTimeframesReworkP1(unittest.TestCase):
     """终审返工 P1-1 (2026-07-25): display_timeframes must enter the Feishu
     consumption path, and the rendered text must distinguish the INTERNAL
@@ -1348,6 +1358,7 @@ def _scheduled_decision(symbol: str, *, grade: str, batch_id: str | None,
     }
 
 
+@pytest.mark.rollback_isolation  # 5.4 SAFE: data-only single-conn (audited)
 class TestPgHourlyScheduledAnalysisDistributionRework(unittest.TestCase):
     """终审返工 P1-2 + P2 (2026-07-25): the last-1-hour distribution MUST be a
     real PostgreSQL aggregate of ``decision_type='scheduled_analysis'`` only,

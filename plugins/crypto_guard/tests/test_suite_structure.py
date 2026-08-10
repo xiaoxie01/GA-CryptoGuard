@@ -42,9 +42,15 @@ pytestmark = pytest.mark.unit
 # -> ``...::test_p1_1_llm_alias_confirmation_fail_closed_ignored``
 # (count unchanged; SHA updated). The LLM-provided alias confirmation is now
 # unconditionally ignored, so the test asserts repairable_count=0 instead of 1.
-BASELINE_TEST_DEFINITION_COUNT = 1219
+# 08-08 R5-P0 (feedback-loop perf): split the single serial ~124s straggler
+# ``Test07_10FairBatchProductionChain::test_r5_p0_defers_past_old_eighth_count_never_exhausted``
+# into three parametrized methods (``_pst180`` / ``_pst300`` / ``_pst1200``) plus
+# a non-test helper ``_r5_p0_defers_past_old_eighth_count_never_exhausted(pst)``.
+# Net manifest delta: -1 (old test) + 3 (new tests) = +2 -> count 1219 -> 1221;
+# SHA recomputed. No assertion semantics changed - the same case set runs.
+BASELINE_TEST_DEFINITION_COUNT = 1221
 BASELINE_TEST_DEFINITION_SHA256 = (
-    "640be7d646570780fa516a051c208ec70113364da5a5df4ad736bb93a89f4988"
+    "6dd0f48c2c9cf5e3889f49460245450fa989b5f63389d1e11887fb9cc13f4ec3"
 )
 BASELINE_CLASS_RENAMES = {
     "Btc9RegressionChainTest": "TradeGateRegressionChainTest",

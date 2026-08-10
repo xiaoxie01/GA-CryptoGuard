@@ -1,0 +1,662 @@
+{
+  "digest": "ff5de36ae1348200cd84a02bf2dee9a1feee6b8b39a1717ec50e80c8db3d54f2",
+  "domains": {
+    "analysis": {
+      "sources": [
+        "plugins/crypto_guard/analysis/chanlun_engine.py",
+        "plugins/crypto_guard/analysis/counter_evidence_engine.py",
+        "plugins/crypto_guard/analysis/market_regime_engine.py",
+        "plugins/crypto_guard/analysis/momentum_engine.py",
+        "plugins/crypto_guard/analysis/order_flow_engine.py",
+        "plugins/crypto_guard/analysis/price_action_engine.py",
+        "plugins/crypto_guard/analysis/smc_engine.py",
+        "plugins/crypto_guard/analysis/trend_stage_engine.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "backtest": {
+      "sources": [
+        "plugins/crypto_guard/backtest/historical_replay.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_market_data_replay_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "config": {
+      "sources": [
+        "plugins/crypto_guard/config/__init__.py",
+        "plugins/crypto_guard/config/loader.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_prompt_audit_d.py",
+        "test_pg_08_04_skills_tools_e.py",
+        "test_pg_connection.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_service_ownership_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "data": {
+      "sources": [
+        "plugins/crypto_guard/data/__init__.py",
+        "plugins/crypto_guard/data/candle_backfill.py",
+        "plugins/crypto_guard/data/candle_store.py",
+        "plugins/crypto_guard/data/market_data_health.py",
+        "plugins/crypto_guard/data/symbol_registry.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_market_data_replay_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "diagnostics": {
+      "sources": [
+        "plugins/crypto_guard/diagnostics/__init__.py",
+        "plugins/crypto_guard/diagnostics/account_feedback_rules_dry_run.py",
+        "plugins/crypto_guard/diagnostics/feedback_rules_dry_run.py",
+        "plugins/crypto_guard/diagnostics/feedback_ttl.py",
+        "plugins/crypto_guard/diagnostics/report_diagnostics.py",
+        "plugins/crypto_guard/diagnostics/state_consistency.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_watch_materialization_terminal_status.py",
+        "test_pg_08_06_bridge_marker_p2.py",
+        "test_pg_08_08_watch_recheck_diagnostics.py",
+        "test_pg_codex_p2_rework_fixes.py",
+        "test_pg_codex_r2_rework_p0_p1.py",
+        "test_pg_deterministic_direction_created_at_cutoff_p1_2.py",
+        "test_pg_execution_funnel_starvation_codex_p1_4.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_feedback_ttl_p8.py",
+        "test_pg_finish_job_datetime_p2.py",
+        "test_pg_hourly_report_current_legacy_split_p1_3.py",
+        "test_pg_hourly_report_feishu_p8.py",
+        "test_pg_llm_failed_direction_fail_closed_marker_p2_1.py",
+        "test_pg_report_diagnostics_execution_funnel_p1_3.py",
+        "test_pg_report_diagnostics_p8.py",
+        "test_pg_schema_breaker_preset_marker_p1_4.py",
+        "test_pg_state_consistency_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "ga_master": {
+      "sources": [
+        "plugins/crypto_guard/ga_master/__init__.py",
+        "plugins/crypto_guard/ga_master/context_builder.py",
+        "plugins/crypto_guard/ga_master/controller.py",
+        "plugins/crypto_guard/ga_master/decision_persistence.py",
+        "plugins/crypto_guard/ga_master/decision_schema.py",
+        "plugins/crypto_guard/ga_master/feishu_action_builder.py",
+        "plugins/crypto_guard/ga_master/performance_gate.py",
+        "plugins/crypto_guard/ga_master/report_adapter.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_ga_master_acceptance.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_reviewer_fixes_f.py",
+        "test_pg_08_08_watch_trigger_order_e2e.py",
+        "test_pg_continuity_invalidated_atomic_codex_p1_2.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_finalize_plan_lifecycle_invalidated_codex_p1_2.py",
+        "test_pg_llm_synthesis_evidence_p1_2.py",
+        "test_pg_plan_lifecycle_finalizer_p1_1.py",
+        "test_pg_report_diagnostics_execution_funnel_p1_3.py",
+        "test_pg_risk_gate_single_validation_codex_p1_1.py",
+        "test_pg_schema_breaker_preset_marker_p1_4.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "notify": {
+      "sources": [
+        "plugins/crypto_guard/notify/__init__.py",
+        "plugins/crypto_guard/notify/alert_delivery.py",
+        "plugins/crypto_guard/notify/feishu_cards.py",
+        "plugins/crypto_guard/notify/hourly_report.py",
+        "plugins/crypto_guard/notify/intent_parser.py",
+        "plugins/crypto_guard/notify/report_consistency.py",
+        "plugins/crypto_guard/notify/time_utils.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_notification_semantics_a.py",
+        "test_pg_08_08_hourly_funnel_stats.py",
+        "test_pg_dead_duckdb_stats_helpers_removed_p2_2.py",
+        "test_pg_execution_funnel_starvation_codex_p1_4.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_hourly_report_current_legacy_split_p1_3.py",
+        "test_pg_hourly_report_feishu_p8.py",
+        "test_pg_hourly_report_render_h.py",
+        "test_pg_hourly_single_statement_consistency_p1_2.py",
+        "test_pg_llm_success_fallback_pollution_p2_1.py",
+        "test_pg_postfix_restart_release_audit_p2_1.py",
+        "test_pg_recent_failed_jobs_release_audit_p1_4.py",
+        "test_pg_report_diagnostics_execution_funnel_p1_3.py",
+        "test_pg_timeframe_parser_and_unsupported_p1_p2.py",
+        "test_pg_timeframe_token_boundary_and_intent_guard_r3.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "paper": {
+      "sources": [
+        "plugins/crypto_guard/paper/__init__.py",
+        "plugins/crypto_guard/paper/execution_quality.py",
+        "plugins/crypto_guard/paper/mark_price.py",
+        "plugins/crypto_guard/paper/paper_broker.py",
+        "plugins/crypto_guard/paper/paper_position_updater.py",
+        "plugins/crypto_guard/paper/pending_order_manager.py",
+        "plugins/crypto_guard/paper/pending_revalidator.py",
+        "plugins/crypto_guard/paper/position_conflict_revalidator.py",
+        "plugins/crypto_guard/paper/shadow_virtual_trade_updater.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_ga_master_acceptance.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_reviewer_fixes_f.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_paper_domain_p8.py",
+        "test_pg_review_domain_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "reasoning": {
+      "sources": [
+        "plugins/crypto_guard/reasoning/__init__.py",
+        "plugins/crypto_guard/reasoning/analysis_state.py",
+        "plugins/crypto_guard/reasoning/context_envelope.py",
+        "plugins/crypto_guard/reasoning/decision_context.py",
+        "plugins/crypto_guard/reasoning/decision_schema.py",
+        "plugins/crypto_guard/reasoning/ga_judge.py",
+        "plugins/crypto_guard/reasoning/llm_agent_judge.py",
+        "plugins/crypto_guard/reasoning/llm_breaker.py",
+        "plugins/crypto_guard/reasoning/llm_fair_scheduler.py",
+        "plugins/crypto_guard/reasoning/market_semantics.py",
+        "plugins/crypto_guard/reasoning/market_state_builder.py",
+        "plugins/crypto_guard/reasoning/summary_builder.py",
+        "plugins/crypto_guard/reasoning/watch_conditions.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_context_anti_pollution_c.py",
+        "test_pg_08_04_prompt_audit_d.py",
+        "test_pg_08_04_reviewer_fixes_f.py",
+        "test_pg_08_04_reviewer_fixes_g.py",
+        "test_pg_08_04_reviewer_fixes_h.py",
+        "test_pg_08_04_watch_order_bridge_b.py",
+        "test_pg_08_08_entry_trigger_confirmation_binding.py",
+        "test_pg_08_08_fake_clock_retry_jitter.py",
+        "test_pg_08_08_payload_serialization_normalizer.py",
+        "test_pg_08_08_timeframe_modules_entry_extraction.py",
+        "test_pg_08_08_watch_trigger_order_e2e.py",
+        "test_pg_codex_p2_rework_fixes.py",
+        "test_pg_codex_r2_rework_p0_p1.py",
+        "test_pg_concurrency_p7.py",
+        "test_pg_decision_array_repair_p1_1.py",
+        "test_pg_direction_flip_closed_candle_p1_3.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_llm_breaker_category_contract_p0_2.py",
+        "test_pg_llm_preset_breaker_order_p0_1.py",
+        "test_pg_llm_success_fallback_cleanup_p1_4.py",
+        "test_pg_llm_success_fallback_pollution_p2_1.py",
+        "test_pg_llm_synthesis_evidence_p1_2.py",
+        "test_pg_market_data_replay_p8.py",
+        "test_pg_opportunity_watch_structured_conditions_p0_3.py",
+        "test_pg_plan_lifecycle_finalizer_p1_1.py",
+        "test_pg_prompt_type_contract_p1_3.py",
+        "test_pg_schema_breaker_preset_marker_p1_4.py",
+        "test_pg_suggested_actions_repair_d.py",
+        "test_pg_take_profits_repair_p1_2.py",
+        "test_pg_watch_structured_full_validation_codex_p1_3.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "review": {
+      "sources": [
+        "plugins/crypto_guard/review/daily_reviewer.py",
+        "plugins/crypto_guard/review/evolution_engine.py",
+        "plugins/crypto_guard/review/evolution_triggers.py",
+        "plugins/crypto_guard/review/loss_classifier.py",
+        "plugins/crypto_guard/review/trade_reviewer.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_review_domain_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "risk": {
+      "sources": [
+        "plugins/crypto_guard/risk/__init__.py",
+        "plugins/crypto_guard/risk/account_feedback_gate.py",
+        "plugins/crypto_guard/risk/account_risk_guard.py",
+        "plugins/crypto_guard/risk/risk_engine.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_jsonb_time_p6.py",
+        "test_pg_llm_failed_direction_fail_closed_p2_1.py",
+        "test_pg_llm_success_fallback_cleanup_p1_4.py",
+        "test_pg_llm_success_fallback_pollution_p2_1.py",
+        "test_pg_llm_synthesis_evidence_p1_2.py",
+        "test_pg_risk_gate_single_validation_codex_p1_1.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "runtime_management": {
+      "sources": [
+        "plugins/crypto_guard/service_manager.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_producer_p8.py",
+        "test_pg_service_ownership_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "scheduler": {
+      "sources": [
+        "plugins/crypto_guard/run_scheduler.py",
+        "plugins/crypto_guard/scheduler/__init__.py",
+        "plugins/crypto_guard/scheduler/cron_scheduler.py",
+        "plugins/crypto_guard/scheduler/opportunity_watcher.py",
+        "plugins/crypto_guard/scheduler/task_locks.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_context_anti_pollution_c.py",
+        "test_pg_08_04_notification_semantics_a.py",
+        "test_pg_codex_r2_rework_p0_p1.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_opportunity_watch_structured_conditions_p0_3.py",
+        "test_pg_producer_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "skills": {
+      "sources": [
+        "plugins/crypto_guard/skills/__init__.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_skills_tools_e.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "strategy": {
+      "sources": [
+        "plugins/crypto_guard/strategy/grade_config.py",
+        "plugins/crypto_guard/strategy/self_evolution.py",
+        "plugins/crypto_guard/strategy/shadow_testing.py",
+        "plugins/crypto_guard/strategy/strategy_scorer.py",
+        "plugins/crypto_guard/strategy/version_manager.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_llm_failed_direction_fail_closed_p2_1.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "tools": {
+      "sources": [
+        "plugins/crypto_guard/tools/__init__.py",
+        "plugins/crypto_guard/tools/analysis_tool_broker.py",
+        "plugins/crypto_guard/tools/ga_crypto_tools.py",
+        "plugins/crypto_guard/tools/repair_market_data.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_skills_tools_e.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_hourly_report_feishu_p8.py",
+        "test_pg_timeframe_parser_and_unsupported_p1_p2.py",
+        "test_pg_timeframe_token_boundary_and_intent_guard_r3.py",
+        "test_pg_tool_write_persistence_p9.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "utils": {
+      "sources": [
+        "plugins/crypto_guard/utils.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_market_data_replay_p8.py",
+        "test_pg_paper_domain_p8.py",
+        "test_pg_review_domain_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    },
+    "watch_bridge": {
+      "serial": [
+        "test_pg_08_08_watch_trigger_order_e2e.py"
+      ],
+      "sources": [
+        "plugins/crypto_guard/run_ga_workers.py",
+        "plugins/crypto_guard/storage/migrations.py"
+      ],
+      "tests": [
+        "test_core_regressions.py",
+        "test_fair_scheduler_regressions.py",
+        "test_ga_master_acceptance.py",
+        "test_hourly_report_regressions.py",
+        "test_llm_decision_regressions.py",
+        "test_market_data_contracts.py",
+        "test_paper_orders_regressions.py",
+        "test_pg_08_04_notification_semantics_a.py",
+        "test_pg_08_04_reviewer_fixes_f.py",
+        "test_pg_08_04_watch_order_bridge_b.py",
+        "test_pg_08_06_bridge_marker_p2.py",
+        "test_pg_08_06_legacy_upgrade_p1.py",
+        "test_pg_08_06_trigger_once_ever.py",
+        "test_pg_08_08_entry_trigger_confirmation_binding.py",
+        "test_pg_08_08_payload_serialization_normalizer.py",
+        "test_pg_08_08_risk_check_ok_unification.py",
+        "test_pg_08_08_timeframe_modules_entry_extraction.py",
+        "test_pg_08_08_watch_recheck_diagnostics.py",
+        "test_pg_08_08_watch_trigger_order_e2e.py",
+        "test_pg_codex_r2_rework_p0_p1.py",
+        "test_pg_concurrency_p7.py",
+        "test_pg_fair_llm_raw_reference_p0_1.py",
+        "test_pg_feedback_ttl_p8.py",
+        "test_pg_finish_job_datetime_p2.py",
+        "test_pg_health.py",
+        "test_pg_hourly_report_feishu_p8.py",
+        "test_pg_jsonb_time_p6.py",
+        "test_pg_market_data_replay_p8.py",
+        "test_pg_migrations.py",
+        "test_pg_opportunity_watch_auto_materialize_p0_2.py",
+        "test_pg_opportunity_watch_structured_conditions_p0_3.py",
+        "test_pg_paper_domain_p8.py",
+        "test_pg_state_consistency_p8.py",
+        "test_shadow_lifecycle_regressions.py",
+        "test_smoke.py",
+        "test_suite_structure.py"
+      ]
+    }
+  },
+  "dynamic_imports": {
+    "plugins/crypto_guard/run_ga_workers.py::handle_opportunity_watch_recheck": [
+      "test_pg_08_08_watch_trigger_order_e2e.py"
+    ],
+    "plugins/crypto_guard/tests/test_core_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_fair_scheduler_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_hourly_report_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_llm_decision_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_market_data_contracts.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_paper_orders_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_shadow_lifecycle_regressions.py": [
+      "test_suite_structure.py"
+    ]
+  },
+  "escalate_to_full": [],
+  "inert_artifacts": [
+    ".trellis/"
+  ],
+  "schema_version": 1,
+  "shared_base_modules": {
+    "plugins/crypto_guard/tests/_pg_bootstrap.py": [
+      "test_pg_08_08_change_aware_runner.py",
+      "test_pg_feedback_ttl_p8.py",
+      "test_pg_finish_job_datetime_p2.py",
+      "test_pg_hourly_report_feishu_p8.py",
+      "test_pg_jsonb_time_p6.py",
+      "test_pg_market_data_replay_p8.py",
+      "test_pg_paper_domain_p8.py",
+      "test_pg_state_consistency_p8.py"
+    ],
+    "plugins/crypto_guard/tests/_smoke_suite.py": [
+      "test_core_regressions.py",
+      "test_fair_scheduler_regressions.py",
+      "test_hourly_report_regressions.py",
+      "test_llm_decision_regressions.py",
+      "test_market_data_contracts.py",
+      "test_paper_orders_regressions.py",
+      "test_shadow_lifecycle_regressions.py",
+      "test_smoke.py",
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/conftest.py": {
+      "all": true
+    },
+    "plugins/crypto_guard/tests/pg_fixtures.py": [
+      "test_ga_master_acceptance.py",
+      "test_pg_08_04_context_anti_pollution_c.py",
+      "test_pg_08_04_notification_semantics_a.py",
+      "test_pg_08_04_reviewer_fixes_f.py",
+      "test_pg_08_04_watch_materialization_terminal_status.py",
+      "test_pg_08_04_watch_order_bridge_b.py",
+      "test_pg_08_06_bridge_marker_p2.py",
+      "test_pg_08_06_legacy_upgrade_p1.py",
+      "test_pg_08_06_trigger_once_ever.py",
+      "test_pg_08_08_hourly_funnel_stats.py",
+      "test_pg_08_08_payload_serialization_normalizer.py",
+      "test_pg_08_08_risk_check_ok_unification.py",
+      "test_pg_08_08_rollback_isolation.py",
+      "test_pg_08_08_watch_recheck_diagnostics.py",
+      "test_pg_08_08_watch_trigger_order_e2e.py",
+      "test_pg_codex_r2_rework_p0_p1.py",
+      "test_pg_concurrency_p7.py",
+      "test_pg_conn_transaction_linchpin.py",
+      "test_pg_connection.py",
+      "test_pg_deterministic_direction_created_at_cutoff_p1_2.py",
+      "test_pg_direction_flip_closed_candle_p1_3.py",
+      "test_pg_execution_funnel_starvation_codex_p1_4.py",
+      "test_pg_feedback_ttl_p8.py",
+      "test_pg_finish_job_datetime_p2.py",
+      "test_pg_health.py",
+      "test_pg_hourly_report_current_legacy_split_p1_3.py",
+      "test_pg_hourly_report_feishu_p8.py",
+      "test_pg_hourly_report_render_h.py",
+      "test_pg_hourly_single_statement_consistency_p1_2.py",
+      "test_pg_jsonb_time_p6.py",
+      "test_pg_llm_failed_direction_fail_closed_marker_p2_1.py",
+      "test_pg_llm_failed_direction_fail_closed_p2_1.py",
+      "test_pg_llm_success_fallback_cleanup_p1_4.py",
+      "test_pg_llm_success_fallback_pollution_p2_1.py",
+      "test_pg_llm_synthesis_evidence_p1_2.py",
+      "test_pg_market_data_replay_p8.py",
+      "test_pg_migrations.py",
+      "test_pg_opportunity_watch_auto_materialize_p0_2.py",
+      "test_pg_opportunity_watch_structured_conditions_p0_3.py",
+      "test_pg_paper_domain_p8.py",
+      "test_pg_param_adaptation.py",
+      "test_pg_plan_lifecycle_finalizer_p1_1.py",
+      "test_pg_postfix_restart_release_audit_p2_1.py",
+      "test_pg_producer_p8.py",
+      "test_pg_recent_failed_jobs_release_audit_p1_4.py",
+      "test_pg_report_diagnostics_execution_funnel_p1_3.py",
+      "test_pg_report_diagnostics_p8.py",
+      "test_pg_repository_p5.py",
+      "test_pg_reusable_fixture.py",
+      "test_pg_review_domain_p8.py",
+      "test_pg_risk_gate_single_validation_codex_p1_1.py",
+      "test_pg_savepoint.py",
+      "test_pg_schema.py",
+      "test_pg_schema_breaker_preset_marker_p1_4.py",
+      "test_pg_service_ownership_p8.py",
+      "test_pg_state_consistency_p8.py",
+      "test_pg_suggested_actions_repair_d.py",
+      "test_pg_tool_write_persistence_p9.py",
+      "test_pg_transaction_model.py"
+    ],
+    "plugins/crypto_guard/tests/test_smoke.py": [
+      "test_pg_fair_llm_raw_reference_p0_1.py",
+      "test_suite_structure.py"
+    ]
+  },
+  "test_helpers": {
+    "plugins/crypto_guard/tests/test_fair_scheduler_regressions.py": [
+      "test_suite_structure.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_08_04_watch_order_bridge_b.py": [
+      "test_pg_08_04_reviewer_fixes_f.py",
+      "test_pg_08_08_watch_trigger_order_e2e.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_fair_llm_raw_reference_p0_1.py": [
+      "test_pg_08_08_watch_trigger_order_e2e.py",
+      "test_pg_llm_synthesis_evidence_p1_2.py",
+      "test_pg_plan_lifecycle_finalizer_p1_1.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_migrations.py": [
+      "test_pg_08_06_bridge_marker_p2.py",
+      "test_pg_08_06_legacy_upgrade_p1.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_opportunity_watch_auto_materialize_p0_2.py": [
+      "test_pg_codex_r2_rework_p0_p1.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_plan_lifecycle_finalizer_p1_1.py": [
+      "test_pg_risk_gate_single_validation_codex_p1_1.py"
+    ],
+    "plugins/crypto_guard/tests/test_smoke.py": [
+      "test_pg_fair_llm_raw_reference_p0_1.py",
+      "test_suite_structure.py"
+    ]
+  }
+}

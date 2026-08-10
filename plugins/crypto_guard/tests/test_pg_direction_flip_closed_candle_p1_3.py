@@ -37,7 +37,11 @@ from unittest.mock import patch
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+# 5.4: data-only single-connection tests verified SAFE for the shared
+# per-worker rollback schema (no DDL, no explicit commit, no second connection,
+# no seed-age-dependent assertions). Each make_repo() checkout rolls back at
+# close(); schema init runs once per worker instead of per test (~52x).
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.tests.pg_fixtures import make_repo
 from plugins.crypto_guard.reasoning.market_state_builder import (

@@ -19,6 +19,7 @@ import pytest
 pytestmark = pytest.mark.pg
 
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -61,13 +62,82 @@ class TestPgConnectionLayer(unittest.TestCase):
         self.assertIn("SQLite", str(cm.exception))
 
     def test_bad_port_fails_closed(self) -> None:
-        # Point at an unreachable port. Password redacted; port is the fault.
-        os.environ["CRYPTO_GUARD_DATABASE_URL"] = (
-            "postgresql://crypto_guard_test_app:wrong@localhost:1/crypto_guard_test"
-        )
-        pg_db.reset_pool()
-        with self.assertRaises(pg_db.CryptoGuardDBUnavailable):
-            pg_db.get_pool()
+        # 5.2 bounded connect: ``?connect_timeout=1`` (libpq) fails each attempt
+        # fast, and get_pool()'s eager pool open is bounded, so a dead port must
+        # fail closed in well under a few seconds - never block on the endpoint.
+        # Password redacted; port is the fault.
+        # 终审返工 P1 (08-10): this test sets its OWN explicit 3s open bound and
+        # precisely restores the original environment afterwards. It must NOT
+        # rely on a global 3s test default - production connection posture is 30s.
+        saved_timeout = os.environ.get("CRYPTO_GUARD_POOL_OPEN_TIMEOUT")
+        saved_url = os.environ.get("CRYPTO_GUARD_DATABASE_URL")
+        os.environ["CRYPTO_GUARD_POOL_OPEN_TIMEOUT"] = "3.0"
+        try:
+            os.environ["CRYPTO_GUARD_DATABASE_URL"] = (
+                "postgresql://crypto_guard_test_app:wrong@localhost:1/crypto_guard_test"
+                "?connect_timeout=1"
+            )
+            pg_db.reset_pool()
+            t0 = time.monotonic()
+            with self.assertRaises(pg_db.CryptoGuardDBUnavailable):
+                pg_db.get_pool()
+            self.assertLess(time.monotonic() - t0, 5.0)
+        finally:
+            if saved_timeout is None:
+                os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
+            else:
+                os.environ["CRYPTO_GUARD_POOL_OPEN_TIMEOUT"] = saved_timeout
+            if saved_url is None:
+                os.environ.pop("CRYPTO_GUARD_DATABASE_URL", None)
+            else:
+                os.environ["CRYPTO_GUARD_DATABASE_URL"] = saved_url
+            pg_db.reset_pool()
+
+    def test_pool_open_timeout_default_is_30(self) -> None:
+        # 终审返工 P1 (08-10): the DEFAULT open bound is the production 30s
+        # posture when the env var is absent - never a test-driven 3s.
+        os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
+        try:
+            self.assertEqual(pg_db._pool_open_timeout(), 30.0)
+        finally:
+            os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
+
+    def test_pool_open_timeout_explicit_3_override(self) -> None:
+        # 终审返工 P1 (08-10): an EXPLICIT 3s override is honored exactly - the
+        # fail-fast bound stays available for tests that deliberately use it.
+        os.environ["CRYPTO_GUARD_POOL_OPEN_TIMEOUT"] = "3.0"
+        try:
+            self.assertEqual(pg_db._pool_open_timeout(), 3.0)
+        finally:
+            os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
+
+    def test_pool_open_timeout_env_tunable_healthy_open(self) -> None:
+        # 5.2/P2-4: the eager pool-open bound is configurable (operator can
+        # widen it on a slow machine); a larger bound still opens cleanly
+        # against the real test DB (healthy path).
+        os.environ["CRYPTO_GUARD_POOL_OPEN_TIMEOUT"] = "5.0"
+        try:
+            self.assertEqual(pg_db._pool_open_timeout(), 5.0)
+            pg_db.reset_pool()
+            pool = pg_db.get_pool()
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 AS v")
+                    self.assertEqual(cur.fetchone()["v"], 1)
+        finally:
+            os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
+            pg_db.reset_pool()
+
+    def test_pool_open_timeout_falls_back_on_garbage(self) -> None:
+        # 终审返工 P1 (08-10): values <=0, nan, inf, and non-numeric all fall
+        # back to the PRODUCTION 30s posture (was 3.0 before the rework).
+        for bad in ("not-a-number", "0", "-1", "-2.5", "nan", "inf", "-inf"):
+            os.environ["CRYPTO_GUARD_POOL_OPEN_TIMEOUT"] = bad
+            try:
+                self.assertEqual(pg_db._pool_open_timeout(), 30.0,
+                                 f"{bad!r} must fall back to 30.0")
+            finally:
+                os.environ.pop("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", None)
 
     def test_runtime_rejects_superuser_dsn_without_leaking_password(self) -> None:
         secret = "do-not-echo-this"

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.tests.pg_fixtures import make_repo
 

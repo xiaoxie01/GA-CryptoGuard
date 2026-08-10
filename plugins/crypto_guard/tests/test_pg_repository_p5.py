@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = pytest.mark.pg
+pytestmark = [pytest.mark.pg, pytest.mark.rollback_isolation]
 
 import json
 import unittest

@@ -43,7 +43,7 @@ from unittest import mock
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.ga_master import risk_gate as risk_gate_mod
 from plugins.crypto_guard.risk import risk_engine as risk_engine_mod

@@ -10,6 +10,34 @@ each ``setUp``; this conftest only guarantees the shared role/DB exist.
 from __future__ import annotations
 
 import os
+import sys
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _rollback_isolation_marker(request: pytest.FixtureRequest) -> None:
+    """Step 5.4 opt-in gate: ``@pytest.mark.rollback_isolation`` redirects
+    ``make_repo()``/``make_reusable_repo()`` to one shared per-worker schema
+    wrapped in a per-test transaction rolled back at teardown.
+
+    Non-marked tests pay a marker lookup only (no imports, no PG traffic); the
+    ``pg_fixtures`` module is imported lazily so unit-only runs stay PG-free.
+    """
+    if request.node.get_closest_marker("rollback_isolation") is None:
+        yield
+        return
+    from plugins.crypto_guard.tests import pg_fixtures as fx
+
+    fx.set_rollback_active(True)
+    try:
+        yield
+    finally:
+        fx.set_rollback_active(False)
+        # If the test failed before its handle.close(), roll the open checkout
+        # back so the next opted-in test still sees the clean baseline. The
+        # cleanup must NEVER mask the primary failure (P2-6).
+        fx.safe_close_open_rollback_handle(sys.exc_info()[1])
 
 
 def _ensure_test_db() -> None:

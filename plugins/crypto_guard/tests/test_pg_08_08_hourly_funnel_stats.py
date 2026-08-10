@@ -290,6 +290,26 @@ class TestPgExecutionFunnelWatchStats:
                 f"P2 RED: expected 1 in-window watch_recheck order; got "
                 f"{stats['orders_created']!r}"
             )
+
+            # P2-3 (round-5): this IS the R7-3 "ONE full-path integration test"
+            # that ``test_pg_hourly_report_render_h.py`` points at — it must
+            # prove the REAL-SQL watch stats flow through the renderer, not just
+            # compute them. The OLD test asserted the SQL counters but never
+            # rendered, so the documented full-path chain was never exercised.
+            text = _render(execution_funnel_stats=stats)
+            assert "执行漏斗" in text, (
+                "P2-3: real-SQL watch stats must render a funnel section"
+            )
+            assert "观察触发 1" in text, (
+                f"P2-3: real watches_triggered=1 must render; stats={stats!r}"
+            )
+            assert "生成订单 1" in text, (
+                f"P2-3: real orders_created=1 must render; stats={stats!r}"
+            )
+            assert "risk_ok=false=1" in text and "grade=C=1" in text, (
+                "P2-3: real rejected-by-reason distribution must render; "
+                f"stats={stats!r}"
+            )
         finally:
             handle.close()
 

@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.reasoning.llm_agent_judge import _normalize_llm_decision
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision

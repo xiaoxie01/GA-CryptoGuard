@@ -28,7 +28,7 @@ import unittest
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.diagnostics.state_consistency import (
     WATCH_ORDER_BRIDGE_CONTRACT_MARKER_KEY,

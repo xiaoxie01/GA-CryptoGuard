@@ -55,6 +55,60 @@ def _pytest(
             args_file.unlink(missing_ok=True)
 
 
+_SUMMARY_RE = re.compile(
+    r"^\s*=*\s*.*?\b(\d+)\s+passed\b.*?in\s+\d+(?:\.\d+)?s\b"
+    r"(?:\s*\(\d+:\d+(?::\d+)?\))?\s*=*\s*$"
+)
+
+
+def _last_summary_line(combined: str) -> str | None:
+    """Return the LAST complete pytest summary banner in ``combined``.
+
+    pytest prints its summary banner at process exit, so the last complete
+    banner is the authoritative outcome for the captured run. ``-rA`` log text
+    may contain ``<number> failed`` / ``<number> skipped`` phrases, but those
+    only parse as a complete banner when they are part of a line that also ends
+    in ``in <seconds>s``; a lone application-log line never does. Returns
+    ``None`` when no complete banner is found (fail-closed: callers must not
+    treat the stage as exact).
+    """
+    banner = None
+    for line in combined.splitlines():
+        if _SUMMARY_RE.match(line):
+            banner = line
+    return banner
+
+
+def _stage_counts(combined: str) -> tuple[int, dict[str, int]]:
+    """Parse pytest's authoritative outcome counts from captured stage output.
+
+    ``-rA`` (the change-aware runner's stage flag) appends EVERY test's
+    captured output — including application log records — to the report. Log
+    text can contain ``<number> failed`` / ``<number> skipped`` phrases
+    (fail-closed batch messages like ``..._1783641599999 failed identity
+    contract``, ``enabled=10 queued=10 skipped=0``, ``10 failed jobs``, or
+    ``3 skipped records``) that an UNANCHORED scan misreads as real test
+    outcomes, false-flagging a green stage "not exact".
+    终审返工 P2 (08-10): ONLY the LAST complete pytest summary banner is
+    parsed — keywords are never accumulated globally across the whole captured
+    text. The first ``<digits> passed`` in that banner is the authoritative
+    count (handles ``1 failed, 2121 passed`` and ``2120 passed, 10 subtests
+    passed`` orderings); each nonzero label is its first match or 0. No banner
+    at all → ``(-1, zeros)``, which ``_run_exact_stage`` treats as inexact
+    (fail-closed, never a vacuous GREEN).
+    """
+    banner = _last_summary_line(combined)
+    if banner is None:
+        return -1, {"failed": 0, "skipped": 0, "deselected": 0}
+    first_passed = re.search(r"\b(\d+)\s+passed\b", banner)
+    passed = int(first_passed.group(1)) if first_passed else -1
+    nonzero = {}
+    for label in ("failed", "skipped", "deselected"):
+        m = re.search(rf"\b(\d+)\s+{label}\b", banner)
+        nonzero[label] = int(m.group(1)) if m else 0
+    return passed, nonzero
+
+
 def _run_exact_stage(
     name: str, node_ids: set[str], args: list[str],
 ) -> subprocess.CompletedProcess[str]:
@@ -62,12 +116,7 @@ def _run_exact_stage(
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     combined = f"{result.stdout}\n{result.stderr}"
-    passed_matches = re.findall(r"(?:^|\s)(\d+) passed(?:\s|,|$)", combined)
-    passed = int(passed_matches[-1]) if passed_matches else -1
-    nonzero = {
-        label: sum(int(value) for value in re.findall(rf"(\d+) {label}", combined))
-        for label in ("failed", "skipped", "deselected")
-    }
+    passed, nonzero = _stage_counts(combined)
     if result.returncode == 0 and passed != len(node_ids):
         raise RuntimeError(
             f"{name} stage passed-count mismatch: selected={len(node_ids)} "

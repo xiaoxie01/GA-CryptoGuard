@@ -41,6 +41,9 @@ Thumbs.db
 auth.json
 model_responses.txt
 
+# CryptoGuard test-run evidence store (runtime log, never committed)
+/plugins/crypto_guard/tests/.evidence/
+
 # Sensitive files (API keys, credentials)
 mykey.py
 

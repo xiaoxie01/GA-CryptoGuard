@@ -71,7 +71,7 @@ from unittest.mock import patch
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.reasoning.decision_schema import (
     normalize_suggested_actions,

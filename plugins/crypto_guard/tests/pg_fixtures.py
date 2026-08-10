@@ -30,6 +30,7 @@ runtime - the conversion is done by hand in the test source.
 from __future__ import annotations
 
 import os
+import sys
 import atexit
 import threading
 import uuid
@@ -40,7 +41,9 @@ from typing import Iterator
 import psycopg
 from psycopg import sql
 from psycopg.pq import TransactionStatus
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 from plugins.crypto_guard.storage import pg_db
 from plugins.crypto_guard.storage.migrations import initialize_database
@@ -544,6 +547,9 @@ def make_reusable_repo() -> _ReusableRepoHandle:
 
     global _REUSABLE_SCHEMA
 
+    if rollback_active():
+        return rollback_repo()
+
     _REUSABLE_SCHEMA_LOCK.acquire()
     saved_url = os.environ.get("CRYPTO_GUARD_DATABASE_URL")
     saved_redis_disabled = os.environ.get("CRYPTO_GUARD_REDIS_DISABLED")
@@ -612,6 +618,340 @@ def reset_reusable_schema_manager() -> None:
     _drop_reusable_schema()
 
 
+# --- rollback isolation (08-08 Step 5.4; EXPLICIT OPT-IN) --------------------
+#
+# DEFAULT: ``make_repo()`` creates a fresh per-test schema (unchanged). A test
+# marked ``@pytest.mark.rollback_isolation`` redirects ``make_repo()`` /
+# ``make_reusable_repo()`` to ONE shared per-worker schema and wraps the test in
+# a transaction that ``close()`` rolls back, so the expensive schema DDL runs
+# once per xdist worker instead of once per test. Opting in is a contract: the
+# test must not exercise COMMIT semantics, multi-connection, threads, advisory
+# locks, or schema mutation/DDL (those keep the default fresh-schema isolation,
+# and per 5.5 the advisory-lock/concurrency tests stay serial with their own
+# DDL). The conftest autouse fixture drives ``set_rollback_active()`` from the
+# marker; ``rollback_repo()`` is also callable directly for contract tests.
+
+_ROLLBACK_SCHEMA_LOCK = threading.RLock()
+_ROLLBACK_SCHEMA: str | None = None
+_ROLLBACK_ACTIVE = threading.local()   # .value True only inside an opted-in test
+_ROLLBACK_HANDLE = threading.local()   # .value = the open rollback handle, if any
+
+# Dedicated per-xdist-worker pool (08-09 PoolTimeout fix). Each xdist worker is
+# its own process, so these module globals ARE the per-worker state. The pool is
+# created lazily on the first rollback checkout and ONLY closed at worker
+# teardown -- NEVER per test -- so a worker pays ``pool.open()`` (env-tunable
+# via ``pg_db._pool_open_timeout()``; default 30s production posture, P1 08-10)
+# once instead of on every rollback test (the per-test ``pg_db.reset_pool()``
+# churn that occasionally blew the pool-open timeout under parallel load).
+_ROLLBACK_POOL_LOCK = threading.Lock()
+_ROLLBACK_POOL: ConnectionPool | None = None
+_ROLLBACK_POOL_DSN: str | None = None
+_ROLLBACK_POOL_SCHEMA: str | None = None
+
+
+def set_rollback_active(active: bool) -> None:
+    """Route ``make_repo()``/``make_reusable_repo()`` at the rollback fast path."""
+    _ROLLBACK_ACTIVE.value = bool(active)
+
+
+def rollback_active() -> bool:
+    return bool(getattr(_ROLLBACK_ACTIVE, "value", False))
+
+
+def _ensure_rollback_schema() -> str:
+    """Create + initialize the shared per-worker rollback schema once."""
+    global _ROLLBACK_SCHEMA
+    with _ROLLBACK_SCHEMA_LOCK:
+        if _ROLLBACK_SCHEMA is not None:
+            return _ROLLBACK_SCHEMA
+        schema = _new_schema_name()
+        # The initializer is routed through the GLOBAL pool via the
+        # search_path override; restore that override once the schema exists so
+        # later non-rollback tests in this worker never inherit the rollback
+        # binding (the dedicated rollback pool carries its own).
+        saved_search_path = pg_db.get_test_search_path()
+        _create_scratch_schema(schema)
+        try:
+            _activate_test_schema(schema)
+            _initialize_isolated_test_schema()
+            _ROLLBACK_SCHEMA = schema
+            pg_db.set_test_search_path(saved_search_path)
+            pg_db.reset_pool()
+            return schema
+        except BaseException:
+            pg_db.reset_pool()
+            try:
+                _drop_scratch_schema(schema)
+            finally:
+                pg_db.set_test_search_path(saved_search_path)
+                pg_db.reset_pool()
+                _ROLLBACK_SCHEMA = None
+            raise
+
+
+def _build_rollback_conn_kwargs_for_pool(conn: psycopg.Connection) -> None:
+    """Pool configure hook: bind every rollback-pool conn to the shared schema.
+
+    Mirrors ``pg_db._build_conn_kwargs_for_pool`` (dict_row + UTC +
+    search_path + principal validation) but the search_path is FIXED to the
+    rollback schema captured at pool creation - the pool is per-worker and is
+    never re-routed, so the binding lives on the connections themselves instead
+    of the global ``pg_db`` search-path override. Connections are left READY
+    (autocommit=False, no open txn) for the pool.
+    """
+    conn.row_factory = dict_row
+    schema = _ROLLBACK_POOL_SCHEMA
+    was_autocommit = conn.autocommit
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET TimeZone=UTC")
+            if schema:
+                safe = schema.replace("'", "''")
+                cur.execute(f"SET search_path={safe}")
+        pg_db._validate_connected_identity(conn)
+    finally:
+        conn.autocommit = was_autocommit
+
+
+def _get_rollback_pool() -> ConnectionPool:
+    """Return the per-xdist-worker rollback pool, opening it exactly once.
+
+    The dedicated pool is keyed on the DSN like ``pg_db.get_pool`` but lives
+    entirely in the test layer and is bound to the shared rollback schema. It
+    is created lazily on the first ``rollback_repo()`` and ONLY closed at
+    worker teardown (``_drop_rollback_schema``) - never per test - so
+    consecutive rollback tests reuse one already-open pool instead of paying
+    ``pool.open()`` (env-tunable via ``pg_db._pool_open_timeout()``; default 30s
+    production posture, P1 08-10) on every test.
+    """
+    from plugins.crypto_guard.tests._pg_bootstrap import app_dsn
+
+    global _ROLLBACK_POOL, _ROLLBACK_POOL_DSN, _ROLLBACK_POOL_SCHEMA
+    with _ROLLBACK_POOL_LOCK:
+        dsn = app_dsn()
+        if _ROLLBACK_POOL is not None and _ROLLBACK_POOL_DSN == dsn:
+            return _ROLLBACK_POOL
+        if _ROLLBACK_POOL is not None:
+            try:
+                _ROLLBACK_POOL.close()
+            except Exception:
+                pass
+            _ROLLBACK_POOL = None
+            _ROLLBACK_POOL_DSN = None
+            _ROLLBACK_POOL_SCHEMA = None
+        schema = _ROLLBACK_SCHEMA
+        if schema is None:
+            raise RuntimeError(
+                "rollback schema must be created before the rollback pool opens"
+            )
+        pool = None
+        try:
+            pool = ConnectionPool(
+                conninfo=dsn,
+                min_size=1,
+                max_size=8,
+                timeout=30.0,
+                configure=_build_rollback_conn_kwargs_for_pool,
+                open=False,
+            )
+            # MUST assign before pool.open(): the configure hook reads
+            # _ROLLBACK_POOL_SCHEMA while the pool creates its min_size
+            # connections, and those connections carry the schema binding.
+            _ROLLBACK_POOL = pool
+            _ROLLBACK_POOL_DSN = dsn
+            _ROLLBACK_POOL_SCHEMA = schema
+            pool.open(wait=True, timeout=pg_db._pool_open_timeout())
+        except Exception as exc:  # noqa: BLE001 - any pool/open failure is fatal
+            if pool is not None:
+                try:
+                    pool.close()
+                except Exception:
+                    pass
+            _ROLLBACK_POOL = None
+            _ROLLBACK_POOL_DSN = None
+            _ROLLBACK_POOL_SCHEMA = None
+            raise pg_db.CryptoGuardDBUnavailable(
+                f"rollback pool unavailable ({type(exc).__name__})"
+            ) from exc
+        return pool
+
+
+def _close_rollback_pool() -> None:
+    """Worker-teardown: close the dedicated rollback pool, if any."""
+    global _ROLLBACK_POOL, _ROLLBACK_POOL_DSN, _ROLLBACK_POOL_SCHEMA
+    with _ROLLBACK_POOL_LOCK:
+        if _ROLLBACK_POOL is not None:
+            try:
+                _ROLLBACK_POOL.close()
+            except Exception:
+                pass
+        _ROLLBACK_POOL = None
+        _ROLLBACK_POOL_DSN = None
+        _ROLLBACK_POOL_SCHEMA = None
+
+
+def _drop_rollback_schema() -> None:
+    """Drop the shared rollback schema (atexit + explicit test cleanup)."""
+    global _ROLLBACK_SCHEMA
+    with _ROLLBACK_SCHEMA_LOCK:
+        schema = _ROLLBACK_SCHEMA
+        _ROLLBACK_SCHEMA = None
+        # Close the dedicated per-worker pool BEFORE dropping the schema its
+        # connections are bound to.
+        _close_rollback_pool()
+        if schema is None:
+            return
+        pg_db.reset_pool()
+        try:
+            _drop_scratch_schema(schema)
+        finally:
+            if pg_db.get_test_search_path() == schema:
+                pg_db.set_test_search_path(None)
+            pg_db.reset_pool()
+
+
+@dataclass
+class _RollbackRepoHandle:
+    """One checkout from the dedicated per-worker rollback pool.
+
+    The checkout holds an outer transaction open for the whole test; repo writes
+    become nested savepoints (psycopg3 ``conn.transaction()`` on an INTRANS
+    connection). ``close()`` rolls the transaction back and returns the
+    connection to the dedicated pool - NO ``pg_db.reset_pool()``, NO schema
+    drop, NO per-test churn (the 08-09 PoolTimeout fix). The worker pool is
+    closed only at worker teardown.
+    """
+
+    conn: psycopg.Connection
+    repo: CryptoGuardRepository
+    schema: str
+    _saved_url: str | None
+    _saved_redis_disabled: str | None
+    _pool: ConnectionPool
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if getattr(_ROLLBACK_HANDLE, "value", None) is self:
+            _ROLLBACK_HANDLE.value = None
+        checkout_error: BaseException | None = None
+        try:
+            # Undo every write since BEGIN (incl. all nested savepoints). Roll
+            # back FIRST so the pool receives an IDLE connection (putconn does
+            # not re-run the configure hook; the fixed search_path binding
+            # already lives on the connection).
+            if self.conn.info.transaction_status != TransactionStatus.IDLE:
+                self.conn.rollback()
+        except BaseException as exc:
+            checkout_error = exc
+        try:
+            self._pool.putconn(self.conn)
+        except BaseException as exc:
+            checkout_error = checkout_error or exc
+        if self._saved_url is not None:
+            os.environ["CRYPTO_GUARD_DATABASE_URL"] = self._saved_url
+        else:
+            os.environ.pop("CRYPTO_GUARD_DATABASE_URL", None)
+        if self._saved_redis_disabled is not None:
+            os.environ["CRYPTO_GUARD_REDIS_DISABLED"] = self._saved_redis_disabled
+        else:
+            os.environ.pop("CRYPTO_GUARD_REDIS_DISABLED", None)
+        if checkout_error is not None:
+            raise checkout_error
+
+
+def rollback_repo() -> _RollbackRepoHandle:
+    """Explicit Step 5.4 fast path (same call shape as ``make_repo()``).
+
+    One shared per-worker schema; the checkout's writes are rolled back in
+    ``close()``. The DEFAULT independent per-test schema is UNCHANGED for
+    non-opted-in tests.
+
+    Per-worker pool (08-09 PoolTimeout fix): the checkout comes from the
+    dedicated ``_ROLLBACK_POOL`` bound to the shared rollback schema. The pool
+    is opened ONCE per xdist worker and NEVER reset between tests, so a worker
+    pays the pool-open cost once instead of once per test (the per-test
+    ``pg_db.reset_pool()`` churn behind the flake). No global search_path is
+    touched - the binding lives on the pool's connections.
+    """
+    schema = _ensure_rollback_schema()
+    saved_url = os.environ.get("CRYPTO_GUARD_DATABASE_URL")
+    saved_redis_disabled = os.environ.get("CRYPTO_GUARD_REDIS_DISABLED")
+    try:
+        os.environ["CRYPTO_GUARD_REDIS_DISABLED"] = "1"
+        set_test_dsn()
+        pool = _get_rollback_pool()
+        conn = pool.getconn()
+        try:
+            # Open the outer transaction EXPLICITLY. The pool is
+            # autocommit=False but a bare connection would let the first repo
+            # write auto-BEGIN its own txn and auto-COMMIT on putconn; with
+            # INTRANS already set, every repo write becomes a nested savepoint
+            # that close() rolls back wholesale.
+            conn.execute("BEGIN")
+        except BaseException:
+            pool.putconn(conn)
+            raise
+        handle = _RollbackRepoHandle(
+            conn=conn, repo=CryptoGuardRepository(conn), schema=schema,
+            _saved_url=saved_url,
+            _saved_redis_disabled=saved_redis_disabled,
+            _pool=pool,
+        )
+        _ROLLBACK_HANDLE.value = handle
+        return handle
+    except BaseException:
+        if saved_url is not None:
+            os.environ["CRYPTO_GUARD_DATABASE_URL"] = saved_url
+        else:
+            os.environ.pop("CRYPTO_GUARD_DATABASE_URL", None)
+        if saved_redis_disabled is not None:
+            os.environ["CRYPTO_GUARD_REDIS_DISABLED"] = saved_redis_disabled
+        else:
+            os.environ.pop("CRYPTO_GUARD_REDIS_DISABLED", None)
+        raise
+
+
+def close_open_rollback_handle() -> None:
+    """Fixture-teardown safety net: roll back a handle a failed test left open."""
+    handle = getattr(_ROLLBACK_HANDLE, "value", None)
+    if handle is not None:
+        handle.close()
+
+
+def safe_close_open_rollback_handle(primary_error: BaseException | None) -> None:
+    """Teardown safety net that NEVER masks a primary test failure (P2-6).
+
+    Rolls back a checkout a failed test left open so the next opted-in test
+    still sees the clean baseline. If that cleanup itself raises while the
+    test body ALREADY failed, the cleanup exception is suppressed (logged to
+    stderr) so the reported failure stays the primary one. When the test body
+    was clean a cleanup failure surfaces - it IS the real error.
+    """
+    handle = getattr(_ROLLBACK_HANDLE, "value", None)
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except BaseException as exc:  # noqa: BLE001 - cleanup must not mask primary
+        if primary_error is not None:
+            # P2 (redaction): surface only the exception TYPE, never repr(exc) —
+            # a cleanup-failure body can carry DSN / connection text.
+            sys.stderr.write(
+                f"rollback teardown cleanup suppressed after test failure: "
+                f"{type(exc).__name__}\n")
+            return
+        raise
+
+
+# P2-6: BOTH shared schemas must be dropped at process exit. The rollback
+# schema is per-worker; the reusable schema (make_reusable_repo sites) must not
+# accumulate across runs either. Each drop is lock-guarded and no-ops when its
+# schema was never created, so the two registrations are independent and safe.
+atexit.register(_drop_rollback_schema)
 atexit.register(_drop_reusable_schema)
 
 
@@ -622,7 +962,13 @@ def make_repo(*, initialize_schema: bool = True) -> _RepoHandle:
     ``connect_db`` + ``initialize_database()`` setUp sequence. Each test gets
     its own schema so tests never interfere; the schema is dropped in
     ``close()``.
+
+    Under ``@pytest.mark.rollback_isolation`` (Step 5.4 opt-in) this resolves to
+    :func:`rollback_repo`: one shared per-worker schema + per-test rolled-back
+    transaction. The DEFAULT fresh per-test schema is UNCHANGED.
     """
+    if rollback_active():
+        return rollback_repo()
     saved_url = os.environ.get("CRYPTO_GUARD_DATABASE_URL")
     # 07-16 cutover (Redis test isolation): under SQLite the legacy test DB
     # lived in tempfile.gettempdir(), so redis_adapter.should_use_redis_for_path
@@ -734,4 +1080,9 @@ __all__ = [
     "reset_reusable_schema_manager",
     "direct_conn",
     "_RepoHandle",
+    "set_rollback_active",
+    "rollback_active",
+    "rollback_repo",
+    "close_open_rollback_handle",
+    "safe_close_open_rollback_handle",
 ]

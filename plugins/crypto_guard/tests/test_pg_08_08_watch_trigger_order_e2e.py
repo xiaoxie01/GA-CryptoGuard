@@ -21,6 +21,16 @@ concurrency (task lock -> recheck_already_in_progress), duplicate tasks
 (single analysis, single order), terminal once-ever (a terminal order still
 holds the link -> delayed retry is a duplicate, never a second order).
 
+Step 5.6 narrowing (08-08 test-loop acceleration): the real controller/adapter
+-> watch -> order path is exercised by the happy-path test 1 AND the rejected
+no-plan test 2 (both keep the real controller + adapter). The concurrency /
+duplicate / terminal-once-ever tests are NARROW handler-contract tests: they
+drive ``handle_opportunity_watch_recheck`` with a canned gate-clearing decision
+(``_canned_confirmed_decision``) so only the watch->bridge->order handler logic
+is under test — no snapshot build, no adapter, no controller. The real-path
+tests keep all production branches (happy + rejected) exercised, so no
+production-path coverage drops.
+
 No production DB mutation, no marker write, no service restart, no commit.
 """
 from __future__ import annotations
@@ -238,10 +248,61 @@ def _make_real_controller_analyze(captured: dict, *, fake_call: callable | None 
     return _analyzer
 
 
-def _make_counting_real_analyze(captured: dict, count: dict) -> callable:
-    """Wrap the real controller analyzer with an analyze counter so the
-    duplicate/once-ever tests can assert the analyzer runs exactly once."""
-    inner = _make_real_controller_analyze(captured)
+# ── Step 5.6: canned decision contract (narrow handler-contract tests) ──────
+
+
+def _canned_confirmed_decision(symbol: str = _SYMBOL) -> dict:
+    """A deterministic, gate-clearing recheck decision shaped EXACTLY like the
+    real controller's confirmed output — the ``_recheck_order_gate`` field
+    contract (plan_execution_state=confirmed / grade S / llm ok /
+    plan_origin=llm_confirmed / risk_check.ok=True / valid LONG trade_plan with
+    entry_price != stop_loss). Used by the narrow handler-contract tests so the
+    watch->bridge->order logic is under test WITHOUT the real controller/adapter
+    path (which test 1 keeps). ``entry_type`` mirrors the real SOP plan default.
+    """
+    return {
+        "symbol": symbol,
+        "decision_type": "opportunity_watch_recheck",
+        "plan_execution_state": "confirmed",
+        "effective_signal_grade": "S",
+        "signal_grade": "S",
+        "llm_status": "ok",
+        "plan_origin": "llm_confirmed",
+        "risk_check": {"ok": True},
+        "confidence": 0.95,
+        "signal_id": None,
+        "ga_decision_id": None,
+        "trade_plan": {
+            "side": "LONG",
+            "entry_type": "limit",
+            "entry_price": 100.0,
+            "trigger_price": 100.0,
+            "stop_loss": 95.0,
+            "take_profits": [
+                {"price": 107.5, "ratio": 0.5},
+                {"price": 112.5, "ratio": 0.5},
+            ],
+            "risk_percent": 0.5,
+            "invalid_condition": "15m 收盘跌破 95.0",
+            "reason": "结构偏多，等待回踩确认；仅用于模拟盘（canned 08-08 5.6）",
+        },
+    }
+
+
+def _make_canned_analyze(captured: dict, decision: dict) -> callable:
+    """Narrow handler-contract ``_analyze`` stub: records the canned decision
+    into ``captured`` and returns it. No snapshot, no adapter, no controller —
+    the handler's watch->bridge->order logic is exactly what is under test."""
+    def _analyzer(repo, *, symbol, analysis_time_utc, snapshot_id):
+        captured["decision"] = decision
+        return decision
+    return _analyzer
+
+
+def _make_counting_canned_analyze(captured: dict, count: dict, decision: dict) -> callable:
+    """Wrap the canned analyzer with an analyze counter so the duplicate /
+    once-ever tests can assert the analyzer runs exactly once."""
+    inner = _make_canned_analyze(captured, decision)
 
     def _analyzer(repo, *, symbol, analysis_time_utc, snapshot_id):
         count["n"] += 1
@@ -319,7 +380,10 @@ class TestRejectedPathNoOrder:
     def test_llm_no_plan_rejected_no_order_no_outbox(self) -> None:
         """P1-4 rejected path: the real controller yields a C-grade decision
         (LLM produced no plan) -> the order gate rejects -> recheck_rejected,
-        no paper order, no alert_outbox row."""
+        no paper order, no alert_outbox row. KEPT on the REAL controller/
+        adapter path (Step 5.6): this is the only test exercising the rejected
+        no-plan production branch, so it stays real — the refactor narrows only
+        concurrency/duplicate/terminal-once-ever."""
         handle = make_repo()
         try:
             repo = handle.repo
@@ -362,7 +426,8 @@ class TestConcurrencyTaskLock:
     def test_concurrent_recheck_blocked_by_task_lock(self) -> None:
         """P1-4 concurrency: the per-watch task lock allows only ONE recheck at
         a time. A concurrent recheck (lock already held) returns
-        ``recheck_already_in_progress`` and creates no order."""
+        ``recheck_already_in_progress`` and creates no order. The analyzer is
+        never invoked (canned, Step 5.6) — the lock short-circuits first."""
         handle = make_repo()
         try:
             repo = handle.repo
@@ -376,7 +441,7 @@ class TestConcurrencyTaskLock:
             from plugins.crypto_guard.run_ga_workers import handle_opportunity_watch_recheck
             result = handle_opportunity_watch_recheck(
                 repo, {"watch_id": watch_id}, send_message=None,
-                _analyze=_make_real_controller_analyze({}),
+                _analyze=_make_canned_analyze({}, _canned_confirmed_decision(_SYMBOL)),
             )
             assert result.get("ok") is False, result
             assert result.get("error") == "recheck_already_in_progress", result
@@ -395,7 +460,9 @@ class TestDuplicateTasksSingleOrder:
     def test_repeated_trigger_single_analysis_single_order(self) -> None:
         """P1-4 duplicate: a repeated trigger (duplicate job) must NOT
         re-analyze or re-order — the once-ever link + task lock make the
-        bridge idempotent (single analysis, single order)."""
+        bridge idempotent (single analysis, single order). Canned decisions
+        (Step 5.6): the count wrapper asserts the handler's once-ever logic runs
+        the analyzer exactly once."""
         handle = make_repo()
         try:
             repo = handle.repo
@@ -408,7 +475,8 @@ class TestDuplicateTasksSingleOrder:
             from plugins.crypto_guard.run_ga_workers import handle_opportunity_watch_recheck
             first = handle_opportunity_watch_recheck(
                 repo, {"watch_id": watch_id}, send_message=None,
-                _analyze=_make_counting_real_analyze(captured, count),
+                _analyze=_make_counting_canned_analyze(
+                    captured, count, _canned_confirmed_decision(_SYMBOL)),
             )
             assert first.get("created") is True, first
             assert count["n"] == 1
@@ -419,7 +487,8 @@ class TestDuplicateTasksSingleOrder:
 
             second = handle_opportunity_watch_recheck(
                 repo, {"watch_id": watch_id}, send_message=None,
-                _analyze=_make_counting_real_analyze(captured, count),
+                _analyze=_make_counting_canned_analyze(
+                    captured, count, _canned_confirmed_decision(_SYMBOL)),
             )
             assert second.get("duplicate") is True, (
                 f"P1-4 RED: a repeated trigger must be detected as a duplicate; {second}"
@@ -446,7 +515,9 @@ class TestTerminalOnceEver:
     def test_terminal_order_still_holds_once_ever_link(self) -> None:
         """P1-4 terminal once-ever: a TERMINAL (filled) order still holds the
         once-ever link, so a delayed-retry recheck is judged duplicate and
-        never re-analyzes nor mints a second order."""
+        never re-analyzes nor mints a second order. Canned decisions (Step 5.6):
+        the ``captured2`` probe proves the once-ever lookup short-circuits the
+        analyzer on the retry."""
         handle = make_repo()
         try:
             repo = handle.repo
@@ -458,7 +529,7 @@ class TestTerminalOnceEver:
             from plugins.crypto_guard.run_ga_workers import handle_opportunity_watch_recheck
             first = handle_opportunity_watch_recheck(
                 repo, {"watch_id": watch_id}, send_message=None,
-                _analyze=_make_real_controller_analyze(captured),
+                _analyze=_make_canned_analyze(captured, _canned_confirmed_decision(_SYMBOL)),
             )
             assert first.get("created") is True, first
             order_id = int(first.get("paper_order_id"))
@@ -471,7 +542,7 @@ class TestTerminalOnceEver:
             captured2: dict = {}
             second = handle_opportunity_watch_recheck(
                 repo, {"watch_id": watch_id}, send_message=None,
-                _analyze=_make_real_controller_analyze(captured2),
+                _analyze=_make_canned_analyze(captured2, _canned_confirmed_decision(_SYMBOL)),
             )
             assert second.get("duplicate") is True, (
                 f"P1-4 RED: a terminal order must still hold the once-ever link; {second}"

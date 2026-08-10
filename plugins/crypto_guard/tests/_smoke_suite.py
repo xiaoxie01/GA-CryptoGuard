@@ -50153,7 +50153,19 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         finally:
             lease.release(symbol=held_sym)
 
-    def test_r5_p0_defers_past_old_eighth_count_never_exhausted(self) -> None:
+    def test_r5_p0_defers_past_old_eighth_count_never_exhausted_pst180(self) -> None:
+        """R5-P0 pst=180 -- perf split (was one serial ~124s straggler)."""
+        self._r5_p0_defers_past_old_eighth_count_never_exhausted(180)
+
+    def test_r5_p0_defers_past_old_eighth_count_never_exhausted_pst300(self) -> None:
+        """R5-P0 pst=300 -- perf split (was one serial ~124s straggler)."""
+        self._r5_p0_defers_past_old_eighth_count_never_exhausted(300)
+
+    def test_r5_p0_defers_past_old_eighth_count_never_exhausted_pst1200(self) -> None:
+        """R5-P0 pst=1200 -- perf split (was one serial ~124s straggler)."""
+        self._r5_p0_defers_past_old_eighth_count_never_exhausted(1200)
+
+    def _r5_p0_defers_past_old_eighth_count_never_exhausted(self, pst) -> None:
         """R5-P0 spec test #1: for per_symbol_timeout in {180, 300, 1200}, defer
         the held symbol ITERATIVELY from defer_count=0 PAST the OLD fixed eighth
         count (defer_count reaches 9) -- NONE of the three configs may exhaust
@@ -50203,11 +50215,17 @@ class Test07_10FairBatchProductionChain(TestPhaseA07_10LLMFairSchedulingRepro):
         from datetime import datetime, timezone
         lease = global_single_flight_lease()
         _BUFFER = run_ga_workers._SINGLE_FLIGHT_DEFER_CLEANUP_BUFFER_SECONDS  # 60
-        _cases = [
-            {"pst": 180, "window": 180 + _BUFFER, "exp_max_defers": 17},
-            {"pst": 300, "window": 300 + _BUFFER, "exp_max_defers": 25},
-            {"pst": 1200, "window": 1200 + _BUFFER, "exp_max_defers": 85},
-        ]
+        # Perf (08-08 feedback loop): the three pst cases each drove ~9 REAL
+        # run_once ticks serially in ONE test -- this was the #1 parallel
+        # straggler at ~124s. Parametrizing over pst splits them across nodes;
+        # each node gets a fresh setUp (fresh schema + tmp dir), so case
+        # isolation is strictly better than the old serial loop.
+        _case = {
+            "pst": pst,
+            "window": pst + _BUFFER,
+            "exp_max_defers": (pst + _BUFFER) // 15 + 1,
+        }
+        _cases = [_case]
         for _case in _cases:
             pst = _case["pst"]
             # Sanity: the resolved dynamic max_defers matches the spec and the

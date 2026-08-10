@@ -15,6 +15,8 @@ dedicated ``crypto_guard_app`` role on the ``crypto_guard`` database.
 
 from __future__ import annotations
 
+import math
+import os
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -72,6 +74,26 @@ def database_identity(dsn: str | None = None) -> str:
     return f"postgresql://{user}@{host}:{port}/{dbname}"
 
 
+def _pool_open_timeout() -> float:
+    """Eager pool-open bound, env-tunable (P2-4); default 30.0s (production).
+
+    ``CRYPTO_GUARD_POOL_OPEN_TIMEOUT`` lets an operator narrow the bound on a
+    slow host or for fail-fast tests. A garbage value, a non-positive value,
+    ``nan``, or ``inf`` all fall back to the 30.0s production default
+    (终审返工 P1 08-10: the original production posture was psycopg's 30s
+    ``pool.open`` bound; a global 3s test default must never affect production
+    connection behavior).
+    """
+    raw = os.environ.get("CRYPTO_GUARD_POOL_OPEN_TIMEOUT", "30.0")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    if not math.isfinite(value) or value <= 0:
+        return 30.0
+    return value
+
+
 def get_pool() -> ConnectionPool:
     """Return the process-wide connection pool, creating it on first use."""
     global _POOL, _POOL_DSN
@@ -95,6 +117,17 @@ def get_pool() -> ConnectionPool:
             # bad DSN (wrong port, unreachable host) fails fast HERE, at pool
             # creation - not deferred to the first ``getconn()``. Fail-fast at
             # ``get_pool`` is the fail-closed contract callers rely on.
+            #
+            # ``open(wait=True)`` waits up to *its own* ``timeout`` for the
+            # ``min_size`` connection; a DSN ``connect_timeout`` only bounds each
+            # libpq attempt, not the pool retry, so without this a dead port
+            # blocks 30s+ instead of failing fast. The bound's DEFAULT is the
+            # production 30s posture (终审返工 P1 08-10: the original code had no
+            # explicit timeout, i.e. psycopg's 30s); it is env-tunable
+            # (``CRYPTO_GUARD_POOL_OPEN_TIMEOUT``) and tests that need a tight
+            # fail-fast bound set it EXPLICITLY to 3s locally. The pool *checkout*
+            # timeout (30.0, below) is unchanged - steady-state ``getconn`` under
+            # load is not affected.
             pool = ConnectionPool(
                 conninfo=dsn,
                 min_size=1,
@@ -103,7 +136,7 @@ def get_pool() -> ConnectionPool:
                 configure=_build_conn_kwargs_for_pool,
                 open=False,
             )
-            pool.open(wait=True)
+            pool.open(wait=True, timeout=_pool_open_timeout())
         except Exception as exc:  # noqa: BLE001 - any pool/open failure is fatal-but-catchable
             raise CryptoGuardDBUnavailable(
                 f"PostgreSQL pool unavailable ({type(exc).__name__})"

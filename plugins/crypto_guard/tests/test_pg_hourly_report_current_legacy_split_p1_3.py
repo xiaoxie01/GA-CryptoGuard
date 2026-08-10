@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.tests.pg_fixtures import make_repo
 from plugins.crypto_guard.diagnostics.state_consistency import (

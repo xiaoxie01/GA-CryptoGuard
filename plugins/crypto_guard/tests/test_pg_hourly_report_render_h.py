@@ -70,10 +70,36 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.notify import hourly_report
-from plugins.crypto_guard.tests.pg_fixtures import make_repo
+from plugins.crypto_guard.tests.pg_fixtures import make_repo as _real_make_repo
+
+
+class _RenderNullHandle:
+    """5.3 prebuilt-snapshot fast path.
+
+    Every test in this file is a PURE RENDER test: it feeds hand-built row
+    dicts to the renderers (``_format_opportunity_row`` / ``_trade_plan_summary``
+    / ``_render_plan_state_label``) and asserts on the output text. NONE of them
+    reads ``handle``/``repo``/``conn`` — the ``handle = make_repo()`` call in
+    each test only paid ~5.3s of per-test fresh-schema DDL for nothing. This
+    no-op handle preserves the exact ``handle = make_repo()`` … ``finally:
+    handle.close()`` shape so every assertion stays byte-identical, while the
+    render path runs on the prebuilt snapshots without re-running the DB setup.
+
+    The ONE full-path integration test (real SQL -> funnel stats -> render)
+    lives in ``test_pg_08_08_hourly_funnel_stats.py``
+    (``test_watch_stats_aggregate_and_exclude_pre_marker``); the funnel
+    stats/reminder assertions there are preserved verbatim.
+    """
+
+    def close(self) -> None:
+        pass
+
+
+def make_repo(*, initialize_schema: bool = True) -> _RenderNullHandle:
+    return _RenderNullHandle()
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────

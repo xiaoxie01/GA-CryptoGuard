@@ -39,7 +39,7 @@ from typing import Any
 
 import pytest
 
-pytestmark = [pytest.mark.pg, pytest.mark.e2e]
+pytestmark = [pytest.mark.pg, pytest.mark.e2e, pytest.mark.rollback_isolation]
 
 from plugins.crypto_guard.diagnostics.report_diagnostics import (
     EXECUTION_FUNNEL_REPORT_CONTRACT_MARKER_KEY,
