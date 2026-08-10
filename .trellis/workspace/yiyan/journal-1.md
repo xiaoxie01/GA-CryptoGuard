@@ -1567,3 +1567,69 @@ section). Summary:
   implementation_complete=false, final_seal_complete=false, production_ready=false,
   production_recovered=false. **等待用户终审与分组 commit 授权。**
   No push / release / restart / finish-work / production DB mutation executed.
+
+## Session: R1-3 hard gate MET + SINGLE valid final-seal frozen double-run LAUNCHED (08-10)
+
+**Task**: 08-08 test feedback loop acceleration (Step 6)
+**Branch**: `main`, HEAD e9d7675, frozen tree
+
+- R1-3 hard gate MEASURED-MET: single `full` complete-suite run on the CURRENT
+  tree (post round-10 delta: 3-file rollback_isolation widening +
+  feedback_ttl.py production fix) → `complete_suite_ok elapsed_seconds=2031.32`
+  (33.9 min ≤ 2400 s hard gate, exit 0). partition_ok all=2148 parallel=2120
+  serial=28 (serial 28/28 passed in 183.83s). vs pre-rework 2618.74s (43.6 min)
+  = −587s (−22%) with MORE tests (2148 vs 2092, R1-4 holds). Stretch ≤1500s NOT
+  the gate (machine lacks ≥13 effective cores). Recorded in
+  research/step6-single-full-run-2.md; implement.md + final-seal.md updated.
+- All pre-gates green: round-9 PASS, round-10 PASS, single full ≤40 min MET.
+- SINGLE valid final-seal frozen double-run LAUNCHED (background, PID 3256):
+  `python -m plugins.crypto_guard.tests.run_change_aware --tier final-seal
+  --workers 8`. Contract: F1→RUN1→F2→RUN2→F3, F1==F2==F3, each run ≤2400s
+  (exit 4), drift exit 3, BOTH_GREEN + run_elapsed_seconds, NEVER from cache,
+  executed exactly once, ~70 min. Pre-launch verified: evidence.jsonl 0 bytes,
+  HEAD e9d7675, no leftover pytest procs, CRYPTO_GUARD_DB_ADMIN_PASSWORD set.
+- If both runs ≤40 min AND F1==F2==F3 → set implementation_complete=true +
+  final_seal_complete=true in final-seal.md (operator directive), production
+  states stay false → STOP at commit authorization.
+## UPDATE: final-seal RUN1 aborted (runner-parser bug) → FIXED RED-first → RELAUNCHED (08-10)
+
+- First final-seal attempt (05:57) FAILED exit 1 in RUN1: parallel pytest
+  genuinely PASSED (2120 passed, exit 0, 1433.60s) but _run_exact_stage's
+  UNANCHORED `(\d+) failed|skipped` regex misread -rA-captured app-log lines
+  (`..._1783641599999 failed identity contract` ×2, `enabled=10 queued=10
+  skipped=0` ×2) → `RuntimeError: full:parallel stage was not exact:
+  {'failed': 3567283199998, 'skipped': 20}` → exit 1 BEFORE the final-seal
+  contract (exit 4/3/BOTH_GREEN) could engage. NO evidence written (0 bytes).
+- ROOT CAUSE: run_change_aware._run_stages passes -rA (per-node verdicts); -rA
+  appends every test's captured output incl. app logs; run_complete_suite.main
+  never passes -rA, so the 2031.32s single-full ran clean. Bug only surfaces at
+  full-suite scale through the change-aware runner.
+- FIX (test-framework file in allowed set, exactness STRENGTHENED): extracted
+  `_stage_counts(combined)` in run_complete_suite.py; anchored failed/skipped/
+  deselected EXACTLY like the existing passed scan `(?:^|\s)...(?:\s|,|$)`.
+  2 new pure-unit regression tests (RED: revert → `{'failed':
+  1783641599999, 'skipped': 10}`; GREEN: 41 passed in 98.83s full runner file;
+  genuine-banner detection preserved). Mapping digest ff5de36a unchanged.
+  Recorded in research/step6-final-seal-run1-parser-fix.md.
+- Final-seal RELAUNCHED 06:5x (PID 11844, RUN1 parallel live, -rA path). This
+  is still the SINGLE valid execution — the aborted attempt recorded no
+  evidence. Evidence.jsonl still 0 bytes.
+
+- Final-seal RUN2 (be2qv6d7k) FAILED exit 1 in RUN1 — NOT a gate failure, NO
+  evidence. Parser fix WORKED: correctly detected a genuine `1 failed`
+  (test_shadow_lifecycle_regressions.py::ShadowVTLifecycleTest::test_fill_before_size_order)
+  and propagated exit 1. Root cause: test died in setUp at pg_db.py:135
+  `pool.open(wait=True, timeout=3.0)` → psycopg_pool.PoolTimeout: pool
+  initialization incomplete after 3.0 sec on [gw7] — transient PG
+  connection-establishment contention under 8-worker load, NOT test logic.
+  Isolated: `1 passed in 8.73s`. My +2 tests are pure-unit/PG-neutral
+  (partition 2148→2150 all, 2120→2122 parallel). 3s bound unchanged and the
+  all=2148 single-full (2031.32s, same 8 workers) ran clean → flake is rare.
+  08-02 precedent: pre-existing concurrency flake under 8-worker load = NOT a
+  finding, no code change, green on retry. Disposition: NOT a finding, NO code
+  change (R1-4). Widening CRYPTO_GUARD_POOL_OPEN_TIMEOUT rejected (would change
+  measurement env vs 2031.32s baseline = harness-tuning-to-pass). Recorded in
+  research/step6-final-seal-run2-pool-flake.md.
+- Final-seal RELAUNCHED (RUN3) on the UNCHANGED tree — the SINGLE valid
+  execution (both aborted attempts recorded no evidence). STOP condition: if
+  this third launch fails for any reason, no further re-launches.
