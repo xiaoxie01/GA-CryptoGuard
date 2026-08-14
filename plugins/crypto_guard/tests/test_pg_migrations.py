@@ -74,6 +74,19 @@ EXPECTED_MARKERS = {
     "watch_recheck_risk_shape_contract_v1",
     "watch_review_payload_serialization_contract_v1",
     "watch_recheck_funnel_contract_v1",
+    # 08-10 Step 3: entry-confirmation lifecycle contract marker. Written by
+    # initialize_database ONLY after the entry_confirmation_events table +
+    # exact UNIQUE fingerprint index exist AND the health gate passes (same
+    # transaction as the schema change, LAST marker). Absence is fail-closed
+    # (diagnose_state_consistency marker-missing error).
+    "entry_confirmation_lifecycle_contract_v1",
+    # 08-10 Step 9: LLM risk-governance contract markers. Written by
+    # initialize_database AFTER the health gate passes (same transaction,
+    # LAST markers). Absence is fail-closed in
+    # diagnose_llm_risk_governance (marker-missing error per marker).
+    "llm_risk_proposal_contract_v1",
+    "risk_adjustment_verifier_contract_v1",
+    "llm_risk_context_isolation_contract_v1",
 }
 
 
@@ -551,6 +564,79 @@ class TestPostgresInitializeDatabase(unittest.TestCase):
             markers_after,
             markers_before,
             "failed init changed the marker set (not atomic)",
+        )
+
+
+class TestRiskAdvisoryModeMigration(unittest.TestCase):
+    """08-12 (fresh reviewer P2-2): ``paper_orders.risk_advisory_mode``.
+
+    Pins the additive migration's two contracts:
+    1. On a fresh greenfield scratch schema (``paper_orders`` does NOT exist
+       yet -- ``initialize_database`` runs the additive migrations BEFORE the
+       schema DDL), the migration safe no-ops; the schema DDL then declares the
+       column directly. WITHOUT the table-existence guard this path raises
+       ``UndefinedTable`` (the final-seal RED cluster that broke test_pg_health
+       / test_pg_migrations / test_pg_08_06_legacy_upgrade_p1).
+    2. On a legacy schema where ``paper_orders`` exists WITHOUT the column, the
+       migration adds it.
+    """
+
+    def setUp(self) -> None:
+        self._repo_handle = make_repo(initialize_schema=False)
+
+    def tearDown(self) -> None:
+        self._repo_handle.close()
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        with pg_db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = %s AND column_name = %s",
+                    (table, column),
+                )
+                found = cur.fetchone() is not None
+            conn.rollback()
+        return found
+
+    def test_fresh_schema_safe_no_op(self) -> None:
+        """No ``paper_orders`` yet -> the additive migration safe no-ops."""
+        from plugins.crypto_guard.storage.migrations import (
+            apply_08_12_risk_advisory_mode_migration,
+        )
+
+        # The migration must not raise on a schema that lacks the table.
+        with pg_db.transaction() as conn:
+            apply_08_12_risk_advisory_mode_migration(conn)
+        self.assertFalse(
+            self._column_exists("paper_orders", "risk_advisory_mode"),
+            "fresh-schema migration created a column in a table that does not exist",
+        )
+
+    def test_legacy_schema_with_paper_orders_adds_column(self) -> None:
+        """``paper_orders`` exists WITHOUT the column -> the migration adds it."""
+        from plugins.crypto_guard.storage.migrations import (
+            apply_08_12_risk_advisory_mode_migration,
+        )
+
+        initialize_database()
+        # Greenfield declares the column; drop it to simulate a legacy pre-08-12
+        # schema, then the additive migration re-adds it.
+        with pg_db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE paper_orders DROP COLUMN risk_advisory_mode"
+                )
+        self.assertFalse(
+            self._column_exists("paper_orders", "risk_advisory_mode"),
+            "precondition: column should be gone after DROP",
+        )
+        with pg_db.transaction() as conn:
+            apply_08_12_risk_advisory_mode_migration(conn)
+        self.assertTrue(
+            self._column_exists("paper_orders", "risk_advisory_mode"),
+            "additive migration did not re-add the column",
         )
 
 

@@ -41,6 +41,13 @@ DEFAULTS = {
     # healthy account. Cooldown / negative avgR still block during
     # ordinary risk_off and during recovery.
     "block_healthy_account_on_negative_combo_avg_r": False,
+    # 08-10 P2-3 (reviewer finding): per-trade and total account risk caps.
+    # prd.md P1-3: effective risk may never exceed the configured per-trade
+    # cap nor the remaining total-account budget. These feed the risk
+    # adjustment verifier's FAIL-CLOSED cap gate through
+    # run_ga_workers._derive_account_state.
+    "max_single_trade_risk_pct": 2.0,
+    "max_total_risk_pct": 10.0,
 }
 
 

@@ -24,6 +24,10 @@ from plugins.crypto_guard.reasoning.watch_conditions import (
     is_structured_watch,
     normalize_opportunity_watch,
 )
+from plugins.crypto_guard.risk.risk_committee import (
+    build_risk_adjustment_review_system_prompt,
+    validate_risk_adjustment_review,
+)
 from plugins.crypto_guard.risk.risk_engine import apply_risk_to_decision
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
 from plugins.crypto_guard.utils import _strict_positive_int_ms
@@ -92,6 +96,9 @@ TASK_SYSTEM_PROMPTS: dict[str, str] = {
     "self_evolution_candidate_patch": """你是 GA CryptoGuard 的自进化候选补丁 Agent。
 基于复盘聚合提出策略 candidate patch；必须避免单品种过拟合；只能输出 candidate patch，不能直接 active。
 只输出一个符合本任务 schema 的 JSON 对象，禁止 Markdown；patch 字段为空表示当前不应生成补丁。""",
+    # 08-10 Step 5: ``build_risk_adjustment_review_system_prompt`` is the single
+    # source of truth (LLM_PROMPTS.md §4.2 inventory mirrors it verbatim).
+    "risk_adjustment_review": build_risk_adjustment_review_system_prompt(),
 }
 
 # Every generic task has a per-task schema under ``schemas/<name>.schema.json``
@@ -111,6 +118,7 @@ TASK_SCHEMAS: dict[str, str] = {
     "candidate_strategy_config_review": "candidate_strategy_config_review.schema.json",
     "shadow_test_strategy_verdict": "shadow_test_strategy_verdict.schema.json",
     "self_evolution_candidate_patch": "self_evolution_candidate_patch.schema.json",
+    "risk_adjustment_review": "risk_adjustment_review.schema.json",
 }
 
 
@@ -126,8 +134,15 @@ def _semantic_self_evolution_candidate_patch(result: dict[str, Any]) -> tuple[bo
 
 # Per-task semantic validation hooks applied to the MERGED result (fallback +
 # LLM candidate) after schema validation. Absent entries mean no extra hook.
+# 08-10 Step 5: ``risk_adjustment_review`` registers
+# ``validate_risk_adjustment_review``; at this call site it is invoked with NO
+# round context (``context=None``), so only the schema-independent structural
+# verdict checks run there. The context-aware validation (reason codes,
+# evidence refs, blocker acknowledgment) runs in the risk pipeline via
+# ``parse_risk_adjustment_review(raw, context=ctx)`` (Step 8).
 TASK_SEMANTIC_VALIDATORS: dict[str, Callable[[dict[str, Any]], tuple[bool, str | None]]] = {
     "self_evolution_candidate_patch": _semantic_self_evolution_candidate_patch,
+    "risk_adjustment_review": validate_risk_adjustment_review,
 }
 
 

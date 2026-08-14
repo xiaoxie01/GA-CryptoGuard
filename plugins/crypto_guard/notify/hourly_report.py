@@ -355,6 +355,27 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
             )
         else:
             LOGGER.warning("hourly_report: %s", _watch_stats.get("error") or "watch funnel stats unavailable")
+    # 08-10 Step 9: LLM risk-committee funnel. Same deploy-flag semantics as the
+    # execution-funnel split: ANY missing 08-10 marker fails closed (no risk
+    # section, no orders_created count). Decision-side counters come from
+    # current-scope ``_decision_row`` output; ``orders_created`` is a real
+    # PostgreSQL aggregate (paper_orders JOIN ga_decisions, filtered on the
+    # DECISION-side created_at because a paper order's own created_at is the
+    # fill time, unrelated to the marker window).
+    llm_risk_cutoff_utc = _get_llm_risk_report_contract_marker_ts(repo)
+    llm_risk_funnel_stats: dict[str, Any] | None = None
+    if llm_risk_cutoff_utc:
+        llm_risk_funnel_stats = _aggregate_llm_risk_funnel([
+            _decision_row(
+                row,
+                execution_funnel_cutoff_utc=execution_funnel_cutoff_utc,
+                llm_risk_cutoff_utc=llm_risk_cutoff_utc,
+            )
+            for row in ga_decisions
+        ])
+        llm_risk_funnel_stats["orders_created"] = _pg_llm_risk_orders_created(
+            repo, llm_risk_cutoff_utc,
+        )
     # P2 (07-09 R4): ``_agent_hourly_brief`` applies the legacy schema-fail
     # split internally so the LLM brief context never receives archived
     # legacy jobs. Pass raw ``failed_jobs`` here - the function filters.
@@ -384,7 +405,7 @@ def build_hourly_report(repo: CryptoGuardRepository, *, retry_count: int = 0, ex
         "batch": batch_state,
         "agent_brief": agent_brief,
         "text": (
-            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc, execution_funnel_stats=execution_funnel_stats)
+            render_ga_hourly_summary(now, active_symbols, ga_decisions, open_orders, active_watches, failed_jobs, queue_counts, equity_snapshot=equity, duckdb_stats=duckdb_stats, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc, execution_funnel_stats=execution_funnel_stats, llm_risk_cutoff_utc=llm_risk_cutoff_utc, llm_risk_funnel_stats=llm_risk_funnel_stats)
             if ga_decisions
             else render_hourly_report_text(now, active_symbols, signals, open_orders, failed_jobs, queue_counts, agent_brief=agent_brief, analysis_states=states, equity_snapshot=equity, risk_state=risk_state, shadow_data_quality=shadow_data_quality, feedback_patterns=feedback_patterns, long_short_performance=long_short_performance, account_feedback_gate=account_feedback_gate, market_regime_gate=market_regime_gate, state_consistency=state_consistency, batch_state=batch_state, report_accuracy_diagnostics=report_accuracy_diagnostics, market_data_quality=market_data_quality)
         ),
@@ -938,12 +959,20 @@ def render_ga_hourly_summary(
     market_data_quality: dict[str, Any] | None = None,
     execution_funnel_cutoff_utc: str | None = None,
     execution_funnel_stats: dict[str, Any] | None = None,
+    llm_risk_cutoff_utc: str | None = None,
+    llm_risk_funnel_stats: dict[str, Any] | None = None,
 ) -> str:
     # 08-02 P2-3 (fresh reviewer): forward the execution-funnel report-contract
     # marker cutoff so pre-marker rows render the four-aspect split as legacy
-    # (None aspects) instead of a misleading all-False current split.
+    # (None aspects) instead of a misleading all-False current split. 08-10
+    # Step 9: forward ``llm_risk_cutoff_utc`` the same way so the risk-committee
+    # envelope keys and ``llm_risk_scope`` land on every rendered row.
     rows = [
-        _decision_row(row, execution_funnel_cutoff_utc=execution_funnel_cutoff_utc)
+        _decision_row(
+            row,
+            execution_funnel_cutoff_utc=execution_funnel_cutoff_utc,
+            llm_risk_cutoff_utc=llm_risk_cutoff_utc,
+        )
         for row in ga_decisions
     ]
     grade_counts: dict[str, int] = {grade: 0 for grade in ("S", "A", "B", "C", "D")}
@@ -1477,6 +1506,47 @@ def render_ga_hourly_summary(
                 watches=int(execution_funnel_stats.get("watches_triggered") or 0),
                 rejected=rejected_txt or "-",
                 orders=int(execution_funnel_stats.get("orders_created") or 0),
+            )
+        )
+
+    # 08-10 Step 9: LLM risk-committee section. Rendered only when the caller
+    # supplies ``llm_risk_funnel_stats`` (missing 08-10 markers fail closed to
+    # no section, matching the deploy-flag ``llm_risk_scope`` gate).
+    if llm_risk_funnel_stats and not llm_risk_funnel_stats.get("error"):
+        _llm_conf = llm_risk_funnel_stats.get("confirmation") or {}
+        _llm_verdicts = llm_risk_funnel_stats.get("proposal_verdicts") or {}
+        _llm_rejected = llm_risk_funnel_stats.get("verifier_rejected_by_reason") or {}
+        rejected_txt = ", ".join(
+            f"{k}={int(v)}" for k, v in sorted(_llm_rejected.items())
+        )
+        lines.extend(["", "**LLM 风控委员会（本小时）**"])
+        lines.append(
+            "- 入场确认 当前 {current} · 已延续 {carried} · 已过期 {expired} "
+            "· 已失效 {invalidated} · 缺失 {absent}".format(
+                current=int(_llm_conf.get("current") or 0),
+                carried=int(_llm_conf.get("carried") or 0),
+                expired=int(_llm_conf.get("expired") or 0),
+                invalidated=int(_llm_conf.get("invalidated") or 0),
+                absent=int(_llm_conf.get("absent") or 0),
+            )
+        )
+        lines.append(
+            "- 建议 通过 {approve} · 调整 {adjust} · 等待 {wait} · 拒绝 {reject} "
+            "· 失败 {failed}".format(
+                approve=int(_llm_verdicts.get("approve_as_is") or 0),
+                adjust=int(_llm_verdicts.get("adjust") or 0),
+                wait=int(_llm_verdicts.get("wait") or 0),
+                reject=int(_llm_verdicts.get("reject") or 0),
+                failed=int(_llm_verdicts.get("failed") or 0),
+            )
+        )
+        lines.append(
+            "- 验证 接受 {accepted} · 拒绝 {rejected} · 最终风控通过 {passed} "
+            "· 生成订单 {orders}".format(
+                accepted=int(llm_risk_funnel_stats.get("verifier_accepted") or 0),
+                rejected=rejected_txt or "-",
+                passed=int(llm_risk_funnel_stats.get("final_risk_pass") or 0),
+                orders=int(llm_risk_funnel_stats.get("orders_created") or 0),
             )
         )
 
@@ -2530,6 +2600,7 @@ def _decision_row(
     row: dict[str, Any],
     *,
     execution_funnel_cutoff_utc: str | None = None,
+    llm_risk_cutoff_utc: str | None = None,
 ) -> dict[str, Any]:
     raw = _safe_json(row.get("raw_decision_json"), {})
     trade_plan = _safe_json(row.get("trade_plan_json"), {})
@@ -2541,6 +2612,14 @@ def _decision_row(
         if _after_execution_funnel_cutoff(row.get("created_at"), execution_funnel_cutoff_utc)
         else "legacy"
     )
+    # 08-10 Step 9: ``llm_risk_scope`` uses DEPLOY-FLAG semantics (NOT a
+    # ``created_at >= cutoff`` comparison). A deployed 08-10 report-contract
+    # marker means the running codebase persists the risk-governance envelopes,
+    # so every row in the report is "current"; a missing marker FAILS CLOSED to
+    # "legacy" (never fail-open). This mirrors the end-to-end contract: a row
+    # created BEFORE the cutoff but read by a post-marker codebase still counts
+    # as current because its envelopes were persisted by the new code.
+    llm_risk_scope = "current" if llm_risk_cutoff_utc else "legacy"
     # P1-9: prefer rendered_summary, fallback to final_summary
     rendered_summary = row.get("rendered_summary")
     final_summary = row.get("final_summary")
@@ -2619,6 +2698,15 @@ def _decision_row(
         # scope is "legacy".
         "execution_funnel_scope": execution_funnel_scope,
         **_execution_funnel_four_aspects(raw, risk_check, execution_funnel_scope),
+        # 08-10 Step 9: the three risk-governance envelopes (persisted inside
+        # raw_decision_json) + the ``llm_risk_scope`` gate, exactly parallel to
+        # the execution-funnel split above. The envelope keys are plain
+        # ``raw.get(...)`` so pre-marker rows (no envelopes) naturally read
+        # None without raising.
+        "llm_risk_scope": llm_risk_scope,
+        "entry_confirmation_lifecycle": raw.get("entry_confirmation_lifecycle"),
+        "llm_risk_proposal": raw.get("llm_risk_proposal"),
+        "risk_adjustment_verification": raw.get("risk_adjustment_verification"),
     }
 
 
@@ -2651,6 +2739,135 @@ def _aggregate_execution_funnel(rows: list[dict[str, Any]]) -> dict[str, int]:
             if row.get(aspect) is True:
                 stats[stat] += 1
     return stats
+
+
+def _aggregate_llm_risk_funnel(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """08-10 Step 9: sum the LLM risk-committee buckets over ONLY the
+    ``llm_risk_scope == "current"`` rows (deploy-flag marker gate).
+
+    Confirmation statuses bucket on the persisted lifecycle envelope; proposal
+    verdicts bucket ``approve_as_is / adjust / wait / reject`` and treat any
+    ``proposal_status == "failed"`` (or unknown verdict) as ``failed``;
+    verifier counts accepted vs rejected-by-reason (empty reason list falls
+    back to ``hard_gate``); ``final_risk_pass`` counts ``final_risk_check_ok``;
+    ``orders_created`` counts rows carrying a ``paper_order_id``. Legacy rows
+    contribute 0 to every bucket, and every key is always present (zero when
+    there are no current rows).
+    """
+    stats: dict[str, Any] = {
+        "confirmation": {
+            "current": 0, "carried": 0, "expired": 0,
+            "invalidated": 0, "absent": 0,
+        },
+        "proposal_verdicts": {
+            "approve_as_is": 0, "adjust": 0, "wait": 0,
+            "reject": 0, "failed": 0,
+        },
+        "verifier_accepted": 0,
+        "verifier_rejected_by_reason": {},
+        "final_risk_pass": 0,
+        "orders_created": 0,
+    }
+    for row in rows:
+        if row.get("llm_risk_scope") != "current":
+            continue
+        lifecycle = row.get("entry_confirmation_lifecycle")
+        if isinstance(lifecycle, dict):
+            status = lifecycle.get("status")
+            if status == "valid" and lifecycle.get("origin") == "carried_forward":
+                stats["confirmation"]["carried"] += 1
+            elif status == "expired":
+                stats["confirmation"]["expired"] += 1
+            elif status == "invalidated":
+                stats["confirmation"]["invalidated"] += 1
+            elif status == "valid":
+                stats["confirmation"]["current"] += 1
+            else:
+                stats["confirmation"]["absent"] += 1
+        else:
+            stats["confirmation"]["absent"] += 1
+        proposal = row.get("llm_risk_proposal")
+        if isinstance(proposal, dict):
+            proposal_status = proposal.get("proposal_status")
+            verdict = proposal.get("verdict")
+            if proposal_status == "failed":
+                bucket = "failed"
+            elif verdict in stats["proposal_verdicts"]:
+                bucket = verdict
+            else:
+                bucket = "failed"
+            stats["proposal_verdicts"][bucket] += 1
+        verification = row.get("risk_adjustment_verification")
+        if isinstance(verification, dict):
+            if verification.get("accepted") is True:
+                stats["verifier_accepted"] += 1
+            else:
+                reasons = verification.get("rejection_reasons") or []
+                reason_key = reasons[0] if reasons else "hard_gate"
+                stats["verifier_rejected_by_reason"][reason_key] = (
+                    stats["verifier_rejected_by_reason"].get(reason_key, 0) + 1
+                )
+            if verification.get("final_risk_check_ok") is True:
+                stats["final_risk_pass"] += 1
+        if row.get("paper_order_id") is not None:
+            stats["orders_created"] += 1
+    return stats
+
+
+def _get_llm_risk_report_contract_marker_ts(
+    repo: CryptoGuardRepository,
+) -> str | None:
+    """08-10 Step 9: the MAX ``applied_at`` across the four 08-10 markers.
+
+    Fail closed: ANY missing (or unparseable) marker -> None, so a partially
+    deployed contract never opens the risk-committee funnel to current. The
+    function-local import keeps ``hourly_report`` importable while
+    ``llm_risk_governance`` is still being written (RED phase).
+    """
+    from plugins.crypto_guard.diagnostics.llm_risk_governance import MARKERS
+
+    applied: list[datetime] = []
+    for key in MARKERS.values():
+        row = repo.conn.execute(
+            "SELECT applied_at FROM _migration_state WHERE key=%s", (key,),
+        ).fetchone()
+        if not row or not row["applied_at"]:
+            return None
+        try:
+            if isinstance(row["applied_at"], datetime):
+                dt = row["applied_at"]
+            else:
+                dt = datetime.fromisoformat(
+                    str(row["applied_at"]).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OSError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        applied.append(dt)
+    if not applied:
+        return None
+    return max(applied).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _pg_llm_risk_orders_created(
+    repo: CryptoGuardRepository, llm_risk_cutoff_utc: str | None,
+) -> int:
+    """08-10 Step 9: real PostgreSQL count of paper orders whose linked
+    decision is inside the 08-10 marker window.
+
+    Filtered on the DECISION-side ``created_at`` (not the order's own) because
+    an order's ``created_at`` is the fill time — unrelated to the window the
+    decision's risk envelopes belong to. Missing marker -> 0 (never opened).
+    """
+    if not llm_risk_cutoff_utc:
+        return 0
+    row = repo.conn.execute(
+        "SELECT COUNT(*) AS n FROM paper_orders o "
+        "JOIN ga_decisions d ON d.id = o.ga_decision_id "
+        "WHERE d.created_at >= %s::timestamptz",
+        (llm_risk_cutoff_utc,),
+    ).fetchone()
+    return int(row["n"] if row else 0)
 
 
 def _pg_execution_funnel_watch_stats(
@@ -2939,6 +3156,32 @@ def _format_opportunity_row(
         _state_label = _render_plan_state_label(row)
         if _state_label and _state_label not in result:
             result += f"\n  {_state_label}"
+    # 08-10 Step 9: confirmation lifecycle line. Renders the structured
+    # source/timeframe/age/remaining-TTL (or the expiry/invalidation reason)
+    # from the persisted envelope — NEVER a raw JSON dump. Absent confirmation
+    # (no envelope) renders no line, so pre-marker rows stay unchanged.
+    _llm_lifecycle = row.get("entry_confirmation_lifecycle")
+    if isinstance(_llm_lifecycle, dict):
+        _lc_status = _llm_lifecycle.get("status")
+        _lc_source = _llm_lifecycle.get("source")
+        _lc_timeframe = _llm_lifecycle.get("timeframe")
+        if _lc_status == "valid":
+            _lc_age = int(_llm_lifecycle.get("age_bars") or 0)
+            _lc_ttl = _llm_lifecycle.get("ttl_bars")
+            _lc_remaining = ""
+            if _lc_ttl is not None:
+                _lc_remaining = f" · 剩余 {max(0, int(_lc_ttl) - _lc_age)}"
+            result += (
+                f"\n  入场确认 {_lc_source} {_lc_timeframe}"
+                f" · 已延续 {_lc_age}{_lc_remaining}"
+            )
+        elif _lc_status == "invalidated":
+            result += (
+                f"\n  入场确认 {_lc_source} {_lc_timeframe}"
+                f" · 已失效（{_llm_lifecycle.get('invalidation_reason') or '-'}）"
+            )
+        elif _lc_status == "expired":
+            result += f"\n  入场确认 {_lc_source} {_lc_timeframe} · 已过期"
     return result
 
 

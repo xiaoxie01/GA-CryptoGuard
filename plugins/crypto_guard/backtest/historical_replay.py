@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 
 from plugins.crypto_guard.config.loader import load_config
@@ -73,6 +75,88 @@ def _validate_replay_connected_identity(conn: psycopg.Connection) -> None:
         )
 
 
+_SCRATCH_SCHEMA_RE = re.compile(r"^replay_[0-9a-f]{32}$")
+
+_SQLSTATE_RE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+def _safe_error_summary(exc: BaseException) -> str:
+    """Short failure summary safe for external surfaces.
+
+    Never renders ``str(exc)``/``repr(exc)``: exception messages can embed
+    the DSN, credentials, or arbitrary database text. Only the exception
+    type name plus an optional strictly-validated SQLSTATE
+    (``^[0-9A-Z]{5}$``) is allowed. The ``sqlstate`` read is fail-safe: a
+    raising getter is ignored and never replaces the underlying error.
+    """
+    summary = type(exc).__name__
+    try:
+        sqlstate = getattr(exc, "sqlstate", None)
+    except Exception:
+        sqlstate = None
+    if isinstance(sqlstate, str) and _SQLSTATE_RE.match(sqlstate):
+        summary += f" (SQLSTATE {sqlstate})"
+    return summary
+
+
+def _drop_scratch_schema(schema_name: str, dsn: str) -> str | None:
+    """Drop the scratch schema via a dedicated connection; never silent.
+
+    Runs on a FRESH connection (autocommit) so it never depends on the replay
+    connection's transaction state. The schema name must match the
+    ``replay_<32hex>`` scratch contract before any DROP. Returns ``None`` on
+    success or a short human-readable failure description (never the DSN or
+    any credential) when cleanup itself failed.
+    """
+    if not _SCRATCH_SCHEMA_RE.match(schema_name):
+        raise RuntimeError(f"refusing to drop non-scratch schema {schema_name!r}")
+    conn: psycopg.Connection | None = None
+    try:
+        conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
+        _validate_replay_connected_identity(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS count FROM pg_namespace WHERE nspname = %s",
+                (schema_name,),
+            )
+            row = cur.fetchone()
+            if row is None or row["count"] != 0:
+                return "schema still exists after DROP"
+        return None
+    except Exception as exc:
+        return f"cleanup failure: {_safe_error_summary(exc)}"
+    finally:
+        # ``conn.close`` may itself fail (e.g. the server died mid-cleanup);
+        # it must never replace the returned failure string or the in-flight
+        # body exception, so guard it the same way the body guard does.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _attach_cleanup_failure(body_exc: BaseException, failure: str) -> None:
+    """Attach a cleanup-failure detail to the in-flight body exception.
+
+    ``BaseException.add_note`` requires Python 3.11+ (PEP 678); on older
+    runtimes fall back to chaining a ``RuntimeError`` via ``__cause__`` so the
+    cleanup failure is never lost.
+    """
+    message = f"scratch schema cleanup failed: {failure}"
+    add_note = getattr(body_exc, "add_note", None)
+    if callable(add_note):
+        add_note(message)
+    else:
+        body_exc.__cause__ = RuntimeError(message)
+
+
 @contextmanager
 def _scratch_replay_repo() -> Iterator[CryptoGuardRepository]:
     """Yield a repo bound to an isolated scratch schema; drop it on exit.
@@ -90,6 +174,7 @@ def _scratch_replay_repo() -> Iterator[CryptoGuardRepository]:
 
     dsn = resolve_replay_database_url()
     conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
+    body_exc: BaseException | None = None
     try:
         _validate_replay_connected_identity(conn)
         with conn.cursor() as cur:
@@ -112,17 +197,31 @@ def _scratch_replay_repo() -> Iterator[CryptoGuardRepository]:
             _seed_strategies(cur, cfg.strategies)
         conn.commit()
         yield CryptoGuardRepository(conn)
+    except BaseException as exc:
+        body_exc = exc
+        raise
     finally:
-        # Drop the scratch schema (autocommit so DROP works outside a txn) and
-        # close the dedicated connection. Swallow only DROP errors so a replay
-        # exception still propagates from the ``yield``.
+        # NEVER flip ``autocommit`` on a connection that may still be INTRANS
+        # (psycopg raises ProgrammingError). Roll back if the connection is
+        # still usable, close it, then drop the schema through a dedicated
+        # cleanup connection that owns its own transaction state.
         try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+            conn.rollback()
         except Exception:
             pass
-        conn.close()
+        # ``conn.close`` may itself fail (e.g. the server died mid-replay);
+        # it must never skip the schema DROP, so guard it the same way.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        failure = _drop_scratch_schema(schema_name, dsn)
+        if failure is not None:
+            if body_exc is None:
+                raise RuntimeError(
+                    f"scratch schema cleanup failed: {failure}"
+                ) from None
+            _attach_cleanup_failure(body_exc, failure)
 
 
 # ---------------------------------------------------------------------------

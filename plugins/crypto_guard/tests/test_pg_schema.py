@@ -23,11 +23,13 @@ from plugins.crypto_guard.tests.pg_fixtures import make_repo
 
 # The full set of tables the greenfield schema must create. Every name here
 # MUST appear in information_schema.tables after schema_postgres.sql runs.
-# Sourced from storage/schema.sql + the added _analysis_attempt_counter.
+# Sourced from storage/schema.sql + the added _analysis_attempt_counter +
+# the 08-10 entry_confirmation_events audit table.
 EXPECTED_TABLES = {
     "symbols", "candles", "market_profiles", "market_snapshots",
     "module_analysis_results", "analysis_states", "skill_execution_logs",
-    "skill_feedback_memory", "ga_decisions", "analysis_batches",
+    "skill_feedback_memory", "ga_decisions", "entry_confirmation_events",
+    "analysis_batches",
     "batch_symbol_status", "signals", "ad_hoc_analyses",
     "opportunity_watches", "paper_accounts", "paper_orders", "paper_trades",
     "paper_positions", "paper_trade_logs", "paper_equity_snapshots",

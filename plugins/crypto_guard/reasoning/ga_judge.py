@@ -3,8 +3,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from plugins.crypto_guard.config.loader import load_config
+from plugins.crypto_guard.config.loader import cfg_threshold, load_config
 from plugins.crypto_guard.reasoning.decision_schema import no_edge_decision, validate_json
+from plugins.crypto_guard.reasoning.entry_confirmation_lifecycle import (
+    _extract_structured_entry_confirmation,
+)
 from plugins.crypto_guard.reasoning.watch_conditions import normalize_opportunity_watch
 from plugins.crypto_guard.strategy.strategy_scorer import score_snapshot
 from plugins.crypto_guard.utils import _strict_positive_int_ms
@@ -14,7 +17,10 @@ def _get_min_risk_distance(entry: float) -> float:
     """Get minimum risk distance based on entry price magnitude."""
     cfg = load_config().trading_mode
     risk_cfg = cfg.get("risk", {})
-    min_sl_pct = float(risk_cfg.get("min_sl_distance_pct", 0.8)) / 100.0
+    # 08-10 P2-1 (fresh reviewer P2): fail-closed threshold read — a
+    # present-but-invalid value raises (caller fail-closes), never silently
+    # collapses the minimum risk distance to zero.
+    min_sl_pct = cfg_threshold(risk_cfg, "min_sl_distance_pct", 0.8) / 100.0
     return entry * min_sl_pct
 
 
@@ -103,170 +109,6 @@ def _match_price_precision(price: float, reference: float) -> float:
     else:
         decimals = 0
     return round(price, decimals)
-
-
-def _extract_structured_entry_confirmation(
-    snapshot: dict[str, Any],
-    side: str,
-    entry: float,
-) -> dict[str, Any] | None:
-    """Extract structured entry_trigger_confirmation from PA/SMC module structure_events.
-
-    BTC#9 fix: traverses real ``price_action.structure_events`` and
-    ``smc.structure_events`` lists. Forbids defaulting
-    timeframe/closed/direction — missing fields reject the event.
-
-    Selection criteria (newest valid first):
-    - direction matches trade side (LONG→bullish, SHORT→bearish)
-    - closed must be strictly True (identity check, R4-D5)
-    - candle_close_time <= snapshot.analysis_time_utc (no future leak)
-    - price > 0 and finite
-
-    Returns None if no structured event is available (deterministic plans
-    that can't source real confirmation won't have one — blocked by
-    require_ec gate and downgraded to opportunity_watch).
-
-    R9-1: symbol is mandatory — sourced from snapshot.symbol. If snapshot
-    lacks symbol, return None (fail-closed). This aligns the generation
-    end with R8's symbol-mandatory shape check contract.
-    """
-    import math
-
-    snap_symbol = str(snapshot.get("symbol") or "")
-    if not snap_symbol:
-        return None
-
-    modules = snapshot.get("modules") or {}
-    # 08-08 P1-3: also read the 15m/5m entry periods from ``timeframe_modules``
-    # (in addition to the primary ``modules``), so a legal closed-candle
-    # confirmation that lives only in a lower-timeframe entry period is found.
-    tf_modules = snapshot.get("timeframe_modules") or {}
-    # R11-5: snapshot.analysis_time_utc must be strict positive int
-    analysis_time = _strict_positive_int_ms(snapshot.get("analysis_time_utc"))
-    if analysis_time is None:
-        return None
-
-    # Collect candidate events from both PA and SMC modules
-    candidates: list[dict[str, Any]] = []
-
-    for module_key in ("price_action", "smc"):
-        module_data = modules.get(module_key) or {}
-        events = module_data.get("structure_events")
-        if not isinstance(events, list):
-            continue
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            candidates.append({**event, "_source": module_key})
-
-    # Also check SMC events under a different key for compatibility
-    smc = modules.get("smc") or {}
-    smc_events = smc.get("structure_events")
-    if isinstance(smc_events, list):
-        for event in smc_events:
-            if not isinstance(event, dict):
-                continue
-            if "_source" not in event:
-                candidates.append({**event, "_source": "smc"})
-
-    # 08-08 P1-3: collect from the 15m/5m entry periods of ``timeframe_modules``.
-    # ``_source`` records the timeframe provenance (e.g. "15m:price_action").
-    for tf in ("15m", "5m"):
-        tf_module = tf_modules.get(tf) or {}
-        for module_key in ("price_action", "smc"):
-            sub = tf_module.get(module_key) or {}
-            events = sub.get("structure_events")
-            if not isinstance(events, list):
-                continue
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-                candidates.append({**event, "_source": f"{tf}:{module_key}"})
-
-    if not candidates:
-        return None
-
-    expected_dir = "bullish" if side == "LONG" else "bearish"
-
-    # Filter and validate events
-    valid_events: list[tuple[int, dict[str, Any]]] = []
-    for event in candidates:
-        # Parse event_type
-        raw_event_type = str(event.get("event") or event.get("type") or "").upper()
-        for prefix, canonical in [("BULLISH_BOS", "BOS"), ("BEARISH_BOS", "BOS"),
-                                   ("BULLISH_CHOCH", "CHOCH"), ("BEARISH_CHOCH", "CHOCH"),
-                                   ("BOS", "BOS"), ("CHOCH", "CHOCH"),
-                                   ("RECLAIM", "RECLAIM"), ("BREAKOUT_RETEST", "BREAKOUT_RETEST")]:
-            if raw_event_type == prefix:
-                raw_event_type = canonical
-                break
-        if raw_event_type not in {"BOS", "CHOCH", "RECLAIM", "BREAKOUT_RETEST"}:
-            continue
-
-        # Direction: must be explicitly present, no defaulting
-        direction = str(event.get("direction") or "").lower()
-        if direction not in {"bullish", "bearish"}:
-            # Try to derive from the raw event name only if it contains explicit direction
-            raw_name = str(event.get("event") or event.get("type") or "").lower()
-            if "bullish" in raw_name:
-                direction = "bullish"
-            elif "bearish" in raw_name:
-                direction = "bearish"
-            else:
-                # No explicit direction — reject this event
-                continue
-
-        if direction != expected_dir:
-            continue
-
-        # Timeframe: must be explicitly present and valid, no defaulting
-        timeframe = str(event.get("timeframe") or "")
-        if timeframe not in {"1m", "5m", "15m", "1h", "4h"}:
-            continue
-
-        # candle_close_time: R11-5 must be strict positive int
-        close_time = _strict_positive_int_ms(event.get("candle_close_time") or event.get("close_time"))
-        if close_time is None:
-            continue
-
-        # No future leak (R10-4: analysis_time is guaranteed positive here)
-        if close_time > analysis_time:
-            continue
-
-        # Price: must be finite positive
-        price = event.get("price") or event.get("close")
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(price) or price <= 0:
-            continue
-
-        # R4-D5: closed must be strictly True — reject None, False, "false" string, etc.
-        # Previously: `if closed is not None and not bool(closed)` which accepted
-        # closed=None (missing) and closed="false" (bool("false")==True in Python).
-        closed = event.get("closed")
-        if closed is not True:
-            continue
-
-        source = event.get("_source", "price_action")
-        valid_events.append((close_time, {
-            "type": "closed_candle_confirmation",
-            "timeframe": timeframe,
-            "event_type": raw_event_type,
-            "direction": direction,
-            "candle_close_time": close_time,
-            "price": price,
-            "source": source,
-            "symbol": snap_symbol,
-        }))
-
-    if not valid_events:
-        return None
-
-    # Sort by close_time descending (newest valid first)
-    valid_events.sort(key=lambda x: x[0], reverse=True)
-    return valid_events[0][1]
 
 
 # P1-3: structural-break event types accepted as closed-candle confirmation of

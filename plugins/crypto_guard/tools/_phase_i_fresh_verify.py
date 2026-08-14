@@ -18,11 +18,13 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 
 # Bootstrap the dedicated test DB + app role BEFORE importing config/migrations
@@ -63,6 +65,7 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     """
     from plugins.crypto_guard.storage.migrations import (
         _ensure_btc9_trade_gate_contract_marker,
+        _ensure_entry_confirmation_lifecycle_contract_marker,
         _ensure_execution_funnel_report_contract_marker,
         _ensure_hourly_decision_context_continuity_contract_marker,
         _ensure_hourly_market_semantic_accuracy_contract_marker,
@@ -70,9 +73,12 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
         _ensure_llm_failed_direction_fail_closed_marker,
         _ensure_llm_fair_scheduling_context_contract_marker,
         _ensure_llm_provider_timeout_envelope_contract_marker,
+        _ensure_llm_risk_context_isolation_contract_marker,
+        _ensure_llm_risk_proposal_contract_marker,
         _ensure_llm_schema_breaker_preset_integrity_marker,
         _ensure_market_data_contract_marker,
         _ensure_profit_protection_cutoff_marker,
+        _ensure_risk_adjustment_verifier_contract_marker,
         _ensure_stop_loss_adjustment_dedup_marker,
         _ensure_watch_order_bridge_contract_marker,
         _ensure_watch_recheck_risk_shape_contract_marker,
@@ -110,7 +116,98 @@ def _ensure_all_contract_markers(cur: psycopg.Cursor) -> None:
     _ensure_watch_recheck_risk_shape_contract_marker(cur)
     _ensure_watch_review_payload_serialization_contract_marker(cur)
     _ensure_watch_recheck_funnel_contract_marker(cur)
+    # 08-10 Step 3+9: entry-confirmation lifecycle + LLM risk-governance markers.
+    # Without them a fresh (release-initialized) schema reports the corresponding
+    # marker_missing instead of clean.
+    _ensure_entry_confirmation_lifecycle_contract_marker(cur)
+    _ensure_llm_risk_proposal_contract_marker(cur)
+    _ensure_risk_adjustment_verifier_contract_marker(cur)
+    _ensure_llm_risk_context_isolation_contract_marker(cur)
     _ensure_stop_loss_adjustment_dedup_marker(cur)
+
+
+_FRESH_SCHEMA_RE = re.compile(r"^phase_i_[0-9a-f]{32}$")
+
+_SQLSTATE_RE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+def _safe_error_summary(exc: BaseException) -> str:
+    """Short failure summary safe for external surfaces.
+
+    Mirrors ``backtest/historical_replay._safe_error_summary``. Never
+    renders ``str(exc)``/``repr(exc)``: exception messages can embed the
+    DSN, credentials, or arbitrary database text. Only the exception type
+    name plus an optional strictly-validated SQLSTATE
+    (``^[0-9A-Z]{5}$``) is allowed. The ``sqlstate`` read is fail-safe: a
+    raising getter is ignored and never replaces the underlying error.
+    """
+    summary = type(exc).__name__
+    try:
+        sqlstate = getattr(exc, "sqlstate", None)
+    except Exception:
+        sqlstate = None
+    if isinstance(sqlstate, str) and _SQLSTATE_RE.match(sqlstate):
+        summary += f" (SQLSTATE {sqlstate})"
+    return summary
+
+
+def _drop_fresh_schema(schema_name: str) -> str | None:
+    """Drop the scratch schema via a dedicated connection; never silent.
+
+    Mirrors ``backtest/historical_replay._drop_scratch_schema``: runs on a
+    FRESH connection (autocommit) so it never depends on the fresh-repo
+    connection's transaction state. The schema name must match the
+    ``phase_i_<32hex>`` scratch contract before any DROP. Returns ``None`` on
+    success or a short human-readable failure description (never the DSN or
+    any credential) when cleanup itself failed.
+    """
+    if not _FRESH_SCHEMA_RE.match(schema_name):
+        raise RuntimeError(f"refusing to drop non-scratch schema {schema_name!r}")
+    conn: psycopg.Connection | None = None
+    try:
+        conn = psycopg.connect(_APP_DSN, row_factory=dict_row, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS count FROM pg_namespace WHERE nspname = %s",
+                (schema_name,),
+            )
+            row = cur.fetchone()
+            if row is None or row["count"] != 0:
+                return "schema still exists after DROP"
+        return None
+    except Exception as exc:
+        return f"cleanup failure: {_safe_error_summary(exc)}"
+    finally:
+        # ``conn.close`` may itself fail (e.g. the server died mid-cleanup);
+        # it must never replace the returned failure string or the in-flight
+        # body exception, so guard it the same way the body guard does.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _attach_cleanup_failure(body_exc: BaseException, failure: str) -> None:
+    """Attach a cleanup-failure detail to the in-flight body exception.
+
+    Mirrors ``backtest/historical_replay._attach_cleanup_failure``.
+    ``BaseException.add_note`` requires Python 3.11+ (PEP 678); on older
+    runtimes fall back to chaining a ``RuntimeError`` via ``__cause__`` so the
+    cleanup failure is never lost.
+    """
+    message = f"scratch schema cleanup failed: {failure}"
+    add_note = getattr(body_exc, "add_note", None)
+    if callable(add_note):
+        add_note(message)
+    else:
+        body_exc.__cause__ = RuntimeError(message)
 
 
 @contextmanager
@@ -127,6 +224,7 @@ def _scratch_fresh_repo() -> Iterator[CryptoGuardRepository]:
     """
     schema_name = f"phase_i_{uuid.uuid4().hex}".lower()
     conn = psycopg.connect(_APP_DSN, row_factory=dict_row, autocommit=False)
+    body_exc: BaseException | None = None
     try:
         with conn.cursor() as cur:
             cur.execute(f'CREATE SCHEMA "{schema_name}"')
@@ -146,24 +244,39 @@ def _scratch_fresh_repo() -> Iterator[CryptoGuardRepository]:
             _ensure_all_contract_markers(cur)
         conn.commit()
         yield CryptoGuardRepository(conn)
+    except BaseException as exc:
+        body_exc = exc
+        raise
     finally:
-        # Drop the scratch schema (autocommit so DROP works outside a txn) and
-        # close the dedicated connection. Swallow only DROP errors so a
-        # diagnostic exception still propagates from the ``yield``.
+        # NEVER flip ``autocommit`` on a connection that may still be INTRANS
+        # (psycopg raises ProgrammingError). Roll back if the connection is
+        # still usable, close it, then drop the schema through a dedicated
+        # cleanup connection that owns its own transaction state (mirrors
+        # backtest/historical_replay._scratch_replay_repo).
         try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+            conn.rollback()
         except Exception:
             pass
-        conn.close()
+        # ``conn.close`` may itself fail (e.g. the server died mid-run); it
+        # must never skip the schema DROP, so guard it the same way.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        failure = _drop_fresh_schema(schema_name)
+        if failure is not None:
+            if body_exc is None:
+                raise RuntimeError(
+                    f"scratch schema cleanup failed: {failure}"
+                ) from None
+            _attach_cleanup_failure(body_exc, failure)
 
 
 def main() -> int:
     print("=" * 70)
     print("Phase I - fresh PostgreSQL DB verification of diagnostic suites")
     print("=" * 70)
-    print(f"Test DB DSN: {_APP_DSN.split('@')[-1] if '@' in _APP_DSN else _APP_DSN}")
+    print("Test DB: isolated crypto_guard_test scratch schemas (app role)")
     print()
 
     with _scratch_fresh_repo() as repo:

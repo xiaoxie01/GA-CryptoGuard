@@ -13,7 +13,18 @@ SCHEMA_DIR = PLUGIN_ROOT / "schemas"
 
 
 def load_schema(name: str) -> dict[str, Any]:
-    with (SCHEMA_DIR / name).open("r", encoding="utf-8") as f:
+    """Load a JSON Schema from ``SCHEMA_DIR``.
+
+    Accepts both the bare task name (``"risk_adjustment_review"``) and the full
+    file name (``"risk_adjustment_review.schema.json"``). The ``.schema.json``
+    suffix is appended only when the exact path does not exist, so every
+    existing caller that passes the full file name is unaffected (08-10 Step 5
+    contract: ``load_schema("risk_adjustment_review")`` must resolve the schema
+    file delivered as ``schemas/risk_adjustment_review.schema.json``)."""
+    path = SCHEMA_DIR / name
+    if not path.exists() and not name.endswith(".schema.json"):
+        path = SCHEMA_DIR / (name + ".schema.json")
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 

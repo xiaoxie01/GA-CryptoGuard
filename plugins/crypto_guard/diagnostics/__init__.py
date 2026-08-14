@@ -5,6 +5,7 @@ from .feedback_rules_dry_run import evaluate_feedback_rules_dry_run
 from .account_feedback_rules_dry_run import evaluate_account_feedback_rules_dry_run
 from .feedback_ttl import apply_feedback_ttl, get_feedback_with_ttl_weight
 from .report_diagnostics import diagnose_report_accuracy, run_for_report
+from .llm_risk_governance import diagnose_llm_risk_governance
 
 __all__ = [
     "diagnose_state_consistency",
@@ -14,4 +15,5 @@ __all__ = [
     "get_feedback_with_ttl_weight",
     "diagnose_report_accuracy",
     "run_for_report",
+    "diagnose_llm_risk_governance",
 ]

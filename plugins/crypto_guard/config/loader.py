@@ -41,6 +41,19 @@ class CryptoGuardConfig:
         )
 
     @property
+    def risk_assistance(self):
+        """08-10: LLM 风险委员会策略（design.md §4）。
+
+        ``risk_assistance`` 是 ``trading_mode.yaml`` 的顶层段。惰性导入避免
+        config.loader <-> risk 包初始化期循环。段缺失返回编译默认
+        （mode=shadow）；段存在但含任何非法键/值/重叠都抛 ``ValueError``
+        （fail closed —— 协助被禁用而非静默重分类）。
+        """
+        from plugins.crypto_guard.risk.risk_policy import load_risk_assistance_config
+
+        return load_risk_assistance_config(self.trading_mode)
+
+    @property
     def live_trading_enabled(self) -> bool:
         mode = self.trading_mode.get("trading_mode", {})
         return bool(mode.get("live_trading_enabled", False))
@@ -225,6 +238,24 @@ def load_config(config_dir: Path | None = None) -> CryptoGuardConfig:
     # segments. Per-symbol timeout must be a real integer in 180..1200s with
     # no silent clamping — out-of-range values fail fast at startup.
     _validate_llm_scheduling(config.trading_mode)
+    # 08-10: validate the risk_assistance policy segment (design.md §4).
+    # Unknown mode/key, overlapping hard/adaptive gates, empty hard_gates,
+    # TTL above hard max, NaN/inf, and wrong types all fail fast at startup.
+    # 08-10 P2-2 (fresh reviewer P2): validate the account-risk caps segment.
+    # A PRESENT-but-invalid cap (bool, non-numeric, NaN/Inf, <=0) is a config
+    # defect that must fail fast at startup — it can never silently become
+    # "no cap" (which is what a fail-open ``_safe_positive``/``_cfg_pct``
+    # produced for a 0/NaN cap before the fix). Absent caps are safe:
+    # account_risk_guard DEFAULTS (2.0/10.0) fill the gap.
+    _validate_account_risk(config.trading_mode)
+    # 08-10 P2-1 (fresh reviewer P2): validate the ``risk`` thresholds segment.
+    # A PRESENT-but-invalid threshold (bool, non-numeric, NaN/Inf, <=0) is a
+    # config defect that fails fast at startup — as a fail-open
+    # ``float(risk_cfg.get(...))`` it would silently disable the min_rr /
+    # min_sl / min_tp gates (``rr < nan`` is always False). Absent keys are
+    # safe: ``cfg_threshold`` fills the gap with the code defaults.
+    _validate_risk(config.trading_mode)
+    config.risk_assistance
     return config
 
 
@@ -276,6 +307,102 @@ def _validate_market_semantics(trading_mode: dict[str, Any]) -> None:
             raise ValueError(
                 f"market_semantics.{key} 含非法 stage {invalid}；合法集合 {sorted(legal_stages)}"
             )
+
+
+def _validate_account_risk(trading_mode: dict[str, Any]) -> None:
+    """Validate the ``account_risk`` caps segment of trading_mode.yaml (08-10
+    P2-2, fresh-reviewer P2).
+
+    Each cap — ``max_single_trade_risk_pct`` / ``max_total_risk_pct`` — must be,
+    when present, a real finite float strictly greater than 0. ``bool`` is a
+    subclass of ``int`` in Python, so a literal ``true``/``false`` in YAML must
+    be rejected explicitly; NaN/Inf and non-numeric values are rejected too, and
+    a ``0``/negative cap is meaningless (a 0 cap is a config defect — treated as
+    "no cap" would be fail-open). Absent caps are safe: account_risk_guard
+    DEFAULTS (2.0/10.0) fill the gap, so this validator only fails when a value
+    IS present but invalid.
+    """
+    seg = trading_mode.get("account_risk")
+    if seg is None:
+        return  # absent segment -> account_risk_guard DEFAULTS apply
+    if not isinstance(seg, dict):
+        raise ValueError(
+            "trading_mode.account_risk must be a mapping; "
+            f"got {type(seg).__name__}"
+        )
+    import math as _math
+    for key in ("max_single_trade_risk_pct", "max_total_risk_pct"):
+        raw = seg.get(key)
+        if raw is None:
+            continue  # per-key optional; DEFAULTS fill the gap
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(
+                f"trading_mode.account_risk.{key} 必须是有限正数；got {raw!r}"
+            )
+        value = float(raw)
+        if not _math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"trading_mode.account_risk.{key} 必须是有限正数；got {raw!r}"
+            )
+
+
+def cfg_threshold(risk_cfg: dict[str, Any] | None, key: str, default: float) -> float:
+    """Read one ``risk`` threshold FAIL-CLOSED (08-10 P2-1, fresh reviewer P2).
+
+    Every gate that feeds an open/close decision MUST fail closed on a
+    misconfigured threshold, never silently disable itself. A present value
+    that is ``bool`` / non-(int,float) / non-finite / <=0 is a config defect
+    and raises ``ValueError``; the caller is expected to catch it and record a
+    fail-closed rejection (verifier ``_risk_thresholds`` raise -> recorded
+    ``风控阈值配置读取失败``; producer threading raise -> ``failed`` envelope).
+    Absent key -> ``default`` (the code default; e.g. ``min_rr`` 2.0 applies
+    ONLY when the key is absent — the YAML-effective value is 1.5).
+    """
+    raw = (risk_cfg or {}).get(key)
+    if raw is None:
+        return float(default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(
+            f"trading_mode.risk.{key} 必须是有限正数；got {raw!r}"
+        )
+    value = float(raw)
+    import math as _math
+    if not _math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"trading_mode.risk.{key} 必须是有限正数；got {raw!r}"
+        )
+    return value
+
+
+_RISK_THRESHOLD_DEFAULTS: dict[str, float] = {
+    "min_rr": 2.0,
+    "min_sl_distance_pct": 0.8,
+    "min_tp_distance_pct": 1.0,
+    "min_confidence": 0.72,
+    "min_confidence_for_paper_order": 0.72,
+    "rsi_overbought_threshold": 75,
+    "rsi_oversold_threshold": 25,
+}
+
+
+def _validate_risk(trading_mode: dict[str, Any]) -> None:
+    """Validate the ``risk`` thresholds segment of trading_mode.yaml (08-10 P2-1).
+
+    Present-but-invalid thresholds (bool / non-(int,float) / NaN / Inf / <=0)
+    fail fast at startup — a silently-fail-open gate (``rr < nan`` is always
+    False) is exactly the defect class the verifier fail-closed fixes. Absent
+    keys are safe: the code defaults (``cfg_threshold``) fill the gap.
+    """
+    seg = trading_mode.get("risk")
+    if seg is None:
+        return  # absent segment -> code defaults apply
+    if not isinstance(seg, dict):
+        raise ValueError(
+            "trading_mode.risk must be a mapping; "
+            f"got {type(seg).__name__}"
+        )
+    for key, default in _RISK_THRESHOLD_DEFAULTS.items():
+        cfg_threshold(seg, key, default)
 
 
 # 07-10 Phase B: per-symbol deadline range. Out-of-range values fail fast at

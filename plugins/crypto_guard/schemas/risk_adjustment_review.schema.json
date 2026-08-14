@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RiskAdjustmentReview",
+  "description": "08-10 Step 5: constrained LLM risk proposal (design.md §6.1). The LLM is advisory: it may only emit approve_as_is / adjust / wait / reject plus bounded evidence refs and adaptive-only adjustments. additionalProperties is false at EVERY object level so a forged entry_trigger_confirmation, TTL extension, order id, database/notification action, risk_check.ok, quantity/leverage, hard-gate override or chain-of-thought can never pass the schema. 08-10 P2-1 (reviewer): the proposal must ECHO the round identity verbatim — symbol, side, analysis_time_utc, candidate_fingerprint, uncertainty and acknowledged_blockers are REQUIRED; a symbol/side value that merely passes the schema enum is still rejected by the context-aware committee when it mismatches the round.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reason_codes", "summary", "symbol", "side",
+               "analysis_time_utc", "candidate_fingerprint", "uncertainty",
+               "acknowledged_blockers"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "analysis_time_utc": {"type": "integer", "minimum": 1},
+    "candidate_fingerprint": {"type": "string"},
+    "symbol": {"type": "string", "minLength": 1},
+    "side": {"type": "string", "enum": ["LONG", "SHORT"]},
+    "verdict": {
+      "type": "string",
+      "enum": ["approve_as_is", "adjust", "wait", "reject"]
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "acknowledged_blockers": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "uncertainty": {"type": "number", "minimum": 0, "maximum": 1},
+    "evidence_refs": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "counter_evidence_refs": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "adjustments": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entry_price": {"type": "number", "exclusiveMinimum": 0},
+        "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+        "take_profits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["price", "ratio"],
+            "properties": {
+              "price": {"type": "number", "exclusiveMinimum": 0},
+              "ratio": {"type": "number", "minimum": 0}
+            }
+          }
+        },
+        "risk_percent": {"type": "number", "minimum": 0},
+        "news_like_event_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "next_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeframe": {"type": "string"},
+        "condition_code": {"type": "string"}
+      }
+    },
+    "rationale": {"type": "string", "maxLength": 2000},
+    "summary": {"type": "string", "maxLength": 500}
+  }
+}

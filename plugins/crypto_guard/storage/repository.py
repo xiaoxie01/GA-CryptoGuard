@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -556,6 +557,367 @@ class CryptoGuardRepository:
             key = column.removesuffix("_json")
             item[key] = _decode_json(item.get(column), default)
         return item
+
+    def update_ga_decision_risk_governance(
+        self, ga_decision_id: int, *, audit: dict[str, Any]
+    ) -> None:
+        """Merge the risk-governance audit keys into ``raw_decision_json``.
+
+        design.md §9.1/§11 Stage B: the v1 record keeps ALL structured audit
+        fields in the single ``raw_decision_json`` JSONB column, so the
+        producer issues ONE narrow UPDATE by ``ga_decision_id`` (never a full
+        row rewrite). ``audit`` carries the four audit keys
+        (``entry_confirmation_lifecycle`` / ``llm_risk_proposal`` /
+        ``risk_adjustment_verification`` / ``risk_advisory``) plus
+        ``policy_version`` / ``llm_latency_ms`` / ``evidence_ids``; the jsonb
+        ``||`` merge overwrites colliding keys and preserves the rest of the
+        decision. ``COALESCE`` guards a NULL ``raw_decision_json`` (jsonb
+        ``||`` with a NULL operand yields NULL). ``get_ga_decision`` decodes
+        the same column, so diagnostics read the audit unchanged.
+        """
+        audit_json = _json_dumps_payload(audit)
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ga_decisions SET raw_decision_json = "
+                    "COALESCE(raw_decision_json, '{}'::jsonb) || %s::jsonb "
+                    "WHERE id=%s",
+                    (audit_json, int(ga_decision_id)),
+                )
+
+    def insert_entry_confirmation_event_after_decision(
+        self,
+        *,
+        decision_id: int,
+        snapshot_id: int,
+        confirmation: dict[str, Any],
+        analysis_time_ms: int,
+    ) -> int:
+        """Append the canonical confirmation event for its owning decision.
+
+        design.md §5.2/§9: the event is inserted ONLY after the owning decision
+        + snapshot exist (FKs ``source_decision_id`` / ``source_snapshot_id``),
+        inside the SAME decision unit of work, idempotently (``ON CONFLICT
+        (event_fingerprint) DO NOTHING`` returns the existing row's id on a
+        re-observation). Eight fail-closed gates reject anything that is not a
+        trusted re-statement of the owning decision before any row is written:
+        missing decision, snapshot mismatch, non-canonical shape, unknown
+        source, future/unclosed candle, direction-vs-side mismatch,
+        cross-symbol, and provenance mismatch (the confirmation's fingerprint
+        must equal the fingerprint of the decision's own
+        ``entry_trigger_confirmation``).
+        """
+        from plugins.crypto_guard.reasoning.entry_confirmation_lifecycle import (
+            VALID_CONFIRMATION_SOURCES,
+            canonical_confirmation_fingerprint,
+        )
+
+        decision = self.get_ga_decision(int(decision_id))
+        if decision is None:
+            raise ValueError(
+                "entry_confirmation insert: owning decision "
+                f"{decision_id} not found"
+            )
+        if decision.get("snapshot_id") != snapshot_id:
+            raise ValueError(
+                f"entry_confirmation insert: decision {decision_id} snapshot "
+                f"{decision.get('snapshot_id')!r} != given {snapshot_id!r}"
+            )
+
+        required = {
+            "type", "timeframe", "event_type", "direction",
+            "candle_close_time", "price", "source", "symbol",
+        }
+        missing_keys = required - set(confirmation)
+        if missing_keys:
+            raise ValueError(
+                "entry_confirmation insert: missing canonical keys "
+                f"{sorted(missing_keys)}"
+            )
+        if confirmation.get("type") != "closed_candle_confirmation":
+            raise ValueError(
+                "entry_confirmation insert: type must be "
+                f"'closed_candle_confirmation'; got {confirmation.get('type')!r}"
+            )
+        source = confirmation.get("source")
+        if source not in VALID_CONFIRMATION_SOURCES:
+            raise ValueError(
+                f"entry_confirmation insert: unknown source {source!r}; "
+                f"valid {sorted(VALID_CONFIRMATION_SOURCES)}"
+            )
+        close_time = confirmation.get("candle_close_time")
+        if not isinstance(close_time, int) or close_time > int(analysis_time_ms):
+            raise ValueError(
+                "entry_confirmation insert: future/unclosed candle_close_time "
+                f"{close_time!r} > analysis_time_ms {analysis_time_ms}"
+            )
+
+        plan = decision.get("trade_plan") or {}
+        side = plan.get("side")
+        direction = confirmation.get("direction")
+        expected_direction = (
+            "bearish" if side == "SHORT"
+            else ("bullish" if side == "LONG" else None)
+        )
+        if expected_direction is None or direction != expected_direction:
+            raise ValueError(
+                f"entry_confirmation insert: direction {direction!r} does not "
+                f"match owning decision side {side!r}"
+            )
+        if decision.get("symbol") != confirmation.get("symbol"):
+            raise ValueError(
+                "entry_confirmation insert: cross-symbol forbidden; decision "
+                f"{decision.get('symbol')!r} != confirmation "
+                f"{confirmation.get('symbol')!r}"
+            )
+        plan_conf = plan.get("entry_trigger_confirmation")
+        if not isinstance(plan_conf, dict):
+            raise ValueError(
+                "entry_confirmation insert: owning decision trade_plan carries "
+                "no entry_trigger_confirmation"
+            )
+        if canonical_confirmation_fingerprint(plan_conf) != (
+            canonical_confirmation_fingerprint(confirmation)
+        ):
+            raise ValueError(
+                "entry_confirmation insert: confirmation fingerprint does not "
+                "match the owning decision's entry_trigger_confirmation "
+                "(provenance mismatch)"
+            )
+
+        fingerprint = canonical_confirmation_fingerprint(confirmation)
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO entry_confirmation_events(
+                        symbol, side, event_type, timeframe, direction,
+                        event_close_time, event_price, source,
+                        source_snapshot_id, source_decision_id, event_fingerprint
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (event_fingerprint) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        confirmation["symbol"],
+                        side,
+                        confirmation["event_type"],
+                        confirmation["timeframe"],
+                        direction,
+                        int(close_time),
+                        float(confirmation["price"]),
+                        source,
+                        int(snapshot_id),
+                        int(decision_id),
+                        fingerprint,
+                    ),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return int(row["id"])
+                cur.execute(
+                    "SELECT id FROM entry_confirmation_events "
+                    "WHERE event_fingerprint = %s",
+                    (fingerprint,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "entry_confirmation insert: ON CONFLICT DO NOTHING "
+                        "returned no row and no existing row found"
+                    )
+                return int(row["id"])
+
+    def list_recent_entry_confirmation_events(
+        self,
+        *,
+        symbol: str | None = None,
+        direction: str | None = None,
+        since_ms: int | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read-only, parameterized listing of persisted confirmation events.
+
+        Narrow repository method for the lifecycle resolver (Step 4): the pure
+        resolver never writes, it only reads through this surface.
+        """
+        conds: list[str] = []
+        params: list[Any] = []
+        if symbol is not None:
+            conds.append("symbol = %s")
+            params.append(symbol)
+        if direction is not None:
+            conds.append("direction = %s")
+            params.append(direction)
+        if since_ms is not None:
+            conds.append("event_close_time >= %s")
+            params.append(int(since_ms))
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT * FROM entry_confirmation_events
+                {where}
+                ORDER BY event_close_time DESC, id DESC
+                LIMIT %s
+                """,
+                params + [int(limit)],
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_market_snapshot_for_confirmation(
+        self, snapshot_id: int
+    ) -> dict[str, Any] | None:
+        """Thin snapshot loader for the lifecycle resolver.
+
+        ``get_market_snapshot`` returns the raw row (``snapshot_json`` is a
+        JSONB, already decoded by psycopg); this wrapper exposes the decoded
+        snapshot dict with the authoritative row-level ``symbol`` /
+        ``analysis_time`` overlaid so the resolver can re-run its shape checks
+        against a persisted snapshot.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM market_snapshots WHERE id=%s", (int(snapshot_id),)
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        snapshot = _decode_json(item.get("snapshot_json"), {})
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        snapshot["symbol"] = item["symbol"]
+        snapshot["analysis_time_utc"] = int(item["analysis_time"])
+        return snapshot
+
+    def confirmation_lifecycle(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        analysis_time_utc: int,
+        since_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        """08-10 Step 6 narrow read (5th fresh-reviewer P1 real-repo seam):
+        ONE prior trusted entry-confirmation lifecycle event for (symbol, side),
+        newest first, strictly before ``analysis_time_utc`` and inside the
+        carried window. Absence returns ``None`` — the broker renders
+        ``status: "absent"``, never stale. The default window is the design
+        §5.3 carried window: max over timeframes of ``bar_ms ×
+        confirmation_hard_max_bars`` (config default 5m:6 / 15m:2 →
+        1_800_000 ms); callers may pass ``since_ms`` explicitly."""
+        from plugins.crypto_guard.reasoning.entry_confirmation_lifecycle import (
+            _BAR_MS,
+            _expected_direction,
+        )
+
+        at = int(analysis_time_utc)
+        direction = _expected_direction(side)
+        if since_ms is None:
+            since = at - max(
+                _BAR_MS[tf] * hard_max
+                for tf, hard_max in (("5m", 6), ("15m", 2))
+            )
+        else:
+            since = int(since_ms)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM entry_confirmation_events
+                WHERE symbol=%s AND direction=%s
+                  AND event_close_time < %s AND event_close_time >= %s
+                ORDER BY event_close_time DESC, id DESC
+                LIMIT 1
+                """,
+                (symbol, direction, at, since),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        close = int(item["event_close_time"])
+        tf = str(item["timeframe"])
+        return {
+            "close_time": close,
+            "as_of": close,
+            "status": "confirmed",
+            "fingerprint": item["event_fingerprint"],
+            "direction": str(item["direction"]),
+            "timeframe": tf,
+            "age_bars": (
+                (at - close) // _BAR_MS[tf] if tf in _BAR_MS else None
+            ),
+        }
+
+    def adaptive_risk_budget_summary(
+        self,
+        symbol: str | None = None,
+        *,
+        as_of: int,
+        risk_caps: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """08-10 Step 6 narrow read (5th fresh-reviewer P1 real-repo seam):
+        compact account/symbol risk-budget summary for the broker. Per-symbol
+        totals use ``max_single_trade_risk_pct``, account-wide uses
+        ``max_total_risk_pct`` (``trading_mode.account_risk`` over
+        ``account_risk_guard.DEFAULTS``; 2.0 / 10.0 defaults). Risk units are
+        the sum of FINITE positive ``risk_percent`` over OPEN orders
+        (status pending/open/needs_recheck); concentration breach is 3+ open
+        orders (the verifier's ``max_orders``). ``as_of`` is the broker's
+        analysis timestamp (kept for the seam contract; the current-state
+        summary is not time-filtered). Fail-closed: any read error yields a
+        zeroed summary, never a raise through the broker."""
+        from plugins.crypto_guard.risk.account_risk_guard import DEFAULTS
+
+        caps = dict(DEFAULTS)
+        if risk_caps is None:
+            try:
+                from plugins.crypto_guard.config.loader import load_config
+
+                caps.update(load_config().trading_mode.get("account_risk", {}))
+            except Exception:
+                pass  # DEFAULTS stand; callers may pass risk_caps explicitly
+        else:
+            caps.update(risk_caps)
+        cap_single = float(caps.get("max_single_trade_risk_pct") or 2.0)
+        cap_total = float(caps.get("max_total_risk_pct") or 10.0)
+        try:
+            orders = (
+                self.list_open_paper_orders_for_symbol(symbol)
+                if symbol is not None
+                else self.list_open_paper_orders()
+            )
+        except Exception:
+            return {
+                "open_orders_count": 0,
+                "risk_units_free": 0.0,
+                "risk_units_total": cap_single if symbol is not None else cap_total,
+                "risk_units_used": 0.0,
+                "budget_pct_used": 0.0,
+                "concentration_breach": False,
+                "symbols": [],
+            }
+        used = sum(
+            float(o["risk_percent"])
+            for o in orders
+            if isinstance(o.get("risk_percent"), (int, float))
+            and not isinstance(o.get("risk_percent"), bool)
+            and math.isfinite(float(o["risk_percent"]))
+            and float(o["risk_percent"]) > 0
+        )
+        total = cap_single if symbol is not None else cap_total
+        symbols = sorted({str(o.get("symbol")) for o in orders if o.get("symbol")})
+        return {
+            "open_orders_count": len(orders),
+            "risk_units_free": max(0.0, total - used),
+            "risk_units_total": total,
+            "risk_units_used": used,
+            "budget_pct_used": (used / total) if total > 0 else 0.0,
+            "concentration_breach": len(orders) >= 3,
+            "symbols": symbols,
+        }
 
     def latest_ga_decisions_by_symbol(self, limit: int = 80, *, min_analysis_time: int | None = None, batch_id: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []
@@ -2774,6 +3136,7 @@ class CryptoGuardRepository:
         source: str = "signal_compat",
         risk_check_passed: bool = False,
         trigger_watch_id: int | None = None,
+        risk_advisory_mode: str | None = None,
     ) -> tuple[int, bool]:
         from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
 
@@ -2794,6 +3157,12 @@ class CryptoGuardRepository:
         # conflict target, guaranteed to exist). A NULL signal_id never conflicts
         # on the UNIQUE(signal_id) constraint (PG UNIQUE treats NULLs as
         # distinct), matching SQLite. ``risk_check_passed`` is a raw bool.
+        # ``risk_advisory_mode`` (08-12 P2-2) records which governance mode
+        # created the order: NULL = legacy pre-governance order, 'off' =
+        # governance off, 'paper_bounded'/'shadow' = governance ran. The
+        # diagnostic uses it to spot an order whose mode claims governance ran
+        # but whose owning decision lost the audit row (persist-loss invisible
+        # to the decision join).
         with self.conn.transaction():
             # 08-04 contract B + 08-06 once-ever: idempotent bridge. If a paper
             # order of ANY status already exists for this trigger_watch_id, return
@@ -2817,9 +3186,9 @@ class CryptoGuardRepository:
                     INSERT INTO paper_orders(
                         signal_id, ga_decision_id, symbol, side, order_type, entry_price, trigger_price,
                         stop_loss, initial_stop_loss, take_profit_json, quantity, risk_percent, reason, fill_method, source, risk_check_passed,
-                        expires_at, trigger_watch_id
+                        expires_at, trigger_watch_id, risk_advisory_mode
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
@@ -2842,6 +3211,7 @@ class CryptoGuardRepository:
                         bool(risk_check_passed),
                         expires_at,
                         int(trigger_watch_id) if trigger_watch_id is not None else None,
+                        risk_advisory_mode,
                     ),
                 )
                 row = cur.fetchone()
@@ -4014,6 +4384,12 @@ class CryptoGuardRepository:
         evolution_actions: dict[str, Any] | None = None,
         pushed_to_feishu: bool = False,
     ) -> int:
+        # 08-12 (reviewer round 3 P2-1): pushed_to_feishu is MONOTONIC — a
+        # force-rebuild (run_daily_review(force=True) / manual re-run with the
+        # default pushed_to_feishu=False) must never erase the marker of a
+        # delivery that durably happened (mark_alert_sent commits the outbox
+        # 'sent' + marker in ONE transaction). Erasing it would false-positive
+        # marker_missing and re-trigger the producer's already_pushed gate.
         with self.conn.transaction():
             with self.conn.cursor() as cur:
                 cur.execute(
@@ -4025,7 +4401,7 @@ class CryptoGuardRepository:
                         ga_report=excluded.ga_report,
                         skill_updates_json=excluded.skill_updates_json,
                         evolution_actions_json=excluded.evolution_actions_json,
-                        pushed_to_feishu=excluded.pushed_to_feishu
+                        pushed_to_feishu=daily_review_reports.pushed_to_feishu OR excluded.pushed_to_feishu
                     RETURNING id
                     """,
                     (
@@ -4140,6 +4516,22 @@ class CryptoGuardRepository:
             except (json.JSONDecodeError, TypeError) as e:
                 raise ValueError(f"evolution_review content must be valid JSON: {e}") from e
 
+        # 08-12 P1: daily_review:<date> keys are durable once-ever ACROSS all
+        # states (pending/sending/sent/failed). A daily simulated-review
+        # report must be externally delivered exactly once per review_date;
+        # a re-enqueue after a crash, rollback or restart must return the
+        # ORIGINAL row id and never schedule a second delivery. Non-
+        # daily_review keys keep the pending-only semantics below.
+        if dedupe_key and dedupe_key.startswith("daily_review:"):
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM alert_outbox WHERE dedupe_key=%s LIMIT 1",
+                    (dedupe_key,),
+                )
+                existing = cur.fetchone()
+            if existing:
+                return int(existing["id"])
+
         # Dedup: only dedupe against pending alerts. Sent rows keep their
         # history, so a new enqueue with a fresh payload can reuse the same
         # dedupe_key after a previous send (e.g. periodic reports, retries).
@@ -4172,10 +4564,22 @@ class CryptoGuardRepository:
                 if inserted is not None:
                     return int(inserted["id"])
                 if dedupe_key:
-                    cur.execute(
-                        "SELECT id FROM alert_outbox WHERE dedupe_key=%s AND status='pending' LIMIT 1",
-                        (dedupe_key,),
-                    )
+                    if dedupe_key.startswith("daily_review:"):
+                        # 08-12 P1 (reviewer P2-1): the daily_review:<date>
+                        # key is once-ever ACROSS all states — a concurrent
+                        # enqueue whose winner is already 'sent' (pre-read
+                        # missed the row because it was still uncommitted)
+                        # must resolve to the original row id here, never
+                        # RuntimeError.
+                        cur.execute(
+                            "SELECT id FROM alert_outbox WHERE dedupe_key=%s LIMIT 1",
+                            (dedupe_key,),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT id FROM alert_outbox WHERE dedupe_key=%s AND status='pending' LIMIT 1",
+                            (dedupe_key,),
+                        )
                     winner = cur.fetchone()
                     if winner:
                         return int(winner["id"])
@@ -4200,22 +4604,170 @@ class CryptoGuardRepository:
             row = cur.fetchone()
         return bool(row)
 
-    def mark_alert_sent(self, alert_id: int) -> None:
+    def alert_outbox_status(self, alert_id: int) -> dict[str, Any] | None:
+        """Row status by id (None when absent). The enqueue seam used by
+        send_markdown_alert to detect a cross-state dedupe hit (08-12 P1:
+        a daily_review re-enqueue returns the original row's id)."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM alert_outbox WHERE id=%s",
+                (int(alert_id),),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def mark_alert_sent(self, alert_id: int, *, daily_review_date: str | None = None) -> None:
+        # 08-12 P1: for daily_review deliveries the outbox 'sent' flag and the
+        # pushed_to_feishu marker land in the SAME transaction — the report
+        # row is only flagged when the delivery is durably sent. The marker is
+        # written as a REAL BOOLEAN (the production defect bound a Python int
+        # 1 against the BOOLEAN column; DatatypeMismatch rolled back the whole
+        # implicit transaction and duplicate external sends followed).
         with self.conn.transaction():
             with self.conn.cursor() as cur:
                 cur.execute(
                     "UPDATE alert_outbox SET status='sent', updated_at=NOW() WHERE id=%s",
                     (int(alert_id),),
                 )
+                if daily_review_date:
+                    cur.execute(
+                        "UPDATE daily_review_reports SET pushed_to_feishu=TRUE WHERE review_date=%s",
+                        (daily_review_date,),
+                    )
 
-    def mark_alert_failed(self, alert_id: int, error: str, *, max_attempts: int = 3) -> None:
+    def diagnose_daily_review_push_consistency(self) -> dict[str, Any]:
+        """08-12 P1: surface alert_outbox / pushed_to_feishu inconsistencies
+        for daily_review:<date> deliveries in both directions:
+
+        - ``orphan_marker``: a report is flagged pushed_to_feishu=TRUE but no
+          'sent' alert_outbox row exists for its review_date (a marker left by
+          the old non-atomic path, or an outbox row lost to a rollback);
+        - ``marker_missing``: a 'sent' outbox row exists but the report is
+          not flagged (the production defect shape: the external send
+          committed while the marker update was rolled back).
+
+        ``ok`` is True when the diagnostic completed; ``inconsistencies``
+        carries every finding (non-empty => manual reconciliation required).
+
+        08-12 P1 (Codex P1-2): ``delivery_unknown`` reports rows whose external
+        send outcome is NOT verifiable from the database — terminal 'failed'
+        with the send/finalize/crash reason codes (send_outcome_unknown_no_retry
+        / finalize_failed_after_send / dispatcher_crashed_mid_send) or a
+        'sending' row still un-recovered past the stale threshold
+        (stale_sending_unrecovered, same 15-minute window as
+        ``recover_stale_sending_alerts``). Every entry carries
+        ``alert_outbox_id`` / ``review_date`` / ``status`` / ``reason`` for
+        manual reconciliation; the diagnostic NEVER auto-flips
+        pushed_to_feishu — only a human who confirmed the Feishu message can
+        reconcile the marker.
+        """
+        inconsistencies: list[dict[str, Any]] = []
+        with self.conn.cursor() as cur:
+            # marker set but no sent outbox row -> orphan_marker
+            cur.execute(
+                """
+                SELECT r.review_date
+                FROM daily_review_reports r
+                WHERE r.pushed_to_feishu = TRUE
+                  AND NOT EXISTS (
+                      SELECT 1 FROM alert_outbox a
+                      WHERE a.dedupe_key = 'daily_review:' || r.review_date
+                        AND a.status = 'sent'
+                  )
+                ORDER BY r.review_date
+                """
+            )
+            for row in cur.fetchall():
+                inconsistencies.append(
+                    {
+                        "kind": "orphan_marker",
+                        "review_date": row["review_date"],
+                        "detail": "pushed_to_feishu=TRUE but no sent alert_outbox row",
+                    }
+                )
+            # sent outbox row but report missing or not flagged -> marker_missing
+            cur.execute(
+                """
+                SELECT a.id, a.dedupe_key, r.review_date, r.pushed_to_feishu
+                FROM alert_outbox a
+                LEFT JOIN daily_review_reports r
+                       ON r.review_date = split_part(a.dedupe_key, ':', 2)
+                WHERE a.dedupe_key LIKE 'daily_review:%'
+                  AND a.status = 'sent'
+                  AND (r.review_date IS NULL OR r.pushed_to_feishu IS NOT TRUE)
+                ORDER BY a.id
+                """
+            )
+            for row in cur.fetchall():
+                inconsistencies.append(
+                    {
+                        "kind": "marker_missing",
+                        "alert_outbox_id": row["id"],
+                        "review_date": row["dedupe_key"].split(":", 1)[1],
+                        "detail": "alert_outbox row sent but report not flagged pushed_to_feishu",
+                    }
+                )
+            # delivery outcome UNKNOWN (Codex P1-2): terminal failed with the
+            # send/finalize/crash reason codes, or 'sending' stranded past the
+            # stale threshold. Classification by reason in Python keeps the SQL
+            # simple; the 15-minute window matches recover_stale_sending_alerts.
+            delivery_unknown: list[dict[str, Any]] = []
+            cur.execute(
+                """
+                SELECT id, status, last_error, dedupe_key
+                FROM alert_outbox
+                WHERE dedupe_key LIKE 'daily_review:%'
+                  AND (
+                        status = 'failed'
+                     OR (status = 'sending' AND updated_at < NOW() - make_interval(mins => 15))
+                  )
+                ORDER BY id
+                """
+            )
+            for row in cur.fetchall():
+                status = row["status"]
+                last_error = row["last_error"] or ""
+                if status == "failed":
+                    if "daily_review_send_outcome_unknown_no_retry" in last_error:
+                        reason = "send_outcome_unknown_no_retry"
+                    elif "finalize_failed_after_send" in last_error:
+                        reason = "finalize_failed_after_send"
+                    elif "recover_stale_sending_alerts" in last_error:
+                        reason = "dispatcher_crashed_mid_send"
+                    else:
+                        # reviewer P2-1: an unclassified terminal 'failed' row
+                        # (legacy residue, manual edit, future reason code) has
+                        # an equally UNKNOWN delivery outcome — silently
+                        # skipping it hides the very state this diagnostic
+                        # exists to surface. Report it explicitly.
+                        reason = "unclassified_terminal_failed"
+                else:  # 'sending'
+                    reason = "stale_sending_unrecovered"
+                delivery_unknown.append(
+                    {
+                        "alert_outbox_id": row["id"],
+                        "review_date": row["dedupe_key"].split(":", 1)[1],
+                        "status": status,
+                        "reason": reason,
+                    }
+                )
+        return {"ok": True, "inconsistencies": inconsistencies, "delivery_unknown": delivery_unknown}
+
+    def mark_alert_failed(self, alert_id: int, error: str, *, max_attempts: int = 3, force_terminal: bool = False) -> None:
         with self.conn.cursor() as cur:
             cur.execute("SELECT * FROM alert_outbox WHERE id=%s", (int(alert_id),))
             row = cur.fetchone()
         if not row:
             return
+        # 08-12 P1 (reviewer Recommended): a row already in terminal 'failed'
+        # stays terminal — a racing second finalize (send succeeded + finalize
+        # failed twice) must not recycle it back to 'pending' for another
+        # external send. force_terminal callers (finalize-failed-after-send)
+        # are the single legitimate way to overwrite a terminal row.
+        if row["status"] == "failed" and not force_terminal:
+            return
         retry_count = int(row["retry_count"] or 0) + 1
-        if retry_count >= max_attempts:
+        if retry_count >= max_attempts or force_terminal:
             with self.conn.transaction():
                 with self.conn.cursor() as cur:
                     cur.execute(
@@ -4248,18 +4800,77 @@ class CryptoGuardRepository:
                 )
 
     def claim_pending_alerts(self, limit: int = 10) -> list[dict[str, Any]]:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT * FROM alert_outbox
-                WHERE status='pending' AND COALESCE(next_retry_at, created_at) <= NOW()
-                ORDER BY priority ASC, created_at ASC
-                LIMIT %s
-                """,
-                (int(limit),),
-            )
-            rows = cur.fetchall()
+        # 08-12 P1: single-statement atomic claim (UPDATE ... FOR UPDATE SKIP
+        # LOCKED). Two dispatchers claiming concurrently get disjoint rows;
+        # the loser sees nothing pending. The claim is persisted before the
+        # external send (process_alert_outbox commits right after claiming).
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE alert_outbox
+                    SET status='sending', updated_at=NOW()
+                    WHERE id IN (
+                        SELECT id FROM alert_outbox
+                        WHERE status='pending' AND COALESCE(next_retry_at, created_at) <= NOW()
+                        ORDER BY priority ASC, created_at ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING *
+                    """,
+                    (int(limit),),
+                )
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+    def recover_stale_sending_alerts(self, *, stale_after_minutes: int = 15) -> int:
+        # 08-12 P1 fail-closed reclaim: a dispatcher that died between the
+        # atomic claim and the finalize leaves a row in 'sending'. Such a row
+        # must NEVER be re-sent (the external side effect may already have
+        # happened); it is moved to terminal 'failed' with an
+        # alert_failure_log entry, and
+        # diagnose_daily_review_push_consistency() surfaces the marker gap.
+        recovered = 0
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, alert_type, symbol, retry_count FROM alert_outbox
+                    WHERE status='sending'
+                      AND updated_at < NOW() - make_interval(mins => %s)
+                    ORDER BY id
+                    """,
+                    (int(stale_after_minutes),),
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    cur.execute(
+                        """
+                        UPDATE alert_outbox
+                        SET status='failed', last_error=%s, updated_at=NOW()
+                        WHERE id=%s
+                        """,
+                        (
+                            "recover_stale_sending_alerts: dispatcher crashed mid-send; fail-closed, never re-sent",
+                            int(row["id"]),
+                        ),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO alert_failure_log(alert_outbox_id, alert_type, symbol, error_message, retry_count)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            int(row["id"]),
+                            row["alert_type"],
+                            row["symbol"],
+                            "recover_stale_sending_alerts: dispatcher crashed mid-send; fail-closed, never re-sent",
+                            int(row["retry_count"] or 0),
+                        ),
+                    )
+                    recovered += 1
+        return recovered
 
     def request_config_hot_reload(
         self,

@@ -140,6 +140,44 @@ risk:
   # BTC#9 P2-1: HTF weak structure fail-closed — 多周期结构偏弱需更强入场确认
   require_stronger_confirmation_for_weak_structure: true
 
+# 08-10 LLM 风险委员会（design.md §4）：受约束的 LLM 风险协助策略。
+# mode: off=仅确定性路径 | shadow=LLM 只读建议，绝不产生订单 |
+#       paper_bounded=验证通过且全部硬闸门打开时才允许恰好一个模拟盘订单
+# 迁移默认是 shadow —— 部署后绝不静默获得下单能力。
+# 硬闸门集合在代码中编译（risk/risk_policy.py HARD_GATE_CODES），配置只能
+# 选择其非空子集；未知 mode/键、硬自适应重叠、TTL 超过硬上限都 fail closed。
+risk_assistance:
+  contract_version: 1
+  mode: shadow                 # off | shadow | paper_bounded
+  max_rounds: 2
+  max_tool_requests: 5
+  max_context_bytes: 49152
+  max_uncertainty: 0.35
+  confirmation_ttl_bars:
+    5m: 3
+    15m: 1
+  confirmation_hard_max_bars:
+    5m: 6
+    15m: 2
+  max_entry_deviation_pct: 0.50
+  max_entry_deviation_atr: 0.25
+  max_stop_distance_pct: 2.50
+  max_stop_distance_atr: 2.00
+  hard_gates:
+    - market_data_ready
+    - trusted_entry_confirmation
+    - account_enabled
+    - drawdown_limit
+    - exposure_limit
+    - valid_geometry
+    - idempotency
+    - extreme_regime
+  adaptive_gates:
+    - minimum_stop_distance
+    - atr_stop_buffer
+    - minimum_rr
+    - news_like_event
+
 # Phase B (07-03): structured market-semantic normalization.
 # Single source of truth for bias+stage contract, HTF-conflict confidence cap,
 # and grade downgrade rules. The cap must be < MIN_CONFIDENCE_FOR_PAPER_ORDER
@@ -192,6 +230,10 @@ account_risk:
     LTCUSDT_LONG: 48
     ETHUSDT_LONG: 48
     BNBUSDT_SHORT: 48
+  # 08-10 P2-3: 单笔/总账户风险上限（%）。有效风险不得超过单笔上限，
+  # 也不得超过 max_total_risk_pct 减去已在持仓中占用的 open_position_risk_pct。
+  max_single_trade_risk_pct: 2.0       # % — 单笔最大风险
+  max_total_risk_pct: 10.0             # % — 账户总风险上限（含已占用）
 
 paper_trading:
   price_update_interval_minutes: 3

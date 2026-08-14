@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import time
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
-from plugins.crypto_guard.config.loader import load_config
+from plugins.crypto_guard.config.loader import cfg_threshold, load_config
 from plugins.crypto_guard.logging_utils import get_logger
 from plugins.crypto_guard.notify.alert_delivery import (
     DEFAULT_NEVER_SILENCE,
@@ -22,7 +23,25 @@ from plugins.crypto_guard.notify.signal_policy import should_push_signal
 from plugins.crypto_guard.ga_master import GAAnalysisRequest, GAMasterController
 from plugins.crypto_guard.ga_master.decision_schema import controller_decision_from_legacy
 from plugins.crypto_guard.reasoning.market_state_builder import build_market_state_snapshot
-from plugins.crypto_guard.risk.account_risk_guard import AccountRiskGuard
+from plugins.crypto_guard.reasoning.entry_confirmation_lifecycle import (
+    resolve_trusted_entry_confirmation,
+)
+from plugins.crypto_guard.reasoning.llm_agent_judge import run_agent_json_task
+from plugins.crypto_guard.risk.account_risk_guard import (
+    AccountRiskGuard,
+    _load_account_risk_config,
+)
+from plugins.crypto_guard.risk.risk_adjustment_verifier import (
+    candidate_adaptive_blockers,
+    candidate_plan_fingerprint,
+    verify_risk_adjustment,
+)
+from plugins.crypto_guard.risk.risk_committee import parse_risk_adjustment_review
+from plugins.crypto_guard.risk.risk_context import (
+    build_risk_review_context,
+    build_risk_review_user_message,
+)
+from plugins.crypto_guard.risk.risk_policy import KNOWN_REASON_CODES
 from plugins.crypto_guard.ga_master.feishu_action_builder import build_feishu_actions
 from plugins.crypto_guard.paper.paper_position_updater import update_paper_positions
 from plugins.crypto_guard.review.daily_reviewer import run_daily_review
@@ -266,6 +285,107 @@ def _broker_verifier_allows(
         return True, {"reason": "broker_verifier_exception_skip", "order_allowed": True}
 
 
+def _render_auto_order_notification(
+    decision: dict[str, Any],
+    auto_order: dict[str, Any],
+    repo: CryptoGuardRepository,
+) -> str:
+    """Render the create/pending push for a newly auto-created paper order.
+
+    08-10 P2-4 (reviewer finding, PRD P2-1): an order created from a VERIFIED
+    risk-advisory decision (the ``risk_advisory`` envelope with
+    ``proposal_status="ok"`` + ``verification_ok`` + ``final_risk_check_ok``)
+    is announced with ``build_order_notification`` so the operator sees
+    original-vs-adjusted entry/stop geometry, effective risk percent, quantity,
+    the TP list, the confirmation source/timeframe, and the final risk-committee
+    result. The envelope's ``candidate_plan`` is the ORIGINAL pre-adjustment
+    plan (P1-2 binds the adjusted plan into ``decision.trade_plan``); the
+    ``entry_confirmation_lifecycle`` supplies the confirmation source. The
+    builder fails closed (raises ``ValueError``) if it is ever given a
+    non-passing committee — we then fall back to the legacy A4 render with a
+    warning rather than announce an order that never cleared the verifier.
+
+    Decisions WITHOUT a verified envelope keep the 08-04 contract A / E8
+    inline render (order_id / symbol / side / order_type / entry / SL / TP /
+    quantity-or-risk / expiry / decision id) — byte-for-byte unchanged.
+    """
+    envelope = decision.get("risk_advisory")
+    plan = decision.get("trade_plan") or {}
+    if (
+        isinstance(envelope, dict)
+        and envelope.get("proposal_status") == "ok"
+        and envelope.get("verification_ok") is True
+        and envelope.get("final_risk_check_ok") is True
+    ):
+        try:
+            from plugins.crypto_guard.notify.order_notification import (
+                build_order_notification,
+            )
+            return build_order_notification(
+                order={
+                    "symbol": decision.get("symbol"),
+                    "side": str(plan.get("side") or "").upper(),
+                    "order_type": plan.get("entry_type") or "limit",
+                    "entry_price": plan.get("entry_price")
+                    or plan.get("trigger_price") or 0.0,
+                    "stop_loss": plan.get("stop_loss") or 0.0,
+                    "take_profit_json": plan.get("take_profits"),
+                },
+                candidate_plan=envelope.get("candidate_plan") or plan,
+                adjusted_plan=plan,
+                verification={
+                    "verification_ok": bool(envelope.get("verification_ok")),
+                    "final_risk_check_ok": bool(envelope.get("final_risk_check_ok")),
+                },
+                lifecycle=envelope.get("entry_confirmation_lifecycle"),
+                account=_derive_account_state(repo),
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the order path
+            LOGGER.warning(
+                "risk-adjusted order notification failed ga_decision_id=%s error=%s",
+                decision.get("ga_decision_id"), exc,
+            )
+
+    tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
+    side_cn = {"LONG": "做多", "SHORT": "做空"}.get(
+        str(plan.get("side") or "").upper(), plan.get("side") or "-")
+    entry_type = str(plan.get("entry_type") or "limit")
+    status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
+    entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
+    # 08-04 contract A: the create/pending push must carry the mandated fields —
+    # order_id, side, entry, SL/TP, quantity-or-risk, expiry, and the source
+    # decision id.
+    order_id = auto_order.get("order_id")
+    risk_percent = (decision.get("risk_check") or {}).get("risk_percent") \
+        or plan.get("risk_percent")
+    quantity = plan.get("quantity") or plan.get("position_size")
+    quantity_text = f"{quantity} 张" if quantity else (
+        f"{risk_percent}% 风险" if risk_percent else "-")
+    from plugins.crypto_guard.notify.time_utils import format_event_time_cst
+    from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
+    event_time = format_event_time_cst(datetime.now(timezone.utc))
+    grade = str(decision.get("signal_grade") or "D").upper()
+    ga_decision_id = decision.get("ga_decision_id")
+    return "\n".join([
+        "**CryptoGuard 已自动创建模拟盘订单**",
+        "",
+        f"- 时间：{event_time}",
+        f"- 产品：{decision.get('symbol')}",
+        f"- 订单号：{order_id}",
+        f"- 方向：{side_cn}",
+        f"- 状态：{status_cn}",
+        f"- 入场价：{entry_price}",
+        f"- 止损价：{plan.get('stop_loss')}",
+        f"- 止盈价：{tps}",
+        f"- 数量/风险：{quantity_text}",
+        f"- 有效期：{compute_expires_at(entry_type)}",
+        f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
+        f"- 决策ID：{ga_decision_id}",
+        "",
+        "不构成实盘建议，仅用于模拟盘与策略研究。",
+    ])
+
+
 def _post_decision_effects(
     repo: CryptoGuardRepository,
     decision: dict[str, Any],
@@ -322,40 +442,9 @@ def _post_decision_effects(
                 if auto_order.get("ok") and auto_order.get("created"):
                     _target = resolve_report_target(repo, payload)
                     if _target and send_message:
-                        plan = decision.get("trade_plan") or {}
-                        tps = ", ".join(str(tp.get("price")) for tp in plan.get("take_profits", []))
-                        side_cn = {"LONG": "做多", "SHORT": "做空"}.get(str(plan.get("side") or "").upper(), plan.get("side") or "-")
-                        entry_type = str(plan.get("entry_type") or "limit")
-                        status_cn = "待成交挂单" if entry_type == "limit" else "已成交（市价）"
-                        entry_price = plan.get("entry_price") or plan.get("trigger_price") or "-"
-                        # 08-04 contract A: the create/pending push must carry the
-                        # mandated fields — order_id, side, entry, SL/TP,
-                        # quantity-or-risk, expiry, and the source decision id.
-                        order_id = auto_order.get("order_id")
-                        risk_percent = (decision.get("risk_check") or {}).get("risk_percent") or plan.get("risk_percent")
-                        quantity = plan.get("quantity") or plan.get("position_size")
-                        quantity_text = f"{quantity} 张" if quantity else f"{risk_percent}% 风险" if risk_percent else "-"
-                        from plugins.crypto_guard.notify.time_utils import format_event_time_cst
-                        from plugins.crypto_guard.paper.pending_order_manager import compute_expires_at
-                        event_time = format_event_time_cst(datetime.now(timezone.utc))
-                        order_text = "\n".join([
-                            "**CryptoGuard 已自动创建模拟盘订单**",
-                            "",
-                            f"- 时间：{event_time}",
-                            f"- 产品：{decision.get('symbol')}",
-                            f"- 订单号：{order_id}",
-                            f"- 方向：{side_cn}",
-                            f"- 状态：{status_cn}",
-                            f"- 入场价：{entry_price}",
-                            f"- 止损价：{plan.get('stop_loss')}",
-                            f"- 止盈价：{tps}",
-                            f"- 数量/风险：{quantity_text}",
-                            f"- 有效期：{compute_expires_at(entry_type)}",
-                            f"- 信号等级：{grade}，置信度：{round(float(decision.get('confidence', 0)) * 100)}%",
-                            f"- 决策ID：{ga_decision_id}",
-                            "",
-                            "不构成实盘建议，仅用于模拟盘与策略研究。",
-                        ])
+                        order_text = _render_auto_order_notification(
+                            decision, auto_order, repo,
+                        )
                         send_markdown_alert(
                             repo, send_message,
                             receive_id=_target["receive_id"],
@@ -1611,15 +1700,33 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
         evolution_text = _build_evolution_status_text(repo)
         full_text = loss_header + result["text"] + evolution_text
 
-        # Three-layer push defense:
-        # L1: run_daily_review(force=False) already returns idempotent if report exists
-        # L2: check pushed_to_feishu before sending
-        # L3: alert dedupe_key includes review_date
+        # 08-12 P1 (reviewer P0-1): the producer ONLY persists the outbox
+        # intent — send_message is NEVER invoked inside the run_once business
+        # transaction. The old post-send in-transaction marker update
+        # (UPDATE ... SET pushed_to_feishu=1) hit a DatatypeMismatch (int 1 vs
+        # BOOLEAN column), rolled the whole implicit transaction back, and the
+        # scheduler re-ran the job and sent again (>=14 production restarts of
+        # the same daily session). The delivery is decided by the alert_outbox
+        # cycle (process_alert_outbox: atomic claim -> external send ->
+        # single-transaction finalize that sets 'sent' AND pushed_to_feishu
+        # =TRUE as a real BOOLEAN). send_markdown_alert(repo, None, ...) only
+        # enqueues (its quiet/silence/lock seams are preserved); the explicit
+        # commit closes the producer transaction so the report row + outbox
+        # row are durable BEFORE process_job returns — a later crash cannot
+        # roll the intent back. Defense layers: run_daily_review(force=False)
+        # stays idempotent (L1); pushed_to_feishu is written atomically with
+        # the sent flag (L2); the daily_review:<date> dedupe_key is once-ever
+        # across ALL states (L3) — a re-enqueue returns the original row id
+        # and never schedules a second delivery.
         review_date = result.get("day_start_utc", "")[:10]
         already_pushed = result.get("pushed_to_feishu")
-        if target and send_message and not already_pushed:
+        result["target"] = target
+        result["sent"] = False
+        result["deduped"] = False
+        result["queued"] = False
+        if target and not already_pushed:
             sent_result = send_markdown_alert(
-                repo, send_message,
+                repo, None,
                 receive_id=target["receive_id"],
                 receive_id_type=target.get("receive_id_type", "chat_id"),
                 text=full_text,
@@ -1627,17 +1734,10 @@ def process_job(repo: CryptoGuardRepository, job: dict[str, Any], *, send_messag
                 priority=5,
                 dedupe_key=f"daily_review:{review_date}",
             )
-            result["sent"] = bool(sent_result.get("sent"))
-            result["target"] = target
-            # Mark pushed_to_feishu on successful send
-            if sent_result.get("sent") and review_date:
-                repo.conn.execute(
-                    "UPDATE daily_review_reports SET pushed_to_feishu=1 WHERE review_date=%s",
-                    (review_date,),
-                )
-        else:
-            result["sent"] = False
-            result["target"] = target
+            result["queued"] = bool(sent_result.get("queued"))
+            result["deduped"] = bool(sent_result.get("deduped"))
+            result["silenced"] = bool(sent_result.get("silenced"))
+            repo.conn.commit()  # durable outbox intent before process_job returns
         LOGGER.info("process_job done id=%s type=%s ok=%s reviews=%s sent=%s idempotent=%s", job.get("id"), job_type, result.get("ok"), result.get("new_reviews"), result.get("sent"), result.get("idempotent"))
         return result
     if job_type == "intraday_loss_review":
@@ -1936,6 +2036,14 @@ def _run_recheck_analysis(
     ``build_market_state_snapshot`` always rebuilds from the latest closed
     candle (never a stored/stale snapshot), then the real controller pipeline
     runs and persists the decision. This is the default ``_analyze`` seam.
+
+    08-10 P1-1 (reviewer finding): the watch-recheck seam is the production
+    writer for ``entry_confirmation_events``. The decision must own a REAL
+    snapshot id so the owning-decision/snapshot FKs hold, so when the caller
+    passes ``snapshot_id=None`` we persist the rebuilt snapshot here and pass
+    the real id into both the request context (so the controller stamps it on
+    the persisted decision) and the risk-governance producer (which appends the
+    canonical confirmation event AFTER the owning decision exists).
     """
     snapshot = build_market_state_snapshot(
         repo,
@@ -1943,6 +2051,8 @@ def _run_recheck_analysis(
         analysis_time_utc=analysis_time_utc,
         mode="opportunity_watch",
     )
+    if snapshot_id is None:
+        snapshot_id = repo.save_market_snapshot(snapshot)
     controller = GAMasterController(repo)
     request = GAAnalysisRequest(
         symbol=symbol,
@@ -1954,7 +2064,564 @@ def _run_recheck_analysis(
         requested_by="opportunity_watch_recheck",
         request_text="opportunity watch recheck",
     )
-    return controller.analyze_symbol(request)
+    decision = controller.analyze_symbol(request)
+    return _attach_risk_governance(
+        repo,
+        decision=decision,
+        symbol=symbol,
+        snapshot=snapshot,
+        snapshot_id=snapshot_id,
+    )
+
+
+# ── 08-10 Step 9: risk-governance producer (watch-recheck seam) ─────────────
+#
+# design.md §11 Stage B + PRD P1-6: shadow/paper-bounded deployments MUST
+# record the proposal + verifier audit fields separately. This producer runs
+# ONLY in ``_run_recheck_analysis`` (the watch-recheck seam); the main batch
+# order path is out of scope (research/producer-gap-2026-08-11.md). It is
+# fail-closed always-stamp: mode=off is byte-for-byte legacy (no envelope, no
+# LLM call, no persist); shadow/paper_bounded ALWAYS stamp the system-only
+# ``risk_advisory`` envelope on the returned dict AND persist the four audit
+# keys (+ policy_version + llm_latency_ms + evidence_ids) via the narrow repo
+# UPDATE, even when the LLM round / schema validation / verifier / producer
+# itself throws.
+
+# ``run_agent_json_task`` merges its internal bookkeeping into the returned
+# dict; those keys must never leak into ``llm_risk_proposal`` (strict schema
+# has ``additionalProperties: false`` and they are not audit fields).
+_MERGED_RESULT_INTERNAL_KEYS = frozenset(
+    {"agent_source", "llm_status", "llm_error", "llm_failure_category"}
+)
+
+
+def _lifecycle_audit(lifecycle: Any) -> dict[str, Any]:
+    """Flatten a ``LifecycleResolution`` into the flat audit dict shape.
+
+    The diagnostics consumers (``diagnostics/llm_risk_governance.py``) read
+    exactly this key set via ``raw.get(...)`` on the persisted audit field.
+    ``confirmation`` is the resolved structured entry confirmation (a dict
+    when present, else ``None``).
+    """
+    confirmation = lifecycle.confirmation if isinstance(lifecycle.confirmation, dict) else {}
+    return {
+        "status": lifecycle.status,
+        "origin": lifecycle.origin,
+        "timeframe": confirmation.get("timeframe"),
+        "source": confirmation.get("source"),
+        "event_type": confirmation.get("event_type"),
+        "age_bars": lifecycle.age_bars,
+        "ttl_bars": lifecycle.ttl_bars,
+        "source_decision_id": lifecycle.source_decision_id,
+        "source_snapshot_id": lifecycle.source_snapshot_id,
+        "invalidation_reason": lifecycle.invalidation_reason,
+    }
+
+
+def _failed_verification(reasons: list[str]) -> dict[str, Any]:
+    """The fail-closed verification audit used on any failed round."""
+    return {
+        "verification_ok": False,
+        "accepted": False,
+        "rejection_reasons": list(reasons),
+        "monetary_risk_delta": 0.0,
+        "final_risk_check_ok": False,
+        "effective_order_allowed": False,
+    }
+
+
+def _cfg_pct(value: Any) -> float | None:
+    """Finite positive percentage from config.
+
+    08-10 P2-2 (fresh reviewer P2): a PRESENT-but-invalid value (bool,
+    non-number, NaN/Inf, <=0) is a config defect and RAISES — it must never
+    silently become "no cap" (what the pre-fix fail-open None produced for a 0
+    cap). None is returned ONLY when the key is absent; the account_risk_guard
+    DEFAULTS (2.0/10.0) then fill the gap. ``_validate_account_risk`` rejects
+    such values at startup, so this is the second fail-closed layer in the
+    production account snapshot path.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"account risk cap 配置无效：{value!r}")
+    f = float(value)
+    if not math.isfinite(f) or f <= 0:
+        raise ValueError(f"account risk cap 配置无效：{value!r}")
+    return f
+
+
+def _derive_account_state(repo: CryptoGuardRepository) -> dict[str, Any]:
+    """Read-only account snapshot for the verifier.
+
+    ``paper_accounts`` has a ``status`` column (not ``enabled``); the verifier
+    gate reads ``enabled is True``, so map ``status`` -> ``enabled`` here.
+    Absent/exception falls back to a disabled account (fail closed).
+
+    08-10 P2-3 (reviewer finding): the per-trade / total account risk caps come
+    from ``account_risk_guard`` configuration (not ``paper_accounts`` columns),
+    and the already-committed open-position risk is summed over live paper
+    orders' ``risk_percent``. Caps are account-independent config, so they are
+    populated in BOTH branches — including the disabled fallback — so the
+    verifier never receives None in the happy path.
+    """
+    risk_cfg = _load_account_risk_config()
+    cap_single = _cfg_pct(risk_cfg.get("max_single_trade_risk_pct"))
+    cap_total = _cfg_pct(risk_cfg.get("max_total_risk_pct"))
+
+    row = None
+    try:
+        with repo.conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM paper_accounts ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001 - read-only, fail closed to disabled
+        row = None
+    if not row:
+        return {
+            "enabled": False,
+            "paused": False,
+            "equity": 10000.0,
+            "initial_balance": 10000.0,
+            "drawdown_pct": 0.0,
+            "open_orders": 0,
+            "max_orders": 3,
+            "max_single_trade_risk_pct": cap_single,
+            "max_total_risk_pct": cap_total,
+            "open_position_risk_pct": 0.0,
+        }
+    status = str(row.get("status") or "").lower()
+    equity = float(row.get("equity") or 10000.0)
+    initial = float(row.get("initial_balance") or equity or 10000.0)
+    drawdown_pct = min(0.0, (equity - initial) / initial * 100.0) if initial else 0.0
+    try:
+        open_orders = len(repo.list_open_paper_orders())
+    except Exception:  # noqa: BLE001 - read-only, zero is safe here
+        open_orders = 0
+    open_position_risk_pct = 0.0
+    try:
+        for order in repo.list_open_paper_orders():
+            risk = order.get("risk_percent")
+            if isinstance(risk, (int, float)) and not isinstance(risk, bool):
+                f = float(risk)
+                if math.isfinite(f) and f > 0:
+                    open_position_risk_pct += f
+    except Exception:  # noqa: BLE001 - read-only, zero is safe here
+        open_position_risk_pct = 0.0
+    return {
+        "enabled": status not in ("disabled", "paused"),
+        "paused": status == "paused",
+        "equity": equity,
+        "initial_balance": initial,
+        "drawdown_pct": drawdown_pct,
+        "open_orders": open_orders,
+        "max_orders": 3,
+        "max_single_trade_risk_pct": cap_single,
+        "max_total_risk_pct": cap_total,
+        "open_position_risk_pct": open_position_risk_pct,
+    }
+
+
+def _attach_risk_governance(
+    repo: CryptoGuardRepository,
+    *,
+    decision: dict[str, Any],
+    symbol: str,
+    snapshot: dict[str, Any],
+    policy: Any = None,
+    snapshot_id: int | None = None,
+) -> dict[str, Any]:
+    """08-10 Step 9 producer: stamp + persist the risk-governance audit.
+
+    ``mode=off`` -> the SAME dict comes back untouched (legacy path
+    byte-for-byte, PRD P1-6: no envelope, no LLM call, no persist).
+
+    ``shadow`` / ``paper_bounded`` -> ALWAYS stamp the system-only envelope
+    ``{mode, proposal_status, verification_ok, final_risk_check_ok}`` on the
+    returned dict AND persist the audit fields via
+    ``update_ga_decision_risk_governance``. A failing LLM round / schema
+    validation / verifier / producer exception records ``failed`` and NEVER
+    falls through to the legacy no-governance path.
+
+    08-10 P1-1 (reviewer finding): when the seam passes a REAL ``snapshot_id``
+    and the deterministic lifecycle resolves a ``valid`` confirmation, the
+    producer is the production writer for ``entry_confirmation_events`` — it
+    appends the canonical event AFTER the owning decision + snapshot exist
+    (design.md §5.2 persistence contract). The insert is idempotent (``ON
+    CONFLICT (event_fingerprint) DO NOTHING``) so a carried re-observation
+    dedupes against the original row. An insert failure raises into the outer
+    fail-closed handler -> ``proposal_status="failed"`` is stamped, NEVER a
+    missing event weakening the envelope gate.
+    """
+    if not isinstance(decision, dict):
+        return decision
+    _cfg = None
+    # 08-10 P2-2 (fresh reviewer P2): ``mode`` is pre-initialized so the inner
+    # fail-closed except below can NEVER NameError on it when the policy/config
+    # load itself raised (the load happens INSIDE the always-stamp try).
+    mode = "shadow"
+
+    ga_id = int(decision.get("ga_decision_id") or 0)
+
+    def _record(
+        proposal_status: str,
+        *,
+        lifecycle: dict[str, Any] | None = None,
+        proposal: dict[str, Any] | None = None,
+        verification: dict[str, Any] | None = None,
+        evidence_ids: tuple[str, ...] = (),
+        latency_ms: int = 0,
+        candidate_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        audit: dict[str, Any] = {
+            "entry_confirmation_lifecycle": lifecycle,
+            "llm_risk_proposal": {
+                "proposal_status": proposal_status,
+                **(proposal or {}),
+            },
+            "risk_adjustment_verification": verification or _failed_verification([]),
+            "risk_advisory": {
+                "mode": mode,
+                "proposal_status": proposal_status,
+                "verification_ok": bool((verification or {}).get("verification_ok")),
+                "final_risk_check_ok": bool((verification or {}).get("final_risk_check_ok")),
+            },
+            "policy_version": int(getattr(policy, "contract_version", 1)),
+            "llm_latency_ms": max(0, int(latency_ms)),
+            "evidence_ids": sorted({str(e) for e in evidence_ids if e}),
+        }
+        # 08-10 P2-4 (reviewer finding, PRD P2-1): the production order
+        # notification (_post_decision_effects) renders original-vs-adjusted
+        # geometry from the system-only ``risk_advisory`` envelope. P1-2 binds
+        # the ADJUSTED plan into ``decision.trade_plan``, so the ORIGINAL
+        # candidate plan (captured before binding) plus the flat confirmation
+        # lifecycle must ride on the envelope itself. This enrichment is scoped
+        # to the ONLY path that can produce a paper_bounded order notification
+        # (``proposal_status="ok"`` + verified); shadow/off/failed envelopes
+        # keep the minimal persisted shape (existing exact-equality audits).
+        # The PERSISTED envelope stays minimal too — the candidate plan and
+        # lifecycle are already persisted verbatim in the audit's own fields.
+        envelope = dict(audit["risk_advisory"])
+        if (
+            mode == "paper_bounded"
+            and proposal_status == "ok"
+            and bool((verification or {}).get("verification_ok"))
+        ):
+            if candidate_plan is not None:
+                envelope["candidate_plan"] = copy.deepcopy(candidate_plan)
+            if lifecycle is not None:
+                envelope["entry_confirmation_lifecycle"] = copy.deepcopy(lifecycle)
+        # system-only envelope on the returned dict, then persist
+        decision["risk_advisory"] = envelope
+        if ga_id > 0:
+            try:
+                repo.update_ga_decision_risk_governance(ga_id, audit=audit)
+            except Exception as exc:  # noqa: BLE001 - envelope is the gate
+                LOGGER.warning(
+                    "risk governance persist failed for ga_decision_id=%s: %r",
+                    ga_id, exc,
+                )
+        return decision
+
+    try:
+        # 08-10 P2-2 (fresh reviewer P2): the policy/config read lives INSIDE
+        # the always-stamp try. A load_config() raise here (corrupted
+        # trading_mode.yaml, DSN resolution failure, ...) is caught by the outer
+        # except below which stamps ``proposal_status="failed"`` — the
+        # always-stamp invariant (design.md §5.4) requires EVERY producer
+        # exception to leave a fail-closed envelope, never escape bare with no
+        # ``risk_advisory`` key at all.
+        if policy is None:
+            _cfg = load_config()
+            policy = _cfg.risk_assistance
+        mode = getattr(policy, "mode", "shadow")
+        if mode == "off":
+            return decision
+        plan = decision.get("trade_plan")
+        side = str((plan or {}).get("side") or "").upper()
+        if not isinstance(plan, dict) or side not in ("LONG", "SHORT"):
+            return _record(
+                "no_candidate",
+                lifecycle=None,
+                proposal={"proposal_status": "no_candidate"},
+                verification=_failed_verification(["no candidate trade_plan"]),
+                latency_ms=0,
+            )
+
+        lifecycle = resolve_trusted_entry_confirmation(repo, snapshot, plan, policy)
+        lifecycle_flat = _lifecycle_audit(lifecycle)
+        # 08-10 P1-1 (reviewer finding): production writer for the canonical
+        # confirmation event. Scope is ``origin == "current_snapshot"`` ONLY.
+        # A carried-forward event is OWNED by its original decision — the
+        # resolver already found it via ``list_recent_entry_confirmation_events``
+        # and re-inserting it under the re-observing decision is a semantic
+        # no-op that would also trip the provenance gate
+        # (``insert_entry_confirmation_event_after_decision`` requires the
+        # owning decision's plan to carry the confirmation, which the
+        # ``_bind_trusted_entry_confirmation`` fail-closed semantics leave None
+        # on a carried-only recheck -> ValueError -> the whole carried round
+        # would be stamped ``proposal_status="failed"`` and the LLM risk review
+        # would never run). An ``origin == "current_snapshot"`` insert failure
+        # still raises into the outer fail-closed handler below so the envelope
+        # records ``proposal_status="failed"`` — a missing event insert never
+        # weakens the gate.
+        if (
+            lifecycle.status == "valid"
+            and lifecycle.origin == "current_snapshot"
+            and isinstance(lifecycle.confirmation, dict)
+            and ga_id > 0
+            and snapshot_id is not None
+        ):
+            repo.insert_entry_confirmation_event_after_decision(
+                decision_id=ga_id,
+                snapshot_id=snapshot_id,
+                confirmation=lifecycle.confirmation,
+                analysis_time_ms=int(snapshot.get("analysis_time_utc") or 0),
+            )
+        fingerprint = candidate_plan_fingerprint(plan, snapshot=snapshot, policy=policy)
+        # 08-10 fresh-reviewer P2-1: the round's ACTUAL failing adaptive gates,
+        # recomputed deterministically from the candidate + snapshot (mirrors
+        # the verifier's gate math). This is what ``round_ctx.blocker_ids`` and
+        # the ``round_blockers`` trusted fact carry — the LLM must acknowledge
+        # every code, never just the static ``policy.hard_gates`` vocabulary.
+        # Recommended-1: thresholds are threaded from the config already loaded
+        # above (``_cfg``) so ``candidate_adaptive_blockers`` never re-reads it;
+        # when a caller supplies the policy directly (``_cfg`` is None) the
+        # function falls back to its single shared config read. ``getattr``
+        # keeps this defensive for config objects (e.g. test mocks) that expose
+        # ``risk_assistance`` but no ``trading_mode``; the explicit thresholds
+        # then default to the same 0.8/2.0 the fallback would have used.
+        _risk_cfg = (
+            (getattr(_cfg, "trading_mode", None) or {}).get("risk", {})
+            if _cfg is not None else {}
+        )
+        # 08-10 P2-1 (fresh reviewer P2): thread the thresholds FAIL-CLOSED.
+        # ``cfg_threshold`` raises on a present-but-invalid value
+        # (NaN/bool/0/negative), and the raise lands in the outer always-stamp
+        # except below -> ``proposal_status="failed"`` envelope — a
+        # fail-open ``float(_risk_cfg.get(...))`` would silently disable the
+        # adaptive gate instead (``rr < nan`` is always False).
+        failing_blockers = candidate_adaptive_blockers(
+            plan,
+            snapshot=snapshot,
+            min_sl_pct=(cfg_threshold(_risk_cfg, "min_sl_distance_pct", 0.8)
+                        if _cfg is not None else None),
+            min_rr=(cfg_threshold(_risk_cfg, "min_rr", 2.0)
+                    if _cfg is not None else None),
+        )
+        ctx = build_risk_review_context(
+            symbol=symbol,
+            trusted_facts=[
+                {"kind": "candidate_plan", "payload": dict(plan)},
+                {"kind": "confirmation_lifecycle", "payload": lifecycle_flat},
+                {"kind": "risk_check", "payload": dict(decision.get("risk_check") or {})},
+                # 08-10 P2-1 (reviewer): the round identity must be quoted
+                # verbatim by the LLM. These facts carry no symbol key, so
+                # the downstream _assert_same_symbol check skips them.
+                {"kind": "candidate_fingerprint",
+                 "payload": {"fingerprint": fingerprint}},
+                {"kind": "round_analysis_time",
+                 "payload": {"analysis_time_utc": int(snapshot.get("analysis_time_utc") or 0)}},
+                {"kind": "round_blockers",
+                 "payload": {"blocker_ids": list(failing_blockers)}},
+            ],
+            model_derived=[
+                {
+                    "kind": "deterministic_summary",
+                    "payload": {
+                        "summary": str(
+                            decision.get("final_summary") or decision.get("summary") or ""
+                        )
+                    },
+                }
+            ],
+            counter_evidence=[dict(i) for i in (decision.get("counter_evidence") or [])][:3],
+            untrusted_data=[dict(i) for i in (decision.get("evidence") or [])][:3],
+        )
+        # 08-10 fresh-reviewer Recommended-2: ONLY the trusted partitions are
+        # citable. ``counter_evidence`` ids are citable solely via
+        # ``counter_evidence_ids`` below, and ``untrusted_data`` ids are NEVER
+        # citable — an LLM that cites a watch reason / free-text blob fails the
+        # committee's ``证据引用不存在`` check (risk_committee.py).
+        evidence_ids: tuple[str, ...] = tuple(
+            sorted(
+                {
+                    ev
+                    for name in ("trusted_facts", "model_derived")
+                    for item in ctx.partitions.get(name, [])
+                    for ev in (item.get("evidence_id") if isinstance(item, dict) else None,)
+                    if isinstance(ev, str) and ev
+                }
+            )
+        )
+        counter_ids = tuple(
+            item.get("evidence_id") for item in ctx.partitions.get("counter_evidence", [])
+            if isinstance(item, dict) and item.get("evidence_id")
+        )
+        round_ctx: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "candidate_fingerprint": fingerprint,
+            "evidence_ids": list(evidence_ids),
+            "counter_evidence_ids": list(counter_ids),
+            "blocker_ids": list(failing_blockers),
+            "known_reason_codes": sorted(KNOWN_REASON_CODES),
+        }
+        t0 = time.time()
+        result = run_agent_json_task(
+            task_name="risk_adjustment_review",
+            payload={"symbol": symbol, "risk_context": build_risk_review_user_message(ctx)},
+            fallback={
+                "verdict": "reject",
+                "reason_codes": [],
+                "evidence_refs": [],
+                "counter_evidence_refs": [],
+                "summary": "llm unavailable",
+            },
+            use_llm=True,
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+
+        if result.get("llm_status") != "ok":
+            # a provider failure is not a legitimate verdict: record failed
+            # and NEVER parse the deterministic fallback.
+            return _record(
+                "failed",
+                lifecycle=lifecycle_flat,
+                proposal={
+                    "proposal_status": "failed",
+                    "llm_error": str(result.get("llm_error") or ""),
+                    "llm_failure_category": result.get("llm_failure_category"),
+                },
+                verification=_failed_verification(["llm round failed"]),
+                evidence_ids=evidence_ids,
+                latency_ms=latency_ms,
+            )
+
+        cleaned = {
+            k: v for k, v in result.items() if k not in _MERGED_RESULT_INTERNAL_KEYS
+        }
+        proposal, err = parse_risk_adjustment_review(cleaned, context=round_ctx)
+        if err is not None:
+            return _record(
+                "failed",
+                lifecycle=lifecycle_flat,
+                proposal={"proposal_status": "failed", "schema_error": err},
+                verification=_failed_verification([f"proposal schema: {err}"]),
+                evidence_ids=evidence_ids,
+                latency_ms=latency_ms,
+            )
+
+        account_state = _derive_account_state(repo)
+        verification = verify_risk_adjustment(
+            candidate_plan=plan,
+            proposal=proposal,
+            confirmation_lifecycle=lifecycle,
+            snapshot=snapshot,
+            account_state=account_state,
+            policy=policy,
+            decision_confidence=float(decision.get("confidence") or 0.0),
+        )
+        v_audit: dict[str, Any] = {
+            "verification_ok": bool(verification.ok),
+            "accepted": bool(verification.ok),
+            "rejection_reasons": list(verification.errors),
+            "monetary_risk_delta": float(verification.monetary_risk_delta or 0.0),
+            "final_risk_check_ok": bool((verification.final_risk_check or {}).get("ok")),
+            "effective_order_allowed": bool(verification.effective_order_allowed),
+        }
+        # 08-10 P1-2 (reviewer finding): on the paper_bounded success path the
+        # verifier's ADJUSTED plan is the only plan that may reach order
+        # creation. Bind it into the returned (and thus order-bound) dict AND
+        # mirror it into the persisted audit so raw_decision_json carries the
+        # exact plan that passed the final risk check. The verifier only
+        # adjusts allowlisted fields and NEVER tightens the stop, so this is
+        # the safe binding; ``mode`` comes from the policy (line ~2134).
+        if (
+            verification.ok
+            and mode == "paper_bounded"
+            and isinstance(verification.adjusted_plan, dict)
+        ):
+            decision["trade_plan"] = copy.deepcopy(verification.adjusted_plan)
+            v_audit["adjusted_plan"] = copy.deepcopy(verification.adjusted_plan)
+        p_audit: dict[str, Any] = {
+            "proposal_status": "ok",
+            "verdict": proposal.get("verdict"),
+            "reason_codes": list(proposal.get("reason_codes") or []),
+            "evidence_refs": list(proposal.get("evidence_refs") or []),
+            "counter_evidence_refs": list(proposal.get("counter_evidence_refs") or []),
+            "adjustments": proposal.get("adjustments"),
+        }
+        return _record(
+            "ok",
+            lifecycle=lifecycle_flat,
+            proposal=p_audit,
+            verification=v_audit,
+            evidence_ids=evidence_ids,
+            latency_ms=latency_ms,
+            # 08-10 P2-4: the ORIGINAL candidate (pre-adjustment) rides the
+            # envelope for the order notification's original-vs-adjusted render.
+            candidate_plan=plan,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-closed always-stamp
+        try:
+            return _record(
+                "failed",
+                proposal={"proposal_status": "failed", "producer_error": repr(exc)},
+                verification=_failed_verification([f"producer exception: {exc!r}"]),
+            )
+        except Exception:  # noqa: BLE001 - even a record failure stamps the envelope
+            decision["risk_advisory"] = {
+                "mode": mode,
+                "proposal_status": "failed",
+                "verification_ok": False,
+                "final_risk_check_ok": False,
+            }
+            return decision
+
+
+def risk_advisory_order_allowed(
+    *,
+    proposal_verified: bool,
+    final_risk_check_ok: bool,
+    plan_execution_state: str,
+    account_gate_open: bool,
+    regime_gate_open: bool,
+    once_ever_open: bool,
+    mode: str,
+) -> bool:
+    """08-10 design §7 final conjunction: the ONLY route to a risk-advisory
+    paper order.
+
+        proposal verified
+        AND final risk_check.ok is True
+        AND plan_execution_state == confirmed
+        AND account gate open
+        AND market regime gate open
+        AND once-ever watch/order gate open
+        AND mode == paper_bounded
+
+    ``mode`` is the system-only ``risk_advisory`` envelope mode stamped AFTER
+    LLM schema validation (the LLM can never author it). ``off`` = the
+    risk-advisory path is absent and the EXISTING deterministic gate decides
+    (byte-for-byte unchanged). ``shadow`` = hypothetical only, never orders.
+    Any other mode fails closed. ``handle_opportunity_watch_recheck`` enforces
+    this conjunction only when the decision carries the envelope; a decision
+    without the envelope keeps the legacy path.
+    """
+    if mode == "off":
+        return True
+    if mode != "paper_bounded":
+        return False
+    return (
+        bool(proposal_verified)
+        and bool(final_risk_check_ok)
+        and plan_execution_state == "confirmed"
+        and bool(account_gate_open)
+        and bool(regime_gate_open)
+        and bool(once_ever_open)
+    )
 
 
 def _recheck_order_gate(repo: CryptoGuardRepository, watch: dict[str, Any], decision: dict[str, Any]) -> tuple[bool, str]:
@@ -2016,20 +2683,29 @@ def handle_opportunity_watch_recheck(
     _analyze: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """08-04 contract A/B + 08-06 once-ever: triggered-watch follow-up is
-    INTERNAL-ONLY and ONCE-EVER.
+    INTERNAL-ONLY and ONCE-EVER for the observation TRIGGER; a created order is
+    the only user-facing exception (08-10 P2-1 order-creation notification).
 
-    No feishu alert is produced and no alert_outbox row is written. The job
-    runs a FRESH re-analysis from the latest closed candle (contract B). When
-    the recheck clears the order gate (S/A + llm confirmed + risk_ok + account
-    ok + direction valid) it bridges the decision into ONE paper order via
-    ``create_paper_order(trigger_watch_id=...)``; the partial unique index
-    ``idx_paper_orders_trigger_watch_once`` (once-ever: one order per watch over
-    its ENTIRE lifetime, ``WHERE trigger_watch_id IS NOT NULL``) + a task lock
-    make the bridge idempotent (single analysis, single order, no duplicate).
-    A terminal (filled/expired/cancelled) order STILL holds the link: a delayed
-    retry recheck that fires afterwards is judged duplicate and never
-    re-analyzes nor mints a second order. Otherwise the watch's ``recheck_status``
-    records the rejection and nothing is ordered.
+    No observation alert is produced and no alert_outbox row is written for the
+    trigger itself. The job runs a FRESH re-analysis from the latest closed
+    candle (contract B). When the recheck clears the order gate (S/A + llm
+    confirmed + risk_ok + account ok + direction valid) it bridges the decision
+    into ONE paper order via ``create_paper_order(trigger_watch_id=...)``; the
+    partial unique index ``idx_paper_orders_trigger_watch_once`` (once-ever: one
+    order per watch over its ENTIRE lifetime, ``WHERE trigger_watch_id IS NOT
+    NULL``) + a task lock make the bridge idempotent (single analysis, single
+    order, no duplicate). A terminal (filled/expired/cancelled) order STILL
+    holds the link: a delayed retry recheck that fires afterwards is judged
+    duplicate and never re-analyzes nor mints a second order. Otherwise the
+    watch's ``recheck_status`` records the rejection and nothing is ordered.
+
+    When a VERIFIED paper_bounded recheck creates an order, that ORDER is
+    announced with the 08-10 P2-1 order-creation notification
+    (``build_order_notification`` via ``_render_auto_order_notification``) —
+    original-vs-adjusted geometry, effective risk, computed quantity, the TP
+    list, the confirmation source/timeframe and the final risk checks. The
+    observation trigger itself stays silent (``sent: False``); only the created
+    order is user-facing (PRD P2-1 / fresh-reviewer P2-1).
 
     Legacy ``opportunity_watch_alert`` jobs are replayed through this same
     silent path, so a stale queued job degrades to a harmless no-op instead of
@@ -2075,6 +2751,63 @@ def handle_opportunity_watch_recheck(
                 "sent": False, "rejected": True, "reason": reason,
                 "text": "内部观察上下文已归档（不推送）",
             }
+        # 08-10 Step 8: the system-only ``risk_advisory`` envelope (stamped
+        # AFTER LLM schema validation; the LLM can never author it). The design
+        # §7 final conjunction is enforced ONLY when the decision carries the
+        # envelope; without it the legacy path is byte-for-byte unchanged (off /
+        # pre-rollout decisions). ``shadow`` never orders even when every
+        # deterministic gate clears, and only a VERIFIED paper_bounded proposal
+        # may supply the adjusted plan through the order bridge.
+        risk_advisory = decision.get("risk_advisory")
+        # 08-12 P2-2: hoist the governance mode so the order created below can
+        # record which mode produced it (paper_orders.risk_advisory_mode). A
+        # persist failure in ``_attach_risk_governance`` leaves the envelope
+        # ONLY on this in-memory dict (always-stamp invariant); the order-side
+        # marker keeps the diagnostic able to spot that lost-audit-row case.
+        ra_mode = None
+        if isinstance(risk_advisory, dict):
+            ra_mode = risk_advisory.get("mode")
+            ra_allowed = risk_advisory_order_allowed(
+                proposal_verified=(
+                    risk_advisory.get("proposal_status") == "ok"
+                    and risk_advisory.get("verification_ok") is True
+                ),
+                final_risk_check_ok=(
+                    risk_advisory.get("final_risk_check_ok") is True
+                ),
+                plan_execution_state=str(decision.get("plan_execution_state") or ""),
+                # The remaining conjunction terms are already enforced by
+                # ``_recheck_order_gate`` (account not paused), the once-ever
+                # idempotency check above (no existing order) and the verifier/
+                # engine that stamped ``final_risk_check_ok`` (market regime).
+                account_gate_open=True,
+                regime_gate_open=True,
+                once_ever_open=True,
+                mode=ra_mode,
+            )
+            if not ra_allowed:
+                repo.set_opportunity_watch_recheck_status(watch_id, "recheck_rejected")
+                return {
+                    "ok": True, "watch_id": watch_id, "internal_only": True,
+                    "sent": False, "rejected": True,
+                    "reason": f"risk_advisory_rejected:{ra_mode}",
+                    "text": "内部观察上下文已归档（不推送）",
+                }
+        # 08-12 fresh-reviewer Recommended: a decision that CARRIES a
+        # present-but-NON-dict ``risk_advisory`` envelope is a corrupt
+        # governance stamp (the producer always writes a dict). It must fail
+        # closed as ``risk_advisory_rejected:malformed`` -- NEVER silently fall
+        # through to the legacy ordering path as if governance had not run.
+        # Only the envelope's ABSENCE (off / pre-rollout) is treated as
+        # "no governance", never a present-but-broken value.
+        elif "risk_advisory" in decision:
+            repo.set_opportunity_watch_recheck_status(watch_id, "recheck_rejected")
+            return {
+                "ok": True, "watch_id": watch_id, "internal_only": True,
+                "sent": False, "rejected": True,
+                "reason": "risk_advisory_rejected:malformed",
+                "text": "内部观察上下文已归档（不推送）",
+            }
         # 08-04 contract E8 production wiring (fresh reviewer P1): a VETO-ONLY
         # broker verifier round runs before the watch->order bridge. Fail-open
         # (see _broker_verifier_allows); the deterministic recheck gate above
@@ -2108,12 +2841,55 @@ def handle_opportunity_watch_recheck(
             source="watch_recheck",
             risk_check_passed=True,
             trigger_watch_id=watch_id,
+            risk_advisory_mode=ra_mode,
         )
         repo.set_opportunity_watch_recheck_status(watch_id, "order_created", order_id=order_id)
+        # 08-10 P2-1 (fresh reviewer P2): a VERIFIED paper_bounded recheck that
+        # CREATED an order announces THAT ORDER with the order-creation
+        # notification (PRD P2-1) — original-vs-adjusted geometry, effective
+        # risk, computed quantity, the TP list, the confirmation source/timeframe
+        # and the final risk checks. The observation trigger itself stays silent
+        # (``sent: False``); only the created order is user-facing. The same
+        # VERIFIED conjunction the order gate above required gates this, so it
+        # can only fire for orders that actually cleared the committee. Any
+        # notification failure never breaks the already-committed order.
+        order_notification_sent = False
+        if created:
+            envelope = decision.get("risk_advisory")
+            envelope_verified = (
+                isinstance(envelope, dict)
+                and envelope.get("proposal_status") == "ok"
+                and envelope.get("verification_ok") is True
+                and envelope.get("final_risk_check_ok") is True
+            )
+            if envelope_verified:
+                try:
+                    _target = resolve_report_target(repo, payload)
+                    if _target and send_message:
+                        order_text = _render_auto_order_notification(
+                            decision, {"order_id": order_id}, repo,
+                        )
+                        send_markdown_alert(
+                            repo, send_message,
+                            receive_id=_target["receive_id"],
+                            receive_id_type=_target.get("receive_id_type", "chat_id"),
+                            text=order_text,
+                            alert_type="paper_order_filled",
+                            symbol=sym,
+                            priority=3,
+                        )
+                        order_notification_sent = True
+                except Exception as exc:  # noqa: BLE001 - never break the order path
+                    LOGGER.warning(
+                        "order-creation notification failed watch_id=%s error=%s",
+                        watch_id, exc,
+                    )
         return {
             "ok": True, "watch_id": watch_id, "internal_only": True,
             "sent": False, "paper_order_id": order_id, "created": created,
-            "ga_decision_id": ga_id, "text": "内部观察上下文已归档（不推送）",
+            "ga_decision_id": ga_id,
+            "order_notification_sent": order_notification_sent,
+            "text": "内部观察上下文已归档（不推送）",
         }
     finally:
         repo.release_lock(lock_name, "opportunity_watch_recheck")

@@ -1,5 +1,5 @@
 {
-  "digest": "ff5de36ae1348200cd84a02bf2dee9a1feee6b8b39a1717ec50e80c8db3d54f2",
+  "digest": "43b796caf4d16560aecb96d419bfbe18ea28dff5ea52909017ccc528745d7a78",
   "domains": {
     "analysis": {
       "sources": [
@@ -57,6 +57,7 @@
         "test_paper_orders_regressions.py",
         "test_pg_08_04_prompt_audit_d.py",
         "test_pg_08_04_skills_tools_e.py",
+        "test_pg_08_10_risk_adjustment_verifier_p0.py",
         "test_pg_connection.py",
         "test_pg_fair_llm_raw_reference_p0_1.py",
         "test_pg_service_ownership_p8.py",
@@ -93,6 +94,7 @@
         "plugins/crypto_guard/diagnostics/account_feedback_rules_dry_run.py",
         "plugins/crypto_guard/diagnostics/feedback_rules_dry_run.py",
         "plugins/crypto_guard/diagnostics/feedback_ttl.py",
+        "plugins/crypto_guard/diagnostics/llm_risk_governance.py",
         "plugins/crypto_guard/diagnostics/report_diagnostics.py",
         "plugins/crypto_guard/diagnostics/state_consistency.py"
       ],
@@ -106,6 +108,8 @@
         "test_pg_08_04_watch_materialization_terminal_status.py",
         "test_pg_08_06_bridge_marker_p2.py",
         "test_pg_08_08_watch_recheck_diagnostics.py",
+        "test_pg_08_10_llm_risk_diagnostics_p2.py",
+        "test_pg_08_12_daily_review_once_ever_p1.py",
         "test_pg_codex_p2_rework_fixes.py",
         "test_pg_codex_r2_rework_p0_p1.py",
         "test_pg_deterministic_direction_created_at_cutoff_p1_2.py",
@@ -166,6 +170,7 @@
         "plugins/crypto_guard/notify/feishu_cards.py",
         "plugins/crypto_guard/notify/hourly_report.py",
         "plugins/crypto_guard/notify/intent_parser.py",
+        "plugins/crypto_guard/notify/order_notification.py",
         "plugins/crypto_guard/notify/report_consistency.py",
         "plugins/crypto_guard/notify/time_utils.py"
       ],
@@ -178,6 +183,8 @@
         "test_paper_orders_regressions.py",
         "test_pg_08_04_notification_semantics_a.py",
         "test_pg_08_08_hourly_funnel_stats.py",
+        "test_pg_08_10_llm_risk_reporting_p2.py",
+        "test_pg_08_12_daily_review_once_ever_p1.py",
         "test_pg_dead_duckdb_stats_helpers_removed_p2_2.py",
         "test_pg_execution_funnel_starvation_codex_p1_4.py",
         "test_pg_fair_llm_raw_reference_p0_1.py",
@@ -217,6 +224,7 @@
         "test_market_data_contracts.py",
         "test_paper_orders_regressions.py",
         "test_pg_08_04_reviewer_fixes_f.py",
+        "test_pg_08_10_llm_risk_notification_p2.py",
         "test_pg_fair_llm_raw_reference_p0_1.py",
         "test_pg_paper_domain_p8.py",
         "test_pg_review_domain_p8.py",
@@ -232,6 +240,7 @@
         "plugins/crypto_guard/reasoning/context_envelope.py",
         "plugins/crypto_guard/reasoning/decision_context.py",
         "plugins/crypto_guard/reasoning/decision_schema.py",
+        "plugins/crypto_guard/reasoning/entry_confirmation_lifecycle.py",
         "plugins/crypto_guard/reasoning/ga_judge.py",
         "plugins/crypto_guard/reasoning/llm_agent_judge.py",
         "plugins/crypto_guard/reasoning/llm_breaker.py",
@@ -259,6 +268,12 @@
         "test_pg_08_08_payload_serialization_normalizer.py",
         "test_pg_08_08_timeframe_modules_entry_extraction.py",
         "test_pg_08_08_watch_trigger_order_e2e.py",
+        "test_pg_08_10_confirmation_events_migration_p2.py",
+        "test_pg_08_10_confirmation_lifecycle_p1.py",
+        "test_pg_08_10_llm_risk_proposal_p1.py",
+        "test_pg_08_10_llm_risk_rollout_p1.py",
+        "test_pg_08_10_risk_advisory_producer_p1.py",
+        "test_pg_08_10_risk_context_isolation_p1.py",
         "test_pg_codex_p2_rework_fixes.py",
         "test_pg_codex_r2_rework_p0_p1.py",
         "test_pg_concurrency_p7.py",
@@ -310,7 +325,11 @@
         "plugins/crypto_guard/risk/__init__.py",
         "plugins/crypto_guard/risk/account_feedback_gate.py",
         "plugins/crypto_guard/risk/account_risk_guard.py",
-        "plugins/crypto_guard/risk/risk_engine.py"
+        "plugins/crypto_guard/risk/risk_adjustment_verifier.py",
+        "plugins/crypto_guard/risk/risk_committee.py",
+        "plugins/crypto_guard/risk/risk_context.py",
+        "plugins/crypto_guard/risk/risk_engine.py",
+        "plugins/crypto_guard/risk/risk_policy.py"
       ],
       "tests": [
         "test_core_regressions.py",
@@ -324,6 +343,12 @@
         "test_pg_llm_failed_direction_fail_closed_p2_1.py",
         "test_pg_llm_success_fallback_cleanup_p1_4.py",
         "test_pg_llm_success_fallback_pollution_p2_1.py",
+        "test_pg_08_10_confirmation_lifecycle_p1.py",
+        "test_pg_08_10_llm_risk_proposal_p1.py",
+        "test_pg_08_10_llm_risk_rollout_p1.py",
+        "test_pg_08_10_risk_adjustment_verifier_p0.py",
+        "test_pg_08_10_risk_context_isolation_p1.py",
+        "test_pg_08_10_risk_policy_p2.py",
         "test_pg_llm_synthesis_evidence_p1_2.py",
         "test_pg_risk_gate_single_validation_codex_p1_1.py",
         "test_shadow_lifecycle_regressions.py",
@@ -431,8 +456,10 @@
         "test_market_data_contracts.py",
         "test_paper_orders_regressions.py",
         "test_pg_08_04_skills_tools_e.py",
+        "test_pg_08_10_evidence_rounds_p1.py",
         "test_pg_fair_llm_raw_reference_p0_1.py",
         "test_pg_hourly_report_feishu_p8.py",
+        "test_pg_market_data_replay_p8.py",
         "test_pg_timeframe_parser_and_unsupported_p1_p2.py",
         "test_pg_timeframe_token_boundary_and_intent_guard_r3.py",
         "test_pg_tool_write_persistence_p9.py",
@@ -489,6 +516,9 @@
         "test_pg_08_08_timeframe_modules_entry_extraction.py",
         "test_pg_08_08_watch_recheck_diagnostics.py",
         "test_pg_08_08_watch_trigger_order_e2e.py",
+        "test_pg_08_10_llm_risk_rollout_p1.py",
+        "test_pg_08_10_risk_advisory_producer_p1.py",
+        "test_pg_08_12_daily_review_once_ever_p1.py",
         "test_pg_codex_r2_rework_p0_p1.py",
         "test_pg_concurrency_p7.py",
         "test_pg_fair_llm_raw_reference_p0_1.py",
@@ -547,7 +577,6 @@
       "test_pg_finish_job_datetime_p2.py",
       "test_pg_hourly_report_feishu_p8.py",
       "test_pg_jsonb_time_p6.py",
-      "test_pg_market_data_replay_p8.py",
       "test_pg_paper_domain_p8.py",
       "test_pg_state_consistency_p8.py"
     ],
@@ -581,6 +610,16 @@
       "test_pg_08_08_rollback_isolation.py",
       "test_pg_08_08_watch_recheck_diagnostics.py",
       "test_pg_08_08_watch_trigger_order_e2e.py",
+      "test_pg_08_10_confirmation_events_migration_p2.py",
+      "test_pg_08_10_confirmation_lifecycle_p1.py",
+      "test_pg_08_10_evidence_rounds_p1.py",
+      "test_pg_08_10_llm_risk_diagnostics_p2.py",
+      "test_pg_08_10_llm_risk_notification_p2.py",
+      "test_pg_08_10_llm_risk_reporting_p2.py",
+      "test_pg_08_10_llm_risk_rollout_p1.py",
+      "test_pg_08_10_risk_adjustment_verifier_p0.py",
+      "test_pg_08_10_risk_advisory_producer_p1.py",
+      "test_pg_08_12_daily_review_once_ever_p1.py",
       "test_pg_codex_r2_rework_p0_p1.py",
       "test_pg_concurrency_p7.py",
       "test_pg_conn_transaction_linchpin.py",
@@ -637,7 +676,15 @@
     ],
     "plugins/crypto_guard/tests/test_pg_08_04_watch_order_bridge_b.py": [
       "test_pg_08_04_reviewer_fixes_f.py",
-      "test_pg_08_08_watch_trigger_order_e2e.py"
+      "test_pg_08_08_watch_trigger_order_e2e.py",
+      "test_pg_08_10_llm_risk_rollout_p1.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_08_10_confirmation_lifecycle_p1.py": [
+      "test_pg_08_10_confirmation_events_migration_p2.py"
+    ],
+    "plugins/crypto_guard/tests/test_pg_08_10_llm_risk_rollout_p1.py": [
+      "test_pg_08_10_evidence_rounds_p1.py",
+      "test_pg_08_10_risk_advisory_producer_p1.py"
     ],
     "plugins/crypto_guard/tests/test_pg_fair_llm_raw_reference_p0_1.py": [
       "test_pg_08_08_watch_trigger_order_e2e.py",

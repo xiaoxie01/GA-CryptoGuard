@@ -42,6 +42,7 @@ def _diagnostic_query_failure(
 
 def _run_check(
     repo: CryptoGuardRepository,
+    check_name: str,
     check: Any,
 ) -> list[dict[str, Any]]:
     """Run one diagnostic in isolation and fail closed on query errors."""
@@ -49,8 +50,8 @@ def _run_check(
         result = check(repo)
         return result if isinstance(result, list) else []
     except Exception as exc:
-        LOGGER.exception("state consistency check failed: %s", check.__name__)
-        return _diagnostic_query_failure(repo, check.__name__, exc)
+        LOGGER.exception("state consistency check failed: %s", check_name)
+        return _diagnostic_query_failure(repo, check_name, exc)
 
 
 def _safe_json(raw: Any, default: Any) -> Any:
@@ -243,62 +244,70 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         }
     """
     issues: list[dict[str, Any]] = []
+    # 08-12 (reviewer round 3 Recommended-2): checks are registered as
+    # (name, fn) pairs — the name is the STABLE registration identity.
+    # Deriving it from ``fn.__name__`` at call time misidentifies the check
+    # whenever the callable is substituted (test monkeypatch, a decorator
+    # without functools.wraps): failure details must name the registered
+    # check, never the substitute.
     checks = (
-        _check_orphan_patches,
-        _check_status_mismatches,
-        _check_stale_shadows,
-        _check_draft_limbo,
-        _check_duplicate_patches,
-        _check_duplicate_open_trades,
-        _check_candidate_queue_overflow,
-        _check_stalled_candidate,
-        _check_no_real_pnl_progress,
-        _check_strategy_name_mismatch,
-        _check_zero_quantity_virtual_trades,
-        _check_zero_risk_virtual_trades,
-        _check_three_table_status_mismatch,
-        _check_closed_vt_missing_real_pnl_eval,
-        _check_ambiguous_vt_missing_ambiguous_eval,
-        _check_ambiguous_eval_not_real_pnl,
-        _check_duplicate_vt_per_candidate_decision,
-        _check_closed_vt_still_processed,
-        _check_cursor_regression,
-        _check_illegal_status_transitions,
-        _check_active_eval_missing_ga_decision_id,
-        _check_paper_order_missing_active_eval,
-        _check_closed_trade_missing_active_real_pnl,
-        _check_shadow_candidate_legacy_only_samples,
-        _check_financial_action_missing_mark_price,
-        _check_financial_action_stale_price,
-        _check_paper_notification_missing_event_time,
-        _check_schema_health_as_issues,
-        _check_btc9_contract_marker_missing,
-        _check_fallback_llm_failed_created_paper_order,
-        _check_missing_entry_confirmation_paper_order,
-        _check_htf_support_reason_inconsistent,
-        _check_chop_regime_boosted,
-        _check_fill_without_ga_revalidation,
-        _check_invalid_condition_equals_stop_loss,
-        _check_market_data_insufficient_contiguous_samples,
-        _check_market_data_gap_detected,
-        _check_market_data_stale_last_candle,
-        _check_market_data_future_candle,
-        _check_market_data_duplicate_open_time,
-        _check_analysis_created_with_unready_market_data,
-        _check_executable_decision_with_unready_market_data,
-        _check_paper_order_created_with_unready_market_data,
-        _check_report_claims_complete_for_gapped_data,
-        _check_deterministic_direction_from_failed_llm,
-        _check_llm_fair_scheduling_contract_marker_missing,
-        _check_llm_failed_direction_fail_closed_marker_missing,
-        _check_batch_claim_ownership_integrity,
-        _check_watch_order_bridge_contract_marker_missing,
-        _check_watch_recheck_risk_shape_contract_marker_missing,
-        _check_watch_review_payload_serialization_contract_marker_missing,
-        _check_watch_recheck_funnel_contract_marker_missing,
+        ("_check_orphan_patches", _check_orphan_patches),
+        ("_check_status_mismatches", _check_status_mismatches),
+        ("_check_stale_shadows", _check_stale_shadows),
+        ("_check_draft_limbo", _check_draft_limbo),
+        ("_check_duplicate_patches", _check_duplicate_patches),
+        ("_check_duplicate_open_trades", _check_duplicate_open_trades),
+        ("_check_candidate_queue_overflow", _check_candidate_queue_overflow),
+        ("_check_stalled_candidate", _check_stalled_candidate),
+        ("_check_no_real_pnl_progress", _check_no_real_pnl_progress),
+        ("_check_strategy_name_mismatch", _check_strategy_name_mismatch),
+        ("_check_zero_quantity_virtual_trades", _check_zero_quantity_virtual_trades),
+        ("_check_zero_risk_virtual_trades", _check_zero_risk_virtual_trades),
+        ("_check_three_table_status_mismatch", _check_three_table_status_mismatch),
+        ("_check_closed_vt_missing_real_pnl_eval", _check_closed_vt_missing_real_pnl_eval),
+        ("_check_ambiguous_vt_missing_ambiguous_eval", _check_ambiguous_vt_missing_ambiguous_eval),
+        ("_check_ambiguous_eval_not_real_pnl", _check_ambiguous_eval_not_real_pnl),
+        ("_check_duplicate_vt_per_candidate_decision", _check_duplicate_vt_per_candidate_decision),
+        ("_check_closed_vt_still_processed", _check_closed_vt_still_processed),
+        ("_check_cursor_regression", _check_cursor_regression),
+        ("_check_illegal_status_transitions", _check_illegal_status_transitions),
+        ("_check_active_eval_missing_ga_decision_id", _check_active_eval_missing_ga_decision_id),
+        ("_check_paper_order_missing_active_eval", _check_paper_order_missing_active_eval),
+        ("_check_closed_trade_missing_active_real_pnl", _check_closed_trade_missing_active_real_pnl),
+        ("_check_shadow_candidate_legacy_only_samples", _check_shadow_candidate_legacy_only_samples),
+        ("_check_financial_action_missing_mark_price", _check_financial_action_missing_mark_price),
+        ("_check_financial_action_stale_price", _check_financial_action_stale_price),
+        ("_check_paper_notification_missing_event_time", _check_paper_notification_missing_event_time),
+        ("_check_schema_health_as_issues", _check_schema_health_as_issues),
+        ("_check_btc9_contract_marker_missing", _check_btc9_contract_marker_missing),
+        ("_check_fallback_llm_failed_created_paper_order", _check_fallback_llm_failed_created_paper_order),
+        ("_check_missing_entry_confirmation_paper_order", _check_missing_entry_confirmation_paper_order),
+        ("_check_htf_support_reason_inconsistent", _check_htf_support_reason_inconsistent),
+        ("_check_chop_regime_boosted", _check_chop_regime_boosted),
+        ("_check_fill_without_ga_revalidation", _check_fill_without_ga_revalidation),
+        ("_check_invalid_condition_equals_stop_loss", _check_invalid_condition_equals_stop_loss),
+        ("_check_market_data_insufficient_contiguous_samples", _check_market_data_insufficient_contiguous_samples),
+        ("_check_market_data_gap_detected", _check_market_data_gap_detected),
+        ("_check_market_data_stale_last_candle", _check_market_data_stale_last_candle),
+        ("_check_market_data_future_candle", _check_market_data_future_candle),
+        ("_check_market_data_duplicate_open_time", _check_market_data_duplicate_open_time),
+        ("_check_analysis_created_with_unready_market_data", _check_analysis_created_with_unready_market_data),
+        ("_check_executable_decision_with_unready_market_data", _check_executable_decision_with_unready_market_data),
+        ("_check_paper_order_created_with_unready_market_data", _check_paper_order_created_with_unready_market_data),
+        ("_check_report_claims_complete_for_gapped_data", _check_report_claims_complete_for_gapped_data),
+        ("_check_deterministic_direction_from_failed_llm", _check_deterministic_direction_from_failed_llm),
+        ("_check_llm_fair_scheduling_contract_marker_missing", _check_llm_fair_scheduling_contract_marker_missing),
+        ("_check_llm_failed_direction_fail_closed_marker_missing", _check_llm_failed_direction_fail_closed_marker_missing),
+        ("_check_batch_claim_ownership_integrity", _check_batch_claim_ownership_integrity),
+        ("_check_watch_order_bridge_contract_marker_missing", _check_watch_order_bridge_contract_marker_missing),
+        ("_check_watch_recheck_risk_shape_contract_marker_missing", _check_watch_recheck_risk_shape_contract_marker_missing),
+        ("_check_watch_review_payload_serialization_contract_marker_missing", _check_watch_review_payload_serialization_contract_marker_missing),
+        ("_check_watch_recheck_funnel_contract_marker_missing", _check_watch_recheck_funnel_contract_marker_missing),
+        ("_check_llm_risk_governance_diagnostics", _check_llm_risk_governance_diagnostics),
+        ("_check_daily_review_push_consistency", _check_daily_review_push_consistency),
     )
-    for check in checks:
-        issues.extend(_run_check(repo, check))
+    for name, check in checks:
+        issues.extend(_run_check(repo, name, check))
 
     summary = {
         "orphan_patches": len([i for i in issues if i["type"] == "orphan_patch"]),
@@ -337,6 +346,27 @@ def diagnose_state_consistency(repo: CryptoGuardRepository) -> dict[str, Any]:
         "watch_recheck_risk_shape_contract_marker_missing": len([i for i in issues if i["type"] == "watch_recheck_risk_shape_contract_marker_missing"]),
         "watch_review_payload_serialization_contract_marker_missing": len([i for i in issues if i["type"] == "watch_review_payload_serialization_contract_marker_missing"]),
         "watch_recheck_funnel_contract_marker_missing": len([i for i in issues if i["type"] == "watch_recheck_funnel_contract_marker_missing"]),
+        "lifecycle_contract_marker_missing": len([i for i in issues if i["type"] == "lifecycle_contract_marker_missing"]),
+        "proposal_contract_marker_missing": len([i for i in issues if i["type"] == "proposal_contract_marker_missing"]),
+        "verifier_contract_marker_missing": len([i for i in issues if i["type"] == "verifier_contract_marker_missing"]),
+        "context_contract_marker_missing": len([i for i in issues if i["type"] == "context_contract_marker_missing"]),
+        "carried_confirmation_without_provenance": len([i for i in issues if i["type"] == "carried_confirmation_without_provenance"]),
+        "confirmation_survived_expiry": len([i for i in issues if i["type"] == "confirmation_survived_expiry"]),
+        "llm_proposal_immutable_change": len([i for i in issues if i["type"] == "llm_proposal_immutable_change"]),
+        "llm_proposal_unknown_evidence": len([i for i in issues if i["type"] == "llm_proposal_unknown_evidence"]),
+        "accepted_adjustment_increases_monetary_risk": len([i for i in issues if i["type"] == "accepted_adjustment_increases_monetary_risk"]),
+        "order_without_final_verifier_success": len([i for i in issues if i["type"] == "order_without_final_verifier_success"]),
+        "llm_risk_review_starvation": len([i for i in issues if i["type"] == "llm_risk_review_starvation"]),
+        # 08-12 P1 (reviewer round 2): per-type counts for the two
+        # daily_review push-consistency types (the summary dict carries a
+        # count key for every other diagnostic type).
+        "daily_review_push_inconsistency": len([i for i in issues if i["type"] == "daily_review_push_inconsistency"]),
+        "daily_review_delivery_outcome_unknown": len([i for i in issues if i["type"] == "daily_review_delivery_outcome_unknown"]),
+        # 08-12 (reviewer round 3 Recommended-2): fail-closed QUERY errors of
+        # any check must be observable from the summary too — a check that
+        # could not run (or whose SQL broke) is otherwise indistinguishable
+        # from one that ran cleanly.
+        "diagnostic_query_failed": len([i for i in issues if i["type"] == "diagnostic_query_failed"]),
     }
 
     # Section 八: Separate counts for error/warning/legacy_info
@@ -3332,6 +3362,30 @@ def _check_watch_recheck_funnel_contract_marker_missing(repo: CryptoGuardReposit
     return issues
 
 
+def _check_llm_risk_governance_diagnostics(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-10 Step 9 (P1-3): merge the LLM risk-governance diagnostics.
+
+    Runs ``diagnose_llm_risk_governance`` — the four 08-10 fail-closed
+    marker-missing checks (``{name}_contract_marker_missing`` for lifecycle /
+    proposal / verifier / context) plus the seven detection checks over the
+    persisted risk-advisory envelopes (carried-confirmation provenance, expiry,
+    immutable change, unknown evidence, monetary-risk increase, order-without-
+    verifier-success, review starvation) — and surfaces its issues inside the
+    production ``diagnose_state_consistency`` aggregation (the entrypoint the
+    hourly report calls). A lazy function-level import keeps the optional
+    module out of the critical import path; an exception inside the merged
+    entrypoint fails closed via ``_run_check``'s ``_diagnostic_query_failure``.
+    """
+    from plugins.crypto_guard.diagnostics.llm_risk_governance import (
+        diagnose_llm_risk_governance,
+    )
+
+    result = diagnose_llm_risk_governance(repo)
+    if not isinstance(result, dict):
+        return []
+    return list(result.get("issues") or [])
+
+
 def _check_schema_health_as_issues(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
     """Section 九: Delegates to check_schema_health(conn=repo.conn) and
     converts any failures into state_consistency issues.
@@ -3499,6 +3553,56 @@ def _check_batch_claim_ownership_integrity(repo: CryptoGuardRepository) -> list[
                 "缺少 claim_token 或 lease_until 已过期。检查 claim_next_batch "
                 "是否同时写 token+lease，以及 recover_stale_running_jobs 是否复位"
                 "过期租约。(P0#4/S3 契约)"
+            ),
+        })
+    return issues
+
+
+def _check_daily_review_push_consistency(repo: CryptoGuardRepository) -> list[dict[str, Any]]:
+    """08-12 P1 (reviewer P2-2): surface alert_outbox / pushed_to_feishu
+    inconsistencies for daily_review:<date> deliveries inside the production
+    ``diagnose_state_consistency`` aggregation (the entrypoint the hourly
+    report calls) — the defect shape (external send committed while the marker
+    update was rolled back) must never present as a silently-healthy report.
+    An exception inside the merged entrypoint fails closed via ``_run_check``.
+    """
+    result = repo.diagnose_daily_review_push_consistency()
+    if not isinstance(result, dict):
+        return []
+    issues: list[dict[str, Any]] = []
+    for item in result.get("inconsistencies") or []:
+        review_date = item.get("review_date") or ""
+        issues.append({
+            "type": "daily_review_push_inconsistency",
+            "severity": "warning",
+            "details": {
+                "kind": item.get("kind"),
+                "review_date": review_date,
+                "detail": item.get("detail"),
+            },
+            "suggested_action": (
+                "每日复盘推送不一致：人工核对 daily_review_reports.pushed_to_feishu "
+                "与 alert_outbox 'sent' 行后手工修复，不得自动改写。"
+            ),
+        })
+    # 08-12 P1 (Codex P1-2): a daily_review external send whose outcome is
+    # unknown (terminal failed with the send/finalize/crash reason codes, or a
+    # long-stale 'sending' row) is a delivery gap the hourly report must
+    # surface — manual reconciliation against the Feishu channel, never an
+    # automatic pushed_to_feishu flip.
+    for item in result.get("delivery_unknown") or []:
+        issues.append({
+            "type": "daily_review_delivery_outcome_unknown",
+            "severity": "warning",
+            "details": {
+                "alert_outbox_id": item.get("alert_outbox_id"),
+                "review_date": item.get("review_date") or "",
+                "status": item.get("status"),
+                "reason": item.get("reason"),
+            },
+            "suggested_action": (
+                "每日复盘推送结果未知：请人工核对飞书是否收到该日复盘后，再决定是否修复 "
+                "alert_outbox / pushed_to_feishu 状态，不得自动改写 pushed_to_feishu。"
             ),
         })
     return issues

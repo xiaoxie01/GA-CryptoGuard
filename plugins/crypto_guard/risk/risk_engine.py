@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any
 
-from plugins.crypto_guard.config.loader import load_config
+from plugins.crypto_guard.config.loader import cfg_threshold, load_config
 from plugins.crypto_guard.analysis.market_regime_engine import EXTREME_REGIMES, score_market_regime
 from plugins.crypto_guard.reasoning.watch_conditions import normalize_opportunity_watch
 from plugins.crypto_guard.strategy.grade_config import PUSH_GRADES, WATCH_GRADES, STORE_ONLY_GRADES, is_paper_order_eligible
@@ -282,8 +282,21 @@ def apply_risk_to_decision(decision: dict[str, Any], snapshot: dict[str, Any]) -
 def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = load_config().trading_mode
     risk_cfg = cfg.get("risk", {})
-    min_rr = float(risk_cfg.get("min_rr", 2.0))
-    min_conf = float(risk_cfg.get("min_confidence", risk_cfg.get("min_confidence_for_paper_order", 0.72)))
+    # 08-10 P2-1 (fresh reviewer P2): every threshold read is FAIL-CLOSED via
+    # ``cfg_threshold`` — a present-but-invalid value (NaN/bool/0/negative)
+    # raises (plan fails closed), never silently disables the gate
+    # (``rr < nan`` is always False). Reads are hoisted once so the whole
+    # function shares one deterministic threshold set.
+    min_rr = cfg_threshold(risk_cfg, "min_rr", 2.0)
+    min_conf = cfg_threshold(
+        risk_cfg,
+        "min_confidence",
+        cfg_threshold(risk_cfg, "min_confidence_for_paper_order", 0.72),
+    )
+    min_sl_pct = cfg_threshold(risk_cfg, "min_sl_distance_pct", 0.8)
+    min_tp_pct = cfg_threshold(risk_cfg, "min_tp_distance_pct", 1.0)
+    rsi_ob_threshold = cfg_threshold(risk_cfg, "rsi_overbought_threshold", 75)
+    rsi_os_threshold = cfg_threshold(risk_cfg, "rsi_oversold_threshold", 25)
     snapshot = snapshot or {}
     plan = decision.get("trade_plan") if decision.get("has_trade_plan") else None
     reasons: list[str] = []
@@ -416,7 +429,6 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
         if stop:
             sl_distance = abs(entry - stop)
             sl_pct = sl_distance / entry * 100
-            min_sl_pct = float(risk_cfg.get("min_sl_distance_pct", 0.8))
             if sl_pct < min_sl_pct:
                 reasons.append(f"止损距离 {sl_pct:.3f}% 低于最小要求 {min_sl_pct}%，交易空间不足")
 
@@ -452,7 +464,6 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
             if tp_price:
                 tp_distance = abs(tp_price - entry)
                 tp_pct = tp_distance / entry * 100
-                min_tp_pct = float(risk_cfg.get("min_tp_distance_pct", 1.0))
                 if tp_pct < min_tp_pct:
                     reasons.append(f"第一止盈距离 {tp_pct:.3f}% 低于最小要求 {min_tp_pct}%，交易空间不足")
 
@@ -469,12 +480,12 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
             if side == "LONG":
                 distance = entry - stop
                 # Buffer: max(0.2 * ATR, min_sl_distance)
-                min_buffer = max(atr_current * 0.2, entry * float(risk_cfg.get("min_sl_distance_pct", 0.8)) / 100)
+                min_buffer = max(atr_current * 0.2, entry * min_sl_pct / 100)
                 if distance < min_buffer:
                     reasons.append(f"止损距离 {distance:.4f} 不足 ATR 缓冲 {min_buffer:.4f}（0.2×ATR={atr_current*0.2:.4f}），易被噪音打掉")
             elif side == "SHORT":
                 distance = stop - entry
-                min_buffer = max(atr_current * 0.2, entry * float(risk_cfg.get("min_sl_distance_pct", 0.8)) / 100)
+                min_buffer = max(atr_current * 0.2, entry * min_sl_pct / 100)
                 if distance < min_buffer:
                     reasons.append(f"止损距离 {distance:.4f} 不足 ATR 缓冲 {min_buffer:.4f}（0.2×ATR={atr_current*0.2:.4f}），易被噪音打掉")
 
@@ -504,8 +515,6 @@ def validate_trade_plan(decision: dict[str, Any], snapshot: dict[str, Any] | Non
         momentum = modules.get("momentum") or {}
         rsi_value = _safe_float(momentum.get("rsi"))
         if rsi_value is not None:
-            rsi_ob_threshold = float(risk_cfg.get("rsi_overbought_threshold", 75))
-            rsi_os_threshold = float(risk_cfg.get("rsi_oversold_threshold", 25))
             if side == "LONG" and rsi_value >= rsi_ob_threshold:
                 reasons.append(f"RSI {rsi_value:.1f} 超买（>={rsi_ob_threshold}），禁止追多")
             elif side == "SHORT" and rsi_value <= rsi_os_threshold:

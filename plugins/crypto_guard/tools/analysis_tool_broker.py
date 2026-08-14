@@ -25,6 +25,17 @@ bypass the risk gate.
 The broker reads only through a repository-like ``repo`` argument; it never
 writes, never touches the network, and never controls a service. No production
 DB mutation, no marker write, no service restart.
+
+08-10 Step 6 (prd P1-4, design §6.2/§8): the risk proposal LLM may request only
+ENUMERATED read-only broker methods through a structured tool-request schema.
+The 08-04 ``METHODS`` set (exactly five) is frozen by its contract test, so the
+two narrow risk reads (``confirmation_lifecycle_evidence`` /
+``adaptive_risk_budget``) live in the separate ``RISK_READ_METHODS`` set and
+are dispatched through ``call`` without touching ``METHODS``. Every supplement
+round result is stamped with source/as-of/age/trust/schema metadata; stale
+lifecycle evidence raises ``BrokerStaleError``; the structured tool-request
+validator + ``run_risk_supplement_round`` fail closed (``wait``) on more
+requests, unknown methods or budget exhaustion.
 """
 from __future__ import annotations
 
@@ -48,7 +59,51 @@ MAX_LIST_LEN = 100
 
 ALLOWED_TIMEFRAMES = ("1d", "4h", "1h", "15m", "5m")
 ALLOWED_REGIMES = ("normal", "high_volatility", "low_volatility", "extreme", "unknown")
+_ALLOWED_SIDES = ("LONG", "SHORT")
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
+
+# 08-10 Step 6: the enumerated read-only method set for the risk supplement
+# round. Kept SEPARATE from ``AnalysisToolBroker.METHODS`` so the 08-04
+# "exactly five" contract stays frozen. ``previous_round_state`` is excluded by
+# design (§8: "do not add entire prior decisions").
+RISK_READ_METHODS = frozenset({
+    "confirmation_lifecycle_evidence",
+    "adaptive_risk_budget",
+    "latest_closed_market_summary",
+    "deterministic_skill_evidence",
+    "relevant_watch_evidence",
+    "simulated_account_state",
+})
+
+# Trust label per risk read (design §3 partition matrix): deterministic
+# repo/module reads are ``trusted``; skill evidence is a deterministic module
+# output (``trusted``); watch records carry untrusted free text, so the whole
+# method result is ``untrusted_data``.
+RISK_READ_TRUST: dict[str, str] = {
+    "confirmation_lifecycle_evidence": "trusted",
+    "adaptive_risk_budget": "trusted",
+    "latest_closed_market_summary": "trusted",
+    "deterministic_skill_evidence": "trusted",
+    "relevant_watch_evidence": "untrusted_data",
+    "simulated_account_state": "trusted",
+}
+
+RISK_READ_SCHEMA_VERSION: dict[str, str] = {
+    "confirmation_lifecycle_evidence": "confirmation_lifecycle_v1",
+    "adaptive_risk_budget": "adaptive_risk_budget_v1",
+    "latest_closed_market_summary": "market_summary_v1",
+    "deterministic_skill_evidence": "skill_evidence_v1",
+    "relevant_watch_evidence": "watch_evidence_v1",
+    "simulated_account_state": "account_state_v1",
+}
+
+# Default TTL for a prior trusted confirmation event: older evidence fails
+# closed (BrokerStaleError) unless the caller passes an explicit cap.
+DEFAULT_LIFECYCLE_MAX_AGE_MS = 4 * 3600 * 1000  # 4 hours
+
+# Bound for one risk supplement round (design §8: three watches / three
+# counter-evidence records / one lifecycle / one budget / one plan).
+MAX_RISK_TOOL_REQUESTS = 6
 
 # E4: names that must never be reachable on the broker, either as a method
 # call or as an attribute access.
@@ -81,6 +136,11 @@ class BrokerSchemaError(Exception):
 
 class BrokerRoundLimitError(Exception):
     """Raised when a round exceeds MAX_TOOL_REQUESTS_PER_ROUND requests."""
+
+
+class BrokerStaleError(Exception):
+    """Raised when a read result is older than its evidence TTL and therefore
+    cannot support approval (08-10 Step 6 fail-closed contract)."""
 
 
 # ── lightweight result-schema validator (pure, no jsonschema dependency) ────
@@ -181,6 +241,52 @@ RESULT_SCHEMAS: dict[str, dict[str, Any]] = {
             "risk_override_required": {"type": "boolean"},
         },
     },
+    # 08-10 Step 6: narrow risk reads. Their ``data`` is self-describing —
+    # source / as-of / age / trust / schema_version ride inside the result so a
+    # direct ``call`` already satisfies the P1-4 metadata contract.
+    "confirmation_lifecycle_evidence": {
+        "required": [
+            "symbol", "side", "analysis_time_utc", "status", "fingerprint",
+            "direction", "close_time", "age_bars",
+            "source", "as_of", "age_ms", "trust", "schema_version",
+        ],
+        "properties": {
+            "symbol": {"type": "string"},
+            "side": {"type": "string"},
+            "analysis_time_utc": {"type": "integer"},
+            "status": {"type": "string"},
+            "fingerprint": {"type": ["string", "null"]},
+            "direction": {"type": ["string", "null"]},
+            "close_time": {"type": ["integer", "null"]},
+            "age_bars": {"type": ["integer", "null"]},
+            "source": {"type": "string"},
+            "as_of": {"type": "integer"},
+            "age_ms": {"type": "integer"},
+            "trust": {"type": "string"},
+            "schema_version": {"type": "string"},
+        },
+    },
+    "adaptive_risk_budget": {
+        "required": [
+            "symbol", "as_of", "source", "age_ms", "trust", "schema_version",
+            "open_orders_count",
+        ],
+        "properties": {
+            "symbol": {"type": ["string", "null"]},
+            "as_of": {"type": "integer"},
+            "source": {"type": "string"},
+            "age_ms": {"type": "integer"},
+            "trust": {"type": "string"},
+            "schema_version": {"type": "string"},
+            "open_orders_count": {"type": "integer"},
+            "risk_units_free": {"type": ["number", "null"]},
+            "risk_units_total": {"type": ["number", "null"]},
+            "risk_units_used": {"type": ["number", "null"]},
+            "budget_pct_used": {"type": ["number", "null"]},
+            "concentration_breach": {"type": "boolean"},
+            "symbols": {"type": "array"},
+        },
+    },
 }
 
 
@@ -233,6 +339,11 @@ class AnalysisToolBroker:
         if regime not in ALLOWED_REGIMES:
             raise BrokerParamError(f"invalid regime {regime!r}; allowed {ALLOWED_REGIMES}")
 
+    def _validate_side(self, side: Any) -> str:
+        if not isinstance(side, str) or side not in _ALLOWED_SIDES:
+            raise BrokerParamError(f"invalid side {side!r}; expected {_ALLOWED_SIDES}")
+        return side
+
     def _at(self, analysis_time_utc: int | None) -> int:
         return int(analysis_time_utc) if analysis_time_utc is not None else self._now()
 
@@ -249,7 +360,9 @@ class AnalysisToolBroker:
         envelope on success, ``{"ok": False, "error": "read_failed"}`` when the
         underlying read source fails, and raises the broker's own error types on
         forbidden/param/timeout/size/schema violations."""
-        if method not in self.METHODS:
+        # 08-10 Step 6: the two narrow risk reads dispatch here too, but they
+        # are NOT added to ``METHODS`` (frozen by the 08-04 contract test).
+        if method not in self.METHODS and method not in RISK_READ_METHODS:
             raise BrokerForbiddenError(
                 f"AnalysisToolBroker exposes only read-only methods; rejected {method!r}"
             )
@@ -258,7 +371,7 @@ class AnalysisToolBroker:
         try:
             data = fn(**kwargs)
         except (BrokerParamError, BrokerForbiddenError, BrokerTimeoutError,
-                BrokerSizeBudgetError, BrokerSchemaError):
+                BrokerSizeBudgetError, BrokerSchemaError, BrokerStaleError):
             raise
         except Exception as exc:  # noqa: BLE001 — read source failure is not a broker bug
             _LOGGER.warning("analysis broker %s read_failed: %s", method, exc)
@@ -415,6 +528,90 @@ class AnalysisToolBroker:
             "risk_override_required": False,
         }
 
+    # ── 08-10 Step 6 narrow risk reads (design §6.2/§8) ───────────────────
+    def confirmation_lifecycle_evidence(
+        self,
+        symbol: str,
+        side: str,
+        analysis_time_utc: int | None = None,
+        max_age_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Read ONE prior trusted entry-confirmation lifecycle event for
+        (symbol, side). Fail-closed on stale evidence: an event older than
+        ``max_age_ms`` (default ``DEFAULT_LIFECYCLE_MAX_AGE_MS``) raises
+        ``BrokerStaleError``. A repo row of ``None`` yields ``status: "absent"``
+        (not stale — absence is a downstream determinism decision)."""
+        symbol = self._validate_symbol(symbol)
+        side = self._validate_side(side)
+        at = self._at(analysis_time_utc)
+        row = self._repo.confirmation_lifecycle(symbol, side, analysis_time_utc=at)
+        if not row:
+            return {
+                "symbol": symbol,
+                "side": side,
+                "analysis_time_utc": at,
+                "status": "absent",
+                "fingerprint": None,
+                "direction": None,
+                "close_time": None,
+                "age_bars": None,
+                "source": "analysis_tool_broker",
+                "as_of": at,
+                "age_ms": 0,
+                "trust": "trusted",
+                "schema_version": "confirmation_lifecycle_v1",
+            }
+        event_time = int(row.get("close_time") or row.get("as_of") or at)
+        age_ms = max(0, at - event_time)
+        cap = int(max_age_ms) if max_age_ms is not None else DEFAULT_LIFECYCLE_MAX_AGE_MS
+        if age_ms > cap:
+            raise BrokerStaleError(
+                f"confirmation lifecycle evidence stale: age_ms={age_ms} > "
+                f"max_age_ms={cap} (as_of={event_time}, at={at})"
+            )
+        return {
+            "symbol": symbol,
+            "side": side,
+            "analysis_time_utc": at,
+            "status": str(row.get("status") or "confirmed"),
+            "fingerprint": row.get("fingerprint"),
+            "direction": row.get("direction"),
+            "close_time": event_time,
+            "age_bars": row.get("age_bars"),
+            "source": "analysis_tool_broker",
+            "as_of": int(row.get("as_of") or event_time),
+            "age_ms": age_ms,
+            "trust": "trusted",
+            "schema_version": "confirmation_lifecycle_v1",
+        }
+
+    def adaptive_risk_budget(
+        self,
+        symbol: str | None = None,
+        analysis_time_utc: int | None = None,
+    ) -> dict[str, Any]:
+        """Compact account risk budget summary (per-symbol when ``symbol`` is
+        given, whole account otherwise). Reads only the ``adaptive_risk_budget_
+        summary`` repo seam — never raw account rows."""
+        sym = self._validate_symbol(symbol) if symbol is not None else None
+        at = self._at(analysis_time_utc)
+        row = self._repo.adaptive_risk_budget_summary(sym, as_of=at) or {}
+        return {
+            "symbol": sym,
+            "as_of": at,
+            "source": "analysis_tool_broker",
+            "age_ms": 0,
+            "trust": "trusted",
+            "schema_version": "adaptive_risk_budget_v1",
+            "open_orders_count": int(row.get("open_orders_count") or 0),
+            "risk_units_free": row.get("risk_units_free"),
+            "risk_units_total": row.get("risk_units_total"),
+            "risk_units_used": row.get("risk_units_used"),
+            "budget_pct_used": row.get("budget_pct_used"),
+            "concentration_breach": bool(row.get("concentration_breach") or False),
+            "symbols": [str(s) for s in (row.get("symbols") or [])],
+        }
+
 
 class BrokerRoundManager:
     """E6: caps tool requests per round (MAX_TOOL_REQUESTS_PER_ROUND) and
@@ -565,4 +762,176 @@ def run_analysis_rounds(
         "requests_used": manager.requests_used,
         "verifier": verifier,
         "order_allowed": order_allowed,
+    }
+
+
+# ── 08-10 Step 6: structured tool-request schema + supplement executor ─────
+# Per-method param spec used by ``validate_tool_request``. Every risk read
+# declares its own parameter surface; unknown param keys are rejected so a
+# hostile/forged request can never smuggle extra arguments into a read.
+RISK_READ_PARAM_SPECS: dict[str, dict[str, dict[str, Any]]] = {
+    "confirmation_lifecycle_evidence": {
+        "symbol": {"type": "string", "required": True},
+        "side": {"type": "string", "required": True, "enum": _ALLOWED_SIDES},
+        "analysis_time_utc": {"type": "integer", "required": False},
+        "max_age_ms": {"type": "integer", "required": False},
+    },
+    "adaptive_risk_budget": {
+        "symbol": {"type": "string", "required": False},
+        "analysis_time_utc": {"type": "integer", "required": False},
+    },
+    "latest_closed_market_summary": {
+        "symbol": {"type": "string", "required": True},
+        "timeframe": {"type": "string", "required": True, "enum": ALLOWED_TIMEFRAMES},
+        "analysis_time_utc": {"type": "integer", "required": False},
+    },
+    "deterministic_skill_evidence": {
+        "symbol": {"type": "string", "required": True},
+        "timeframe": {"type": "string", "required": True, "enum": ALLOWED_TIMEFRAMES},
+        "analysis_time_utc": {"type": "integer", "required": False},
+    },
+    "relevant_watch_evidence": {
+        "symbol": {"type": "string", "required": True},
+        "regime": {"type": "string", "required": False, "enum": ALLOWED_REGIMES},
+    },
+    "simulated_account_state": {},
+}
+
+
+def validate_tool_request(
+    request: Any,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Validate one structured tool request BEFORE it reaches the broker.
+
+    Returns ``(ok, err, normalized)`` where ``normalized`` is a clean copy
+    ``{"method": ..., "params": ...}``. Rejects non-object requests, any key
+    other than ``method``/``params``, unknown/non-enumerated methods,
+    non-object params, unknown param keys, wrong param types and bad enum
+    values (side/timeframe/regime). Fail-closed: nothing here executes anything.
+    """
+    if not isinstance(request, dict):
+        return False, "tool request must be an object", None
+    keys = set(request)
+    if keys != {"method", "params"}:
+        extra = sorted(keys - {"method", "params"})
+        missing = [k for k in ("method", "params") if k not in request]
+        return False, (
+            f"tool request must carry exactly 'method' and 'params' "
+            f"(extra={extra}, missing={missing})"
+        ), None
+    method = request.get("method")
+    if not isinstance(method, str) or method not in RISK_READ_METHODS:
+        return False, f"unknown or non-enumerated tool method: {method!r}", None
+    params = request.get("params")
+    if not isinstance(params, dict):
+        return False, "tool request params must be an object", None
+    spec = RISK_READ_PARAM_SPECS.get(method, {})
+    unknown = sorted(set(params) - set(spec))
+    if unknown:
+        return False, f"unknown param(s) for {method}: {unknown}", None
+    for name, rule in spec.items():
+        if rule.get("required") and name not in params:
+            return False, f"missing required param {method}.{name}", None
+        if name in params:
+            value = params[name]
+            expected = rule["type"]
+            if not _TYPECHECK.get(expected, lambda _: True)(value):
+                return False, (
+                    f"param {method}.{name} must be {expected}, "
+                    f"got {type(value).__name__}"
+                ), None
+            enum = rule.get("enum")
+            if enum is not None and value not in enum:
+                return False, f"param {method}.{name} must be one of {enum}, got {value!r}", None
+    return True, None, {"method": method, "params": dict(params)}
+
+
+def _risk_evidence_meta(method: str, env: dict[str, Any], at: int) -> dict[str, Any]:
+    """Standard source/as-of/age/trust/schema metadata for one executed result.
+
+    ``as_of`` prefers the result's own self-declared ``as_of`` (when the
+    underlying fact was true), then its ``analysis_time_utc``, then the round
+    time; ``age_ms`` is measured against the round analysis time.
+    """
+    data = env.get("data")
+    as_of: Any = None
+    if isinstance(data, dict):
+        if isinstance(data.get("as_of"), int):
+            as_of = data["as_of"]
+        elif isinstance(data.get("analysis_time_utc"), int):
+            as_of = data["analysis_time_utc"]
+    if not isinstance(as_of, int):
+        as_of = at
+    return {
+        "source": "analysis_tool_broker",
+        "as_of": as_of,
+        "age_ms": max(0, int(at) - int(as_of)),
+        "trust": RISK_READ_TRUST.get(method, "untrusted_data"),
+        "schema_version": RISK_READ_SCHEMA_VERSION.get(method, "unknown"),
+    }
+
+
+def run_risk_supplement_round(
+    broker: AnalysisToolBroker,
+    *,
+    requests: list[Any],
+    symbol: str,
+    analysis_time_utc: int,
+    max_requests: int = MAX_RISK_TOOL_REQUESTS,
+) -> dict[str, Any]:
+    """Execute one validated risk supplement request list (design §6.2 #2/#3).
+
+    - Over-capacity (more than ``max_requests``) raises ``BrokerRoundLimitError``;
+    - an invalid/unknown request raises ``BrokerForbiddenError`` — the round
+      stops there ("more requests, unknown methods ... returns ``wait``");
+    - any executed evidence that fails (``read_failed``) or raises a broker
+      error (stale/param/size/schema/timeout) is recorded as ``ok=False`` with
+      ``error="evidence_failed"`` so the round is never approvable;
+    - every successful result is stamped with source/as-of/age/trust/schema
+      metadata (``env["meta"]``).
+
+    Returns ``{"ok", "symbol", "analysis_time_utc", "results", "requests_used"}``.
+    """
+    if not isinstance(requests, list) or len(requests) > max_requests:
+        raise BrokerRoundLimitError(
+            f"risk supplement round exceeds max_requests={max_requests} "
+            f"(got {len(requests) if isinstance(requests, list) else 'non-list'})"
+        )
+    at = int(analysis_time_utc)
+    results: list[dict[str, Any]] = []
+    for i, req in enumerate(requests):
+        ok, err, normalized = validate_tool_request(req)
+        if not ok:
+            raise BrokerForbiddenError(f"tool request {i} rejected: {err}")
+        method = normalized["method"]
+        params = normalized["params"]
+        # Pin reads that accept an as-of to the round time when the request
+        # omitted it, so evidence age is measured against this proposal round.
+        if "analysis_time_utc" in RISK_READ_PARAM_SPECS.get(method, {}) and "analysis_time_utc" not in params:
+            params["analysis_time_utc"] = at
+        try:
+            env = broker.call(method, **params)
+        except BrokerRoundLimitError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — fail closed on any broker error
+            results.append({
+                "ok": False,
+                "method": method,
+                "error": "evidence_failed",
+                "message": str(exc)[:200],
+                "fail_closed_reason": type(exc).__name__,
+                "elapsed_ms": 0,
+            })
+            continue
+        if not env.get("ok"):
+            results.append({**env, "ok": False, "error": "evidence_failed"})
+            continue
+        env["meta"] = _risk_evidence_meta(method, env, at)
+        results.append(env)
+    return {
+        "ok": all(r.get("ok") for r in results),
+        "symbol": symbol,
+        "analysis_time_utc": at,
+        "results": results,
+        "requests_used": len(results),
     }

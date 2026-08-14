@@ -131,6 +131,113 @@ def _grant_runtime_privileges(cur: psycopg.Cursor) -> None:
     )
 
 
+def _precheck_daily_review_once_ever_duplicates(cur: psycopg.Cursor) -> None:
+    """08-12 P2-2 (fresh reviewer): fail-closed preflight for the once-ever
+    daily_review unique index.
+
+    The schema DDL's ``CREATE UNIQUE INDEX ... idx_alert_outbox_daily_review_once_ever``
+    on a dirty historical DB that already holds TWO rows for one
+    ``daily_review:<date>`` key (the old code had no cross-state constraint)
+    would raise a raw UniqueViolation whose message names no business key —
+    the operator cannot act on it. Detect the duplicates BEFORE the DDL and
+    raise an actionable RuntimeError: exact duplicate keys + row counts +
+    human-merge guidance. Zero deletion, zero rewriting: the caller's
+    transaction rollback leaves every row untouched. Runs only on the
+    dirty-DB migration branch (unhealthy schema), so the greenfield path
+    is untouched and healthy re-runs stay lock-free.
+
+    On a truly empty fresh schema the ``alert_outbox`` table does not exist
+    YET (the schema DDL below creates it), so this safe no-ops -- mirroring
+    the 08-12 sibling migration's table-existence guard. WITHOUT the guard,
+    ``initialize_database`` on a fresh schema raised ``UndefinedTable``
+    (the same fresh-schema RED class as test_pg_health / test_pg_migrations /
+    test_pg_08_06_legacy_upgrade_p1).
+
+    The same function is ALSO re-run from the DDL catch path (reviewer round 3
+    Recommended-1): a raw-SQL writer that bypasses initialize_database can
+    commit a duplicate in the precheck -> DDL window; the savepointed
+    ``CREATE UNIQUE INDEX`` then raises UniqueViolation (sqlstate 23505) and
+    the caller re-invokes this precheck to convert the index-name-only error
+    into the same actionable key-list error.
+    """
+    if not _table_exists(cur, "alert_outbox"):
+        return
+    cur.execute(
+        """
+        SELECT dedupe_key, COUNT(*) AS n
+        FROM alert_outbox
+        WHERE dedupe_key LIKE 'daily_review:%'
+        GROUP BY dedupe_key
+        HAVING COUNT(*) > 1
+        ORDER BY dedupe_key
+        """
+    )
+    dupes = cur.fetchall()
+    if dupes:
+        keys = ", ".join(f"{row['dedupe_key']} (x{row['n']})" for row in dupes)
+        raise RuntimeError(
+            "initialize_database cannot build the once-ever unique index "
+            "idx_alert_outbox_daily_review_once_ever: the dirty DB holds "
+            "DUPLICATE daily_review keys that must be merged manually "
+            f"(zero rows were deleted or rewritten): {keys}. For each "
+            "duplicate, compare the alert_outbox rows (status, last_error, "
+            "created_at), keep the row whose delivery actually happened, "
+            "fail-close or delete the others, then re-run "
+            "initialize_database."
+        )
+
+
+def _precheck_pending_dedupe_key_duplicates(cur: psycopg.Cursor) -> None:
+    """08-12 (reviewer round 4 R-1): fail-closed preflight for the partial
+    unique ``idx_alert_outbox_dedupe_unique`` (dedupe_key, status='pending').
+
+    The schema DDL's ``CREATE UNIQUE INDEX IF NOT EXISTS
+    idx_alert_outbox_dedupe_unique ... WHERE dedupe_key IS NOT NULL AND
+    status = 'pending'`` on a dirty DB that already holds TWO pending rows for
+    one dedupe_key would raise a raw UniqueViolation naming only the index --
+    the operator cannot act on it (same defect class the sibling once-ever
+    precheck fixes for ``daily_review:<date>`` keys, which this function
+    excludes: those are covered by the all-status sibling above). Detect the
+    duplicates BEFORE the DDL and raise an actionable RuntimeError: exact
+    duplicate keys + row counts + human-merge guidance. Zero deletion, zero
+    rewriting: the caller's transaction rollback leaves every row untouched.
+
+    Mirrors the sibling guard: on a schema where ``alert_outbox`` does not
+    exist yet (fresh greenfield) this safe no-ops. Also re-run from the DDL
+    catch path (round 4 R-1): a raw-SQL window writer that commits a duplicate
+    pending row between this precheck and the index build makes the
+    savepointed CREATE UNIQUE INDEX raise UniqueViolation (23505); the caller
+    re-invokes this precheck to convert the index-name-only error into the
+    same actionable key-list error.
+    """
+    if not _table_exists(cur, "alert_outbox"):
+        return
+    cur.execute(
+        """
+        SELECT dedupe_key, COUNT(*) AS n
+        FROM alert_outbox
+        WHERE dedupe_key IS NOT NULL
+          AND status = 'pending'
+          AND dedupe_key NOT LIKE 'daily_review:%'
+        GROUP BY dedupe_key
+        HAVING COUNT(*) > 1
+        ORDER BY dedupe_key
+        """
+    )
+    dupes = cur.fetchall()
+    if dupes:
+        keys = ", ".join(f"{row['dedupe_key']} (x{row['n']})" for row in dupes)
+        raise RuntimeError(
+            "initialize_database cannot build the pending-dedupe unique index "
+            "idx_alert_outbox_dedupe_unique: the dirty DB holds DUPLICATE "
+            "pending dedupe_keys that must be merged manually (zero rows were "
+            f"deleted or rewritten): {keys}. For each duplicate, compare the "
+            "alert_outbox rows (status, last_error, created_at), keep the row "
+            "whose delivery actually happened, fail-close or delete the "
+            "others, then re-run initialize_database."
+        )
+
+
 def initialize_database(
     config: CryptoGuardConfig | None = None,
     *,
@@ -258,8 +365,60 @@ def initialize_database(
                             # safe no-ops (no ``paper_orders`` table yet) and
                             # ``schema_postgres.sql`` creates the full structure.
                             _apply_08_04_watch_order_bridge_migration(cur)
-                            cur.execute(schema_sql)
+                            # 08-10 Step 3: same pattern for the
+                            # entry_confirmation_events audit table. A real
+                            # pre-08-10 schema has no such table, so this safe
+                            # no-ops and schema_postgres.sql creates it; a
+                            # partial/empty 08-10 table (interrupted
+                            # deployment) is dropped and recreated, and a
+                            # partial table holding rows aborts fail-closed.
+                            _apply_08_10_entry_confirmation_events_migration(cur)
+                            # 08-12 P2-2 (fresh reviewer): additive column on
+                            # paper_orders (NULL = legacy). On a legacy pre-08-12
+                            # schema the ALTER appends it; on greenfield the DDL
+                            # below declares it and this safe no-ops.
+                            _apply_08_12_risk_advisory_mode_migration(cur)
+                            # 08-12 P2-2 (fresh reviewer): BEFORE the schema DDL
+                            # builds the once-ever daily_review unique index, a
+                            # dirty historical DB with two rows for one key
+                            # would raise a raw UniqueViolation the operator
+                            # cannot act on. Preflight it with an actionable
+                            # duplicate-key error (zero deletion, fail-closed).
+                            _precheck_daily_review_once_ever_duplicates(cur)
+                            # 08-12 (reviewer round 4 R-1): same preflight for
+                            # the pending-only partial unique
+                            # idx_alert_outbox_dedupe_unique -- every
+                            # non-daily_review dedupe_key with two pending rows
+                            # would fail the index build with the same
+                            # unactionable index-name-only error.
+                            # daily_review:<date> keys are covered by the
+                            # all-status sibling above.
+                            _precheck_pending_dedupe_key_duplicates(cur)
+                            # 08-12 (reviewer round 3 Recommended-1): a raw-SQL
+                            # writer that bypasses initialize_database can
+                            # commit a duplicate daily_review:<date> row in the
+                            # window between the precheck SELECT and the
+                            # CREATE UNIQUE INDEX below (the index build scans
+                            # live data, NOT the precheck snapshot). The nested
+                            # transaction() is a SAVEPOINT inside this single
+                            # init transaction: a UniqueViolation there rolls
+                            # back only the DDL step, leaving the connection
+                            # usable so the catch path below can re-run the
+                            # precheck and report the violating keys.
+                            with conn.transaction():
+                                cur.execute(schema_sql)
                         except _PsycopgDBError as exc:
+                            # 08-12 (reviewer rounds 3 Recommended-1 + 4 R-1):
+                            # the DDL itself still hit a duplicate key
+                            # (precheck window writer). Re-run BOTH prechecks
+                            # from the savepoint -- the all-status once-ever
+                            # one and the pending-only dedupe_key one -- each
+                            # raising the actionable key-list RuntimeError for
+                            # its own index (same contract as the preflight,
+                            # zero deletion).
+                            if exc.sqlstate == "23505" and _table_exists(cur, "alert_outbox"):
+                                _precheck_daily_review_once_ever_duplicates(cur)
+                                _precheck_pending_dedupe_key_duplicates(cur)
                             raise RuntimeError(
                                 "initialize_database DDL failed on an unhealthy "
                                 f"schema (fail-closed): {exc}"
@@ -305,6 +464,20 @@ def initialize_database(
                     # transaction (columns + index + this marker row) rolls back
                     # together - no residue.
                     _ensure_watch_order_bridge_contract_marker(cur)
+                    # 6. 08-10 Step 3: entry-confirmation lifecycle contract
+                    # marker - the LAST step, written ONLY after the
+                    # entry_confirmation_events table + fingerprint index exist
+                    # AND the health gate above passes, still inside the same
+                    # transaction. If the event migration or any later DDL
+                    # failed, the health gate already raised and the whole
+                    # transaction rolls back together - no residue.
+                    _ensure_entry_confirmation_lifecycle_contract_marker(cur)
+                    # 7. 08-10 Step 9: LLM risk-governance contract markers —
+                    # written AFTER the health gate passes, still inside the same
+                    # transaction (roll back together on any DDL failure).
+                    _ensure_llm_risk_proposal_contract_marker(cur)
+                    _ensure_risk_adjustment_verifier_contract_marker(cur)
+                    _ensure_llm_risk_context_isolation_contract_marker(cur)
                 conn.commit()
                 from plugins.crypto_guard.storage.pg_db import database_identity
                 return {"ok": True, "database": database_identity(cfg.database_url)}
@@ -576,6 +749,57 @@ def _ensure_watch_order_bridge_contract_marker(cur: psycopg.Cursor) -> None:
     production service is untouched.
     """
     _ensure_marker(cur, "watch_order_bridge_contract_v1")
+
+
+def _ensure_entry_confirmation_lifecycle_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-10 Step 3: entry-confirmation lifecycle contract marker.
+
+    ``entry_confirmation_lifecycle_contract_v1`` proves the
+    ``entry_confirmation_events`` table + exact UNIQUE fingerprint index + FKs
+    all exist and passed the schema health gate. ``initialize_database`` writes
+    it AFTER the health gate passes and BEFORE commit -- inside the SAME
+    advisory-lock-guarded transaction as the schema change, so a mid-migration
+    failure rolls back the marker row with everything else (no residue).
+
+    Marker-MISSING is fail-closed: the diagnostics treat an undeployed
+    lifecycle persistence contract as an error rather than silently resolving
+    carried/expired events without an audit trail.
+    """
+    _ensure_marker(cur, "entry_confirmation_lifecycle_contract_v1")
+
+
+def _ensure_llm_risk_proposal_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-10 Step 9: LLM risk-proposal contract marker.
+
+    ``llm_risk_proposal_contract_v1`` is the cutoff for the risk-committee
+    proposal diagnostics (immutable-change, unknown-evidence, starvation). Its
+    ``applied_at`` is the SQL lower bound (exclude-only). Marker-MISSING is
+    fail-closed: the proposal checks self-skip and
+    ``llm_risk_proposal_contract_marker_missing`` is emitted.
+    """
+    _ensure_marker(cur, "llm_risk_proposal_contract_v1")
+
+
+def _ensure_risk_adjustment_verifier_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-10 Step 9: risk-adjustment verifier contract marker.
+
+    ``risk_adjustment_verifier_contract_v1`` is the cutoff for the verifier
+    diagnostics (accepted-adjustment-increases-monetary-risk,
+    order-without-final-verifier-success). Same fail-closed semantics as the
+    proposal marker.
+    """
+    _ensure_marker(cur, "risk_adjustment_verifier_contract_v1")
+
+
+def _ensure_llm_risk_context_isolation_contract_marker(cur: psycopg.Cursor) -> None:
+    """08-10 Step 9: LLM risk-context-isolation contract marker.
+
+    ``llm_risk_context_isolation_contract_v1`` proves the read-only evidence
+    rounds / context isolation contract deployed. Part of the four-marker set
+    used by ``_get_llm_risk_report_contract_marker_ts`` (MAX applied_at; ANY
+    missing marker fails closed).
+    """
+    _ensure_marker(cur, "llm_risk_context_isolation_contract_v1")
 
 
 def _ensure_watch_recheck_risk_shape_contract_marker(cur: psycopg.Cursor) -> None:
@@ -906,6 +1130,265 @@ def apply_08_04_watch_order_bridge_migration(conn: psycopg.Connection) -> None:
         _apply_08_04_watch_order_bridge_migration(cur)
 
 
+# ── 08-10: entry_confirmation_events lifecycle contract ─────────────────────
+
+
+CONFIRMATION_FINGERPRINT_INDEX_NAME = "idx_entry_confirmation_events_fingerprint"
+
+# Business columns that MUST exist on entry_confirmation_events (excludes the
+# identity PK). Shared by the schema-health gate (via _REQUIRED_COLUMNS) and the
+# migration's partial-table detection.
+_CONFIRMATION_EVENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "symbol",
+    "side",
+    "event_type",
+    "timeframe",
+    "direction",
+    "event_close_time",
+    "event_price",
+    "source",
+    "source_snapshot_id",
+    "source_decision_id",
+    "event_fingerprint",
+    "created_at",
+)
+
+
+def _introspect_confirmation_fingerprint_index(
+    cur: psycopg.Cursor, schema: str
+) -> dict[str, Any] | None:
+    """Precise catalog facts for ``idx_entry_confirmation_events_fingerprint``.
+
+    Reads ``pg_index`` flags (``indisunique`` / ``indisvalid`` / ``indisready``),
+    the key column via ``pg_attribute``, expression / INCLUDE-key detection, and
+    whether the index is partial (``indpred``). Returns None when the index is
+    absent. Shared by the migration rebuild-detection and the schema-health
+    gate -- never a loose ``indexdef`` string guess.
+    """
+    cur.execute(
+        """
+        SELECT
+            ix.indisunique, ix.indisvalid, ix.indisready,
+            ix.indpred IS NOT NULL AS has_pred,
+            ix.indnkeyatts AS nkeyatts, ix.indnatts AS natts,
+            ix.indexprs IS NOT NULL AS has_expr_keys,
+            a.attname AS key_attname
+        FROM pg_index ix
+        JOIN pg_class c ON ix.indexrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ix.indkey[0]
+        WHERE n.nspname = %s AND c.relname = %s
+        """,
+        (schema, CONFIRMATION_FINGERPRINT_INDEX_NAME),
+    )
+    return cur.fetchone()
+
+
+def _confirmation_fingerprint_index_is_exact(
+    facts: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """EXACT confirmation-fingerprint contract over catalog facts.
+
+    Returns ``(ok, reason)``. ``ok`` is True only when the index is:
+      - UNIQUE, valid, ready;
+      - exactly ONE key column, and it is ``entry_confirmation_events.event_fingerprint``;
+      - no expression keys, no INCLUDE columns;
+      - NON-partial (``indpred`` NULL) -- the full-table unique constraint
+        behind ``ON CONFLICT (event_fingerprint)``.
+
+    Any deviation -- a partial predicate, a non-unique / wrong-column /
+    composite / expression index -- is judged UNHEALTHY and rebuilt.
+    """
+    if facts is None:
+        return False, "index absent"
+    if not facts["indisunique"]:
+        return False, "index is not UNIQUE"
+    if not facts["indisvalid"]:
+        return False, "index is not valid"
+    if not facts["indisready"]:
+        return False, "index is not ready"
+    if facts["has_expr_keys"]:
+        return False, "index has an expression key"
+    if facts["nkeyatts"] != 1 or facts["natts"] != 1:
+        return False, (
+            f"expected exactly one key column and no INCLUDE "
+            f"(nkeyatts={facts['nkeyatts']}, natts={facts['natts']})"
+        )
+    if facts["key_attname"] != "event_fingerprint":
+        return False, (
+            f"key column is {facts['key_attname']!r}, expected 'event_fingerprint'"
+        )
+    if facts["has_pred"]:
+        return False, "index is partial; expected a non-partial full-table UNIQUE index"
+    return True, "exact confirmation fingerprint index"
+
+
+def _check_entry_confirmation_events_fingerprint_index(
+    cur: psycopg.Cursor, schema: str
+) -> list[dict[str, str]]:
+    """Schema-health checker for the exact fingerprint UNIQUE index."""
+    facts = _introspect_confirmation_fingerprint_index(cur, schema)
+    ok, reason = _confirmation_fingerprint_index_is_exact(facts)
+    if ok:
+        return []
+    if facts is None:
+        return [
+            {
+                "table": "entry_confirmation_events",
+                "column": "idx_entry_confirmation_events_fingerprint (missing)",
+            }
+        ]
+    return [
+        {
+            "table": "entry_confirmation_events",
+            "column": f"idx_entry_confirmation_events_fingerprint {reason}",
+        }
+    ]
+
+
+def _apply_08_10_entry_confirmation_events_migration(cur: psycopg.Cursor) -> None:
+    """08-10 Step 3: entry-confirmation lifecycle persistence contract.
+
+    Pure additive upgrade for existing DBs; on a fresh greenfield schema the
+    table does not exist yet, so this safe no-ops and lets
+    ``schema_postgres.sql`` create the full structure. The caller owns the
+    transaction (``initialize_database`` runs this inside the SAME
+    advisory-lock-guarded transaction as the schema DDL).
+
+    Because this feature ships NOW, no legitimate business row can pre-exist
+    outside this deployment: the table is append-only and nothing writes it
+    before the 08-10 code is live. The migration therefore:
+
+      - ABORTS (RuntimeError) on a partial table that already holds rows
+        (never auto-delete business rows);
+      - DROPs a partial EMPTY table so ``schema_postgres.sql`` recreates the
+        exact canonical shape (columns + FKs + index);
+      - dedupes IDENTICAL duplicate fingerprints (an interrupted re-run of the
+        same decision batch, keep-lowest-id) and ABORTS on non-identical
+        duplicates (tampered rows: the live insert path's ``ON CONFLICT DO
+        NOTHING`` can never produce two rows sharing a fingerprint, so any
+        such pair is corruption);
+      - introspects ``pg_index`` / ``pg_attribute`` and REBUILDS a same-name
+        index unless it is EXACTLY the non-partial UNIQUE ``event_fingerprint``
+        contract (``CREATE UNIQUE INDEX IF NOT EXISTS`` is a name-only no-op
+        and would silently keep a wrong-shaped index).
+    """
+    if not _table_exists(cur, "entry_confirmation_events"):
+        return
+    missing = [
+        col for col in _CONFIRMATION_EVENTS_REQUIRED_COLUMNS
+        if not _column_exists(cur, "entry_confirmation_events", col)
+    ]
+    if missing:
+        cur.execute("SELECT count(*) AS n FROM entry_confirmation_events")
+        n = int(cur.fetchone()["n"])
+        if n:
+            raise RuntimeError(
+                "apply_08_10_entry_confirmation_events_migration: "
+                f"entry_confirmation_events exists but is missing columns "
+                f"{missing} and already holds {n} row(s); refusing to "
+                "auto-delete business data"
+            )
+        cur.execute("DROP TABLE entry_confirmation_events")
+        return  # schema DDL recreates the full canonical shape below
+
+    # Conflicting duplicates: same fingerprint, different business fields. The
+    # live insert's ON CONFLICT DO NOTHING can never create a shared
+    # fingerprint, so any such pair is corruption -> abort (never auto-delete).
+    cur.execute(
+        """
+        SELECT event_fingerprint, COUNT(*) AS n,
+               COUNT(DISTINCT (symbol, side, event_type, timeframe, direction,
+                               event_close_time, event_price, source)) AS variants
+        FROM entry_confirmation_events
+        GROUP BY event_fingerprint HAVING COUNT(*) > 1
+        """
+    )
+    conflicts = [dict(r) for r in cur.fetchall()]
+    bad = [r for r in conflicts if r["variants"] > 1]
+    if bad:
+        fp = bad[0]["event_fingerprint"]
+        raise RuntimeError(
+            "idx_entry_confirmation_events_fingerprint cannot be built: "
+            f"fingerprint {fp} has {bad[0]['n']} rows across "
+            f"{bad[0]['variants']} distinct business-field variants; "
+            "refusing to auto-delete business data (conflicting duplicate)"
+        )
+    if conflicts:
+        # Identical duplicates (interrupted-batch artifact): keep-lowest-id.
+        cur.execute(
+            """
+            DELETE FROM entry_confirmation_events a
+            USING entry_confirmation_events b
+            WHERE a.event_fingerprint = b.event_fingerprint AND a.id > b.id
+            """
+        )
+
+    # Rebuild a same-name index unless it is EXACTLY the contract.
+    cur.execute("SELECT current_schema() AS s")
+    schema = cur.fetchone()["s"]
+    facts = _introspect_confirmation_fingerprint_index(cur, schema)
+    ok, _reason = _confirmation_fingerprint_index_is_exact(facts)
+    if ok:
+        return
+    if facts is not None:
+        cur.execute(f"DROP INDEX {CONFIRMATION_FINGERPRINT_INDEX_NAME}")
+    cur.execute(
+        f"""
+        CREATE UNIQUE INDEX {CONFIRMATION_FINGERPRINT_INDEX_NAME}
+            ON entry_confirmation_events(event_fingerprint)
+        """
+    )
+
+
+def apply_08_10_entry_confirmation_events_migration(
+    conn: psycopg.Connection,
+) -> None:
+    """Public wrapper: 08-10 entry-confirmation lifecycle contract (see the
+    cursor-based ``_apply_08_10_entry_confirmation_events_migration``).
+
+    The release path performs this automatically inside ``initialize_database``;
+    the helper stays idempotent so an extra explicit call is a no-op. The
+    caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        _apply_08_10_entry_confirmation_events_migration(cur)
+
+
+def _apply_08_12_risk_advisory_mode_migration(cur: psycopg.Cursor) -> None:
+    """08-12 (fresh reviewer P2-2): add ``paper_orders.risk_advisory_mode``.
+
+    Pure additive ``ALTER TABLE ADD COLUMN`` (NULL default = legacy
+    pre-governance order), so it is safe on a DB that already holds order
+    rows. On a fresh greenfield schema the ``paper_orders`` table does not
+    exist YET (the schema DDL below creates it), so this safe no-ops and lets
+    ``schema_postgres.sql`` declare the column directly -- mirroring the
+    08-04 bridge migration's table-existence guard. WITHOUT the guard,
+    ``initialize_database`` on a fresh schema raised ``UndefinedTable``
+    (fresh-schema RED: test_pg_health / test_pg_migrations /
+    test_pg_08_06_legacy_upgrade_p1). The caller owns the transaction
+    (``initialize_database`` runs this inside the SAME advisory-lock-guarded
+    transaction as the schema DDL).
+    """
+    if not _table_exists(cur, "paper_orders"):
+        return
+    _add_column(cur, "paper_orders", "risk_advisory_mode", "TEXT")
+
+
+def apply_08_12_risk_advisory_mode_migration(
+    conn: psycopg.Connection,
+) -> None:
+    """Public wrapper: 08-12 ``paper_orders.risk_advisory_mode`` (see the
+    cursor-based ``_apply_08_12_risk_advisory_mode_migration``).
+
+    The release path performs this automatically inside ``initialize_database``;
+    the helper stays idempotent so an extra explicit call is a no-op. The
+    caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        _apply_08_12_risk_advisory_mode_migration(cur)
+
+
 def apply_r10_attempt_counter_migration(conn: psycopg.Connection) -> None:
     """Ensure the ``_analysis_attempt_counter`` table exists (R10-P2).
 
@@ -1064,6 +1547,7 @@ _REQUIRED_COLUMNS: dict[str, list[str]] = {
         "initial_stop_loss",
         "last_processed_candle_time",
         "trigger_watch_id",
+        "risk_advisory_mode",
     ],
     "paper_trades": ["initial_stop_loss", "initial_risk_usdt"],
     "paper_trade_logs": ["dedupe_key"],
@@ -1081,6 +1565,20 @@ _REQUIRED_COLUMNS: dict[str, list[str]] = {
         "last_open_time_fetched",
         "last_updated_ms",
     ],
+    "entry_confirmation_events": [
+        "symbol",
+        "side",
+        "event_type",
+        "timeframe",
+        "direction",
+        "event_close_time",
+        "event_price",
+        "source",
+        "source_snapshot_id",
+        "source_decision_id",
+        "event_fingerprint",
+        "created_at",
+    ],
     "agent_jobs": ["claim_token", "lease_until", "defer_count", "deferred_at"],
     "analysis_batches": ["claim_ready_at", "sealed_at"],
     "_service_ownership": ["owner_token"],
@@ -1095,6 +1593,8 @@ _REQUIRED_INDEXES: list[str] = [
     "idx_alert_outbox_dedupe_unique",
     "idx_paper_trade_logs_dedupe_key",
     "idx_paper_orders_trigger_watch_once",
+    "idx_entry_confirmation_events_fingerprint",
+    "idx_alert_outbox_daily_review_once_ever",
 ]
 
 # Required tables (must exist by name).
@@ -1145,6 +1645,7 @@ _REQUIRED_TABLES: list[str] = [
     "user_feedback",
     "sop_definitions",
     "shadow_virtual_trades",
+    "entry_confirmation_events",
 ]
 
 # SHA-256 of the normalized PostgreSQL catalog contract produced by
@@ -1160,7 +1661,19 @@ _REQUIRED_TABLES: list[str] = [
 # declares them mid-table; the two paths yield the identical logical catalog,
 # and only an order-insensitive fingerprint lets an upgraded legacy schema pass
 # the health gate (its SHA-256 must equal this greenfield value).
-_EXPECTED_SCHEMA_FINGERPRINT = "c937a91931256296e2eee02dd34956aa6be0ed0b1dacd4b5386a144f264d39bf"
+#
+# 08-12 (fresh reviewer P2-2): regenerated from a fresh scratch schema after
+# adding ``paper_orders.risk_advisory_mode`` (additive; greenfield DDL declares
+# it and the migration ``_add_column`` no-ops, so upgraded and fresh schemas
+# converge on this value).
+#
+# 08-12 (P1 daily-review once-ever): regenerated from a fresh scratch schema
+# after adding ``idx_alert_outbox_daily_review_once_ever`` (partial UNIQUE on
+# alert_outbox.dedupe_key WHERE dedupe_key LIKE 'daily_review:%'). The index is
+# created by the greenfield DDL with ``IF NOT EXISTS``; the schema-health gate
+# additionally requires it by name (``_REQUIRED_INDEXES``) and the fingerprint
+# pins its exact predicate/definition.
+_EXPECTED_SCHEMA_FINGERPRINT = "db8ce9f2470b4e145c78fb994f8de2d35ee2895ed86f221eeec5f2ece237dd0d"
 
 
 def _normalize_catalog_text(value: Any, schema: str) -> str:
@@ -1341,6 +1854,9 @@ def _introspect_schema_health(cur: psycopg.Cursor) -> dict[str, Any]:
 
     # ── paper_orders trigger_watch_id partial unique index (08-04 contract B) ─
     missing.extend(_check_paper_orders_trigger_watch_index(cur, schema))
+
+    # ── entry_confirmation_events fingerprint UNIQUE index (08-10 contract) ─
+    missing.extend(_check_entry_confirmation_events_fingerprint_index(cur, schema))
 
     # ── backfill_progress composite primary key (symbol, interval) ─────────
     missing.extend(_check_backfill_progress_primary_key(cur, schema))
@@ -1645,4 +2161,6 @@ __all__ = [
     "apply_r6f_service_ownership_migration",
     "apply_r10_attempt_counter_migration",
     "apply_08_04_watch_order_bridge_migration",
+    "apply_08_10_entry_confirmation_events_migration",
+    "apply_08_12_risk_advisory_mode_migration",
 ]

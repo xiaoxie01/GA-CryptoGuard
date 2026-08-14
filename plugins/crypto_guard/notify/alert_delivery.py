@@ -99,31 +99,78 @@ def send_markdown_alert(
             default_dedupe_key = f"{symbol or '-'}:{alert_type}"
     else:
         default_dedupe_key = None
+    resolved_dedupe_key = dedupe_key or default_dedupe_key
+    # 08-12 P2-2 (fresh reviewer Recommended-1): a daily_review:<date>
+    # delivery is once-ever — that guarantee lives in the outbox QUEUE's
+    # claim -> send -> finalize sequence (process_alert_outbox). A direct
+    # send here bypasses the claim entirely: a crash between the send and
+    # the finalize leaves the row claimable again, and a second run would
+    # send AGAIN (the production defect this task repairs). Reject it
+    # BEFORE enqueue so no intent row is left behind.
+    if resolved_dedupe_key and resolved_dedupe_key.startswith("daily_review:") and send_message is not None:
+        raise ValueError(
+            "daily_review:<date> deliveries must go through the outbox queue "
+            "(process_alert_outbox / send_message=None): a direct send cannot "
+            "guarantee the at-most-once once-ever contract"
+        )
     alert_id = repo.enqueue_alert(
         alert_type=alert_type,
         symbol=symbol,
         priority=priority,
         payload=payload,
-        dedupe_key=dedupe_key or default_dedupe_key,
+        dedupe_key=resolved_dedupe_key,
     )
     if not send_message:
+        # 08-12 P1 (Codex P2-1): with send_message=None the enqueue result is
+        # ambiguous — enqueue_alert returns the ORIGINAL row id on a
+        # daily_review:<date> dedupe hit in ANY state. Only a 'pending' row is
+        # a real queue slot; a sent/sending/failed hit means the once-ever
+        # delivery already happened or was fail-closed, so report deduped —
+        # never queued=true on a row the dispatcher must not claim.
+        status = repo.alert_outbox_status(alert_id)
+        if status and status["status"] != "pending":
+            return {"ok": True, "sent": False, "deduped": True, "alert_id": alert_id, "status": status["status"]}
         return {"ok": True, "sent": False, "queued": True, "alert_id": alert_id}
-    return _deliver_alert(repo, alert_id, payload, send_message)
+    # 08-12 P1: enqueue is the cross-state dedupe gate — a daily_review
+    # re-enqueue returns the ORIGINAL row id whatever its state; only a
+    # 'pending' row may be delivered. Anything else (sent/sending/failed
+    # after a crash, rollback or restart) means the once-ever delivery
+    # already happened or was fail-closed: report deduped, never a second
+    # external send.
+    status = repo.alert_outbox_status(alert_id)
+    if status and status["status"] != "pending":
+        return {"ok": True, "sent": False, "deduped": True, "alert_id": alert_id, "status": status["status"]}
+    return _deliver_alert(repo, alert_id, payload, send_message, resolved_dedupe_key)
 
 
 def process_alert_outbox(repo: CryptoGuardRepository, send_message: Callable[..., Any] | None, *, limit: int = 10) -> dict[str, Any]:
     if not send_message:
         return {"ok": True, "processed": 0, "sent": 0, "failed": 0}
+    # 08-12 P1: reclaim dispatcher crashes first, fail-closed (terminal
+    # 'failed' + alert_failure_log; such rows are NEVER re-sent — the external
+    # side effect may already have happened).
+    repo.recover_stale_sending_alerts()
     processed = sent = failed = 0
     for row in repo.claim_pending_alerts(limit=limit):
         processed += 1
+        # Dispatcher transaction boundary: the atomic claim must be durable
+        # BEFORE the external send. Committing here closes the implicit
+        # transaction / savepoint (psycopg3) left open by the enqueue, so the
+        # side effect below is never inside a business transaction that a
+        # later failure could roll back.
+        repo.conn.commit()
         # 07-16 cutover: ``payload_json`` is a JSONB column, so psycopg3 returns
         # it as an already-decoded dict (NOT str). ``json.loads(dict)`` raises
         # TypeError -> ``_deliver_alert`` never runs -> every alert silently
         # fails to send. Pass dict/list through; only parse str.
         raw_payload = row["payload_json"]
         payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload or "{}")
-        result = _deliver_alert(repo, int(row["id"]), payload, send_message)
+        result = _deliver_alert(repo, int(row["id"]), payload, send_message, row.get("dedupe_key"))
+        # Finalize (mark_alert_sent / mark_alert_failed) is its own short
+        # transaction; commit it immediately so a racing dispatcher never
+        # blocks on an uncommitted row lock (savepoint-in-implicit-txn
+        # deadlock pattern) and a later failure cannot roll the finalize back.
+        repo.conn.commit()
         if result.get("sent"):
             sent += 1
         elif result.get("failed"):
@@ -131,7 +178,13 @@ def process_alert_outbox(repo: CryptoGuardRepository, send_message: Callable[...
     return {"ok": True, "processed": processed, "sent": sent, "failed": failed}
 
 
-def _deliver_alert(repo: CryptoGuardRepository, alert_id: int, payload: dict[str, Any], send_message: Callable[..., Any]) -> dict[str, Any]:
+def _deliver_alert(
+    repo: CryptoGuardRepository,
+    alert_id: int,
+    payload: dict[str, Any],
+    send_message: Callable[..., Any],
+    dedupe_key: str | None = None,
+) -> dict[str, Any]:
     try:
         sent = send_message(
             payload["receive_id"],
@@ -139,11 +192,62 @@ def _deliver_alert(repo: CryptoGuardRepository, alert_id: int, payload: dict[str
             msg_type=payload.get("msg_type", "interactive"),
             receive_id_type=payload.get("receive_id_type", "chat_id"),
         )
-        if sent:
-            repo.mark_alert_sent(alert_id)
-            return {"ok": True, "sent": True, "alert_id": alert_id}
-        raise RuntimeError("send_message returned falsy")
     except Exception as exc:
+        # 08-12 P1 (Codex P1-1): for a daily_review send the outcome is
+        # UNKNOWN — the provider may have accepted the request before the
+        # client raised (timeout reading the response). There is no upstream
+        # provider idempotency key, so at-most-once and exactly-once cannot be
+        # jointly held; duplicate daily pushes must be avoided first:
+        # TERMINAL 'failed' + reason code, never recycled to 'pending', never
+        # re-dispatched. Other alert types keep the existing bounded-retry
+        # policy (max_attempts, backoff) on the same row.
+        if dedupe_key and dedupe_key.startswith("daily_review:"):
+            repo.mark_alert_failed(
+                alert_id,
+                f"daily_review_send_outcome_unknown_no_retry: {exc}",
+                max_attempts=1,
+                force_terminal=True,
+            )
+            return {
+                "ok": True, "sent": False, "failed": True, "alert_id": alert_id,
+                "error": f"daily_review_send_outcome_unknown_no_retry: {exc}",
+            }
         max_attempts = int((load_config().trading_mode.get("alerts") or {}).get("retry_max_attempts", 3))
         repo.mark_alert_failed(alert_id, str(exc), max_attempts=max_attempts)
         return {"ok": True, "sent": False, "failed": True, "alert_id": alert_id, "error": str(exc)}
+    if not sent:
+        # 08-12 (reviewer round 3 Recommended-3): a FALSY return is the
+        # provider EXPLICITLY refusing the message — it was never accepted, so
+        # a retry cannot duplicate (only the EXCEPTION path above is
+        # outcome-unknown). A daily_review falsy return keeps the bounded
+        # retry policy on the SAME row (once-ever index untouched); it must
+        # NOT terminate with the outcome-unknown reason code, which would
+        # silently miss the daily push forever for a recoverable condition.
+        max_attempts = int((load_config().trading_mode.get("alerts") or {}).get("retry_max_attempts", 3))
+        repo.mark_alert_failed(alert_id, "send_message returned falsy", max_attempts=max_attempts)
+        return {"ok": True, "sent": False, "failed": True, "alert_id": alert_id, "error": "send_message returned falsy"}
+    # 08-12 P1: the external send SUCCEEDED — a finalize failure must NOT
+    # recycle the row to 'pending' (a retry would send AGAIN: the production
+    # defect restarted the same daily session >=14 times). For daily_review
+    # keys the 'sent' flag and the report's pushed_to_feishu marker commit
+    # together (single short transaction); any finalize exception fails closed
+    # to terminal 'failed' + alert_failure_log, never a second external send.
+    daily_review_date = (
+        dedupe_key.split(":", 1)[1]
+        if dedupe_key and dedupe_key.startswith("daily_review:")
+        else None
+    )
+    try:
+        repo.mark_alert_sent(alert_id, daily_review_date=daily_review_date)
+    except Exception as exc:
+        repo.mark_alert_failed(
+            alert_id,
+            f"finalize_failed_after_send: {exc}",
+            max_attempts=1,
+            force_terminal=True,
+        )
+        return {
+            "ok": True, "sent": False, "failed": True, "alert_id": alert_id,
+            "error": f"finalize_failed_after_send: {exc}",
+        }
+    return {"ok": True, "sent": True, "alert_id": alert_id}

@@ -43,7 +43,7 @@ from unittest.mock import MagicMock, patch
 
 from plugins.crypto_guard.config.loader import PLUGIN_ROOT
 
-# The 11 task_names registered with run_agent_json_task (market-decision keeps
+# The 12 task_names registered with run_agent_json_task (market-decision keeps
 # SYSTEM_PROMPT and is NOT part of this map).
 _TASKS = [
     "historical_replay_backtest_analysis",
@@ -57,6 +57,7 @@ _TASKS = [
     "candidate_strategy_config_review",
     "shadow_test_strategy_verdict",
     "self_evolution_candidate_patch",
+    "risk_adjustment_review",
 ]
 
 
